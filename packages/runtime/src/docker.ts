@@ -8,15 +8,21 @@ export function validateDockerEndpoint(endpoint: DockerRuntimeEndpoint): void {
   }
 }
 
-/** Never inherit a user's Docker context, credentials, remote TLS or version override. */
-export function dockerInvocation(endpoint: DockerRuntimeEndpoint, args: readonly string[]): { command: string; args: string[]; env: NodeJS.ProcessEnv } {
-  validateDockerEndpoint(endpoint);
-  const env = { ...process.env };
+/** Shared by the bundled CLI and native adapters before they pin their owned endpoint. */
+export function cleanDockerEnvironment(source: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const env = { ...source };
   for (const key of ['DOCKER_CONTEXT', 'DOCKER_TLS', 'DOCKER_TLS_VERIFY', 'DOCKER_CERT_PATH', 'DOCKER_API_VERSION', 'DOCKER_CUSTOM_HEADERS', 'DOCKER_AUTH_CONFIG', 'BUILDKIT_HOST']) delete env[key];
-  env.DOCKER_HOST = endpoint.host; env.DOCKER_CONFIG = endpoint.configDirectory;
   // Envmux uses the supported Docker Engine build API; do not require an
   // unbundled Buildx plugin because of an inherited developer preference.
   env.DOCKER_BUILDKIT = '0';
+  return env;
+}
+
+/** Never inherit a user's Docker context, credentials, remote TLS or version override. */
+export function dockerInvocation(endpoint: DockerRuntimeEndpoint, args: readonly string[]): { command: string; args: string[]; env: NodeJS.ProcessEnv } {
+  validateDockerEndpoint(endpoint);
+  const env = cleanDockerEnvironment();
+  env.DOCKER_HOST = endpoint.host; env.DOCKER_CONFIG = endpoint.configDirectory;
   env.PATH = `${dirname(endpoint.cliPath)}${delimiter}${env.PATH ?? ''}`;
   return { command: endpoint.cliPath, args: ['--host', endpoint.host, '--config', endpoint.configDirectory, ...args], env };
 }

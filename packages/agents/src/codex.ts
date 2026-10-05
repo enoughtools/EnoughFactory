@@ -124,7 +124,7 @@ export class CodexTurn {
     }
   }
   async run(): Promise<TurnResult> {
-    await this.request("initialize", { clientInfo: { name: "enoughfactory", title: "EnoughFactory", version: "0.1.0" }, capabilities: { experimentalApi: false } });
+    await this.request("initialize", { clientInfo: { name: "enoughfactory", title: "EnoughFactory", version: "0.1.1" }, capabilities: { experimentalApi: false } });
     this.process.write({ method: "initialized", params: {} });
     const approvalPolicy = this.input.approvalMode === "approve-all" ? "never" : "on-request";
     const parameters = { cwd: this.input.cwd, approvalPolicy, approvalsReviewer: "user", sandbox: "danger-full-access", model: this.input.model, developerInstructions: this.input.systemInstructions };

@@ -47,7 +47,7 @@ If the user D-Bus session is missing, install the package above and log into an 
 
 ## Build and open from source
 
-Install Node 22.14+, pnpm 10.34.5, Git, the .NET 10 SDK, Python 3.10+ and POSIX build tools (`make`, `tar`, `file`; Xcode Command Line Tools on Mac), then run:
+Install Node 22.14+, pnpm 10.34.5, Git, the .NET 10 SDK, Python 3.10+ and build tools (`make`, `gperf`, `tar`, `file`, binutils and standard shell utilities; Xcode Command Line Tools on Mac), then run:
 
 ```sh
 git clone https://github.com/enoughtools/EnoughFactory.git

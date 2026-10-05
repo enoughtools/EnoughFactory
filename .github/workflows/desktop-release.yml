@@ -22,7 +22,7 @@ jobs:
       - name: Resolve and verify the locked Ubuntu source set
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y gpgv
+          sudo apt-get install -y gpgv zstd
           python3 runtime/container/os-source-kit/prepare-source-companion.py resolve --cache .cache/ubuntu-source-companion --lock .cache/ubuntu-source-companion/Ubuntu-sources.resolved.json --output dist/ubuntu-source-companion
           cmp runtime/container/os-source-kit/Ubuntu-sources.lock.json .cache/ubuntu-source-companion/Ubuntu-sources.resolved.json
       - name: Deliver exact source archives and signed metadata
@@ -75,6 +75,11 @@ jobs:
           NODE
       - name: Publish native engine
         run: node scripts/envmux-build.mjs "${{ matrix.rid }}"
+      - name: Prepare native Linux source-build tools
+        if: matrix.platform == 'linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y gperf make python3 file binutils
       - name: Build application bundles
         run: node scripts/package-desktop.mjs --platform "${{ matrix.platform }}" --arch "${{ matrix.arch }}"
         env:

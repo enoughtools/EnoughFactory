@@ -15,7 +15,7 @@ node runtime/container/relink-kit/build-go-engine.mjs \
   --output /path/to/container-build
 ```
 
-The native script needs Python 3.10 or newer, a POSIX shell, `make`, `tar` and `file`. It downloads and verifies the pinned Go and Zig toolchains for Mac or Linux, then cross-compiles Linux ARM64 and x64:
+The native script needs Python 3.10 or newer, a POSIX shell/Bash, `make`, `gperf`, `file`, binutils (`nm`, `ld`, `strip`) and ordinary coreutils/`grep`/`sed`/`awk`/`tar`/`gzip`. Xcode Command Line Tools supply the Mac build utilities. The pinned release contains its generated configure/libtool files; Python bindings are disabled, so autoconf, automake, Cython and CMake are not required. It downloads and verifies the pinned Go and Zig toolchains for Mac or Linux, then cross-compiles Linux ARM64 and x64:
 
 ```sh
 python3 runtime/container/relink-kit/build-native.py \

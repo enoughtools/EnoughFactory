@@ -119,7 +119,7 @@ export async function initializeNetwork(app: DeviceApp): Promise<{
   const remoteCatalogs=new Map(app.store.list<Catalog>('remote-catalog').map(catalog=>[catalog.id,catalog]));
   const liveApprovals=new Map<string,Approval[]>();
   let peers!: PeerManager;let remoteEvent=false;let closed=false;let lastPublished='';let lastApprovals='';
-  const localState=():FactoryState=>({product:'EnoughFactory',version:'0.1.0',device:app.device,devices:[app.device],
+  const localState=():FactoryState=>({product:'EnoughFactory',version:'0.1.1',device:app.device,devices:[app.device],
     ...publicCatalog(app),approvals:app.store.list('approvals'),diagnostics:app.diagnostics,
     settings:{...app.settings,turnCredential:undefined}});
   const saveCatalog=(peerId:string,value:unknown)=>{

@@ -20,7 +20,7 @@ Linux desktop bundles require a graphical desktop and the system libraries requi
 
 On Mac, open the DMG and drag EnoughFactory into Applications. The ZIP distribution contains the same application. On Linux, make the AppImage executable and launch it, or extract the tar archive and run the included application executable. Keep the archive's `resources` directory beside its executable.
 
-Release filenames include version, platform and architecture, for example `EnoughFactory-0.1.0-mac-arm64.dmg` and `EnoughFactory-0.1.0-linux-x64.AppImage`. Select the archive matching your device. Mac packaging is unsigned unless release signing credentials have been configured. Unsigned builds are labeled as such in the release manifest; macOS can ask for confirmation when opening them. Signing/notarization status must not be inferred from a successful packaging command.
+Release filenames include version, platform and architecture, for example `EnoughFactory-0.1.1-mac-arm64.dmg` and `EnoughFactory-0.1.1-linux-x64.AppImage`. Select the archive matching your device. Mac packaging is unsigned unless release signing credentials have been configured. Unsigned builds are labeled as such in the release manifest; macOS can ask for confirmation when opening them. Signing/notarization status must not be inferred from a successful packaging command.
 
 ## Install the Mac user service
 
@@ -117,6 +117,6 @@ node scripts/check-installed-service.mjs \
   --source-commit "<release source commit>"
 ```
 
-This check verifies native startup, authenticated health/catalog access, the runtime's positive stopped state, safe uninstall, removal of startup and resources, and preservation of device state. It does not start a second VM or substitute for the private engine/session journey. Its JSON receipt binds the result to the bundle manifest hash, source commit and native platform/architecture. A failed check keeps its isolated diagnostics for inspection.
+This check verifies native startup, authenticated health/catalog access, the runtime's positive stopped state, safe uninstall, removal of startup and resources, and preservation of device state. It does not start a second VM or substitute for the private engine/session journey. Its JSON receipt binds the result to the bundle manifest hash, source commit and native platform/architecture. Add `--keep-state` to retain the isolated state after a successful check; a failed check always keeps its diagnostics for inspection.
 
 Publish the built archives, their SHA-256 hashes, architecture and actual signing status through the release manifest used by `factory.enoughtools.com`. Never label an archive available before its download URL has been verified. Include `LICENSE`, `THIRD_PARTY_NOTICES.md`, the Node runtime license and the original envmux and EnoughUI notices with the distribution. The Enough application icon is the supplied brand mark; its separate license is included in `apps/desktop/assets/LICENSE`.

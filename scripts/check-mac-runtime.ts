@@ -194,8 +194,9 @@ try {
   }
   // This VM belongs only to the fresh proof directory, even on failure.
   await runtime.stop();
+  assert.equal((await runtime.status()).phase, "stopped", "The private proof VM must stop before recording success.");
+  assert.equal(await digest(userDockerConfiguration), originalConfiguration, "The user's Docker configuration changed.");
 }
-assert.equal(await digest(userDockerConfiguration), originalConfiguration, "The user's Docker configuration changed.");
 checks.push("inherited user Docker context and TLS settings ignored", "user Docker configuration unchanged");
 console.log(`Private Mac runtime journey passed. Proof state retained at ${proof}.`);
 

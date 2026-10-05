@@ -5,7 +5,7 @@ import { formatBytes, parseReleaseManifest, platformLabel, type ReleaseManifest,
 
 type Route = 'home' | 'docs' | 'downloads' | 'not-found';
 type Autonomy = 'manual' | 'assisted' | 'autonomous';
-const fallback: ReleaseManifest = { schemaVersion: 1, product: 'EnoughFactory', version: '0.1.0', status: 'preparing', publishedAt: null, sourceUrl: null, artifacts: [] };
+const fallback: ReleaseManifest = { schemaVersion: 1, product: 'EnoughFactory', version: '0.1.1', status: 'preparing', publishedAt: null, sourceUrl: null, artifacts: [] };
 const modes: Record<Autonomy, { label: string; title: string; body: string; actions: string[] }> = {
   manual: { label: 'Manual', title: 'You choose the next move.', body: 'Open an environment, talk to an agent and decide what happens next. Everything stays together in the workbench.', actions: ['Choose a task', 'Work with an agent', 'Review the result'] },
   assisted: { label: 'Assisted', title: 'A plan you can steer.', body: 'Let the factory organize the work and suggest its next step. Keep decisions close while agents handle the execution.', actions: ['Make a plan', 'Approve the next task', 'Inspect the evidence'] },

@@ -167,7 +167,11 @@ importers:
 
   packages/contracts: {}
 
-  packages/envmux: {}
+  packages/envmux:
+    dependencies:
+      '@enoughfactory/runtime':
+        specifier: workspace:*
+        version: link:../runtime
 
   packages/factory:
     dependencies:

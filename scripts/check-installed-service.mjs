@@ -16,8 +16,9 @@ for (let index = 2; index < process.argv.length; index++) {
   if (flag === '--resources') options.resources = process.argv[++index];
   else if (flag === '--receipt') options.receipt = process.argv[++index];
   else if (flag === '--source-commit') options.sourceCommit = process.argv[++index];
+  else if (flag === '--keep-state') options.keepState = true;
   else if (flag === '--help') {
-    console.log('Usage: node scripts/check-installed-service.mjs --resources <native installed app resources> --receipt <output.json> [--source-commit <40hex>]\nRequires an available launchd login domain or systemd user manager. Refuses an existing EnoughFactory startup registration. Runs an isolated install/start/remove journey without starting a container VM.');
+    console.log('Usage: node scripts/check-installed-service.mjs --resources <native installed app resources> --receipt <output.json> [--source-commit <40hex>] [--keep-state]\nRequires an available launchd login domain or systemd user manager. Refuses an existing EnoughFactory startup registration. Runs an isolated install/start/remove journey without starting a container VM.');
     process.exit(0);
   } else throw new Error(`Unknown option: ${flag}`);
 }
@@ -165,7 +166,7 @@ try {
     formatVersion: 1, product: 'EnoughFactory', version: provenance.version, platform: process.platform, arch: process.arch,
     sourceCommit: provenance.sourceCommit, verifiedAt: new Date().toISOString(), verificationScope: 'installed-user-service',
     resources: { bundleProvenanceSha256: digest(provenanceBytes), copiedBundleProvenanceSha256: digest(copiedProvenanceBytes), verifiedFiles, copiedVerifiedFiles },
-    service: { manager: mac ? 'launchd' : 'systemd-user', startup: 'registered-and-started', health: 'authenticated', version: health.version, unauthenticatedStateStatus: denied.status, stateDirectory: 'isolated-fixture', privateRuntimeStartupState: runtime.state, runtimeStarted: false, uninstall: 'authenticated-owned-runtime-stop-and-service-shutdown', startupRegistrationRemoved: true, connectionClosed: true, installedResourcesRemoved: true, deviceStatePreserved: true },
+    service: { manager: mac ? 'launchd' : 'systemd-user', startup: 'registered-and-started', health: 'authenticated', version: health.version, unauthenticatedStateStatus: denied.status, stateDirectory: 'isolated-fixture', privateRuntimeStartupState: runtime.state, runtimeStarted: false, uninstall: 'authenticated-owned-runtime-stop-and-service-shutdown', startupRegistrationRemoved: true, connectionClosed: true, installedResourcesRemoved: true, deviceStatePreserved: true, ...(options.keepState ? { preservedFixtureStateDirectory: home } : {}) },
   };
   await mkdir(dirname(receiptPath), { recursive: true });
   await writeFile(receiptPath, `${JSON.stringify(receipt, null, 2)}\n`);
@@ -178,6 +179,7 @@ try {
       await run(join(serviceDir, 'runtime/node'), join(serviceDir, 'install/uninstall-device-service.mjs'), ['--service-dir', serviceDir]);
     } catch (error) { console.error(`Fixture cleanup preserved resources for inspection at ${fixture}: ${error.message}`); }
   }
-  if (success) await rm(fixture, { recursive: true, force: true });
+  if (success && !options.keepState) await rm(fixture, { recursive: true, force: true });
+  else if (success) console.log(`Fixture device state preserved at ${home}.`);
   else console.error(`Installation check did not complete; fixture diagnostics remain at ${fixture}.`);
 }

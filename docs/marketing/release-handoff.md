@@ -33,7 +33,15 @@ The catalog links a public package verification record beside each checksum. Its
 
 ### Corresponding runtime sources
 
-The published specification also supplies `releaseBaseUrl`, such as `https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.0`, and `sourceArtifacts: [{ "path": "releases/EnoughFactory-0.1.0-darwin-arm64-container-sources.tar.gz" }, { "path": "releases/EnoughFactory-0.1.0-darwin-arm64-container-sources.tar.gz.json" }]`. Supply the archive and JSON for every packaged platform/architecture. These paths are relative to the specification file; the filename and hash must match each archive receipt’s embedded `containerRuntime.engineSourceBuild.sourceCompanion`. A supplied source `url` must equal its filename beneath the actual release base.
+After downloading the final approved release files and their passed archive receipts into one directory, assemble the exact specification without typing each target by hand:
+
+```sh
+node release/marketing/assemble-specification.mjs /absolute/path/to/final-release /absolute/path/to/release-specification.json
+```
+
+The assembly helper reads the repository version, requires Mac ARM64 and both Linux targets with matching native runtime receipts, gathers each target’s source archive and JSON, and checks the complete Ubuntu input set. It writes only a specification. The preparation step still verifies actual package and source bytes and public availability before changing the catalog. Use `--ubuntu-sources /absolute/path/to/final-ubuntu-files` when the seven final Ubuntu files are kept separately.
+
+The published specification also supplies `releaseBaseUrl`, such as `https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.1`, and `sourceArtifacts: [{ "path": "releases/EnoughFactory-0.1.1-darwin-arm64-container-sources.tar.gz" }, { "path": "releases/EnoughFactory-0.1.1-darwin-arm64-container-sources.tar.gz.json" }]`. Supply the archive and JSON for every packaged platform/architecture. These paths are relative to the specification file; the filename and hash must match each archive receipt’s embedded `containerRuntime.engineSourceBuild.sourceCompanion`. A supplied source `url` must equal its filename beneath the actual release base.
 
 Ubuntu files default to `dist/ubuntu-source-companion`. An optional `ubuntuSourceDirectory` selects another directory relative to the specification file, including the final files downloaded from CI. Preparation reads the actual index and hashes its listed source parts, archive evidence, lock, index, README and checksums. The current release requires all seven files. The index must cover every package in the audited source lock, and its image hashes must match the verified bundled Mac guest. Regenerated archive hashes are taken from the final index and files; prior local gzip hashes are not assumed.
 

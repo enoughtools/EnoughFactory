@@ -6,6 +6,7 @@ import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
 import type { Readable } from 'node:stream';
 import { isIP } from 'node:net';
+import { cleanDockerEnvironment } from '@enoughfactory/runtime';
 
 export const ENVMUX_REVISION = '38914dd0fb49682a062dc17eb3427f6b4f27c5fe';
 
@@ -227,8 +228,7 @@ export class EnvmuxEngine {
   }
 
   private environment(): NodeJS.ProcessEnv {
-    const env = { ...process.env };
-    for (const name of ['DOCKER_CONTEXT', 'DOCKER_TLS_VERIFY', 'DOCKER_CERT_PATH', 'DOCKER_API_VERSION']) delete env[name];
+    const env = cleanDockerEnvironment();
     env.ENVMUX_MANAGED_DOCKER = '1';
     env.ENVMUX_DOCKER_HOST = this.dockerRuntime?.host ?? '';
     env.DOCKER_HOST = this.dockerRuntime?.host ?? '';

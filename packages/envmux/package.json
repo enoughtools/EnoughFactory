@@ -1,8 +1,9 @@
 {
   "name": "@enoughfactory/envmux",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "type": "module",
   "exports": "./src/index.ts",
-  "scripts": { "typecheck": "tsc -p tsconfig.json", "build:engine": "node ../../scripts/envmux-build.mjs" }
+  "scripts": { "typecheck": "tsc -p tsconfig.json", "verify": "tsx --test tests/*.test.ts", "build:engine": "node ../../scripts/envmux-build.mjs" },
+  "dependencies": { "@enoughfactory/runtime": "workspace:*" }
 }

@@ -4,7 +4,7 @@ Read the [build plan](docs/build-plan.md) and [implementation instructions](AGEN
 
 ## Development
 
-Install Node 22.14+, pnpm 10.34.5, Git, the .NET 10 SDK, Python 3.10+ and POSIX build tools (`make`, `tar`, `file`; Xcode Command Line Tools on Mac). Runtime preparation downloads its pinned Go/Zig toolchains and builds the native engine components. Satisfy the target's host prerequisites; an existing Docker daemon is not a product dependency. Clone the repository, then:
+Install Node 22.14+, pnpm 10.34.5, Git, the .NET 10 SDK, Python 3.10+ and build tools (`make`, `gperf`, `tar`, `file`, binutils and standard shell utilities; Xcode Command Line Tools on Mac). Runtime preparation downloads its pinned Go/Zig toolchains and builds the native engine components. Satisfy the target's host prerequisites; an existing Docker daemon is not a product dependency. Clone the repository, then:
 
 ```sh
 pnpm install --frozen-lockfile

@@ -59,7 +59,7 @@ requiring those keys.
 
 ## Generate companion assets for a release
 
-Prerequisites: Python 3 and `gpgv`; sufficient storage for the source cache and
+Prerequisites: Python 3, `gpgv` and `zstd`; sufficient storage for the source cache and
 release archives. The commands use private cache paths and do not alter host apt
 configuration, Docker, GPG keyrings or the bundled guest images.
 

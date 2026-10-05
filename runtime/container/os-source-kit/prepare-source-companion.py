@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Resolve and deliver complete source packages for EnoughFactory's pinned Ubuntu guests.
 
-Uses only the Python standard library plus gpgv for signed archive verification.
+Uses the Python standard library, zstd and gpgv for signed archive verification.
 No host package manager, Docker daemon, apt configuration or keyring is changed.
 """
 
@@ -122,6 +122,15 @@ def archive_keyring(cache):
         data = raw[offset + 60:offset + 60 + size]
         offset += 60 + size + size % 2
         if name.startswith("data.tar"):
+            # Debian's pinned keyring package uses zstd. Python's tarfile only
+            # gained that codec in 3.14; release runners also use Python 3.12.
+            if name == "data.tar.zst":
+                try:
+                    data = subprocess.run(["zstd", "--decompress", "--stdout"],
+                                          input=data, stdout=subprocess.PIPE,
+                                          stderr=subprocess.PIPE, check=True).stdout
+                except FileNotFoundError as error:
+                    raise RuntimeError("Install zstd to unpack the pinned Ubuntu archive keyring") from error
             with tarfile.open(fileobj=io.BytesIO(data), mode="r:*") as archive:
                 member = archive.getmember("./usr/share/keyrings/ubuntu-archive-keyring.gpg")
                 path = cache / "ubuntu-archive-keyring.gpg"

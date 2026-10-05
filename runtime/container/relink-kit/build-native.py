@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Build the owned engine's runc and docker-init without using any Docker daemon.
 
-Python 3.10+, POSIX shell and make are the only host prerequisites. The pinned
-Go and Zig toolchains supply the cross compiler, Linux headers and musl libc.
+Host prerequisites include Python 3.10+, a POSIX shell/Bash, make, gperf, file,
+binutils and ordinary coreutils/grep/sed/awk/tar/gzip (Xcode tools on Mac).
+The pinned Go and Zig toolchains supply the compiler, Linux headers and musl.
 The output retains sources, libseccomp objects/archive, Go external-link objects,
 and an exact command/input/output manifest for rebuilding and LGPL relinking.
 """
