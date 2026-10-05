@@ -197,6 +197,6 @@ jobs:
           GH_REPO: ${{ github.repository }}
         run: |
           if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            gh release create "$RELEASE_TAG" --verify-tag --title "EnoughFactory $RELEASE_TAG" --notes "Mac Apple Silicon and Linux x64/ARM64 desktop bundles. These initial builds are unsigned. Bundles include a private container runtime, device service, Node runtime, envmux engine, web interface and dependency notices. First launch prepares EnoughFactory's own runtime and dedicated socket. Provider sign-in is configured during onboarding."
+            gh release create "$RELEASE_TAG" --verify-tag --draft --title "EnoughFactory $RELEASE_TAG" --notes "Mac Apple Silicon and Linux x64/ARM64 desktop bundles. These initial builds are unsigned. Bundles include a private container runtime, device service, Node runtime, envmux engine, web interface and dependency notices. First launch prepares EnoughFactory's own runtime and dedicated socket. Provider sign-in is configured during onboarding."
           fi
           gh release upload "$RELEASE_TAG" releases/*.dmg releases/*.zip releases/*.AppImage releases/*.tar.gz releases/*container-sources.tar.gz.json releases/*.verification.json releases/*.verification.json.png releases/Ubuntu-source-companion* releases/Ubuntu-sources.lock.json releases/SHA256SUMS releases/provenance.json --clobber
