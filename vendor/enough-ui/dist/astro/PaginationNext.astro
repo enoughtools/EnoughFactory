@@ -1,0 +1,10 @@
+---
+import { cn } from '../lib/utils.js';
+import PaginationLink from './PaginationLink.astro';
+import type { ComponentProps } from 'astro/types';
+import { presentation } from '../lib/presentation.js';
+import { directionIconClass, directionChevronPaths } from '../lib/direction-icons.js';
+type Props = ComponentProps<typeof PaginationLink> & { text?: string };
+const {class: className, text = 'Next', ...attributes} = Astro.props;
+---
+<PaginationLink aria-label="Go to next page" size="default" {...attributes} class={cn(presentation.PaginationNext,className)}><span class="max-[479px]:sr-only"><slot>{text}</slot></span><svg aria-hidden="true" focusable="false" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class={cn(directionIconClass, 'rtl:rotate-180')}><path d={directionChevronPaths.right} /></svg></PaginationLink>

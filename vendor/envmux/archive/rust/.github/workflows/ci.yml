@@ -1,0 +1,244 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Least privilege by default. The one job that needs more asks for it itself.
+permissions:
+  contents: read
+
+# A branch only needs its newest run. Pushes to main are left alone, because
+# main's history is what the release tags are cut from and a cancelled run
+# leaves a commit with no verdict.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+# Note on toolchains: rust-toolchain.toml pins the whole repository to the
+# MSRV, and rustup honours that file over whatever a workflow installs. Every
+# job below therefore compiles at the MSRV — which is the intent — and the
+# `stable` job overrides it with RUSTUP_TOOLCHAIN to cover the other end.
+jobs:
+  check:
+    name: fmt + clippy + docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo doc --workspace --no-deps --locked
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      # Whether a failure is on one platform or all three is the first thing
+      # worth knowing, and cancelling the others withholds it.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@nextest
+        if: runner.os != 'macOS'
+      - run: cargo nextest run --workspace --locked
+        if: runner.os != 'macOS'
+      # macOS proves the workspace compiles and nothing more, for now: Docker
+      # is not reachable on the hosted macOS runner, and a suite that cannot
+      # reach it reports failures about the runner rather than about the code.
+      # Revisit when the runner has a working engine — the tests themselves are
+      # not the problem.
+      - name: Build only (no Docker on the macOS runner)
+        if: runner.os == 'macOS'
+        run: cargo build --workspace --all-targets --locked
+
+  msrv:
+    name: MSRV build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # From the manifest rather than written out here: two copies of a version
+      # number is one copy that goes stale, and the stale one would be this.
+      - name: Read the declared MSRV
+        id: msrv
+        run: |
+          version=$(grep -m1 '^rust-version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+          echo "MSRV is $version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+      - uses: Swatinem/rust-cache@v2
+      # RUSTUP_TOOLCHAIN, not just the installed default: rust-toolchain.toml
+      # otherwise wins, which would quietly make this a duplicate of every
+      # other job and let a manifest claiming an older MSRV go unchecked.
+      - run: cargo check --workspace --locked
+        env:
+          RUSTUP_TOOLCHAIN: ${{ steps.msrv.outputs.version }}
+
+  # The other end of the range. Every job above builds at the pin in
+  # rust-toolchain.toml, so nothing here ever saw a compiler newer than it —
+  # which is where a new lint or a tightened rule lands first.
+  stable:
+    name: current stable
+    runs-on: ubuntu-latest
+    env:
+      RUSTUP_TOOLCHAIN: stable
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --workspace --all-targets --locked
+
+  agent-musl:
+    name: envmux-agent (static musl)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+      # Dependency-free by design, so rust-lld links it without a musl gcc;
+      # keeping this job green is what keeps the crate dependency-free.
+      - run: cargo build -p envmux-agent --release --locked --target x86_64-unknown-linux-musl
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: rust-lld
+      - name: The agent must stay small
+        run: |
+          size=$(stat -c%s target/x86_64-unknown-linux-musl/release/envmux-agent)
+          echo "envmux-agent: $size bytes"
+          [ "$size" -lt 2097152 ] || { echo "agent exceeds the 2 MiB budget" >&2; exit 1; }
+
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+
+  audit:
+    name: cargo-audit
+    runs-on: ubuntu-latest
+    # The action reports through a check run, and opens an issue for an
+    # advisory found on a push to main. Both are writes, and the workflow-wide
+    # default here is read-only — without these it fails with "Resource not
+    # accessible by integration" rather than telling you about the advisory.
+    permissions:
+      contents: read
+      checks: write
+      issues: write
+    # The action builds cargo-audit with `cargo install`, which rustup runs at
+    # whatever rust-toolchain.toml says — the MSRV. cargo-audit's own
+    # dependencies move faster than that (kstring needs 1.96), so the install
+    # fails before a single advisory is checked. This tool is not our code and
+    # has no reason to be built at our MSRV.
+    env:
+      RUSTUP_TOOLCHAIN: stable
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  development-images:
+    name: Development images
+    runs-on: ubuntu-latest
+    # Three full image builds, so the ceiling is generous — but a registry
+    # pull that stalls should fail within the hour rather than hold a runner
+    # for the six-hour default.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build general image
+        run: docker build -t envmux-default:ci -f images/default.Dockerfile .
+      - name: Build .NET 10 + Node image
+        run: docker build -t envmux-dotnet-node:ci -f images/dotnet-node.Dockerfile .
+      - name: Build Rust + Node image
+        run: docker build -t envmux-rust-node:ci -f images/rust-node.Dockerfile .
+      - name: Verify installed tools
+        run: |
+          docker run --rm envmux-default:ci sh -lc \
+            'jq --version && aws --version && codex --version && claude --version && opencode --version && codex-security --help >/dev/null'
+          docker run --rm envmux-dotnet-node:ci sh -lc 'dotnet --version && node --version'
+          docker run --rm envmux-rust-node:ci sh -lc 'rustc --version && cargo --version && node --version'
+      # These two are asserted inside dev-common.sh as well; checking them here
+      # too keeps the guarantee visible at the image level. Both have already
+      # been shipped broken once: Bookworm's git was below envmux's own minimum,
+      # and Trixie's docker.io only Recommends docker-cli, so the images had
+      # dockerd but no `docker` command.
+      - name: Verify the substrate envmux itself requires
+        run: |
+          for image in envmux-default:ci envmux-dotnet-node:ci envmux-rust-node:ci; do
+            echo "== $image"
+            docker run --rm "$image" sh -lc '
+              set -e
+              docker --version
+              dockerd --version >/dev/null
+              tmux -V
+              git --version
+              git_version=$(git --version | sed "s/^git version //")
+              # envmux refuses to start below 2.40.
+              [ "$(printf "2.40\n%s\n" "$git_version" | sort -V | head -n1)" = "2.40" ] \
+                || { echo "git $git_version < 2.40 required by envmux" >&2; exit 1; }
+              # tmux >= 3.2 is a hard requirement for anything envmux shells into.
+              tmux_version=$(tmux -V | sed "s/^tmux //; s/[a-z]*$//")
+              [ "$(printf "3.2\n%s\n" "$tmux_version" | sort -V | head -n1)" = "3.2" ] \
+                || { echo "tmux $tmux_version < 3.2 required by envmux" >&2; exit 1; }
+            '
+          done
+      # The images run as `user`, uid 1000, and the generated .envmux.toml
+      # declares volume paths under /home/user on the strength of it. Asserted
+      # from outside, because the failure mode is silent: a base image that
+      # renumbered uid 1000 would give every workspace root-owned agent-state
+      # volumes it cannot write, and nothing would say so until an agent
+      # failed to save its credentials.
+      - name: Verify the images do not run as root
+        run: |
+          for image in envmux-default:ci envmux-dotnet-node:ci envmux-rust-node:ci; do
+            echo "== $image"
+            docker run --rm "$image" sh -lc '
+              set -e
+              [ "$(id -un)" = "user" ] || { echo "runs as $(id -un), not user" >&2; exit 1; }
+              [ "$(id -u)" = "1000" ] || { echo "user is uid $(id -u), not 1000" >&2; exit 1; }
+              [ "$HOME" = "/home/user" ] || { echo "HOME is $HOME" >&2; exit 1; }
+              # The workdir and the agent-state paths the starter declares must
+              # be writable by that account, or a volume mounted over them
+              # inherits ownership nobody in the workspace has.
+              for dir in /work "$HOME/.claude" "$HOME/.codex" "$HOME/.config/opencode"; do
+                [ -w "$dir" ] || { echo "$dir is not writable by user" >&2; exit 1; }
+              done
+              # Root is still reachable for the things that genuinely need it.
+              sudo -n true
+            '
+          done
+
+  docker-integration:
+    name: Docker-backed integration (required)
+    runs-on: ubuntu-latest
+    # The smoke script provisions containers and waits on them; a workspace
+    # that never becomes ready would otherwise hang until the runner is
+    # reclaimed.
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build binaries
+        run: cargo build -p envmux-cli --locked
+      - name: Smoke workflow
+        run: bash scripts/smoke.sh

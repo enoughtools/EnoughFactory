@@ -1,0 +1,7 @@
+---
+import type { HTMLAttributes } from 'astro/types';
+import Separator from './Separator.astro';
+type Props = HTMLAttributes<'div'> & { orientation?: 'horizontal' | 'vertical'; decorative?: boolean };
+const { class: className, ...attributes } = Astro.props;
+---
+<Separator data-slot="item-separator" {...attributes} class={className} />

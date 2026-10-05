@@ -1,0 +1,9 @@
+---
+import type { HTMLAttributes } from 'astro/types';
+import { cn } from '../lib/utils.js';
+import { presentation } from '../lib/presentation.js';
+type Props = HTMLAttributes<'div'> & {errors?: ({message?: string} | undefined)[]};
+const {class: className, errors = [], ...attributes} = Astro.props;
+const messages = [...new Set(errors.map(e=>e?.message).filter((e): e is string => Boolean(e)))];
+---
+<>{(Astro.slots.has("default") || messages.length > 0) && <div {...attributes} role="alert" aria-live="polite" data-slot="field-error" class={cn(presentation.FieldError,className)}><slot>{messages.length === 1 ? messages[0] : <ul class="ml-4 list-square space-y-1">{messages.map(message=><li>{message}</li>)}</ul>}</slot></div>}</>

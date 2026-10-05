@@ -1,0 +1,9 @@
+---
+import type { HTMLAttributes } from 'astro/types';
+import { cn } from '../lib/utils.js';
+import { emptyMediaVariants } from '../lib/variants.js';
+import type { VariantProps } from 'class-variance-authority';
+type Props = Omit<HTMLAttributes<'div'>, keyof VariantProps<typeof emptyMediaVariants>> & VariantProps<typeof emptyMediaVariants>;
+const { class: className, variant, ...attributes } = Astro.props;
+---
+<div data-slot="empty-media" {...attributes} class={cn(emptyMediaVariants({ variant }), className)}><slot /></div>

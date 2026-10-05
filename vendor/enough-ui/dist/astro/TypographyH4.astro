@@ -1,0 +1,8 @@
+---
+import type { HTMLAttributes } from 'astro/types';
+import { cn } from '../lib/utils.js';
+import { typographyVariants } from '../lib/variants.js';
+type Props = HTMLAttributes<'h4'>;
+const {class: className, ...attributes} = Astro.props;
+---
+<h4 {...attributes} data-slot="typography-h4" class={cn(typographyVariants({variant:"h4"}),className)}><slot /></h4>

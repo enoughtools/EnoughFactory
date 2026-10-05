@@ -1,0 +1,7 @@
+---
+import Button from './Button.astro';
+import type { ComponentProps } from 'astro/types';
+type Props = ComponentProps<typeof Button>;
+const { variant = 'ghost', size = 'icon-xs', ...attributes } = Astro.props;
+---
+<Button data-slot="attachment-action" variant={variant} size={size} {...attributes}><slot /></Button>

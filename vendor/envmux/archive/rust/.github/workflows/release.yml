@@ -1,0 +1,154 @@
+name: Release
+
+# Tagged releases only. Everything here is reproducible from the tag: the
+# workflow builds the CLI natively on each platform and attaches the results
+# to one GitHub Release.
+#
+# There is deliberately **no auto-updater**. Shipping a self-updating binary
+# means committing to an update endpoint, signing keys, and a rollback story;
+# until those exist, an updater that half-works is worse than none. Archives
+# are downloaded and unpacked.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build (for a dry run; no release is published)"
+        required: false
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  bundle:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows (x64)
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+          - name: macOS (Apple silicon)
+            os: macos-latest
+            target: aarch64-apple-darwin
+            archive: tar
+          - name: macOS (Intel)
+            os: macos-latest
+            target: x86_64-apple-darwin
+            archive: tar
+          - name: Linux (x64)
+            os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            archive: tar
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}, x86_64-unknown-linux-musl
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build the envmux binary
+        run: cargo build --release --locked -p envmux-cli --target ${{ matrix.target }}
+
+      # The in-container agent ships beside the host binary on every platform:
+      # workspace containers are Linux regardless of the host, and the daemon
+      # looks for `envmux-agent-linux-amd64` next to its own executable.
+      # Dependency-free by design, so rust-lld cross-links it from anywhere.
+      - name: Build the in-container agent (static musl)
+        run: cargo build --release --locked -p envmux-agent --target x86_64-unknown-linux-musl
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: rust-lld
+
+      # One archive per platform: the binary is the CLI *and* the daemon, so
+      # this file plus the agent beside it is all anyone needs.
+      - name: Stage the CLI archive
+        shell: bash
+        run: |
+          staging="envmux-${{ matrix.target }}"
+          mkdir -p "$staging"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp "target/${{ matrix.target }}/release/envmux.exe" "$staging/"
+          else
+            cp "target/${{ matrix.target }}/release/envmux" "$staging/"
+          fi
+          cp "target/x86_64-unknown-linux-musl/release/envmux-agent" \
+             "$staging/envmux-agent-linux-amd64"
+          cp README.md LICENSE "$staging/"
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            7z a -tzip "$staging.zip" "$staging"
+          else
+            tar -czf "$staging.tar.gz" "$staging"
+          fi
+
+      - name: Collect artifacts
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp envmux-${{ matrix.target }}.* dist/ 2>/dev/null || true
+          ls -la dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: envmux-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Publish the release
+    needs: bundle
+    runs-on: ubuntu-latest
+    # A dry run builds everything and publishes nothing.
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Flatten and list
+        run: |
+          mkdir -p dist
+          find artifacts -type f -exec cp {} dist/ \;
+          ls -la dist
+
+      - name: Publish
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          draft: true
+          generate_release_notes: true
+          body: |
+            ## Install
+
+            Download the archive for your platform below, or see the
+            [README](https://github.com/strigops-io/envmux#install).
+
+            | Platform | File |
+            |---|---|
+            | Windows | `envmux-*-windows-*.zip` |
+            | macOS | `envmux-*-darwin.tar.gz` — Apple silicon and Intel builds are separate |
+            | Linux | `envmux-*-linux-*.tar.gz` |
+
+            Each archive contains the `envmux` binary — the CLI, the daemon,
+            and the TUI in one executable. Unpack it, run
+            `envmux install`, and it copies itself somewhere permanent.
+
+            **These builds are not code-signed.** Windows SmartScreen will
+            warn — "More info" then "Run anyway". macOS needs
+            `xattr -d com.apple.quarantine envmux` once.
+
+            envmux needs a local Docker engine (Docker Desktop on Windows and
+            macOS, using Linux containers) and host git 2.40 or newer.
+
+            There is no auto-updater: download a newer archive to upgrade.

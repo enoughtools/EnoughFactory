@@ -1,0 +1,24 @@
+[package]
+name = "envmux-config"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+envmux-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+toml_edit = { workspace = true }
+thiserror = { workspace = true }
+miette = { workspace = true }
+blake3 = { workspace = true }
+petgraph = { workspace = true }
+jiff = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

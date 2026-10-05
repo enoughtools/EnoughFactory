@@ -1,0 +1,8 @@
+---
+import type { HTMLAttributes } from 'astro/types';
+import { cn } from '../lib/utils.js';
+import { presentation } from '../lib/presentation.js';
+type Props = HTMLAttributes<'legend'> & {variant?: 'legend'|'label'};
+const {class: className, variant = 'legend', ...attributes} = Astro.props;
+---
+<legend {...attributes} data-slot="field-legend" data-variant={variant} class={cn(presentation.FieldLegend,className)}><slot /></legend>

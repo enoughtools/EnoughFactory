@@ -1,0 +1,9 @@
+---
+import type { HTMLAttributes } from 'astro/types';
+import { cn } from '../lib/utils.js';
+import { inputGroupButtonVariants, inputGroupButtonClasses, buttonVariants } from '../lib/variants.js';
+import type { VariantProps } from 'class-variance-authority';
+type Props = Omit<HTMLAttributes<'button'>, keyof VariantProps<typeof inputGroupButtonVariants>> & VariantProps<typeof inputGroupButtonVariants> & { variant?: VariantProps<typeof buttonVariants>['variant'] };
+const { class: className, size, variant = 'ghost', type = 'button', ...attributes } = Astro.props;
+---
+<button data-slot="input-group-button" data-size={size ?? 'xs'} type={type} {...attributes} class={cn(inputGroupButtonClasses({ variant, size }), className)}><slot /></button>

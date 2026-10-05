@@ -1,0 +1,161 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>envmux</AssemblyName>
+    <RootNamespace>Envmux</RootNamespace>
+
+    <!-- The Web SDK is here for Kestrel and YARP, not for a web app: there is
+         no wwwroot, no static assets, and no launch profile to generate. -->
+    <StaticWebAssetsEnabled>false</StaticWebAssetsEnabled>
+
+    <!-- On, and not for the XML file — which nothing reads, and which is kept
+         out of the package below. It is on because it is the only thing that
+         checks a <see cref="..."/>, and a comment pointing at a type that has
+         been renamed or moved is worse than no comment: it is a signpost to
+         somewhere that does not exist. Warnings are errors, so a stale one
+         fails the build. CS1591 does not apply here — everything is internal. -->
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+
+    <!-- Under obj/, and named literally: $(IntermediateOutputPath) and
+         $(AssemblyName) are both unset this early in evaluation, so using them
+         here lands the file in the project directory — which is the same trap
+         the portal zip below carries a comment about, walked into twice. -->
+    <DocumentationFile>$(MSBuildProjectDirectory)\obj\envmux.xml</DocumentationFile>
+
+    <!-- CS1573 is "some parameters are documented and some are not", which is
+         the house style rather than an oversight: a <param> restating the name
+         of the argument is the sort of comment this codebase deletes. The ones
+         that matter are kept, and the ones checked here are the ones that can
+         be *wrong* — a cref to a moved type (CS1574), or a <param> naming an
+         argument that no longer exists (CS1572). -->
+    <NoWarn>$(NoWarn);CS1573</NoWarn>
+
+    <!-- Nothing here is hosted under IIS, and a web.config beside a terminal
+         program is only ever a question somebody has to answer. -->
+    <IsTransformWebConfigDisabled>true</IsTransformWebConfigDisabled>
+
+    <!-- Native releases have no runtime to reflect over. Keep the same JSON
+         boundary and analyzers in SDK builds so tests exercise that contract. -->
+    <JsonSerializerIsReflectionEnabledByDefault>false</JsonSerializerIsReflectionEnabledByDefault>
+    <EnableAotAnalyzer>true</EnableAotAnalyzer>
+    <EnableTrimAnalyzer>true</EnableTrimAnalyzer>
+    <EnableRequestDelegateGenerator>true</EnableRequestDelegateGenerator>
+    <OptimizationPreference>Size</OptimizationPreference>
+    <PublishSingleFile Condition="'$(PublishAot)' != 'true'">true</PublishSingleFile>
+    <SelfContained>false</SelfContained>
+
+    <!-- Installable as a .NET global tool under a name that cannot be mistaken
+         for a real install: `devenvmux` is the one you are testing, `envmux`
+         is the one you shipped. scripts/dev-install.* do the packing. -->
+    <PackAsTool>true</PackAsTool>
+    <PackageId>devenvmux</PackageId>
+    <ToolCommandName>devenvmux</ToolCommandName>
+    <IsPackable>true</IsPackable>
+    <PackageOutputPath>$(MSBuildThisFileDirectory)..\..\artifacts\tool</PackageOutputPath>
+    <Version>0.1.0</Version>
+    <Description>envmux — one process, one port, one container. Development build.</Description>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+  </PropertyGroup>
+
+  <!-- One package, and it is not a UI one. The window is escape sequences
+       written to stdout by src/Envmux/Lean, so there is no toolkit here to
+       reference — see that folder for why, and feat/consolonia-tui for the
+       version that had one. -->
+  <ItemGroup>
+    <PackageReference Include="Yarp.ReverseProxy" Version="2.3.0" />
+  </ItemGroup>
+
+  <!-- The portal: a React page built by Vite and carried inside the executable
+       as one zip. It is built by `dotnet build` when Node is on PATH and
+       skipped when it is not, so a working tree with no Node still builds, still
+       runs, and still routes — it just serves a page saying it was built
+       without one. A release always has Node, which is what makes the zip
+       something the binary can rely on rather than something it might have. -->
+  <PropertyGroup>
+    <PortalUi>$(MSBuildThisFileDirectory)Portal\ui</PortalUi>
+    <PortalDist>$(PortalUi)\dist</PortalDist>
+    <!-- Under obj/, and not under obj/$(Configuration)/$(TargetFramework)/:
+         $(IntermediateOutputPath) is not yet set this early in evaluation, and
+         the page does not differ between a Debug build and a Release one. -->
+    <PortalZip>$(MSBuildProjectDirectory)\obj\portal.zip</PortalZip>
+
+    <!-- Set this to false to build envmux without touching Node at all, even
+         where it is installed. -->
+    <BuildPortal Condition="'$(BuildPortal)' == ''">true</BuildPortal>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PortalSource Include="$(PortalUi)\src\**\*" />
+    <PortalSource Include="$(PortalUi)\index.html" />
+    <PortalSource Include="$(PortalUi)\package.json" />
+    <PortalSource Include="$(PortalUi)\package-lock.json" />
+    <PortalSource Include="$(PortalUi)\vite.config.ts" />
+    <PortalSource Include="$(PortalUi)\tsconfig.json" />
+  </ItemGroup>
+
+  <!-- Inputs and outputs, so this runs when the page changed and not on every
+       build: Vite is fast, and starting it four hundred times a day is still
+       four hundred seconds. -->
+  <Target Name="BuildPortalPage"
+          Condition="'$(BuildPortal)' == 'true'"
+          Inputs="@(PortalSource)"
+          Outputs="$(PortalZip)">
+
+    <!-- Through a shell, so a machine with no Node reports an exit code rather
+         than failing the build. -->
+    <Exec Command="node --version"
+          IgnoreExitCode="true"
+          StandardOutputImportance="low"
+          StandardErrorImportance="low">
+      <Output TaskParameter="ExitCode" PropertyName="PortalNode" />
+    </Exec>
+
+    <Message Condition="'$(PortalNode)' != '0'"
+             Importance="high"
+             Text="envmux: no Node on PATH — building without the portal page." />
+
+    <Exec Condition="'$(PortalNode)' == '0' And !Exists('$(PortalUi)\node_modules')"
+          Command="npm ci --no-audit --no-fund"
+          WorkingDirectory="$(PortalUi)" />
+
+    <Exec Condition="'$(PortalNode)' == '0'"
+          Command="npm run build"
+          WorkingDirectory="$(PortalUi)" />
+
+    <ZipDirectory Condition="'$(PortalNode)' == '0'"
+                  SourceDirectory="$(PortalDist)"
+                  DestinationFile="$(PortalZip)"
+                  Overwrite="true" />
+  </Target>
+
+  <!-- Separate from the build, and deliberately: the target above is skipped
+       when the page is already up to date, and an EmbeddedResource declared
+       inside it would be skipped with it. -->
+  <Target Name="EmbedPortalPage" BeforeTargets="PrepareForBuild" DependsOnTargets="BuildPortalPage">
+    <ItemGroup Condition="Exists('$(PortalZip)')">
+      <EmbeddedResource Include="$(PortalZip)" LogicalName="Envmux.Portal.zip" />
+    </ItemGroup>
+  </Target>
+
+  <!-- The golden image's build context: images/golden, carried inside the
+       executable file by file. The Docker backend builds the golden image
+       through the engine's API from these, so an installed envmux can do it
+       with no checkout beside it — and the tag it builds under is a hash of
+       exactly these bytes, so the image can never be older than the binary
+       that asks for it. Dotfiles are housekeeping for git, not context. -->
+  <ItemGroup>
+    <GoldenContextFile Include="$(MSBuildThisFileDirectory)..\..\images\golden\**\*"
+                       Exclude="$(MSBuildThisFileDirectory)..\..\images\golden\**\.*" />
+    <EmbeddedResource Include="@(GoldenContextFile)"
+                      LogicalName="Envmux.Golden/%(RecursiveDir)%(Filename)%(Extension)"
+                      Link="Golden\%(RecursiveDir)%(Filename)%(Extension)" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="../../skills/envmux-*/SKILL.md"
+                      LogicalName="Envmux.Skills/%(RecursiveDir)%(Filename)%(Extension)" />
+    <InternalsVisibleTo Include="Envmux.Tests" />
+  </ItemGroup>
+
+</Project>

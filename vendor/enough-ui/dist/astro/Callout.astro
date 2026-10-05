@@ -1,0 +1,16 @@
+---
+import type { HTMLAttributes } from 'astro/types';
+import { cn } from '../lib/utils.js';
+import { calloutStyles } from '../lib/callout.js';
+
+// Adapted from enough-tools' editorial callout, with proportional typography.
+interface Props extends HTMLAttributes<'aside'> {
+  label: string;
+  tone?: 'accent' | 'warn';
+}
+const { label, tone = 'accent', class: className, ...attributes } = Astro.props;
+---
+<aside {...attributes} class={cn(calloutStyles.root, calloutStyles[tone], className)}>
+  <span class={calloutStyles.label}>{label}</span>
+  <div class={calloutStyles.content}><slot /></div>
+</aside>

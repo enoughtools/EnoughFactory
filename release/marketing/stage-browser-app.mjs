@@ -1,0 +1,21 @@
+import { execFile } from 'node:child_process';
+import { cp, mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { promisify } from 'node:util';
+
+const root = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
+const execute = promisify(execFile);
+const marketing = resolve(root, 'apps/marketing/dist');
+await stat(resolve(marketing, 'index.html'));
+const { stdout, stderr } = await execute('pnpm', ['--filter', '@enoughfactory/web', 'exec', 'vite', 'build', '--base=/app/', '--outDir=dist-hosted'], { cwd: root });
+if (stdout.trim()) console.log(stdout.trim());
+if (stderr.trim()) console.error(stderr.trim());
+const source = resolve(root, 'apps/web/dist-hosted');
+const html = await readFile(resolve(source, 'index.html'), 'utf8');
+if (!html.includes('/app/assets/')) throw new Error('The browser build does not use the hosted app base path.');
+await rm(resolve(marketing, 'app'), { recursive: true, force: true });
+await mkdir(resolve(marketing, 'app'), { recursive: true });
+await cp(source, resolve(marketing, 'app'), { recursive: true });
+await writeFile(resolve(marketing, 'app/index.html'), html.replace('href="./factory.svg"', 'href="/app/factory.svg"'));
+console.log('Staged the actual browser application at /app.');

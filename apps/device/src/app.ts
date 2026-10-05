@@ -1,0 +1,177 @@
+import http, { type IncomingMessage, type ServerResponse } from 'node:http';
+import { randomBytes } from 'node:crypto';
+import { homedir, hostname } from 'node:os';
+import path from 'node:path';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { createReadStream } from 'node:fs';
+import WebSocket, { WebSocketServer } from 'ws';
+import type { FactoryState, Project, Session, Settings, Device, Diagnostics } from '@enoughfactory/contracts';
+import { PRODUCT } from '@enoughfactory/contracts';
+import { Store } from './store.ts';
+import { SessionController } from './sessions.ts';
+import { equalSecret, exec, HttpError, id, now } from './util.ts';
+
+export interface ApiCall { method: string; url: URL; body: Record<string, unknown>; peerId?: string; }
+export type Extension = (call: ApiCall) => Promise<unknown | undefined>;
+const MIME: Record<string,string> = {'.html':'text/html; charset=utf-8','.js':'text/javascript; charset=utf-8','.css':'text/css; charset=utf-8','.svg':'image/svg+xml','.woff2':'font/woff2','.png':'image/png','.json':'application/json'};
+export class DeviceApp {
+  readonly dataDir = process.env.ENOUGHFACTORY_HOME || path.join(homedir(), '.enoughfactory');
+  readonly port = Number(process.env.ENOUGHFACTORY_PORT || 4317);
+  readonly store = new Store(this.dataDir);
+  readonly token: string;
+  readonly sessions: SessionController;
+  readonly server: http.Server;
+  readonly extensions: Extension[] = [];
+  readonly listeners = new Set<(topic:string,data:unknown)=>void>();
+  readonly closers: Array<()=>void | Promise<void>> = [];
+  routeRemote?: (call: ApiCall)=>Promise<unknown | undefined>;
+  remoteTerminal?: (sessionId:string,url:URL,client:WebSocket)=>Promise<boolean>;
+  catalog?: ()=>Partial<FactoryState>;
+  device: Device;
+  devices: Device[];
+  diagnostics: Diagnostics = {docker:{available:false},envmux:{available:false},runtimes:[]};
+  private sse = new Set<ServerResponse>();
+  private changeTimer?: ReturnType<typeof setTimeout>;
+  private closing = false;
+  private socketServer = new WebSocketServer({noServer:true, maxPayload:1024*1024});
+  settings: Settings;
+
+  constructor() {
+    mkdirSync(this.dataDir,{recursive:true,mode:0o700});
+    const saved=this.store.get<{id:string;token:string}>('private','access');
+    this.token=saved?.token || randomBytes(32).toString('base64url');
+    if(!saved)this.store.set('private',{id:'access',token:this.token});
+    this.settings=this.store.get<Settings & {id:string}>('settings','main') || {deviceName:hostname(),defaultRuntime:'codex',defaultApprovalMode:'approve-all'};
+    this.device=this.store.get<Device>('devices','local') || {id:id('device'),name:this.settings.deviceName,platform:process.platform,arch:process.arch,online:true,lastSeen:now(),local:true,transport:'local',capacity:2};
+    this.device={...this.device,name:this.settings.deviceName,online:true,lastSeen:now()};
+    this.devices=[this.device];
+    this.sessions=new SessionController(this.store,this.device.id,()=>this.changed(),(topic,data)=>this.emit(topic,data));
+    this.server=http.createServer((req,res)=>{void this.handle(req,res);});
+    this.server.on('upgrade',(req,socket,head)=>{
+      const url=new URL(req.url||'/',`http://127.0.0.1:${this.port}`);
+      if(!this.authorized(req,url)){socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');socket.destroy();return;}
+      const match=url.pathname.match(/^\/api\/sessions\/([^/]+)\/terminal$/);
+      if(!match){socket.destroy();return;}
+      try {
+        this.socketServer.handleUpgrade(req,socket,head,client=>{void(async()=>{
+          if(await this.remoteTerminal?.(match[1],url,client))return;
+          const engine=this.sessions.get(match[1]); const upstreamUrl=new URL(engine.shellUrl(url.searchParams.get('terminalId')||'main'));
+          for(const key of ['cols','rows']) if(url.searchParams.get(key))upstreamUrl.searchParams.set(key,url.searchParams.get(key)!);
+          const upstream=new WebSocket(upstreamUrl,{headers:engine.shellHeaders()});
+          const pending: Array<string | Buffer>=[];
+          client.on('message',(data,binary)=>{
+            const value=binary?Buffer.from(data as Buffer):data.toString();
+            let message:string | Buffer=typeof value==='string'?Buffer.from(value):value;
+            if(typeof value==='string'){try {const parsed=JSON.parse(value);if(parsed.type==='input')message=Buffer.from(String(parsed.data));if(parsed.type==='resize')message=JSON.stringify({resize:{cols:parsed.cols,rows:parsed.rows}});}catch{}}
+            if(upstream.readyState===WebSocket.OPEN)upstream.send(message);else if(pending.length<256)pending.push(message);else client.close(1009,'Input queue full');
+          });
+          upstream.on('open',()=>{for(const message of pending)upstream.send(message);pending.length=0;});
+          upstream.on('message',(data,binary)=>{if(client.readyState===WebSocket.OPEN)client.send(binary?data:JSON.stringify({type:'output',data:data.toString()}));});
+          client.on('close',()=>upstream.close());upstream.on('close',()=>client.close());
+          upstream.on('error',error=>{if(client.readyState===WebSocket.OPEN)client.send(JSON.stringify({type:'error',data:error.message}));client.close();});
+          client.on('error',()=>upstream.close());
+        })().catch(error=>{client.send(JSON.stringify({type:'error',data:error.message}));client.close();});});
+      }catch {socket.write('HTTP/1.1 409 Conflict\r\n\r\n');socket.destroy();}
+    });
+  }
+  setDevice(device: Device): void {this.device=device;this.devices=[device,...this.devices.filter(d=>!d.local)];this.sessions.setDeviceId(device.id);}
+  state(): FactoryState {
+    return {product:PRODUCT,version:'0.1.0',device:{...this.device,lastSeen:now()},devices:this.devices,projects:this.store.list<Project>('projects').filter(p=>!p.internal),sessions:this.store.list('sessions'),chats:this.store.list('chats'),approvals:this.store.list('approvals'),goals:this.store.list('goals'),tasks:this.store.list('tasks'),attempts:this.store.list('attempts'),diagnostics:this.diagnostics,settings:{...this.settings,turnCredential:undefined},...this.catalog?.()};
+  }
+  emit(topic: string,data: unknown): void {
+    if(this.closing)return;
+    const packet=`event: ${topic}\ndata: ${JSON.stringify(data)}\n\n`;
+    for(const res of this.sse){if(res.writableLength>1024*1024){res.end();this.sse.delete(res);}else res.write(packet);}
+    for(const listener of this.listeners)listener(topic,data);
+  }
+  changed(): void {if(this.closing||this.changeTimer)return;this.changeTimer=setTimeout(()=>{this.changeTimer=undefined;if(!this.closing)this.emit('state',this.state());},50);}
+  async dispatch(call: ApiCall): Promise<unknown> {
+    const {method,url,body}=call;const route=url.pathname;
+    if(this.routeRemote){const remote=await this.routeRemote(call);if(remote!==undefined)return remote;}
+    if(method==='GET' && route==='/api/health')return {ok:true,product:PRODUCT,version:'0.1.0',deviceId:this.device.id};
+    if(method==='GET' && route==='/api/state')return this.state();
+    if(method==='POST' && route==='/api/service/shutdown'){setTimeout(()=>{void this.close().then(()=>process.exit(0));},200);return {ok:true};}
+    if(method==='GET' && route==='/api/diagnostics'){await this.refreshDiagnostics();return this.diagnostics;}
+    if(method==='GET' && route==='/api/projects')return this.store.list('projects');
+    if(method==='POST' && route==='/api/projects'){
+      if(typeof body.path!=='string'||!body.path.trim())throw new HttpError(400,'Choose a repository folder.');
+      const projectPath=path.resolve(body.path);await exec('git',['-C',projectPath,'rev-parse','--show-toplevel']).catch(()=>{throw new HttpError(400,'This folder must contain a Git repository.');});
+      const existing=this.store.list<Project>('projects').find(p=>p.path===projectPath);if(existing)return existing;
+      const project:Project={id:id('project'),name:String(body.name||path.basename(projectPath)),path:projectPath,deviceId:this.device.id,createdAt:now(),runtime:['codex','antigravity','claude'].includes(String(body.runtime))?body.runtime as Project['runtime']:this.settings.defaultRuntime,approvalMode:['approve-all','rules','manual'].includes(String(body.approvalMode))?body.approvalMode as Project['approvalMode']:this.settings.defaultApprovalMode,rules:[]};
+      this.store.set('projects',project);this.changed();return project;
+    }
+    const projectRoute=route.match(/^\/api\/projects\/([^/]+)(?:\/(validate|config))?$/);
+    if(projectRoute){const project=this.store.get<Project>('projects',projectRoute[1]);if(!project)throw new HttpError(404,'Project not found.');
+      if(method==='GET'&&projectRoute[2]==='validate')return this.sessions.engine.validate(project.path);
+      if(projectRoute[2]==='config'){
+        const filename=path.join(project.path,'.envmux.json');
+        if(method==='PUT'){
+          if(typeof body.content!=='string')throw new HttpError(400,'Environment configuration must be JSON text.');
+          let config:unknown;try{config=JSON.parse(body.content);}catch{throw new HttpError(400,'Environment configuration must contain valid JSON.');}
+          if(!config||typeof config!=='object'||Array.isArray(config))throw new HttpError(400,'Environment configuration must be an object.');
+          writeFileSync(filename,body.content+'\n');this.changed();
+        }
+        if(method==='GET'||method==='PUT'){const validation=await this.sessions.engine.validate(project.path);return {content:existsSync(filename)?readFileSync(filename,'utf8'):'{}',...validation};}
+      }
+      if(method==='DELETE'){if(this.store.list<Session>('sessions').some(s=>s.projectId===project.id&&!['stopped','failed'].includes(s.status)))throw new HttpError(409,'Stop this project’s sessions before removing it.');this.store.delete('projects',project.id);this.changed();return {ok:true};}
+      if(method==='PATCH'){const next={...project};if(typeof body.name==='string')next.name=body.name;if(['codex','antigravity','claude'].includes(String(body.runtime)))next.runtime=body.runtime as Project['runtime'];if(['approve-all','rules','manual'].includes(String(body.approvalMode)))next.approvalMode=body.approvalMode as Project['approvalMode'];if(Array.isArray(body.rules))next.rules=body.rules as Project['rules'];this.store.set('projects',next);this.changed();return next;}
+    }
+    if(method==='POST'&&route==='/api/sessions'){
+      const project=this.store.get<Project>('projects',String(body.projectId));if(!project)throw new HttpError(404,'Project not found.');
+      return this.sessions.create(project,String(body.name||`work-${Date.now().toString(36)}`));
+    }
+    const sessionRoute=route.match(/^\/api\/sessions\/([^/]+)(?:\/(.+))?$/);
+    if(sessionRoute){const sid=sessionRoute[1],action=sessionRoute[2];this.sessions.record(sid);
+      if(method==='GET'&&!action)return this.sessions.record(sid);
+      if(method==='GET'&&action==='state')return this.sessions.get(sid).state();
+      if(method==='GET'&&action==='changes')return this.sessions.changes(sid);
+      if(method==='GET'&&action==='output'){const task=url.searchParams.get('task');return task?this.sessions.get(sid).logs(task):this.sessions.output(sid);}
+      if(method==='POST'&&action==='stop'){void this.sessions.stop(sid).catch(error=>this.emit('error',{sessionId:sid,error:error.message}));return {ok:true};}
+      if(method==='POST'&&action==='restart'){await this.sessions.restart(sid);return {ok:true};}
+      const service=action?.match(/^services\/([^/]+)\/(start|stop|restart)$/);
+      if(method==='POST'&&service){await this.sessions.get(sid).task(decodeURIComponent(service[1]),service[2] as 'start'|'stop'|'restart');return {ok:true};}
+    }
+    if(method==='PATCH'&&route==='/api/settings'){
+      for(const key of ['deviceName','signalingUrl','defaultRuntime','defaultApprovalMode','turnUrls','turnUsername','turnCredential'] as const)if(body[key]!==undefined)(this.settings as unknown as Record<string,unknown>)[key]=body[key];
+      this.store.set('settings',{id:'main',...this.settings});this.device.name=this.settings.deviceName;this.changed();return this.state().settings;
+    }
+    for(const extension of this.extensions){const value=await extension(call);if(value!==undefined)return value;}
+    throw new HttpError(404,'This operation was not found.');
+  }
+  private authorized(req: IncomingMessage,url:URL):boolean {const header=req.headers.authorization;const candidate=header?.startsWith('Bearer ')?header.slice(7):url.searchParams.get('token')||'';return equalSecret(candidate,this.token);}
+  private cors(req:IncomingMessage,res:ServerResponse):boolean {
+    const origin=req.headers.origin;if(!origin)return true;
+    let allowed=false;try {const parsed=new URL(origin);allowed=['127.0.0.1','localhost','factory.enoughtools.com'].includes(parsed.hostname)||origin==='file://';}catch{allowed=origin==='null';}
+    if(allowed){res.setHeader('Access-Control-Allow-Origin',origin);res.setHeader('Vary','Origin');res.setHeader('Access-Control-Allow-Headers','Authorization, Content-Type');res.setHeader('Access-Control-Allow-Methods','GET,POST,PUT,PATCH,DELETE,OPTIONS');}
+    return allowed;
+  }
+  private async handle(req:IncomingMessage,res:ServerResponse):Promise<void>{
+    const url=new URL(req.url||'/',`http://127.0.0.1:${this.port}`);res.setHeader('X-Content-Type-Options','nosniff');
+    if(!this.cors(req,res)){res.writeHead(403);res.end('Origin unavailable');return;}
+    if(req.method==='OPTIONS'){res.writeHead(204);res.end();return;}
+    if(!url.pathname.startsWith('/api/')){this.static(url,res);return;}
+    if(!this.authorized(req,url)){res.writeHead(401,{'Content-Type':'application/json'});res.end(JSON.stringify({error:'Connect to this device with its access token.'}));return;}
+    if(url.pathname==='/api/events'){
+      res.writeHead(200,{'Content-Type':'text/event-stream','Cache-Control':'no-store','Connection':'keep-alive'});res.write(`event: state\ndata: ${JSON.stringify(this.state())}\n\n`);this.sse.add(res);
+      const heartbeat=setInterval(()=>res.write(': heartbeat\n\n'),20000);req.on('close',()=>{clearInterval(heartbeat);this.sse.delete(res);});return;
+    }
+    try {
+      let body:Record<string,unknown>={};if(['POST','PATCH','PUT'].includes(req.method||'')){const chunks:Buffer[]=[];let size=0;for await(const chunk of req){size+=chunk.length;if(size>8*1024*1024)throw new HttpError(413,'Request too large.');chunks.push(Buffer.from(chunk));}if(size){try {body=JSON.parse(Buffer.concat(chunks).toString());}catch {throw new HttpError(400,'Request must contain valid JSON.');}if(!body||typeof body!=='object'||Array.isArray(body))throw new HttpError(400,'Request must be an object.');}}
+      const result=await this.dispatch({method:req.method||'GET',url,body});res.writeHead(200,{'Content-Type':'application/json','Cache-Control':'no-store'});res.end(JSON.stringify(result));
+    }catch(error){const e=error as Error;res.writeHead(error instanceof HttpError?error.status:500,{'Content-Type':'application/json'});res.end(JSON.stringify({error:e.message,code:error instanceof HttpError?error.code:undefined}));}
+  }
+  private static(url:URL,res:ServerResponse):void{
+    const root=process.env.ENOUGHFACTORY_WEB_PATH||path.resolve(process.env.ENOUGHFACTORY_REPO||process.cwd(),'apps/web/dist');
+    let target=path.resolve(root,'.'+decodeURIComponent(url.pathname));if(!target.startsWith(path.resolve(root)+path.sep)&&target!==path.resolve(root)){res.writeHead(404);res.end();return;}
+    if(!existsSync(target)||url.pathname.endsWith('/'))target=path.join(root,'index.html');
+    if(!existsSync(target)){res.writeHead(503,{'Content-Type':'text/plain'});res.end('EnoughFactory is starting. Build the web application or run the development server.');return;}
+    res.writeHead(200,{'Content-Type':MIME[path.extname(target)]||'application/octet-stream'});const stream=createReadStream(target);stream.on('error',()=>res.end());stream.pipe(res);
+  }
+  async refreshDiagnostics():Promise<void>{const info=await this.sessions.engine.detect();this.diagnostics={...this.diagnostics,docker:info.docker,envmux:{available:info.available,version:info.version,error:info.error}};this.changed();}
+  async listen():Promise<void>{
+    await new Promise<void>((resolve,reject)=>{this.server.once('error',reject);this.server.listen(this.port,'127.0.0.1',()=>resolve());});
+    writeFileSync(path.join(this.dataDir,'connection.json'),JSON.stringify({url:`http://127.0.0.1:${this.port}`,token:this.token,pid:process.pid,version:'0.1.0'},null,2),{mode:0o600});
+    void this.refreshDiagnostics();await this.sessions.recover();
+  }
+  async close():Promise<void>{if(this.closing)return;this.closing=true;if(this.changeTimer)clearTimeout(this.changeTimer);for(const close of this.closers)await close();this.sessions.close();for(const res of this.sse)res.end();this.socketServer.close();await new Promise<void>(resolve=>this.server.close(()=>{this.store.close();resolve();}));}
+}

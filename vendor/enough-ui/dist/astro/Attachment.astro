@@ -1,0 +1,13 @@
+---
+import type { HTMLAttributes } from 'astro/types';
+import type { VariantProps } from 'class-variance-authority';
+import { attachmentVariants } from '../lib/conversation.js';
+import { cn } from '../lib/utils.js';
+type Props = HTMLAttributes<'div'> & VariantProps<typeof attachmentVariants> & {
+  state?: 'idle' | 'uploading' | 'processing' | 'error' | 'done';
+};
+const { class: className, size = 'default', state = 'done', orientation = 'horizontal', ...attributes } = Astro.props;
+---
+<div data-slot="attachment" data-state={state} data-size={size} data-orientation={orientation}
+  aria-busy={state === 'uploading' || state === 'processing' || undefined}
+  class={cn(attachmentVariants({ size, orientation }), className)} {...attributes}><slot /></div>

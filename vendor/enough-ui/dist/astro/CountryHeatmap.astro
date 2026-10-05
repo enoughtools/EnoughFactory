@@ -1,0 +1,60 @@
+---
+import type { HTMLAttributes } from 'astro/types';
+import { cn } from '../lib/utils.js';
+import {
+  countryHeatmapClasses as classes, countryHeatmapDescription,
+  countryHeatmapNoDataColor, createCountryHeatmapModel, type CountryHeatmapOptions,
+} from '../lib/country-heatmap.js';
+
+type Props = Omit<HTMLAttributes<'figure'>, 'title'> & CountryHeatmapOptions;
+const {
+  data, title = 'Country heatmap', description = countryHeatmapDescription,
+  valueLabel = 'Value', countryLabel = 'Country', noDataLabel = 'No data',
+  emptyLabel = 'No country data to display', tableLabel = 'View country data',
+  legendLabel = 'Map legend', unmappedLabel = 'Not shown at this map scale',
+  scaleLabel = 'Log scale', locale, formatValue, scale = 'linear', domain,
+  tableOpen = false, note, class: className, ...attributes
+} = Astro.props;
+const uniqueId = `country-heatmap-${crypto.randomUUID()}`;
+const model = createCountryHeatmapModel({ data, locale, formatValue, scale, domain, noDataLabel, unmappedLabel });
+---
+<figure {...attributes} data-slot="country-heatmap" data-scale={scale} class={cn(classes.root, className)}>
+  <figcaption class={classes.caption}>
+    <span class={classes.title}>{title}</span>
+    <span class={classes.description}>{description}</span>
+  </figcaption>
+  <svg viewBox="0 0 720 300" role="img" aria-labelledby={`${uniqueId}-title`} aria-describedby={`${uniqueId}-description`} data-slot="country-heatmap-map" class={classes.map}>
+    <title id={`${uniqueId}-title`}>{title}</title>
+    <desc id={`${uniqueId}-description`}>{description}</desc>
+    {model.countries.map((country) => <path data-country={country.code} data-state={country.state} d={country.path} fill={country.color} stroke="var(--color-surface)" stroke-width="0.7" fill-rule="evenodd">
+      <title>{`${country.name}: ${country.formattedValue}`}</title>
+    </path>)}
+  </svg>
+  <div role="list" aria-label={legendLabel} data-slot="country-heatmap-legend" class={classes.legend}>
+    <span role="listitem" class={classes.legendItem}><span aria-hidden="true" class={classes.swatch} style={{ backgroundColor: countryHeatmapNoDataColor }} />{noDataLabel}</span>
+    {model.hasData && <span role="listitem" class={classes.range}>
+      {!model.collapsed && <span class={classes.endpoint}>{model.minimumLabel}</span>}
+      <span aria-hidden="true" class={model.collapsed ? classes.swatch : classes.ramp}>{model.legendColors.map((color) => <span class={classes.rampStep} style={{ backgroundColor: color, display: 'block' }} />)}</span>
+      <span class={classes.endpoint}>{model.maximumLabel} {valueLabel}</span>
+      {scale === 'log' && <span class={classes.note}>({scaleLabel})</span>}
+    </span>}
+  </div>
+  {!model.hasData && <p data-slot="country-heatmap-empty" class={classes.empty}>{emptyLabel}</p>}
+  {note && <p class={classes.note}>{note}</p>}
+  <details data-slot="country-heatmap-data" open={tableOpen} class={classes.details}>
+    <summary class={classes.summary}>{tableLabel}</summary>
+    <div data-slot="country-heatmap-table-scroll" role="region" aria-label={`${title}: ${valueLabel}`} tabindex="0" class={classes.tableWrapper}>
+      <table class={classes.table}>
+        <caption class={classes.tableCaption}>{title}: {valueLabel}</caption>
+        <thead><tr><th scope="col" class={classes.head}>{countryLabel}</th><th scope="col" class={classes.numberHead}>{valueLabel}</th></tr></thead>
+        <tbody>{model.rows.map((row) => <tr data-country={row.code} class={classes.row}>
+          <th scope="row" class={classes.country}>{row.label}<span class={classes.code}>{row.code}</span>{!row.mapped && <span class={classes.unmapped}>{unmappedLabel}</span>}</th>
+          <td class={classes.value}>{row.formattedValue}</td>
+        </tr>)}
+        {!model.rows.length && <tr><td colspan="2" class={classes.country}>{emptyLabel}</td></tr>}
+        </tbody>
+      </table>
+    </div>
+  </details>
+  <p class={classes.credit}>Boundaries: <a href="https://www.naturalearthdata.com/about/terms-of-use/" class={classes.creditLink}>Natural Earth</a>, 1:110m. Antarctica is omitted; some small countries are visible only in the data table.</p>
+</figure>

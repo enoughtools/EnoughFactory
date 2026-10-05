@@ -1,0 +1,14 @@
+---
+import type { HTMLAttributes } from 'astro/types';
+import { cn } from '../lib/utils.js';
+import { surfaces, metaColors } from '../lib/tool-row.js';
+type Props = Omit<HTMLAttributes<'a'>,'title'> & {title:string; href?:string; tile?:string; iconSrc?:string; meta?:string; metaColor?:string; action?:string; actionAccent?:boolean; surface?:keyof typeof surfaces};
+const {title,href,tile = 'P',iconSrc,meta,metaColor,action,actionAccent = false,surface = 'light',class:className,...attributes} = Astro.props;
+const Tag = href ? 'a' : 'div';
+const onDark = surface === 'dark' || surface === 'gap';
+---
+<Tag {...attributes} href={href} class={cn('flex items-center w-full gap-[13px] font-sans',surface !== 'transparent' && 'px-[16px] py-[13px]',href && 'cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-[var(--color-accent)]',href && (onDark ? 'hover:bg-[var(--color-ink)] active:bg-[var(--color-ink-border)]' : 'hover:bg-[var(--color-hover)] active:bg-[var(--color-active)]'),surfaces[surface],className)}>
+  <slot name="icon">{iconSrc ? <img src={iconSrc} width="22" height="22" alt="" /> : <span class={cn('flex w-[22px] h-[22px] items-center justify-center text-[11px] font-bold border',onDark ? 'border-[var(--color-dark-text-3)] text-[var(--color-dark-text-2)]' : 'border-[var(--color-ink)] text-[var(--color-ink)]')}>{tile}</span>}</slot>
+  <div class="flex-1 text-left"><div class="text-[15px] font-semibold">{title}</div>{meta && <div class={cn('text-[12px]',!metaColor && metaColors[surface])} style={{color:metaColor}}>{meta}</div>}<slot /></div>
+  {action && <span class={cn('font-sans text-[11px] uppercase tracking-[0.08em] whitespace-nowrap',actionAccent ? (onDark ? 'text-[var(--color-accent-on-ink)]' : 'text-[var(--color-accent)]') : (onDark ? 'text-[var(--color-dark-text-3)]' : 'text-[var(--color-text-4)]'))}>{action}</span>}
+</Tag>

@@ -1,0 +1,10 @@
+---
+import type { HTMLAttributes } from 'astro/types';
+import { cn } from '../lib/utils.js';
+import { typographyVariants } from '../lib/variants.js';
+import type { VariantProps } from 'class-variance-authority';
+type Props = HTMLAttributes<'p'> & VariantProps<typeof typographyVariants> & { as?: 'h1' | 'h2' | 'h3' | 'h4' | 'p' | 'div' | 'small' | 'span' };
+const { class: className, variant = 'p', align, as: element, ...attributes } = Astro.props;
+const Tag = element ?? ({h1:'h1',h2:'h2',h3:'h3',h4:'h4',small:'small',large:'div'} as const)[variant as 'h1'|'h2'|'h3'|'h4'|'small'|'large'] ?? 'p';
+---
+<Tag {...attributes} data-slot="typography" data-variant={variant} class={cn(typographyVariants({variant, align}), className)}><slot /></Tag>

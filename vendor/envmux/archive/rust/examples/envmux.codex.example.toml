@@ -1,0 +1,54 @@
+# General Codex/Claude/OpenCode workspace. Copy to `.envmux.toml` at the
+# repository root and adjust the namespace and image selection.
+[meta]
+schema = 2
+namespace = "agent-workspace"
+
+[image]
+dockerfile = "images/default.Dockerfile"
+context = "."
+
+[workspace]
+workdir = "/work"
+# The images run as the non-root account `user`; every path below is in its
+# home. An image with a different account needs both changed together.
+user = "user"
+naming = "branch"
+# The sync volumes below are what make this arrive already signed in.
+# terminal = "claude"
+
+[volumes.named.npm]
+class = "cache"
+path = "/home/user/.npm"
+
+[volumes.named.python]
+class = "cache"
+path = "/home/user/.cache/pip"
+
+[volumes.named.codex]
+class = "sync"
+path = "/home/user/.codex"
+
+[volumes.named.codex-security]
+class = "sync"
+path = "/home/user/.local/share/codex-security"
+
+[volumes.named.claude]
+class = "sync"
+path = "/home/user/.claude"
+
+[volumes.named.opencode]
+class = "sync"
+path = "/home/user/.config/opencode"
+
+[lease]
+initial = "7d"
+attach_extension = "24h"
+max_workspaces = 8
+
+[env]
+# Claude Code keeps `.claude.json` beside $HOME rather than inside ~/.claude,
+# so the sync volume covers all of its state only once this points it there.
+CLAUDE_CONFIG_DIR = "/home/user/.claude"
+CODEX_HOME = "/home/user/.codex"
+CODEX_SECURITY_STATE_DIR = "/home/user/.local/share/codex-security"

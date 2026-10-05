@@ -1,0 +1,7 @@
+# Private keys and the PFX minted by certs.sh, and the load balancer address
+# deploy.sh learned. The CA and the public certificates are harmless but also
+# regenerable, so the whole directory stays out.
+certs/
+hub.ip
+.body
+.resp

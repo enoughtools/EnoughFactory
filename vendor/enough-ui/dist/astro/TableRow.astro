@@ -1,0 +1,8 @@
+---
+import type { HTMLAttributes } from 'astro/types';
+import { cn } from '../lib/utils.js';
+import { presentation } from '../lib/presentation.js';
+type Props = HTMLAttributes<'tr'>;
+const { class: className, ...attributes } = Astro.props;
+---
+<tr data-slot="table-row" {...attributes} class={cn(presentation.TableRow, className)}><slot /></tr>

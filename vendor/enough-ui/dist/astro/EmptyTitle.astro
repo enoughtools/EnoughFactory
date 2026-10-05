@@ -1,0 +1,8 @@
+---
+import type { HTMLAttributes } from 'astro/types';
+import { cn } from '../lib/utils.js';
+import { presentation } from '../lib/presentation.js';
+type Props = HTMLAttributes<'h3'>;
+const { class: className, ...attributes } = Astro.props;
+---
+<h3 data-slot="empty-title" {...attributes} class={cn(presentation.EmptyTitle, className)}><slot /></h3>

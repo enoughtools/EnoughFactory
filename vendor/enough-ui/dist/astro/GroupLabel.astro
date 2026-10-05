@@ -1,0 +1,9 @@
+---
+import type { HTMLAttributes } from 'astro/types';
+import { cn } from '../lib/utils.js';
+
+type Props = HTMLAttributes<'div'> & {accent?: boolean; onInk?: boolean; marker?: boolean};
+const {class: className, accent = false, onInk = false, marker = false, ...attributes} = Astro.props;
+const color = onInk ? (accent ? 'text-[var(--color-accent-on-ink)]' : 'text-[var(--color-dark-text-3)]') : (accent ? 'text-[var(--color-accent)]' : 'text-[var(--color-text-3)]');
+---
+<div {...attributes} class={cn("flex items-center gap-[12px] font-sans text-[10px] uppercase tracking-[0.12em]",color,className)}>{marker && <span aria-hidden="true" class={cn("inline-block box-border w-[8px] h-[8px]",accent ? "bg-[var(--color-accent)] border-none" : "border border-current bg-transparent")}></span>}<slot /></div>

@@ -1,0 +1,62 @@
+#!/bin/sh
+# envmux-init — what a session container runs when nobody tells it otherwise.
+#
+# On Incus the golden instance has systemd, and systemd starts sshd. On a
+# Docker engine there is neither: a container is one process, and the editor
+# still wants an sshd on 22 — reached, like everything else in a session here,
+# from inside rather than through a published port. So this starts one and
+# then waits to be told to stop, which is all a session's first process has
+# ever had to do — everything else arrives over exec.
+#
+# Plain POSIX sh, and no bashisms: this is the first thing to run in the image
+# and it should need nothing the image might one day stop carrying.
+set -u
+
+# Host keys live on the /home volume rather than in /etc/ssh. A session whose
+# plan changed is removed and made again from the same volumes — and an sshd
+# that came back with new keys every time would have ssh shouting about a
+# changed host for what is, to the person using it, the same machine. None are
+# baked into the image: the Dockerfile deletes the ones the package made,
+# because keys in an image are keys every session shares.
+keys=${ENVMUX_HOST_KEYS:-/home/.envmux/ssh}
+
+start_sshd() {
+    [ "${ENVMUX_SSHD:-1}" = "0" ] && return 0
+    [ -x /usr/sbin/sshd ] || return 0
+
+    if [ "$(id -u)" != "0" ]; then
+        echo "envmux-init: not root, so no sshd — the editor will not be able to attach" >&2
+        return 0
+    fi
+
+    mkdir -p "$keys" /run/sshd /var/log/envmux
+    chmod 0755 "$(dirname "$keys")"
+    chmod 0700 "$keys"
+
+    for type in ed25519 rsa; do
+        [ -s "$keys/ssh_host_${type}_key" ] ||
+            ssh-keygen -q -t "$type" -N '' -C envmux -f "$keys/ssh_host_${type}_key" || return 0
+    done
+
+    # By its full path, which sshd insists on so that it can re-exec itself. It
+    # puts itself in the background; -E because there is no syslog here, and a
+    # refused key explains itself only in sshd's own log.
+    /usr/sbin/sshd \
+        -h "$keys/ssh_host_ed25519_key" \
+        -h "$keys/ssh_host_rsa_key" \
+        -E /var/log/envmux/sshd.log ||
+        echo "envmux-init: sshd would not start; see /var/log/envmux/sshd.log" >&2
+}
+
+start_sshd
+
+# A trap and a wait, not `sleep infinity`: a container's first process gets no
+# default signal handling, so a bare sleep ignores SIGTERM and every stop waits
+# out the grace period before being killed. `wait` returns the moment a trapped
+# signal arrives.
+trap 'exit 0' TERM INT
+
+while :; do
+    sleep 86400 &
+    wait $!
+done

@@ -1,0 +1,64 @@
+{
+  // envmux is a .NET 10 console app (envmux.slnx, TargetFramework net10.0 in
+  // Directory.Build.props) that also carries a Vocs documentation site under
+  // docs/pages. A session starts from a plain Debian instance, so both
+  // toolchains are installed by tasks — pinned, and where they can be read.
+  "name": "envmux",
+
+  "routes": {
+    // Proof of life: a Vite app bound to the instance's own 127.0.0.1
+    // (tests/proof-of-life). This route is EXPECTED to fail — a route reaches
+    // the instance's address, not its loopback. `b` opens a browser whose
+    // localhost is the instance, at http://localhost:5174/, and that one works.
+    "proof": 5174,
+
+    // The docs site is the only thing here a developer opens in a browser.
+    // Reached at http://envmux-<session>.envmux:5173 — the port vocs binds,
+    // at this session's own address.
+    "docs": 5173
+  },
+
+  "tasks": {
+    // 10.0 because Directory.Build.props targets net10.0 and CI pins 10.0.x.
+    "dotnet": {
+      "command": "curl -fsSL https://dot.net/v1/dotnet-install.sh | bash -s -- --channel 10.0 --install-dir $HOME/.dotnet && printf 'export DOTNET_ROOT=$HOME/.dotnet\\nexport PATH=$HOME/.dotnet:$PATH\\n' >> $HOME/.bashrc",
+      "kind": "once"
+    },
+
+    // 24 to match .github/workflows/docs.yml; package.json pins no Node.
+    "node": {
+      "command": "curl -fsSL https://deb.nodesource.com/setup_24.x | sudo -E bash - && sudo apt-get install -y nodejs",
+      "kind": "once"
+    },
+
+    "restore": { "command": "dotnet restore", "kind": "once", "dependsOn": "dotnet" },
+
+    "install": { "command": "npm ci", "kind": "once", "dependsOn": "node" },
+
+    // The proof-of-life app. Its bind address and port are in its own
+    // vite.config.js (127.0.0.1:5174, strictPort), so nothing here can widen
+    // it by accident. Ready is probed from inside the instance, on loopback.
+    "proof-install": { "command": "npm ci --prefix tests/proof-of-life", "kind": "once", "dependsOn": "node" },
+    "proof": {
+      "command": "npm run dev --prefix tests/proof-of-life",
+      "dependsOn": "proof-install",
+      "ready": 5174
+    },
+
+    // --port pins the dev server to the routed port: vocs defaults to 5173 but
+    // walks to another port if that one is taken, which would leave the route
+    // pointing at nothing. --host because a server bound to loopback inside
+    // this machine is reachable from inside it and from nowhere else.
+    "docs": {
+      "command": "npm run docs:dev -- --port 5173",
+      "dependsOn": "install",
+      "ready": 5173
+    }
+  },
+
+  // `b` lands on the proof-of-life page: the quickest check that the instance,
+  // the exec relay, the HMR websocket and the local egress all work.
+  "browser": { "open": "proof" },
+
+  "tools": { "claude": "auto", "codex": "auto" }
+}

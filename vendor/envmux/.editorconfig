@@ -1,0 +1,28 @@
+# Line endings, and only line endings.
+#
+# There is nothing else here on purpose: the style rules live in
+# Directory.Build.props, where they are already errors rather than suggestions,
+# and a second place to configure the same thing is a second place to disagree.
+#
+# This exists because `dotnet format` had no instruction and so used the running
+# platform's newline. The repository is LF, CI is Linux and passes; the same
+# command on the Windows workstation envmux is developed from reported two dozen
+# WHITESPACE errors, every one of them asking for a carriage return. The check
+# was therefore useless on the machine where it would have been most useful, and
+# "ignore the format errors" is a habit that eventually ignores a real one.
+root = true
+
+[*]
+end_of_line = lf
+insert_final_newline = true
+charset = utf-8
+
+# Not the shell scripts envmux generates — those are strings in C# and are
+# handled by Shell.Line — but the ones checked in, which a Linux guest runs and
+# a carriage return breaks in the same way.
+[*.{sh,bash}]
+end_of_line = lf
+
+# PowerShell is the Windows half and stays as Windows writes it.
+[*.ps1]
+end_of_line = crlf

@@ -1,0 +1,8 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Envmux/Envmux.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Envmux.Tests/Envmux.Tests.csproj" />
+  </Folder>
+</Solution>

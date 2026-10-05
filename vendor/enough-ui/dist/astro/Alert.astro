@@ -1,0 +1,10 @@
+---
+import type { HTMLAttributes } from 'astro/types';
+import { cn } from '../lib/utils.js';
+import { alertVariants } from '../lib/variants.js';
+import { apiPresentation } from '../lib/api-presentation.js';
+import type { VariantProps } from 'class-variance-authority';
+type Props = Omit<HTMLAttributes<'div'>, keyof VariantProps<typeof alertVariants>> & VariantProps<typeof alertVariants>;
+const { class: className, variant, ...attributes } = Astro.props;
+---
+<div role="alert" data-slot="alert" {...attributes} class={cn(alertVariants({ variant }), apiPresentation.Alert, className)}><slot /></div>

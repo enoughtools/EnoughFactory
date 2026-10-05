@@ -1,0 +1,8 @@
+---
+import type { HTMLAttributes } from 'astro/types';
+import { cn } from '../lib/utils.js';
+import { presentation } from '../lib/presentation.js';
+type Props = HTMLAttributes<'tbody'>;
+const { class: className, ...attributes } = Astro.props;
+---
+<tbody data-slot="table-body" {...attributes} class={cn(presentation.TableBody, className)}><slot /></tbody>

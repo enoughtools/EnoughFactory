@@ -1,0 +1,17 @@
+[package]
+name = "envmux-agent"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The in-container half of envmux: a credential bridge over the exec stream"
+
+# Deliberately dependency-free. This binary is cross-compiled to static musl
+# and copied into every workspace container; every dependency is paid for at
+# that boundary, and std is enough for a unix socket and length-prefixed
+# frames.
+[dependencies]
+
+[lints]
+workspace = true

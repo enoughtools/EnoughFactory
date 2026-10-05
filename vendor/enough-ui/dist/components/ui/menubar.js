@@ -1,0 +1,37 @@
+"use client";
+import { jsx as _jsx, jsxs as _jsxs } from "react/jsx-runtime";
+import * as React from "react";
+import * as MenubarPrimitive from "@radix-ui/react-menubar";
+import { cn } from "../../lib/utils.js";
+import { menubarCheckboxItemClassName, menubarContentClassName, menubarItemVariants, menubarLabelVariants, menubarRadioItemClassName, menubarRootClassName, menubarSeparatorClassName, menubarShortcutClassName, menubarSubContentClassName, menubarSubTriggerVariants, menubarTriggerClassName, } from "../../lib/menubar.js";
+const MenubarMenu = MenubarPrimitive.Menu;
+const MenubarGroup = MenubarPrimitive.Group;
+const MenubarPortal = MenubarPrimitive.Portal;
+const MenubarSub = MenubarPrimitive.Sub;
+const MenubarRadioGroup = MenubarPrimitive.RadioGroup;
+const Menubar = React.forwardRef(({ className, ...props }, ref) => (_jsx(MenubarPrimitive.Root, { ref: ref, className: cn(menubarRootClassName, className), ...props })));
+Menubar.displayName = MenubarPrimitive.Root.displayName;
+const MenubarTrigger = React.forwardRef(({ className, ...props }, ref) => (_jsx(MenubarPrimitive.Trigger, { ref: ref, className: cn(menubarTriggerClassName, className), ...props })));
+MenubarTrigger.displayName = MenubarPrimitive.Trigger.displayName;
+const MenubarSubTrigger = React.forwardRef(({ className, inset, children, ...props }, ref) => (_jsxs(MenubarPrimitive.SubTrigger, { ref: ref, className: cn(menubarSubTriggerVariants({ inset }), className), ...props, children: [children, _jsx("svg", { "aria-hidden": "true", focusable: "false", className: "ms-auto size-4 shrink-0 text-[var(--color-text-3)] rtl:rotate-180", viewBox: "0 0 24 24", fill: "none", stroke: "currentColor", strokeWidth: "2", strokeLinecap: "round", strokeLinejoin: "round", children: _jsx("polyline", { points: "9 18 15 12 9 6" }) })] })));
+MenubarSubTrigger.displayName = MenubarPrimitive.SubTrigger.displayName;
+const MenubarSubContent = React.forwardRef(({ className, alignOffset = -5, sideOffset = 2, ...props }, ref) => (_jsx(MenubarPrimitive.Portal, { children: _jsx(MenubarPrimitive.SubContent, { ref: ref, alignOffset: alignOffset, sideOffset: sideOffset, className: cn(menubarSubContentClassName, className), ...props }) })));
+MenubarSubContent.displayName = MenubarPrimitive.SubContent.displayName;
+const MenubarContent = React.forwardRef(({ className, align = "start", alignOffset = -4, sideOffset = 8, ...props }, ref) => (_jsx(MenubarPrimitive.Portal, { children: _jsx(MenubarPrimitive.Content, { ref: ref, align: align, alignOffset: alignOffset, sideOffset: sideOffset, className: cn(menubarContentClassName, className), ...props }) })));
+MenubarContent.displayName = MenubarPrimitive.Content.displayName;
+const MenubarItem = React.forwardRef(({ className, inset, variant = "default", ...props }, ref) => (_jsx(MenubarPrimitive.Item, { ref: ref, className: cn(menubarItemVariants({ inset, variant }), className), ...props })));
+MenubarItem.displayName = MenubarPrimitive.Item.displayName;
+const MenubarCheckboxItem = React.forwardRef(({ className, children, checked, ...props }, ref) => (_jsxs(MenubarPrimitive.CheckboxItem, { ref: ref, checked: checked, className: cn(menubarCheckboxItemClassName, className), ...props, children: [_jsx("span", { "aria-hidden": "true", className: "absolute start-[8px] flex size-[16px] items-center justify-center", children: _jsx(MenubarPrimitive.ItemIndicator, { children: checked === "indeterminate" ? (_jsx("span", { "aria-hidden": "true", className: "select-none font-bold text-[14px] leading-none", children: "\u2013" })) : (_jsx("span", { "aria-hidden": "true", className: "select-none text-[14px] leading-none", children: "\u2713" })) }) }), children] })));
+MenubarCheckboxItem.displayName = MenubarPrimitive.CheckboxItem.displayName;
+const MenubarRadioItem = React.forwardRef(({ className, children, ...props }, ref) => (_jsxs(MenubarPrimitive.RadioItem, { ref: ref, className: cn(menubarRadioItemClassName, className), ...props, children: [_jsx("span", { "aria-hidden": "true", className: "absolute start-[8px] flex size-[16px] items-center justify-center", children: _jsx(MenubarPrimitive.ItemIndicator, { children: _jsx("span", { "aria-hidden": "true", className: "select-none text-[10px] leading-none", children: "\u25CF" }) }) }), children] })));
+MenubarRadioItem.displayName = MenubarPrimitive.RadioItem.displayName;
+const MenubarLabel = React.forwardRef(({ className, inset, ...props }, ref) => (_jsx(MenubarPrimitive.Label, { ref: ref, className: cn(menubarLabelVariants({ inset }), className), ...props })));
+MenubarLabel.displayName = MenubarPrimitive.Label.displayName;
+const MenubarSeparator = React.forwardRef(({ className, ...props }, ref) => (_jsx(MenubarPrimitive.Separator, { ref: ref, className: cn(menubarSeparatorClassName, className), ...props })));
+MenubarSeparator.displayName = MenubarPrimitive.Separator.displayName;
+const MenubarShortcut = ({ className, ...props }) => {
+    return (_jsx("span", { className: cn(menubarShortcutClassName, className), ...props }));
+};
+MenubarShortcut.displayName = "MenubarShortcut";
+export { Menubar, MenubarMenu, MenubarTrigger, MenubarPortal, MenubarContent, MenubarGroup, MenubarItem, MenubarCheckboxItem, MenubarRadioGroup, MenubarRadioItem, MenubarLabel, MenubarSeparator, MenubarShortcut, MenubarSub, MenubarSubTrigger, MenubarSubContent, };
+//# sourceMappingURL=menubar.js.map

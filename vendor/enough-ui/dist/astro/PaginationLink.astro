@@ -1,0 +1,10 @@
+---
+import type { HTMLAttributes } from 'astro/types';
+import { cn } from '../lib/utils.js';
+import { paginationLinkVariants } from '../lib/variants.js';
+import type { VariantProps } from 'class-variance-authority';
+type Props = HTMLAttributes<'a'> & Pick<VariantProps<typeof paginationLinkVariants>,'size'> & {disabled?:boolean; isActive?:boolean};
+const {class: className, href, disabled = false, isActive = false, size, 'aria-disabled': ariaDisabled, ...attributes} = Astro.props;
+const blocked = disabled || ariaDisabled === true || ariaDisabled === 'true';
+---
+<a {...attributes} href={blocked ? undefined : href} aria-current={isActive ? "page" : undefined} aria-disabled={blocked || undefined} tabindex={blocked ? -1 : attributes.tabindex} data-slot="pagination-link" data-active={isActive ? "true" : undefined} data-disabled={blocked ? "true" : undefined} class={cn(paginationLinkVariants({variant:isActive ? "active" : "default",size}),className)}><slot /></a>

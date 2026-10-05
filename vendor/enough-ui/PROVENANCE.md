@@ -1,0 +1,1 @@
+EnoughUI @enoughtools/ui-react 0.4.0, vendored distribution from https://github.com/enoughtools/enough-ui at revision 2c0a5f41ceb589b19224dd3f06f5345a14b2a0cd. MIT; upstream notices preserved. Source and generated output remain upstream-owned.

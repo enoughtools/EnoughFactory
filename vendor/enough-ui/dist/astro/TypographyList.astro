@@ -1,0 +1,8 @@
+---
+import type { HTMLAttributes } from 'astro/types';
+import { cn } from '../lib/utils.js';
+import { presentation } from '../lib/presentation.js';
+type Props = HTMLAttributes<'ul'>;
+const { class: className, ...attributes } = Astro.props;
+---
+<ul data-slot="typography-list" {...attributes} class={cn(presentation.TypographyList, className)}><slot /></ul>

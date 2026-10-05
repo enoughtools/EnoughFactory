@@ -1,0 +1,20 @@
+"use client";
+import { jsx as _jsx } from "react/jsx-runtime";
+import * as React from "react";
+import * as AvatarPrimitive from "@radix-ui/react-avatar";
+import { cn } from "../../lib/utils.js";
+import { avatarVariants, avatarImageClass, avatarFallbackClass, avatarBadgeVariants, avatarGroupVariants, avatarGroupCountVariants, } from "../../lib/minor-presentation.js";
+const Avatar = React.forwardRef(({ className, size = "default", ...props }, ref) => (_jsx(AvatarPrimitive.Root, { ref: ref, "data-slot": "avatar", "data-size": size, className: cn(avatarVariants({ size }), className), ...props })));
+Avatar.displayName = AvatarPrimitive.Root.displayName;
+const AvatarImage = React.forwardRef(({ className, ...props }, ref) => (_jsx(AvatarPrimitive.Image, { ref: ref, "data-slot": "avatar-image", className: cn(avatarImageClass, className), ...props })));
+AvatarImage.displayName = AvatarPrimitive.Image.displayName;
+const AvatarFallback = React.forwardRef(({ className, ...props }, ref) => (_jsx(AvatarPrimitive.Fallback, { ref: ref, "data-slot": "avatar-fallback", className: cn(avatarFallbackClass, className), ...props })));
+AvatarFallback.displayName = AvatarPrimitive.Fallback.displayName;
+const AvatarBadge = React.forwardRef(({ className, variant = "default", size = "default", ...props }, ref) => (_jsx("span", { ref: ref, "data-slot": "avatar-badge", className: cn(avatarBadgeVariants({ variant, size }), className), ...props })));
+AvatarBadge.displayName = "AvatarBadge";
+const AvatarGroup = React.forwardRef(({ className, size = "default", ...props }, ref) => (_jsx("div", { ref: ref, "data-slot": "avatar-group", className: cn(avatarGroupVariants({ size }), className), ...props })));
+AvatarGroup.displayName = "AvatarGroup";
+const AvatarGroupCount = React.forwardRef(({ className, size = "default", ...props }, ref) => (_jsx("span", { ref: ref, "data-slot": "avatar-group-count", className: cn(avatarGroupCountVariants({ size }), className), ...props })));
+AvatarGroupCount.displayName = "AvatarGroupCount";
+export { Avatar, AvatarImage, AvatarFallback, AvatarBadge, AvatarGroup, AvatarGroupCount, };
+//# sourceMappingURL=avatar.js.map

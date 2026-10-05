@@ -1,0 +1,43 @@
+[package]
+name = "envmux-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "envmux"
+path = "src/main.rs"
+
+[dependencies]
+envmux-core = { workspace = true }
+envmux-docker = { workspace = true }
+envmux-tmux = { workspace = true }
+envmux-config = { workspace = true }
+envmux-api-types = { workspace = true }
+envmux-daemon = { workspace = true }
+
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "io-util", "io-std", "time", "process", "signal"] }
+clap = { workspace = true }
+clap_complete = { workspace = true }
+comfy-table = { workspace = true }
+crossterm = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http-body-util = { workspace = true }
+tokio-tungstenite = { workspace = true }
+futures-util = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+bollard = { workspace = true }
+jiff = { workspace = true }
+miette = { workspace = true }
+dirs = { workspace = true }
+bytes = { workspace = true }
+tar = { workspace = true }
+ratatui = "0.30"

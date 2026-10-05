@@ -1,0 +1,8 @@
+---
+import type { HTMLAttributes } from 'astro/types';
+import { cn } from '../lib/utils.js';
+import { apiPresentation } from '../lib/api-presentation.js';
+type Props = HTMLAttributes<'div'>;
+const { class: className, ...attributes } = Astro.props;
+---
+<div data-slot="alert-action" {...attributes} class={cn(apiPresentation.AlertAction, className)}><slot /></div>

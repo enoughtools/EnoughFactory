@@ -1,0 +1,1 @@
+{"version":3,"file":"country-heatmap-geometry.d.ts","sourceRoot":"","sources":["../../src/lib/country-heatmap-geometry.ts"],"names":[],"mappings":"AAAA;;;;;;GAMG;AACH,MAAM,MAAM,sBAAsB,GAAG;IAAE,QAAQ,CAAC,IAAI,EAAE,MAAM,CAAC;IAAC,QAAQ,CAAC,IAAI,EAAE,MAAM,CAAC;IAAC,QAAQ,CAAC,IAAI,EAAE,MAAM,CAAA;CAAE,CAAA;AAE5G,eAAO,MAAM,sBAAsB,EAAE,SAAS,sBAAsB,EAA4p3I,CAAA"}

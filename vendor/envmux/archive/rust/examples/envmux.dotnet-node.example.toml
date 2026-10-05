@@ -1,0 +1,45 @@
+[meta]
+schema = 2
+namespace = "dotnet-node"
+
+[image]
+dockerfile = "images/dotnet-node.Dockerfile"
+context = "."
+
+[workspace]
+workdir = "/work"
+user = "user"
+naming = "branch"
+
+[tasks.restore]
+command = "dotnet restore"
+
+[volumes.named.nuget]
+class = "cache"
+path = "/home/user/.nuget/packages"
+
+[volumes.named.npm]
+class = "cache"
+path = "/home/user/.npm"
+
+[volumes.named.claude]
+class = "sync"
+path = "/home/user/.claude"
+
+[volumes.named.codex]
+class = "sync"
+path = "/home/user/.codex"
+
+[routes]
+app = 5000
+
+[lease]
+initial = "7d"
+attach_extension = "24h"
+max_workspaces = 8
+
+[env]
+ASPNETCORE_URLS = "http://0.0.0.0:5000"
+CLAUDE_CONFIG_DIR = "/home/user/.claude"
+CODEX_HOME = "/home/user/.codex"
+DOTNET_CLI_TELEMETRY_OPTOUT = "1"

@@ -1,0 +1,25 @@
+{
+  "name": "@enoughfactory/device",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "start": "tsx src/index.ts",
+    "build": "node build.mjs",
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "@enoughfactory/contracts": "workspace:*",
+    "@enoughfactory/envmux": "workspace:*",
+    "ws": "^8.18.3",
+    "@enoughfactory/agents": "workspace:*",
+    "@enoughfactory/peers": "workspace:*",
+    "@enoughfactory/factory": "workspace:*",
+    "@enoughfactory/workspaces": "workspace:*",
+    "@enoughfactory/previews": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/ws": "^8.18.1"
+  }
+}

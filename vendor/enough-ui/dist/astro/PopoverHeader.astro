@@ -1,0 +1,8 @@
+---
+import type { HTMLAttributes } from 'astro/types';
+import { cn } from '../lib/utils.js';
+import { popoverPresentation } from '../lib/popover-presentation.js';
+type Props = HTMLAttributes<'div'>;
+const { class: className, ...attributes } = Astro.props;
+---
+<div data-slot="popover-header" {...attributes} class={cn(popoverPresentation.Header, className)}><slot /></div>

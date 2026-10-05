@@ -1,0 +1,73 @@
+name: enoughfactory-signaling
+
+services:
+  signaling:
+    build:
+      context: .
+    restart: unless-stopped
+    init: true
+    environment:
+      ENOUGH_SIGNALING_HOST: 0.0.0.0
+      PORT: "8788"
+      ENOUGH_SIGNALING_ALLOW_RELAY: ${ENOUGH_SIGNALING_ALLOW_RELAY:-true}
+      ENOUGH_SIGNALING_ALLOWED_ORIGINS: ${ENOUGH_SIGNALING_ALLOWED_ORIGINS:-}
+      ENOUGH_SIGNALING_DEVICE_IDS: ${ENOUGH_SIGNALING_DEVICE_IDS:-}
+      STUN_URLS: ${STUN_URLS:-stun:stun.cloudflare.com:3478}
+      TURN_URLS: ${TURN_URLS:-}
+      TURN_SECRET: ${TURN_SECRET:-}
+      TURN_TTL_SECONDS: ${TURN_TTL_SECONDS:-3600}
+    ports:
+      - "${SIGNALING_BIND_ADDRESS:-127.0.0.1}:${PORT:-8788}:8788"
+
+  caddy:
+    image: caddy:2-alpine
+    profiles: [tls]
+    restart: unless-stopped
+    command:
+      - caddy
+      - reverse-proxy
+      - --from
+      - ${SIGNALING_DOMAIN:-localhost}
+      - --to
+      - signaling:8788
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      signaling:
+        condition: service_healthy
+
+  # Deploy this profile on Linux. Host networking preserves advertised TURN ports.
+  coturn:
+    image: coturn/coturn:4.18.0-r0
+    profiles: [turn]
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      TURN_SECRET: ${TURN_SECRET:-}
+      TURN_REALM: ${TURN_REALM:-enoughfactory}
+      TURN_EXTERNAL_IP: ${TURN_EXTERNAL_IP:-}
+      TURN_MIN_PORT: ${TURN_MIN_PORT:-49160}
+      TURN_MAX_PORT: ${TURN_MAX_PORT:-49200}
+    entrypoint: [/bin/sh, -ec]
+    command:
+      - |
+        test -n "$$TURN_SECRET" || { echo "Set TURN_SECRET before enabling the turn profile" >&2; exit 1; }
+        set -- /usr/bin/turnserver -n --log-file=stdout --fingerprint \
+          --use-auth-secret --static-auth-secret="$$TURN_SECRET" \
+          --realm="$$TURN_REALM" --listening-port=3478 \
+          --min-port="$$TURN_MIN_PORT" --max-port="$$TURN_MAX_PORT" \
+          --no-tls --no-dtls --no-cli --no-multicast-peers \
+          --denied-peer-ip=127.0.0.0-127.255.255.255 --denied-peer-ip=::1
+        if [ -n "$$TURN_EXTERNAL_IP" ]; then
+          set -- "$$@" --external-ip="$$TURN_EXTERNAL_IP"
+        fi
+        exec "$$@"
+
+volumes:
+  caddy_data:
+  caddy_config:

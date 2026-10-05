@@ -1,0 +1,9 @@
+---
+import type { HTMLAttributes } from 'astro/types';
+import type { VariantProps } from 'class-variance-authority';
+import { attachmentMediaVariants } from '../lib/conversation.js';
+import { cn } from '../lib/utils.js';
+type Props = HTMLAttributes<'div'> & VariantProps<typeof attachmentMediaVariants>;
+const { class: className, variant = 'icon', ...attributes } = Astro.props;
+---
+<div data-slot="attachment-media" data-variant={variant} class={cn(attachmentMediaVariants({ variant }), className)} {...attributes}><slot /></div>

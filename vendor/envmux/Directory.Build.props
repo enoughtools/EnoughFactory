@@ -1,0 +1,20 @@
+<Project>
+
+  <!-- Shared across every project. Kept here so a csproj is only ever the
+       things that project actually differs on. -->
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <InvariantGlobalization>true</InvariantGlobalization>
+
+    <!-- A warning that is allowed to accumulate is not a warning. -->
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <EnforceCodeStyleInBuild>true</EnforceCodeStyleInBuild>
+    <AnalysisLevel>latest-recommended</AnalysisLevel>
+
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+</Project>

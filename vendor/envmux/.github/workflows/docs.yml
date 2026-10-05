@@ -1,0 +1,55 @@
+name: Docs
+
+# The documentation site is built from the same Markdown the repository
+# renders, under docs/pages. Building on every pull request catches dead links
+# and MDX breakage before they land; only main publishes.
+#
+# Pull requests validate the site; only main deploys.
+on:
+  push:
+    branches: [main, "release/**"]
+    paths: ["docs/**", "vocs.config.ts", "package.json", "package-lock.json", ".github/workflows/docs.yml"]
+  pull_request:
+    paths: ["docs/**", "vocs.config.ts", "package.json", "package-lock.json", ".github/workflows/docs.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Per-ref, and pull requests only. A single shared `pages` group meant any
+# pull-request build cancelled whichever deploy of main was in flight, which
+# is how the site ends up older than main without anything appearing to fail.
+concurrency:
+  group: pages-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+      - run: npm ci
+      # Vocs validates internal links, so a build failure here usually means a
+      # link pointing outside docs/pages. Link to GitHub for those.
+      - run: npm run docs:build
+      - uses: actions/upload-pages-artifact@v3
+        if: github.ref == 'refs/heads/main'
+        with:
+          path: docs/dist
+
+  deploy:
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - id: deploy
+        uses: actions/deploy-pages@v4

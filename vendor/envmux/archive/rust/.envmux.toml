@@ -1,0 +1,108 @@
+# Self-hosting demonstration: envmux runs inside envmux and receives its own
+# isolated, privileged Docker daemon. This is intentionally unsafe and for
+# local demonstration/development only.
+[meta]
+schema = 2
+namespace = "envmux-selfhost"
+
+[image]
+dockerfile = "images/rust-node.Dockerfile"
+context = "."
+
+[mirror]
+fetch = "on-demand"
+
+[workspace]
+workdir = "/work"
+# The one configuration in this repository that is still root, and the reason
+# is the nested daemon below: `dockerd` in a privileged container is root's
+# job. Everything else — the images, the starter, the examples — defaults to
+# the non-root `user` account, which is why the paths here are under /root
+# while theirs are under /home/user.
+user = "root"
+naming = "branch"
+# What a session drops you into: "shell" (default), "manage", or a command —
+# the agent state volumes below mean `terminal = "claude"` arrives logged in.
+# terminal = "claude"
+dangerously_enable_dind = true # UNSAFE: privileged container; demo only
+
+[tasks.docker]
+command = "dockerd --host=unix:///var/run/docker.sock --storage-driver=vfs"
+long_running = true
+check = { kind = "exec", cmd = "docker info >/dev/null 2>&1", interval = "2s", timeout = "120s" }
+restart = { policy = "on-failure", max = 3, backoff = "3s" }
+
+[tasks.nested-daemon]
+# The nested daemon serves local IPC only — v2's one transport. A long grace
+# keeps it alive between the demo's task steps.
+command = "cargo run -p envmux-cli -- daemon --state-dir /root/.local/share/envmux-demo --grace-secs 3600"
+after = ["docker"]
+long_running = true
+check = { kind = "exec", cmd = "test -S /root/.local/share/envmux-demo/daemon.sock", interval = "3s", timeout = "900s" }
+restart = { policy = "on-failure", max = 3, backoff = "5s" }
+
+[tasks.self-register]
+command = "ENVMUX_STATE_DIR=/root/.local/share/envmux-demo cargo run -p envmux-cli -- up"
+after = ["nested-daemon"]
+
+# The proof of self-hosting: the nested daemon creates a second-level
+# workspace of this same repository, inside the workspace it is already
+# running in. `envmux ls` against the nested state dir is where it shows.
+[tasks.self-workspace]
+command = "ENVMUX_STATE_DIR=/root/.local/share/envmux-demo cargo run -p envmux-cli -- create --wait --name selfhosted"
+after = ["self-register"]
+
+# CARGO_HOME is /usr/local/cargo in the image — outside any home directory, so
+# a non-root workspace can read the toolchain — and these follow it there.
+[volumes.named.cargo-registry]
+class = "cache"
+path = "/usr/local/cargo/registry"
+
+[volumes.named.cargo-git]
+class = "cache"
+path = "/usr/local/cargo/git"
+
+[volumes.named.npm]
+class = "cache"
+path = "/root/.npm"
+
+[volumes.named.codex]
+class = "sync"
+path = "/root/.codex"
+
+[volumes.named.claude]
+class = "sync"
+path = "/root/.claude"
+
+[volumes.named.opencode]
+class = "sync"
+path = "/root/.config/opencode"
+
+[volumes.named.codex-security]
+class = "sync"
+path = "/root/.local/share/codex-security"
+
+[volumes.named.nested-envmux]
+class = "sync"
+path = "/root/.local/share/envmux-demo"
+
+[capture]
+interval = "5m"
+retention = "30d"
+
+[observe]
+interval = "30s"
+depth = "full"
+
+[lease]
+initial = "3d"
+attach_extension = "24h"
+max_workspaces = 4
+
+[env]
+# Claude Code keeps `.claude.json` beside $HOME rather than inside ~/.claude,
+# so the sync volume covers all of its state only once this points it there.
+CLAUDE_CONFIG_DIR = "/root/.claude"
+CODEX_HOME = "/root/.codex"
+CODEX_SECURITY_STATE_DIR = "/root/.local/share/codex-security"
+DOCKER_HOST = "unix:///var/run/docker.sock"

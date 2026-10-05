@@ -1,0 +1,9 @@
+{
+  "name": "@enoughfactory/previews",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": "./src/index.ts",
+  "scripts": { "typecheck": "tsc -p tsconfig.json", "verify": "tsx --test tests/*.test.ts" },
+  "dependencies": { "socks": "^2.8.7" }
+}

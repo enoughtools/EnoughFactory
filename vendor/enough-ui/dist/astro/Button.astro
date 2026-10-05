@@ -1,0 +1,23 @@
+---
+import type { HTMLAttributes } from 'astro/types';
+import type { VariantProps } from 'class-variance-authority';
+import { buttonVariants } from '../lib/variants.js';
+import { cn } from '../lib/utils.js';
+
+type Props = HTMLAttributes<'button'> & VariantProps<typeof buttonVariants> & {
+  href?: string;
+  target?: HTMLAttributes<'a'>['target'];
+  rel?: string;
+  download?: HTMLAttributes<'a'>['download'];
+  className?: string;
+};
+const { href, target, rel, download, variant, size, disabled, class: className, className: reactClassName, type = 'button', 'data-slot': dataSlot = 'button', ...attributes } = Astro.props;
+const isDisabled = disabled === true || disabled === '';
+const classes = cn(buttonVariants({ variant, size }), isDisabled && 'pointer-events-none opacity-50', reactClassName, className);
+---
+{href !== undefined ? (
+  <a data-slot={dataSlot} {...attributes} role={isDisabled ? attributes.role ?? 'link' : attributes.role} href={isDisabled ? undefined : href} target={target} rel={rel} download={download}
+    aria-disabled={isDisabled || undefined} tabindex={isDisabled ? -1 : attributes.tabindex} class={classes}><slot /></a>
+) : (
+  <button data-slot={dataSlot} {...attributes} type={type} disabled={isDisabled} class={classes}><slot /></button>
+)}

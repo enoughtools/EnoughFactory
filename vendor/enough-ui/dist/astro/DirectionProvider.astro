@@ -1,0 +1,27 @@
+---
+import type { HTMLAttributes } from 'astro/types';
+import { cn } from '../lib/utils.js';
+import {
+  resolveDirection,
+  type Direction,
+} from '../lib/minor-presentation.js';
+
+interface Props extends HTMLAttributes<'div'> {
+  direction?: Direction;
+  dir?: Direction;
+  as?: 'div' | 'span' | 'section' | 'article' | 'main';
+}
+
+const {
+  direction,
+  dir,
+  as: Tag = 'div',
+  class: className,
+  ...attributes
+} = Astro.props;
+
+const resolvedDir = resolveDirection(direction, dir);
+---
+<Tag dir={resolvedDir} class={cn(className)} {...attributes}>
+  <slot />
+</Tag>

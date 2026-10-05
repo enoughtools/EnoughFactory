@@ -1,0 +1,23 @@
+---
+import type { HTMLAttributes } from 'astro/types';
+import { cn } from '../lib/utils.js';
+import {
+  avatarGroupCountVariants,
+  type AvatarSize,
+} from '../lib/minor-presentation.js';
+
+interface Props extends HTMLAttributes<'span'> {
+  size?: AvatarSize;
+}
+
+const {
+  size = 'default',
+  class: className,
+  ...attributes
+} = Astro.props;
+---
+<span
+  data-slot="avatar-group-count"
+  class={cn(avatarGroupCountVariants({ size }), className)}
+  {...attributes}
+><slot /></span>

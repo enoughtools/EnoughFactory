@@ -1,0 +1,22 @@
+---
+import type { HTMLAttributes } from 'astro/types';
+import Button from './Button.astro';
+import { cn } from '../lib/utils.js';
+type Props = HTMLAttributes<'header'> & {
+  links?: {label:string; href:string}[]; active?:string; brand?:string;
+  homeHref?:string; homeLabel?:string; skipToHref?:string;
+  cta?:string; ctaHref?:string;
+};
+const { links = [], active, brand = 'EnoughUI', homeHref = '/', homeLabel = 'Home',
+  skipToHref = '#main', cta, ctaHref = '/', class: className, ...attributes } = Astro.props;
+---
+<header {...attributes} class={cn('border-b border-[var(--color-ink)] bg-[var(--color-paper)] font-sans',className)}>
+  <a href={skipToHref} class="sr-only focus:not-sr-only focus:absolute focus:left-4 focus:top-4 focus:z-50 focus:bg-[var(--color-ink)] focus:px-4 focus:py-2 focus:text-[var(--color-dark-text)]">Skip to content</a>
+  <div class="flex flex-wrap items-center justify-between gap-x-5 gap-y-3 px-6 py-[14px] lg:px-[64px] lg:py-[18px]">
+    <a href={homeHref} aria-label={homeLabel} class="font-serif font-bold text-[19px] text-[var(--color-text-main)] focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-[var(--color-accent)]"><slot name="brand">{brand}</slot></a>
+    <nav aria-label="Main navigation" class="order-3 -mx-6 flex w-[calc(100%+3rem)] gap-x-5 overflow-x-auto whitespace-nowrap border-t border-[var(--color-hairline)] px-6 pt-3 text-[13px] font-medium lg:order-none lg:mx-0 lg:w-auto lg:gap-x-[28px] lg:overflow-visible lg:border-t-0 lg:px-0 lg:pt-0 lg:text-[14px]">
+      {links.map(({label,href}) => <a href={href} aria-current={active === label ? 'page' : undefined} class={cn('py-1 focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-[var(--color-accent)]', active === label ? 'border-b-2 border-[var(--color-accent)] pb-[2px] text-[var(--color-text-main)]' : active ? 'text-[var(--color-text-3)] hover:text-[var(--color-text-main)]' : 'text-[var(--color-text-main)] hover:text-[var(--color-text-2)]')}>{label}</a>)}
+    </nav>
+    <div class="flex items-center gap-[14px]"><slot name="actions" />{cta && <Button href={ctaHref} variant="ink">{cta}</Button>}</div>
+  </div>
+</header>

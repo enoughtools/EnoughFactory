@@ -1,0 +1,9 @@
+{
+  "upstream": "https://github.com/cloudflare/artifact-fs",
+  "source": "https://github.com/enoughtools/reporeach",
+  "revision": "6a62f2f34aebe75da3d8b917131a6ace185928e5",
+  "license": "Apache-2.0",
+  "image": "enoughfactory/artifactfs:6a62f2f34aeb",
+  "patches": ["allow-other.patch"],
+  "purpose": "Linux ArtifactFS workspace manager; agent containers receive the mount without manager capabilities."
+}

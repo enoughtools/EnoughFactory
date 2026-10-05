@@ -1,0 +1,9 @@
+{
+  "name": "@enoughfactory/agents",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": "./src/index.ts",
+  "scripts": { "typecheck": "tsc -p tsconfig.json", "verify": "tsx --test src/*.test.ts" },
+  "dependencies": { "@enoughfactory/contracts": "workspace:*" }
+}

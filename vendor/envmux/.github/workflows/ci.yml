@@ -1,0 +1,93 @@
+name: CI
+
+on:
+  push:
+    branches: [main, "release/**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      # envmux is a developer tool that has to work where developers are, and
+      # the parts most likely to differ by platform — the port walk, the
+      # default routing domain, console handling — are the parts under test.
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+      # For the portal page, which `dotnet build` builds with Vite and embeds
+      # in the executable. A build without Node still succeeds and simply has
+      # no page in it, which is not what a release should be — so Node is set
+      # up here, and the tests that ask for a real asset then run rather than
+      # skipping.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: src/Envmux/Portal/ui/package-lock.json
+
+      - run: dotnet restore
+      # Warnings are errors in Directory.Build.props, so this is also the lint.
+      - run: dotnet build --no-restore --configuration Release
+      - run: dotnet test --no-build --configuration Release --verbosity normal --logger trx --results-directory artifacts/ci-tests
+        env:
+          ENVMUX_DOCKER_LIVE: "0"
+          ENVMUX_GOLDEN_LIVE: "0"
+          ENVMUX_E2E: ""
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-results-${{ matrix.os }}
+          path: artifacts/ci-tests/*.trx
+
+      # Everything up to the first API call is reachable without a host: if this
+      # stops working, config resolution or the hostname scheme broke.
+      - run: dotnet run --project src/Envmux --configuration Release --no-build -- --dry-run
+
+  secrets:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Scan source and history
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force artifacts/audit-tools | Out-Null
+          $base = 'https://github.com/betterleaks/betterleaks/releases/download/v1.9.0'
+          $archive = 'betterleaks_1.9.0_windows_x64.zip'
+          Invoke-WebRequest "$base/$archive" -OutFile "artifacts/audit-tools/$archive"
+          Invoke-WebRequest "$base/checksums.txt" -OutFile artifacts/audit-tools/checksums.txt
+          $line = Get-Content artifacts/audit-tools/checksums.txt | Where-Object { $_ -match "\s+$([regex]::Escape($archive))$" }
+          if (@($line).Count -ne 1 -or (Get-FileHash "artifacts/audit-tools/$archive" -Algorithm SHA256).Hash -ne ($line -split '\s+')[0]) { throw 'Betterleaks checksum mismatch' }
+          Expand-Archive "artifacts/audit-tools/$archive" artifacts/audit-tools/scanner
+          ./scripts/secret-audit.ps1 -Betterleaks ./artifacts/audit-tools/scanner/betterleaks.exe
+
+  format:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+      # This one only reads C#, and there is no Node on this job anyway. The
+      # variable is read by MSBuild as a property and keeps the portal target
+      # from being considered at all.
+      - run: dotnet format --verify-no-changes
+        env:
+          BuildPortal: "false"

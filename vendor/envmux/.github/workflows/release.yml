@@ -1,0 +1,161 @@
+name: Beta release
+on:
+  push:
+    branches: ["release/**"]
+    tags: ["v*.*.*-beta.*", "v*.*.*-rc.*"]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: beta-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  audit:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Scan source and history
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force artifacts/audit-tools | Out-Null
+          $base = 'https://github.com/betterleaks/betterleaks/releases/download/v1.9.0'
+          $archive = 'betterleaks_1.9.0_windows_x64.zip'
+          Invoke-WebRequest "$base/$archive" -OutFile "artifacts/audit-tools/$archive"
+          Invoke-WebRequest "$base/checksums.txt" -OutFile artifacts/audit-tools/checksums.txt
+          $line = Get-Content artifacts/audit-tools/checksums.txt | Where-Object { $_ -match "\s+$([regex]::Escape($archive))$" }
+          if (@($line).Count -ne 1 -or (Get-FileHash "artifacts/audit-tools/$archive" -Algorithm SHA256).Hash -ne ($line -split '\s+')[0]) { throw 'Betterleaks checksum mismatch' }
+          Expand-Archive "artifacts/audit-tools/$archive" artifacts/audit-tools/scanner
+          ./scripts/secret-audit.ps1 -Betterleaks ./artifacts/audit-tools/scanner/betterleaks.exe
+  build:
+    needs: audit
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            rid: win-x64
+            extension: zip
+          - os: ubuntu-24.04
+            rid: linux-x64
+            extension: tar.gz
+          - os: ubuntu-24.04-arm
+            rid: linux-arm64
+            extension: tar.gz
+          - os: macos-15
+            rid: osx-arm64
+            extension: tar.gz
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: Install Linux native compiler
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes clang zlib1g-dev
+      - name: Select immutable version
+        id: version
+        run: |
+          $version = if ('${{ github.ref_type }}' -eq 'tag') { '${{ github.ref_name }}'.Substring(1) } else { '0.1.0-beta.review.${{ github.run_id }}.${{ github.run_attempt }}' }
+          "value=$version" >> $env:GITHUB_OUTPUT
+      - run: dotnet build -c Release
+      - run: dotnet test -c Release --no-build --logger trx --results-directory artifacts/release-tests
+        env:
+          ENVMUX_DOCKER_LIVE: "0"
+          ENVMUX_GOLDEN_LIVE: "0"
+          ENVMUX_E2E: ""
+      - name: Build and verify native archive
+        run: |
+          $version = '${{ steps.version.outputs.value }}'
+          ./scripts/release-build.ps1 -Version $version -Rid '${{ matrix.rid }}'
+          ./scripts/release-check.ps1 -Archive "artifacts/releases/$version-${{ matrix.rid }}/dist/envmux-$version-${{ matrix.rid }}.${{ matrix.extension }}" -Version $version
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.rid }}
+          path: artifacts/releases/${{ steps.version.outputs.value }}-${{ matrix.rid }}/dist/
+          compression-level: 0
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: beta-verification-${{ matrix.rid }}
+          path: artifacts/release-tests/*.trx
+
+  assemble:
+    needs: [audit, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: artifacts/downloaded
+      - name: Assemble checksums and metadata
+        shell: pwsh
+        run: |
+          $dist = New-Item -ItemType Directory -Path artifacts/dist
+          $sums = [Collections.Generic.List[string]]::new()
+          $isTag = '${{ github.ref_type }}' -eq 'tag'
+          $version = if ($isTag) { '${{ github.ref_name }}'.Substring(1) } else { '0.1.0-beta.review.${{ github.run_id }}.${{ github.run_attempt }}' }
+          $builds = @()
+          foreach ($rid in @('win-x64', 'linux-x64', 'linux-arm64', 'osx-arm64')) {
+            $source = "artifacts/downloaded/release-$rid"
+            $extension = if ($rid -eq 'win-x64') { 'zip' } else { 'tar.gz' }
+            $name = "envmux-$version-$rid.$extension"
+            $archive = Join-Path $source $name
+            if (-not (Test-Path -LiteralPath $archive)) { throw "Missing archive: $name" }
+            $line = @(Get-Content (Join-Path $source 'SHA256SUMS.txt'))
+            $hash = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($line.Count -ne 1 -or $line[0] -ne "$hash  $name") { throw "Checksum mismatch: $name" }
+            Copy-Item -LiteralPath $archive -Destination $dist.FullName
+            $sums.Add($line[0])
+            $build = Get-Content (Join-Path $source 'build.json') -Raw | ConvertFrom-Json
+            if ($build.rid -ne $rid -or $build.version -ne $version -or $build.commit -ne '${{ github.sha }}' -or $build.dirty -or $build.nativeAot -ne $true) { throw "Unexpected build metadata: $rid" }
+            $builds += $build
+          }
+          [IO.File]::WriteAllText((Join-Path $dist.FullName 'SHA256SUMS.txt'), ($sums -join "`n") + "`n")
+          [IO.File]::WriteAllText((Join-Path $dist.FullName 'builds.json'), ($builds | ConvertTo-Json))
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-dist
+          path: artifacts/dist/
+          compression-level: 0
+          if-no-files-found: error
+
+  draft:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: assemble
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-dist
+          path: artifacts/dist
+      - name: Create draft prerelease
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = '${{ github.ref_name }}'
+          $version = $tag.Substring(1)
+          gh release view $tag --repo '${{ github.repository }}' *> $null
+          if ($LASTEXITCODE -eq 0) { throw 'Release already exists; tags and archives are immutable' }
+          $files = @(Get-ChildItem artifacts/dist -File | ForEach-Object FullName)
+          $visibility = if ($version -match '-rc\.') { @() } else { @('--draft') }
+          $notes = if ($version -match '-rc\.') { '.github/rc-release-notes.md' } else { '.github/beta-release-notes.md' }
+          gh release create $tag @files @visibility --repo '${{ github.repository }}' --verify-tag --prerelease --title "envmux $version" --notes-file $notes
+          if ($LASTEXITCODE -ne 0) { throw 'Draft release failed' }

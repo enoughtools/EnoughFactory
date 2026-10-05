@@ -1,0 +1,8 @@
+---
+import type { HTMLAttributes } from 'astro/types';
+import { cn } from '../lib/utils.js';
+import { presentation } from '../lib/presentation.js';
+type Props = HTMLAttributes<'textarea'>;
+const { class: className, ...attributes } = Astro.props;
+---
+<textarea data-slot="input-group-control" {...attributes} class={cn(presentation.Textarea, presentation.InputGroupTextarea, className)}><slot /></textarea>

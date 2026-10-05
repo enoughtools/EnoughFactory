@@ -1,0 +1,19 @@
+.git
+.agents
+.codex
+target
+**/target
+*.db
+*.log
+
+# The project-local envmux state: database (and its WAL), logs, mirrors,
+# shadow history. It changes on every daemon heartbeat, so shipping it in the
+# context busts the build cache each run — and on Windows the live WAL can be
+# locked, which fails the context upload outright.
+.envmux
+
+# Node and docs build artifacts: large, regenerated, and irrelevant to the
+# image. Shipping them in the build context slows every build and, on Windows
+# named pipes, is enough to break the context upload outright.
+**/node_modules
+docs/dist

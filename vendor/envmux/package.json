@@ -1,0 +1,19 @@
+{
+  "name": "envmux-docs",
+  "private": true,
+  "type": "module",
+  "description": "Documentation site for envmux, built from docs/pages with Vocs",
+  "scripts": {
+    "docs:dev": "vocs dev",
+    "docs:build": "vocs build",
+    "docs:preview": "vocs preview"
+  },
+  "devDependencies": {
+    "react": "^19",
+    "react-dom": "^19",
+    "vocs": "^1.0.20"
+  },
+  "overrides": {
+    "toml": "5.0.0"
+  }
+}

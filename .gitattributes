@@ -1,0 +1,4 @@
+vendor/** linguist-vendored -whitespace
+THIRD_PARTY_NOTICES.md linguist-generated -whitespace
+**/*OFL.txt -whitespace
+runtime/workspaces/*.patch -whitespace

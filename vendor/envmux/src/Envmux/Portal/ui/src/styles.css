@@ -1,0 +1,506 @@
+/*
+ * The same palette the terminal window draws with: a DOS layout in cyberpunk
+ * colours. Two ruled boxes and a transcript there, a column and a pane here —
+ * the same product seen through a different window, rather than a second look
+ * for the same tool.
+ */
+:root {
+  --ink: #0a0118;
+  --ink-raised: #140a26;
+  --rule: #3a2d52;
+  --text: #d8dce3;
+  --dim: #6b5f8a;
+  --hot: #ff2bd6;
+  --cool: #00f0ff;
+  --live: #39ff14;
+  --bad: #ff3864;
+  --warn: #ffd166;
+
+  color-scheme: dark;
+  font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--ink);
+  color: var(--text);
+}
+
+button {
+  font: inherit;
+  color: var(--cool);
+  background: none;
+  border: 1px solid var(--rule);
+  border-radius: 2px;
+  padding: 0.15rem 0.5rem;
+  cursor: pointer;
+}
+
+button:hover:not(:disabled) {
+  border-color: var(--cool);
+}
+
+button:disabled {
+  color: var(--dim);
+  cursor: not-allowed;
+}
+
+a {
+  color: var(--cool);
+  text-decoration: none;
+}
+
+a:hover {
+  text-decoration: underline;
+}
+
+/* A button that reads as a link: a route, which is opened by asking envmux
+   rather than by this tab navigating. */
+button.link {
+  background: none;
+  border: 0;
+  padding: 0;
+  font: inherit;
+  color: var(--cool);
+  cursor: pointer;
+}
+
+button.link:hover {
+  text-decoration: underline;
+}
+
+.waiting {
+  padding: 3rem;
+  color: var(--dim);
+}
+
+.app {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+}
+
+/* ── the identity bar ─────────────────────────────────────────────────── */
+
+header {
+  display: flex;
+  align-items: center;
+  gap: 1.5rem;
+  flex-wrap: wrap;
+  padding: 0.75rem 1rem;
+  border-bottom: 1px solid var(--rule);
+  background: var(--ink-raised);
+}
+
+h1 {
+  margin: 0;
+  font-size: 0.95rem;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--hot);
+}
+
+h1 .slash {
+  color: var(--dim);
+}
+
+.identity {
+  display: grid;
+  grid-template-columns: repeat(4, auto auto);
+  gap: 0.1rem 0.5rem;
+  margin: 0;
+  min-width: 0;
+}
+
+.identity dt,
+.about dt {
+  color: var(--dim);
+}
+
+.identity dd,
+.about dd {
+  margin: 0 1rem 0 0;
+  max-width: 22ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.doing {
+  display: flex;
+  gap: 0.75rem;
+  align-items: center;
+}
+
+.actions {
+  margin-left: auto;
+  display: flex;
+  gap: 0.5rem;
+}
+
+.good {
+  color: var(--live);
+}
+
+.busy {
+  color: var(--warn);
+}
+
+.bad {
+  color: var(--bad);
+}
+
+.said {
+  color: var(--dim);
+}
+
+/* ── the column and the pane ──────────────────────────────────────────── */
+
+.body {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+}
+
+aside {
+  width: 26rem;
+  flex: none;
+  overflow-y: auto;
+  border-right: 1px solid var(--rule);
+  padding: 0.5rem 0 2rem;
+}
+
+section {
+  padding: 0.5rem 1rem 1rem;
+}
+
+h2 {
+  margin: 0 0 0.5rem;
+  font-size: 0.75rem;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--hot);
+}
+
+.none {
+  margin: 0;
+  color: var(--dim);
+}
+
+ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.services li {
+  display: flex;
+  gap: 0.5rem;
+  align-items: baseline;
+  padding: 0.2rem 0;
+}
+
+/* Routes and tasks are two lines each: what it is on the first, and what it
+   last said — or where it is — on the second. One line each meant the useful
+   half was always the half that was ellipsised away. */
+.routes li,
+.tasks li {
+  padding: 0.25rem 0;
+}
+
+.routes .top,
+.tasks .top {
+  display: flex;
+  gap: 0.5rem;
+  align-items: baseline;
+}
+
+.under {
+  display: block;
+  color: var(--dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.port,
+.what {
+  color: var(--dim);
+}
+
+.tag {
+  color: var(--dim);
+  border: 1px solid var(--rule);
+  border-radius: 2px;
+  padding: 0 0.25rem;
+  font-size: 0.85em;
+}
+
+/* The one row in the list that is this page. Lit, because it is the row
+   somebody is looking for when they want the link to send. */
+.tag.portal {
+  color: var(--hot);
+  border-color: var(--hot);
+}
+
+.tasks .name {
+  border: none;
+  padding: 0;
+  text-align: left;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.tasks .name:hover {
+  color: var(--cool);
+}
+
+.tasks .own {
+  color: var(--hot);
+}
+
+.tasks .status {
+  font-size: 0.9em;
+}
+
+.doings {
+  display: flex;
+  gap: 0.2rem;
+  margin-left: auto;
+  visibility: hidden;
+}
+
+.tasks li:hover .doings {
+  visibility: visible;
+}
+
+.doings button {
+  padding: 0 0.35rem;
+}
+
+.about dl {
+  display: grid;
+  grid-template-columns: 6rem 1fr;
+  gap: 0.1rem 0.5rem;
+  margin: 0;
+}
+
+/* ── tabs and what is under them ──────────────────────────────────────── */
+
+main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.tabs {
+  display: flex;
+  gap: 0.25rem;
+  align-items: center;
+  padding: 0.4rem 0.75rem;
+  border-bottom: 1px solid var(--rule);
+  overflow-x: auto;
+}
+
+.tab {
+  display: inline-flex;
+  align-items: center;
+  border: 1px solid var(--rule);
+  border-radius: 2px;
+}
+
+.tab button {
+  border: none;
+  color: var(--dim);
+}
+
+.tab.on {
+  border-color: var(--hot);
+}
+
+.tab.on button {
+  color: var(--text);
+}
+
+.tab .close {
+  padding: 0 0.35rem;
+}
+
+.tab.new {
+  color: var(--live);
+  border-color: var(--rule);
+  padding: 0.15rem 0.5rem;
+  white-space: nowrap;
+}
+
+/* A tool is a shell with a name on it, and reads as one: the same button in
+   the accent that marks everything envmux brought rather than declared. */
+.tab.new.tool {
+  color: var(--hot);
+}
+
+.pane {
+  flex: 1;
+  min-height: 0;
+  position: relative;
+  padding: 0.5rem;
+
+  /* xterm scrolls its own viewport. A pane that also scrolls puts two bars on
+     one terminal and lets the whole thing drift under the tab bar. */
+  overflow: hidden;
+}
+
+.pane.log {
+  overflow: auto;
+}
+
+/* Hidden rather than unmounted: a shell that was unmounted would be a shell
+   that was killed, and a tail that was unmounted would lose its scrollback. */
+.hidden {
+  display: none;
+}
+
+.terminal {
+  height: 100%;
+  width: 100%;
+}
+
+.again {
+  position: absolute;
+  left: 50%;
+  bottom: 1.5rem;
+  transform: translateX(-50%);
+  background: var(--ink-raised);
+  color: var(--live);
+}
+
+.log p {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.log .at {
+  color: var(--dim);
+  margin-right: 0.75rem;
+}
+
+.log .warn {
+  color: var(--warn);
+}
+
+.log .error {
+  color: var(--bad);
+}
+
+.log .debug {
+  color: var(--dim);
+}
+
+/* Remote agents: the same list shape as the tasks, a form to start one, and
+   the room as a pane of plain lines — which is what the room is. */
+.agents h2 {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+}
+
+.agents h2 .small {
+  font-size: inherit;
+  padding: 0 0.4rem;
+  color: var(--live);
+}
+
+.agents .said {
+  color: var(--dim);
+  margin: 0.25rem 0;
+}
+
+.delegate {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  margin: 0.25rem 0 0.5rem;
+}
+
+.delegate input,
+.delegate textarea,
+.say input {
+  font: inherit;
+  color: var(--text);
+  background: var(--ink-raised);
+  border: 1px solid var(--rule);
+  border-radius: 2px;
+  padding: 0.25rem 0.4rem;
+}
+
+.delegate textarea {
+  resize: vertical;
+}
+
+.pane.room {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.room .lines {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+}
+
+.room .lines p {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.room .lines .at {
+  color: var(--dim);
+  margin-right: 0.75rem;
+}
+
+.room .lines .who {
+  color: var(--cool);
+}
+
+.room .lines .event {
+  color: var(--dim);
+}
+
+.room .lines .tag {
+  margin-right: 0.5rem;
+}
+
+.say {
+  display: flex;
+  gap: 0.35rem;
+}
+
+.say .nick {
+  width: 9rem;
+}
+
+.say .text {
+  flex: 1;
+}
+
+@media (max-width: 60rem) {
+  .body {
+    flex-direction: column;
+  }
+
+  aside {
+    width: 100%;
+    border-right: none;
+    border-bottom: 1px solid var(--rule);
+    max-height: 40vh;
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "name": "envmux",
+  "version": "0.1.0",
+  "homepage": "https://github.com/envmux/envmux",
+  "description": "Skills for working with envmux: delegate a task to a remote envmux agent on a branch of its own, talk to it through the project's .context/chatroom/, watch it, and merge its commits back. The skills defer to the installed binary for the authoritative instructions (`envmux agent prompt`), so they match whatever build is on the PATH.",
+  "author": {
+    "name": "strigops",
+    "email": "matt@prompt.nz"
+  }
+}

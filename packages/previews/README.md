@@ -1,0 +1,13 @@
+# Session previews
+
+`PreviewGateway` belongs to the device service. Its `getSession` callback returns the active engine's private SOCKS URL; its optional `connectPeer` callback can return a backpressured TCP `Duplex` tunneled to the session-owning device. A peer callback returning `undefined` selects the local engine route. A disconnected peer must reject instead of returning `undefined`.
+
+`createDesktop(sessionId, url)` returns a loopback HTTP proxy and a separate, scoped `proxyAuth` grant. Electron keeps these in its main process, uses an isolated session partition, disables implicit localhost proxy bypass with `<-loopback>`, and answers only that proxy's authentication challenge. `WebContentsView` receives no application preload or Node access. CONNECT, HTTP and WebSocket traffic use authenticated SOCKS, so localhost remains the container's localhost. Credentials are not inherited from the engine's external browser launch.
+
+`createBrowser(sessionId, targetUrl)` returns a grant bootstrap URL on a distinct `p<id>.localhost` origin. The bootstrap sets an HttpOnly preview-only cookie and redirects without passing the grant to the development server. Subsequent HTTP and WebSocket requests stay on that origin. The gateway removes its cookie, rewrites same-target redirects and scopes upstream domain cookies to the preview origin. It sends `X-Forwarded-Host` and `X-Forwarded-Proto` for development servers configured to generate public URLs.
+
+Browser gateways preserve frame/CSP protections. Open an external preview tab when embedding or third-party cookie policy blocks the app. They do not rewrite application JavaScript, hardcoded localhost URLs, links to a different container port, or service worker bodies. Applications requiring unrestricted container-localhost browsing use the Electron session browser.
+
+For browser clients without an installed service, configure `publicBrowserGateway: { originTemplate: "https://{id}.preview.example.org", port: 43126 }`. The service starts one additional loopback listener that dispatches HTTP and WebSocket requests by exact enrolled preview host. A self-hosted TLS reverse proxy must preserve `Host` and forward `*.preview.example.org` to that listener. Set wildcard DNS and TLS for this separate preview domain; use `listenHost` only when the reverse proxy is on another network interface. Hosted grants use Secure, HttpOnly, SameSite=None cookies. No factory API or credentials are present on the preview listener. Unconfigured local preview listeners remain loopback-only.
+
+Close a grant with `closePreview`, all grants for a stopped session with `closeSession`, or the listeners at service shutdown with `close`. Closing the workbench window itself does not stop environments.

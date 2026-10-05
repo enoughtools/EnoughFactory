@@ -1,0 +1,10 @@
+---
+import type { HTMLAttributes } from 'astro/types';
+import { cn } from '../lib/utils.js';
+import { normalizeProgress, progressClasses, progressValueLabel } from '../lib/progress.js';
+
+type Props = Omit<HTMLAttributes<'div'>,'value'> & {value?:number | null; max?:number; label?:string; getValueLabel?:(value:number,max:number)=>string};
+const {class: className, value, max = 100, label = 'Progress', getValueLabel = progressValueLabel, 'aria-label': ariaLabel = label, ...attributes} = Astro.props;
+const progress = normalizeProgress(value, max);
+---
+<div {...attributes} role="progressbar" aria-label={ariaLabel} aria-valuemin="0" aria-valuemax={progress.max} aria-valuenow={progress.value} aria-valuetext={progress.value === null ? undefined : getValueLabel(progress.value, progress.max)} data-slot="progress" data-state={progress.state} data-value={progress.value} data-max={progress.max} class={cn(progressClasses.root,className)}><div data-slot="progress-indicator" data-state={progress.state} data-value={progress.value} data-max={progress.max} class={progressClasses.indicator} style={{transform:`translateX(-${100-progress.percentage}%)`}}></div></div>

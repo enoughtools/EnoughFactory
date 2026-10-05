@@ -1,0 +1,9 @@
+---
+import type { HTMLAttributes } from 'astro/types';
+import { cn } from '../lib/utils.js';
+import { presentation } from '../lib/presentation.js';
+import { presentation as p } from '../lib/presentation.js';
+type Props = HTMLAttributes<'input'>;
+const { class: className, ...attributes } = Astro.props;
+---
+<input data-slot="input-group-control" {...attributes} class={cn(p.Input, presentation.InputGroupInput, className)} />

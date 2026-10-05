@@ -1,0 +1,4 @@
+16:27:44.987 box on 127.0.0.1:52391; socks5 on 127.0.0.1:52392 (user demo-session)
+16:27:45.466 pid 85716 curl (not a launched browser) [user/pass (demo-session)] CONNECT localhost:3000 (name) -> the box
+16:27:45.509 pid 97908 curl (not a launched browser): bad credentials for 'demo-session'
+16:27:45.550 pid 80880 curl (not a launched browser) [no auth offered] CONNECT localhost:3000 (name) -> the box

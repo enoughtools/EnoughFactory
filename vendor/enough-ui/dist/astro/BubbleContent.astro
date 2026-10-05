@@ -1,0 +1,15 @@
+---
+import type { HTMLAttributes } from 'astro/types';
+import { conversation } from '../lib/conversation.js';
+import { cn } from '../lib/utils.js';
+type Props = HTMLAttributes<'div'> & {
+  as?: 'div' | 'a' | 'button';
+  href?: string;
+  target?: HTMLAttributes<'a'>['target'];
+  rel?: string;
+  type?: HTMLAttributes<'button'>['type'];
+  disabled?: HTMLAttributes<'button'>['disabled'];
+};
+const { as: Tag = 'div', class: className, ...attributes } = Astro.props;
+---
+<Tag data-slot="bubble-content" class={cn(conversation.BubbleContent, className)} {...attributes}><slot /></Tag>

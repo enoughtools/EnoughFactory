@@ -1,0 +1,8 @@
+node_modules/
+bin/
+obj/
+*.log
+*.out
+state.json
+screenshot.png
+settings.json.backup

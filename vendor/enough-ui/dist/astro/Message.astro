@@ -1,0 +1,8 @@
+---
+import type { HTMLAttributes } from 'astro/types';
+import { conversation } from '../lib/conversation.js';
+import { cn } from '../lib/utils.js';
+type Props = HTMLAttributes<'div'> & { align?: 'start' | 'end' };
+const { class: className, align = 'start', ...attributes } = Astro.props;
+---
+<div data-slot="message" data-align={align} class={cn(conversation.Message, className)} {...attributes}><slot /></div>

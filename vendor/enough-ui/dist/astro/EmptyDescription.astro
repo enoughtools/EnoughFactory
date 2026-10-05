@@ -1,0 +1,8 @@
+---
+import type { HTMLAttributes } from 'astro/types';
+import { cn } from '../lib/utils.js';
+import { presentation } from '../lib/presentation.js';
+type Props = HTMLAttributes<'p'>;
+const { class: className, ...attributes } = Astro.props;
+---
+<p data-slot="empty-description" {...attributes} class={cn(presentation.EmptyDescription, className)}><slot /></p>

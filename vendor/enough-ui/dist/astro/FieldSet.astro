@@ -1,0 +1,8 @@
+---
+import type { HTMLAttributes } from 'astro/types';
+import { cn } from '../lib/utils.js';
+import { presentation } from '../lib/presentation.js';
+type Props = HTMLAttributes<'fieldset'>;
+const { class: className, ...attributes } = Astro.props;
+---
+<fieldset data-slot="field-set" {...attributes} class={cn(presentation.FieldSet, className)}><slot /></fieldset>

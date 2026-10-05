@@ -1,0 +1,9 @@
+---
+import type { HTMLAttributes } from 'astro/types';
+import type { VariantProps } from 'class-variance-authority';
+import { bubbleVariants } from '../lib/conversation.js';
+import { cn } from '../lib/utils.js';
+type Props = HTMLAttributes<'div'> & VariantProps<typeof bubbleVariants> & { align?: 'start' | 'end' };
+const { class: className, variant = 'default', align = 'start', ...attributes } = Astro.props;
+---
+<div data-slot="bubble" data-variant={variant} data-align={align} class={cn(bubbleVariants({ variant }), className)} {...attributes}><slot /></div>

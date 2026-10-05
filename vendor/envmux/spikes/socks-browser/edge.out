@@ -1,0 +1,7 @@
+Z:\envmux\spikes\socks-browser\socks.cs(336,15): warning CA2020: Starting with .NET 7 the explicit conversion '(Int32)IntPtr' will not throw when overflowing in an unchecked context. Wrap the expression with a 'checked' statement to restore the .NET 6 behavior. (https://learn.microsoft.com/dotnet/fundamentals/code-analysis/quality-rules/ca2020)
+16:27:25.474 box on 127.0.0.1:54758; socks5 on 127.0.0.1:54759 (user demo-session)
+16:27:25.489 launched msedge.exe pid 7668 for 10s
+16:27:25.840 pid 14464 msedge ⊂ launched 7668 [msedge] [no auth offered] CONNECT localhost:3000 (name) -> the box
+16:27:26.009 pid 14464 msedge ⊂ launched 7668 [msedge] [no auth offered] CONNECT localhost:3000 (name) -> the box
+16:27:26.019 pid 14464 msedge ⊂ launched 7668 [msedge] [no auth offered] CONNECT localhost:3000 (name) -> the box
+16:27:26.038 pid 14464 msedge ⊂ launched 7668 [msedge] [no auth offered] CONNECT localhost:3000 (name) -> the box

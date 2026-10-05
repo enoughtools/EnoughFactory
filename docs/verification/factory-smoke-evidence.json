@@ -1,0 +1,413 @@
+{
+  "verifiedAt": "2026-10-05T20:19:42.951Z",
+  "fixture": "/var/folders/xx/cg7xb9kn7xn80rn6xg_td2wm0000gn/T/enoughfactory-product-cNDeG9",
+  "repository": "/var/folders/xx/cg7xb9kn7xn80rn6xg_td2wm0000gn/T/enoughfactory-product-cNDeG9/repository",
+  "initialHead": "16747f2a2adfdf40ab7aaaa37e982ba8b6caa07b",
+  "head": "cbb8cfc18d97af9691f8af87cac3226421f582a0",
+  "goal": {
+    "id": "fb68d5c9-fe98-4f5f-8842-0f10b244c750",
+    "projectId": "project_c7baaaa2b294148a",
+    "coordinatorId": "d78093c28e7cad073d73da6359e32513",
+    "title": "Ship the slug CLI",
+    "objective": "Build and document a useful dependency-free POSIX shell slug CLI in bin/slug.sh. Implement its focused shell tests in tests/slug.test.sh. Use one compact implementation task covering code, tests and docs; this is a small utility. Run checks with bash tests/slug.test.sh, using standard shell tools only (no Node/Python/packages). Preserve .envmux.json unchanged. Make the actual source executable and finish the full goal. Do not stop at a proposal.",
+    "criteria": [
+      "bin/slug.sh accepts one text argument and prints lowercase ASCII letters/digits separated by single hyphens, removing leading/trailing hyphens; Hello__World!! produces hello-world.",
+      "Whitespace-only or punctuation-only input exits 2 and prints a clear error to stderr; tests/slug.test.sh passes for normal, mixed-case, repeated separator, empty-result and digit inputs.",
+      "README.md documents invoking the CLI, the normalization contract, the empty-result exit status and running the tests; all source is integrated into this repository.",
+      "bin/slug.sh is executable POSIX shell source accepting exactly one text argument.",
+      "Output contains lowercase ASCII letters and digits, with runs of other characters replaced by single hyphens and leading/trailing hyphens removed; Hello__World!! produces hello-world.",
+      "Whitespace-only, punctuation-only, and empty input exit 2, emit a clear error to stderr, and produce no stdout.",
+      "tests/slug.test.sh passes for normal text, mixed case, repeated separators, empty results, and digits.",
+      "README.md documents invocation, normalization, empty-result exit status, and the test command.",
+      ".envmux.json remains unchanged."
+    ],
+    "status": "completed",
+    "autonomy": "autonomous",
+    "approvalMode": "approve-all",
+    "runtime": "codex",
+    "createdAt": "2026-10-05T20:14:55.402Z",
+    "updatedAt": "2026-10-05T20:18:09.553Z",
+    "revision": 1,
+    "nextAction": "Completion criteria satisfied",
+    "concurrency": 1
+  },
+  "tasks": [
+    {
+      "id": "268e4645-e89e-4a9a-a450-4420c9f721fd",
+      "goalId": "fb68d5c9-fe98-4f5f-8842-0f10b244c750",
+      "title": "Build and document the POSIX shell slug CLI with focused tests",
+      "description": "Create bin/slug.sh using a /bin/sh shebang and standard shell tools only, with no Node, Python, or packages. Use LC_ALL=C for deterministic ASCII normalization and printf for safe argument handling. Require exactly one argument; invalid argument counts should print usage to stderr and exit 2. Normalize ASCII uppercase to lowercase, replace each run of non-ASCII-letter/digit characters with one hyphen, trim boundary hyphens, and print the result with a newline. If normalization produces nothing, print a clear error to stderr and exit 2 without stdout. Make the actual source executable and preserve its executable Git mode. Create tests/slug.test.sh using shell assertions that invoke the executable directly and verify output, exit status, and stderr for normal text, Hello__World!!, mixed case, repeated separators, boundary separators, digits, whitespace-only, punctuation-only, empty input, and invalid argument counts. Expand the existing minimal README.md with invocation examples, the ASCII normalization contract, exit status 2 for empty results, and bash tests/slug.test.sh. Preserve .envmux.json byte-for-byte. Run the listed checks, fix failures, and deliver all code, tests, and documentation integrated into the repository.",
+      "dependsOn": [],
+      "status": "completed",
+      "createdAt": "2026-10-05T20:15:41.222Z",
+      "updatedAt": "2026-10-05T20:17:19.871Z",
+      "currentAttemptId": "a735e153-b4df-49ba-922f-b8963b07bf15",
+      "deviceId": "d78093c28e7cad073d73da6359e32513",
+      "sessionId": "session_004e89ce63d4cf3e"
+    }
+  ],
+  "attempts": [
+    {
+      "id": "a735e153-b4df-49ba-922f-b8963b07bf15",
+      "taskId": "268e4645-e89e-4a9a-a450-4420c9f721fd",
+      "generation": 1,
+      "deviceId": "d78093c28e7cad073d73da6359e32513",
+      "status": "succeeded",
+      "startedAt": "2026-10-05T20:15:41.223Z",
+      "baseCommit": "16747f2a2adfdf40ab7aaaa37e982ba8b6caa07b",
+      "sessionId": "session_004e89ce63d4cf3e",
+      "chatId": "chat_9faea36550191c74",
+      "endedAt": "2026-10-05T20:17:19.871Z",
+      "candidate": "528d9f4ea7ef019229921d1e7eb7758eb1bf622d"
+    }
+  ],
+  "decisions": [
+    {
+      "id": "4a55663e-7efd-4059-9dc8-ddd73e23a62e",
+      "goalId": "fb68d5c9-fe98-4f5f-8842-0f10b244c750",
+      "at": "2026-10-05T20:14:55.402Z",
+      "kind": "goal-created",
+      "text": "Goal created in autonomous mode with approve-all policy."
+    },
+    {
+      "id": "fb3f346b-62e8-4eb9-835a-77295cf1270a",
+      "goalId": "fb68d5c9-fe98-4f5f-8842-0f10b244c750",
+      "at": "2026-10-05T20:15:41.222Z",
+      "kind": "plan",
+      "text": "Implement, test, and document the slug CLI in one compact task.",
+      "data": {
+        "chatId": "chat_6667d5b9f777c217",
+        "taskCount": 1,
+        "revision": 1
+      }
+    },
+    {
+      "id": "c04903b0-3bcd-44d3-9c75-5c95204c2d1a",
+      "goalId": "fb68d5c9-fe98-4f5f-8842-0f10b244c750",
+      "at": "2026-10-05T20:15:41.223Z",
+      "kind": "dispatch",
+      "text": "Dispatched Build and document the POSIX shell slug CLI with focused tests to Russells-MacBook-Pro-2.local.",
+      "data": {
+        "taskId": "268e4645-e89e-4a9a-a450-4420c9f721fd",
+        "attemptId": "a735e153-b4df-49ba-922f-b8963b07bf15",
+        "generation": 1,
+        "deviceId": "d78093c28e7cad073d73da6359e32513"
+      }
+    },
+    {
+      "id": "8a0efa83-b996-48e4-a8c4-80ce56ade63b",
+      "goalId": "fb68d5c9-fe98-4f5f-8842-0f10b244c750",
+      "at": "2026-10-05T20:15:43.460Z",
+      "kind": "paused",
+      "text": "New dispatch and integration are paused. Worker execution remains observable."
+    },
+    {
+      "id": "aa099618-1437-4325-a2e7-41afe8998cf1",
+      "goalId": "fb68d5c9-fe98-4f5f-8842-0f10b244c750",
+      "at": "2026-10-05T20:17:15.406Z",
+      "kind": "attempt-recovered",
+      "text": "Execution status is unknown after service recovery; reconcile with its owner before continuing.",
+      "data": {
+        "attemptId": "a735e153-b4df-49ba-922f-b8963b07bf15"
+      }
+    },
+    {
+      "id": "3628fc96-59ff-4561-9990-8c7440f2bd10",
+      "goalId": "fb68d5c9-fe98-4f5f-8842-0f10b244c750",
+      "at": "2026-10-05T20:17:15.478Z",
+      "kind": "resumed",
+      "text": "Coordination resumed from its retained plan and attempts."
+    },
+    {
+      "id": "52e0817d-b304-46d7-ab52-f68b6d825a0b",
+      "goalId": "fb68d5c9-fe98-4f5f-8842-0f10b244c750",
+      "at": "2026-10-05T20:17:19.871Z",
+      "kind": "integrated",
+      "text": "Build and document the POSIX shell slug CLI with focused tests integrated at cbb8cfc18d97.",
+      "data": {
+        "taskId": "268e4645-e89e-4a9a-a450-4420c9f721fd",
+        "attemptId": "a735e153-b4df-49ba-922f-b8963b07bf15",
+        "candidate": "528d9f4ea7ef019229921d1e7eb7758eb1bf622d",
+        "commit": "cbb8cfc18d97af9691f8af87cac3226421f582a0",
+        "checks": [
+          {
+            "command": "bash tests/slug.test.sh",
+            "passed": true,
+            "output": "Passed 16 slug tests\n",
+            "exitCode": 0,
+            "candidateCommit": "528d9f4ea7ef019229921d1e7eb7758eb1bf622d",
+            "checkedCommit": "cbb8cfc18d97af9691f8af87cac3226421f582a0"
+          },
+          {
+            "command": "sh -n bin/slug.sh",
+            "passed": true,
+            "output": "",
+            "exitCode": 0,
+            "candidateCommit": "528d9f4ea7ef019229921d1e7eb7758eb1bf622d",
+            "checkedCommit": "cbb8cfc18d97af9691f8af87cac3226421f582a0"
+          },
+          {
+            "command": "test -x bin/slug.sh",
+            "passed": true,
+            "output": "",
+            "exitCode": 0,
+            "candidateCommit": "528d9f4ea7ef019229921d1e7eb7758eb1bf622d",
+            "checkedCommit": "cbb8cfc18d97af9691f8af87cac3226421f582a0"
+          },
+          {
+            "command": "test \"$(cksum .envmux.json)\" = '3280904616 201 .envmux.json'",
+            "passed": true,
+            "output": "",
+            "exitCode": 0,
+            "candidateCommit": "528d9f4ea7ef019229921d1e7eb7758eb1bf622d",
+            "checkedCommit": "cbb8cfc18d97af9691f8af87cac3226421f582a0"
+          },
+          {
+            "command": "git diff --exit-code -- .envmux.json",
+            "passed": true,
+            "output": "",
+            "exitCode": 0,
+            "candidateCommit": "528d9f4ea7ef019229921d1e7eb7758eb1bf622d",
+            "checkedCommit": "cbb8cfc18d97af9691f8af87cac3226421f582a0"
+          },
+          {
+            "command": "test \"$(bin/slug.sh 'Hello__World!!')\" = hello-world",
+            "passed": true,
+            "output": "",
+            "exitCode": 0,
+            "candidateCommit": "528d9f4ea7ef019229921d1e7eb7758eb1bf622d",
+            "checkedCommit": "cbb8cfc18d97af9691f8af87cac3226421f582a0"
+          }
+        ]
+      }
+    },
+    {
+      "id": "65c59795-4147-4764-ab55-8012f25fb96e",
+      "goalId": "fb68d5c9-fe98-4f5f-8842-0f10b244c750",
+      "at": "2026-10-05T20:18:09.553Z",
+      "kind": "completed",
+      "text": "The full objective is complete in commit cbb8cfc18d97af9691f8af87cac3226421f582a0. Source, focused tests, and documentation are integrated; all 16 tests pass; .envmux.json is unchanged.",
+      "data": {
+        "evaluationId": "eafff3b0-a2b9-4829-9438-add9c22f87e8",
+        "head": "cbb8cfc18d97af9691f8af87cac3226421f582a0",
+        "criteria": [
+          {
+            "criterion": "bin/slug.sh accepts one text argument and prints lowercase ASCII letters/digits separated by single hyphens, removing leading/trailing hyphens; Hello__World!! produces hello-world.",
+            "satisfied": true,
+            "evidence": [
+              "bin/slug.sh validates exactly one argument and uses LC_ALL=C, tr, and sed to implement normalization.",
+              "Current bash tests/slug.test.sh passes all 16 tests, including Hello__World!! → hello-world."
+            ]
+          },
+          {
+            "criterion": "Whitespace-only or punctuation-only input exits 2 and prints a clear error to stderr; tests/slug.test.sh passes for normal, mixed-case, repeated separator, empty-result and digit inputs.",
+            "satisfied": true,
+            "evidence": [
+              "Current bash tests/slug.test.sh reports 'Passed 16 slug tests'.",
+              "Tests assert exit 2, empty stdout, and stderr containing 'ASCII letter or digit' for whitespace-only and punctuation-only inputs."
+            ]
+          },
+          {
+            "criterion": "README.md documents invoking the CLI, the normalization contract, the empty-result exit status and running the tests; all source is integrated into this repository.",
+            "satisfied": true,
+            "evidence": [
+              "README.md contains executable invocation examples, ASCII normalization rules, empty-result status 2, and bash tests/slug.test.sh.",
+              "bin/slug.sh and tests/slug.test.sh exist in the integrated checkout at cbb8cfc18d97af9691f8af87cac3226421f582a0; git status is clean."
+            ]
+          },
+          {
+            "criterion": "bin/slug.sh is executable POSIX shell source accepting exactly one text argument.",
+            "satisfied": true,
+            "evidence": [
+              "bin/slug.sh has a #!/bin/sh shebang and POSIX shell syntax; sh -n bin/slug.sh passes.",
+              "Git records bin/slug.sh with mode 100755; test -x passes.",
+              "The argument-count guard rejects zero or multiple arguments; both cases pass focused tests."
+            ]
+          },
+          {
+            "criterion": "Output contains lowercase ASCII letters and digits, with runs of other characters replaced by single hyphens and leading/trailing hyphens removed; Hello__World!! produces hello-world.",
+            "satisfied": true,
+            "evidence": [
+              "Source uses tr 'A-Z' 'a-z', tr -cs 'a-z0-9' '-', and boundary trimming under LC_ALL=C.",
+              "Passing tests cover the required example, repeated and boundary separators, embedded newlines, digits, and non-ASCII separators."
+            ]
+          },
+          {
+            "criterion": "Whitespace-only, punctuation-only, and empty input exit 2, emit a clear error to stderr, and produce no stdout.",
+            "satisfied": true,
+            "evidence": [
+              "Passing assert_error cases cover spaces, newline/tab, punctuation, and the empty argument.",
+              "Each case verifies exit 2, no stdout, and the explanatory ASCII-letter-or-digit stderr message."
+            ]
+          },
+          {
+            "criterion": "tests/slug.test.sh passes for normal text, mixed case, repeated separators, empty results, and digits.",
+            "satisfied": true,
+            "evidence": [
+              "Current execution of bash tests/slug.test.sh reports 'Passed 16 slug tests'.",
+              "Inspected assertions explicitly cover every required input category and compare exact output bytes."
+            ]
+          },
+          {
+            "criterion": "README.md documents invocation, normalization, empty-result exit status, and the test command.",
+            "satisfied": true,
+            "evidence": [
+              "Inspected README.md documents all four requirements, including status 2 and bash tests/slug.test.sh."
+            ]
+          },
+          {
+            "criterion": ".envmux.json remains unchanged.",
+            "satisfied": true,
+            "evidence": [
+              "git diff --exit-code 16747f2a2adfdf40ab7aaaa37e982ba8b6caa07b -- .envmux.json passes with no differences.",
+              "Current checksum is 3280904616 201 .envmux.json, matching retained baseline checks."
+            ]
+          }
+        ]
+      }
+    }
+  ],
+  "evaluations": [
+    {
+      "id": "eafff3b0-a2b9-4829-9438-add9c22f87e8",
+      "goalId": "fb68d5c9-fe98-4f5f-8842-0f10b244c750",
+      "revision": 1,
+      "at": "2026-10-05T20:18:09.553Z",
+      "head": "cbb8cfc18d97af9691f8af87cac3226421f582a0",
+      "evaluation": {
+        "complete": true,
+        "summary": "The full objective is complete in commit cbb8cfc18d97af9691f8af87cac3226421f582a0. Source, focused tests, and documentation are integrated; all 16 tests pass; .envmux.json is unchanged.",
+        "criteria": [
+          {
+            "criterion": "bin/slug.sh accepts one text argument and prints lowercase ASCII letters/digits separated by single hyphens, removing leading/trailing hyphens; Hello__World!! produces hello-world.",
+            "satisfied": true,
+            "evidence": [
+              "bin/slug.sh validates exactly one argument and uses LC_ALL=C, tr, and sed to implement normalization.",
+              "Current bash tests/slug.test.sh passes all 16 tests, including Hello__World!! → hello-world."
+            ]
+          },
+          {
+            "criterion": "Whitespace-only or punctuation-only input exits 2 and prints a clear error to stderr; tests/slug.test.sh passes for normal, mixed-case, repeated separator, empty-result and digit inputs.",
+            "satisfied": true,
+            "evidence": [
+              "Current bash tests/slug.test.sh reports 'Passed 16 slug tests'.",
+              "Tests assert exit 2, empty stdout, and stderr containing 'ASCII letter or digit' for whitespace-only and punctuation-only inputs."
+            ]
+          },
+          {
+            "criterion": "README.md documents invoking the CLI, the normalization contract, the empty-result exit status and running the tests; all source is integrated into this repository.",
+            "satisfied": true,
+            "evidence": [
+              "README.md contains executable invocation examples, ASCII normalization rules, empty-result status 2, and bash tests/slug.test.sh.",
+              "bin/slug.sh and tests/slug.test.sh exist in the integrated checkout at cbb8cfc18d97af9691f8af87cac3226421f582a0; git status is clean."
+            ]
+          },
+          {
+            "criterion": "bin/slug.sh is executable POSIX shell source accepting exactly one text argument.",
+            "satisfied": true,
+            "evidence": [
+              "bin/slug.sh has a #!/bin/sh shebang and POSIX shell syntax; sh -n bin/slug.sh passes.",
+              "Git records bin/slug.sh with mode 100755; test -x passes.",
+              "The argument-count guard rejects zero or multiple arguments; both cases pass focused tests."
+            ]
+          },
+          {
+            "criterion": "Output contains lowercase ASCII letters and digits, with runs of other characters replaced by single hyphens and leading/trailing hyphens removed; Hello__World!! produces hello-world.",
+            "satisfied": true,
+            "evidence": [
+              "Source uses tr 'A-Z' 'a-z', tr -cs 'a-z0-9' '-', and boundary trimming under LC_ALL=C.",
+              "Passing tests cover the required example, repeated and boundary separators, embedded newlines, digits, and non-ASCII separators."
+            ]
+          },
+          {
+            "criterion": "Whitespace-only, punctuation-only, and empty input exit 2, emit a clear error to stderr, and produce no stdout.",
+            "satisfied": true,
+            "evidence": [
+              "Passing assert_error cases cover spaces, newline/tab, punctuation, and the empty argument.",
+              "Each case verifies exit 2, no stdout, and the explanatory ASCII-letter-or-digit stderr message."
+            ]
+          },
+          {
+            "criterion": "tests/slug.test.sh passes for normal text, mixed case, repeated separators, empty results, and digits.",
+            "satisfied": true,
+            "evidence": [
+              "Current execution of bash tests/slug.test.sh reports 'Passed 16 slug tests'.",
+              "Inspected assertions explicitly cover every required input category and compare exact output bytes."
+            ]
+          },
+          {
+            "criterion": "README.md documents invocation, normalization, empty-result exit status, and the test command.",
+            "satisfied": true,
+            "evidence": [
+              "Inspected README.md documents all four requirements, including status 2 and bash tests/slug.test.sh."
+            ]
+          },
+          {
+            "criterion": ".envmux.json remains unchanged.",
+            "satisfied": true,
+            "evidence": [
+              "git diff --exit-code 16747f2a2adfdf40ab7aaaa37e982ba8b6caa07b -- .envmux.json passes with no differences.",
+              "Current checksum is 3280904616 201 .envmux.json, matching retained baseline checks."
+            ]
+          }
+        ]
+      }
+    }
+  ],
+  "steps": [
+    {
+      "at": "2026-10-05T20:19:41.999Z",
+      "event": "fixture-ready",
+      "detail": {
+        "fixture": "/var/folders/xx/cg7xb9kn7xn80rn6xg_td2wm0000gn/T/enoughfactory-product-cNDeG9",
+        "repository": "/var/folders/xx/cg7xb9kn7xn80rn6xg_td2wm0000gn/T/enoughfactory-product-cNDeG9/repository",
+        "initialHead": "16747f2a2adfdf40ab7aaaa37e982ba8b6caa07b"
+      }
+    },
+    {
+      "at": "2026-10-05T20:19:42.221Z",
+      "event": "device-service-ready",
+      "detail": {
+        "pid": 13460
+      }
+    },
+    {
+      "at": "2026-10-05T20:19:42.740Z",
+      "event": "autonomous-goal-created",
+      "detail": {
+        "goalId": "fb68d5c9-fe98-4f5f-8842-0f10b244c750",
+        "approvalMode": "approve-all",
+        "autonomy": "autonomous"
+      }
+    },
+    {
+      "at": "2026-10-05T20:19:42.742Z",
+      "event": "completed-fixture-reverification",
+      "detail": {
+        "goalId": "fb68d5c9-fe98-4f5f-8842-0f10b244c750"
+      }
+    },
+    {
+      "at": "2026-10-05T20:19:42.950Z",
+      "event": "real-goal-completed",
+      "detail": {
+        "goalId": "fb68d5c9-fe98-4f5f-8842-0f10b244c750",
+        "head": "cbb8cfc18d97af9691f8af87cac3226421f582a0",
+        "attemptId": "a735e153-b4df-49ba-922f-b8963b07bf15",
+        "tests": "Passed 16 slug tests",
+        "criteria": [
+          "bin/slug.sh accepts one text argument and prints lowercase ASCII letters/digits separated by single hyphens, removing leading/trailing hyphens; Hello__World!! produces hello-world.",
+          "Whitespace-only or punctuation-only input exits 2 and prints a clear error to stderr; tests/slug.test.sh passes for normal, mixed-case, repeated separator, empty-result and digit inputs.",
+          "README.md documents invoking the CLI, the normalization contract, the empty-result exit status and running the tests; all source is integrated into this repository.",
+          "bin/slug.sh is executable POSIX shell source accepting exactly one text argument.",
+          "Output contains lowercase ASCII letters and digits, with runs of other characters replaced by single hyphens and leading/trailing hyphens removed; Hello__World!! produces hello-world.",
+          "Whitespace-only, punctuation-only, and empty input exit 2, emit a clear error to stderr, and produce no stdout.",
+          "tests/slug.test.sh passes for normal text, mixed case, repeated separators, empty results, and digits.",
+          "README.md documents invocation, normalization, empty-result exit status, and the test command.",
+          ".envmux.json remains unchanged."
+        ]
+      }
+    }
+  ],
+  "scope": "Real Codex planner, worker and evaluator in envmux Docker sessions via authenticated device HTTP API. Paused candidate retained across a clean device-service restart; same attempt integrated once. No browser/Electron packaging, multi-device transport or selective approval coverage claimed by this script."
+}

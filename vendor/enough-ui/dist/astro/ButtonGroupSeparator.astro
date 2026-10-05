@@ -1,0 +1,8 @@
+---
+import type { HTMLAttributes } from 'astro/types';
+import { cn } from '../lib/utils.js';
+
+type Props = HTMLAttributes<'div'> & { orientation?: 'horizontal'|'vertical'; decorative?: boolean };
+const { class: className, orientation = 'vertical', decorative = true, ...attributes } = Astro.props;
+---
+<div {...attributes} role={decorative ? "none" : "separator"} aria-orientation={decorative ? undefined : orientation} data-orientation={orientation} class={cn("self-stretch shrink-0 rounded-none bg-[var(--color-ink)]", orientation === "vertical" ? "my-0 w-px" : "mx-0 h-px", className)}></div>

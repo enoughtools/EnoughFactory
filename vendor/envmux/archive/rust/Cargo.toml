@@ -1,0 +1,141 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/envmux-agent",
+    "crates/envmux-core",
+    "crates/envmux-config",
+    "crates/envmux-docker",
+    "crates/envmux-git",
+    "crates/envmux-tmux",
+    "crates/envmux-services",
+    "crates/envmux-secrets",
+    "crates/envmux-api-types",
+    "crates/envmux-daemon",
+    "crates/envmux-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT"
+repository = "https://github.com/strigops-io/envmux"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# Curated allows: these pedantic lints fight the codebase style rather than improve it.
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+struct_field_names = "allow"
+too_many_lines = "allow"
+result_large_err = "allow"
+format_push_string = "allow"
+unnecessary_literal_bound = "allow"
+zero_sized_map_values = "allow"
+map_unwrap_or = "allow"
+redundant_closure = "allow"
+redundant_closure_for_method_calls = "allow"
+similar_names = "allow"
+useless_conversion = "allow"
+collapsible_if = "allow"
+unused_async = "allow"
+match_same_arms = "allow"
+doc_markdown = "allow"
+duration_suboptimal_units = "allow"
+single_match_else = "allow"
+cast_precision_loss = "allow"
+items_after_statements = "allow"
+
+[workspace.dependencies]
+# Internal crates
+envmux-core = { path = "crates/envmux-core" }
+envmux-config = { path = "crates/envmux-config" }
+envmux-docker = { path = "crates/envmux-docker" }
+envmux-git = { path = "crates/envmux-git" }
+envmux-tmux = { path = "crates/envmux-tmux" }
+envmux-services = { path = "crates/envmux-services" }
+envmux-secrets = { path = "crates/envmux-secrets" }
+envmux-api-types = { path = "crates/envmux-api-types" }
+envmux-daemon = { path = "crates/envmux-daemon" }
+
+# Async runtime and supervision
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+futures-util = "0.3"
+
+# Docker
+bollard = "0.17"
+
+# HTTP / API
+axum = { version = "0.8", features = ["ws"] }
+tower = { version = "0.5", features = ["util"] }
+hyper = { version = "1", features = ["full"] }
+hyper-util = { version = "0.1", features = ["full"] }
+http-body-util = "0.1"
+
+# Persistence
+sqlx = { version = "0.8", default-features = false, features = ["sqlite", "runtime-tokio", "macros", "migrate", "json", "derive"] }
+
+# Config
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+toml_edit = "0.22"
+
+# Git (read-only host-side inspection)
+gix = { version = "0.66", default-features = false }
+
+# Time
+jiff = { version = "0.1", features = ["serde"] }
+
+# Hashing / ids / names
+blake3 = "1"
+uuid = { version = "1", features = ["v7", "serde"] }
+petname = { version = "2", default-features = false, features = ["default-rng", "default-words"] }
+
+# Graphs
+petgraph = "0.6"
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+clap_complete = "4"
+comfy-table = "7"
+# Pinned to what ratatui re-exports: two crossterm versions in one process
+# fight over raw mode and the alternate screen, and the loser leaves the
+# terminal wrecked on exit.
+crossterm = { version = "0.29", features = ["event-stream"] }
+
+# Errors
+thiserror = "2"
+anyhow = "1"
+miette = { version = "7", features = ["fancy"] }
+
+# Tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-appender = "0.2"
+
+# Secrets
+keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust", "vendored"] }
+rand = "0.8"
+base64 = "0.22"
+
+# Archives
+tar = "0.4"
+flate2 = "1"
+
+# Service admin clients
+redis = { version = "0.27", features = ["tokio-comp", "acl"] }
+
+# Misc
+bytes = "1"
+dirs = "5"
+fs4 = "0.9"
+schemars = "0.8"
+tokio-tungstenite = "0.24"

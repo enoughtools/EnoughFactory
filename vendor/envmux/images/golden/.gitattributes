@@ -1,0 +1,2 @@
+# Built inside Linux whatever checked it out: a CRLF in envmux-init is "#!/bin/sh: not found".
+* text eol=lf

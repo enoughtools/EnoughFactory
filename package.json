@@ -1,0 +1,36 @@
+{
+  "name": "enoughfactory",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "packageManager": "pnpm@10.34.5",
+  "engines": {
+    "node": ">=22.14.0"
+  },
+  "scripts": {
+    "dev": "tsx scripts/dev.ts",
+    "dev:device": "pnpm --filter @enoughfactory/device dev",
+    "dev:web": "pnpm --filter @enoughfactory/web dev",
+    "build": "pnpm -r --if-present build",
+    "typecheck": "pnpm -r --if-present typecheck",
+    "verify": "pnpm -r --if-present verify",
+    "desktop": "pnpm --filter @enoughfactory/desktop start",
+    "package": "pnpm --filter @enoughfactory/desktop package"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3",
+    "tsx": "^4.20.6",
+    "esbuild": "^0.25.10",
+    "@types/node": "^22.18.6",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "electron",
+      "esbuild",
+      "node-datachannel"
+    ]
+  }
+}

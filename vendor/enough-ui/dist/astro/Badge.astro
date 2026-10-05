@@ -1,0 +1,9 @@
+---
+import type { HTMLAttributes } from 'astro/types';
+import { cn } from '../lib/utils.js';
+import { badgeVariants } from '../lib/variants.js';
+import type { VariantProps } from 'class-variance-authority';
+type Props = Omit<HTMLAttributes<'span'>, keyof VariantProps<typeof badgeVariants>> & VariantProps<typeof badgeVariants>;
+const { class: className, variant, ...attributes } = Astro.props;
+---
+<span data-slot="badge" {...attributes} class={cn(badgeVariants({ variant }), className)}><slot /></span>

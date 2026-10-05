@@ -1,0 +1,10 @@
+---
+import type { HTMLAttributes } from 'astro/types';
+import { cn } from '../lib/utils.js';
+import { markerVariants } from '../lib/variants.js';
+import type { VariantProps } from 'class-variance-authority';
+type Props = Omit<HTMLAttributes<'mark'>, keyof VariantProps<typeof markerVariants>> & VariantProps<typeof markerVariants>;
+const { class: className, variant, size, ...attributes } = Astro.props;
+const Tag = variant === 'border' || variant === 'separator' ? 'div' : 'mark';
+---
+<Tag data-slot="marker" data-variant={variant ?? "default"} {...attributes} class={cn(markerVariants({ variant, size }), className)}><slot /></Tag>

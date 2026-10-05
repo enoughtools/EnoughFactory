@@ -1,0 +1,46 @@
+---
+import type { HTMLAttributes } from 'astro/types';
+import { cn } from '../lib/utils.js';
+import {
+  avatarVariants,
+  avatarImageClass,
+  avatarFallbackClass,
+  type AvatarSize,
+} from '../lib/minor-presentation.js';
+
+interface Props extends HTMLAttributes<'span'> {
+  src?: string;
+  alt?: string;
+  fallback?: string;
+  size?: AvatarSize;
+}
+
+const {
+  src,
+  alt = '',
+  fallback,
+  size = 'default',
+  class: className,
+  ...attributes
+} = Astro.props;
+
+const hasSrc = Boolean(src && src.trim().length > 0);
+const hasFallback = fallback !== undefined || Astro.slots.has('fallback');
+---
+<span
+  data-slot="avatar"
+  data-size={size}
+  class={cn(avatarVariants({ size }), className)}
+  {...attributes}
+>
+  {hasSrc ? (
+    <img src={src} alt={alt} data-slot="avatar-image" class={avatarImageClass} />
+  ) : hasFallback && (
+    <span data-slot="avatar-fallback" class={avatarFallbackClass}>
+      {fallback}
+      <slot name="fallback" />
+    </span>
+  )}
+  <slot />
+  <slot name="badge" />
+</span>

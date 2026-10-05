@@ -1,0 +1,24 @@
+# Machine note, kept because the failure it explains is misleading.
+#
+# A Windows box can have several Visual Studio installs, and rustc picks one by
+# itself. If it picks an installation carrying only the onecore libraries — no
+# `lib\x64\msvcrt.lib`, no `vcruntime.h` — every C-compiling dependency (ring,
+# bundled SQLite, Tauri) fails to link with:
+#
+#     LNK1104: cannot open file 'msvcrt.lib'
+#
+# That reads like "MSVC is not installed" and is not: it is the wrong one of
+# two. Initialise the environment of an install that has the x64 CRT first —
+# `VC\Auxiliary\Build\vcvars64.bat` under the *Build Tools* install, typically —
+# and the whole workspace builds normally. `scripts/install.ps1` does this
+# automatically via vswhere, skipping incomplete toolsets.
+#
+# This repository's original development machine also carries a rustup
+# directory override to `stable-x86_64-pc-windows-gnu` (GCC from WinLibs) as an
+# older workaround for the same problem. That override applies to the whole
+# directory tree, so the Tauri app under `desktop/` — which does not support
+# windows-gnu — must be built with an explicit
+# `+stable-x86_64-pc-windows-msvc`.
+#
+# CI and other machines are unaffected; rust-toolchain.toml remains the
+# canonical pin.

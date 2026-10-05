@@ -1,0 +1,27 @@
+---
+import type { HTMLAttributes } from 'astro/types';
+import { cn } from '../lib/utils.js';
+import {
+  normalizeAspectRatio,
+  getAspectRatioWrapperStyleString,
+  aspectRatioClasses,
+} from '../lib/minor-presentation.js';
+
+interface Props extends HTMLAttributes<'div'> {
+  ratio?: number;
+}
+
+const { ratio = 1, class: className, style, ...attributes } = Astro.props;
+const safeRatio = normalizeAspectRatio(ratio);
+const wrapperStyle = getAspectRatioWrapperStyleString(safeRatio);
+---
+<div style={wrapperStyle} data-radix-aspect-ratio-wrapper="">
+  <div
+    {...attributes}
+    data-slot="aspect-ratio"
+    class={cn(aspectRatioClasses.inner, className)}
+    style={style}
+  >
+    <slot />
+  </div>
+</div>

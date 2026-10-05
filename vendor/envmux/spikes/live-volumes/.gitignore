@@ -1,0 +1,5 @@
+# What restart.sh leaves behind: the server's stdout (the mount description,
+# which contains this session's keys) and its request log.
+live.out
+live.log
+keys.json

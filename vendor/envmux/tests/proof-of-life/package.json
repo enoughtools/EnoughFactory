@@ -1,0 +1,12 @@
+{
+  "name": "envmux-proof-of-life",
+  "private": true,
+  "type": "module",
+  "description": "A Vite app bound to the instance's own 127.0.0.1, so only the session's browser proxy can reach it",
+  "scripts": {
+    "dev": "vite"
+  },
+  "devDependencies": {
+    "vite": "^8.3.0"
+  }
+}

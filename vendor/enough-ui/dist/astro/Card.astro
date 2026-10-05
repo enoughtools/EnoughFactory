@@ -1,0 +1,8 @@
+---
+import type { HTMLAttributes } from 'astro/types';
+import { cn } from '../lib/utils.js';
+import { presentation } from '../lib/presentation.js';
+type Props = HTMLAttributes<'div'> & { size?: 'default' | 'sm' };
+const { class: className, size = 'default', ...attributes } = Astro.props;
+---
+<div data-slot="card" data-size={size} {...attributes} class={cn(presentation.Card, "group/card flex flex-col", className)}><slot /></div>

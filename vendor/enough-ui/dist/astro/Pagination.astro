@@ -1,0 +1,8 @@
+---
+import type { HTMLAttributes } from 'astro/types';
+import { cn } from '../lib/utils.js';
+import { presentation } from '../lib/presentation.js';
+type Props = HTMLAttributes<'nav'>;
+const { class: className, ...attributes } = Astro.props;
+---
+<nav aria-label="Pagination" data-slot="pagination" {...attributes} class={cn(presentation.Pagination, className)}><slot /></nav>

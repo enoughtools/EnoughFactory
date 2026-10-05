@@ -1,0 +1,7 @@
+---
+import Component from './EmptyMedia.astro';
+import type { ComponentProps } from 'astro/types';
+type Props = ComponentProps<typeof Component>;
+
+---
+<Component {...Astro.props}><slot /></Component>

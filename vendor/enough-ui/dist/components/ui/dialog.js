@@ -1,0 +1,24 @@
+"use client";
+import { jsx as _jsx, jsxs as _jsxs } from "react/jsx-runtime";
+import * as React from "react";
+import * as DialogPrimitive from "@radix-ui/react-dialog";
+import { cn } from "../../lib/utils.js";
+import { Button } from "./button.js";
+const Dialog = DialogPrimitive.Root;
+const DialogTrigger = DialogPrimitive.Trigger;
+const DialogPortal = DialogPrimitive.Portal;
+const DialogClose = DialogPrimitive.Close;
+const DialogOverlay = React.forwardRef(({ className, ...props }, ref) => (_jsx(DialogPrimitive.Overlay, { ref: ref, className: cn("fixed inset-0 z-50 bg-[var(--enough-ui-scrim)]", className), ...props })));
+DialogOverlay.displayName = DialogPrimitive.Overlay.displayName;
+const DialogContent = React.forwardRef(({ className, children, showCloseButton, hideClose = false, ...props }, ref) => (_jsxs(DialogPortal, { children: [_jsx(DialogOverlay, {}), _jsxs(DialogPrimitive.Content, { ref: ref, "data-slot": "dialog-content", className: cn("fixed left-[50%] top-[50%] z-50 grid max-h-[calc(100dvh-2rem)] w-[calc(100%-2rem)] max-w-lg translate-x-[-50%] translate-y-[-50%] gap-[16px] overflow-y-auto border-2 border-[var(--color-ink)] bg-[var(--color-card)] p-[24px] shadow-[var(--shadow-palette)] rounded-none font-sans", className), ...props, children: [children, (showCloseButton ?? !hideClose) && _jsxs(DialogPrimitive.Close, { "data-slot": "dialog-close", className: "absolute right-2 top-2 flex h-11 w-11 items-center justify-center text-[16px] text-[var(--color-text-3)] hover:text-[var(--color-ink)] focus:outline-none focus-visible:ring-1 focus-visible:ring-[var(--color-accent)] disabled:pointer-events-none", children: [_jsx("span", { "aria-hidden": "true", children: "\u2715" }), _jsx("span", { className: "sr-only", children: "Close" })] })] })] })));
+DialogContent.displayName = DialogPrimitive.Content.displayName;
+const DialogHeader = ({ className, ...props }) => (_jsx("div", { className: cn("flex flex-col space-y-[6px] text-center sm:text-left", className), ...props }));
+DialogHeader.displayName = "DialogHeader";
+const DialogFooter = ({ className, children, showCloseButton = false, ...props }) => (_jsxs("div", { "data-slot": "dialog-footer", className: cn("flex flex-col-reverse gap-2 sm:flex-row sm:justify-end", className), ...props, children: [children, showCloseButton && (_jsx(DialogPrimitive.Close, { asChild: true, children: _jsx(Button, { variant: "outline", type: "button", children: "Close" }) }))] }));
+DialogFooter.displayName = "DialogFooter";
+const DialogTitle = React.forwardRef(({ className, ...props }, ref) => (_jsx(DialogPrimitive.Title, { ref: ref, className: cn("text-[18px] font-semibold leading-none tracking-tight text-[var(--color-text-main)]", className), ...props })));
+DialogTitle.displayName = DialogPrimitive.Title.displayName;
+const DialogDescription = React.forwardRef(({ className, ...props }, ref) => (_jsx(DialogPrimitive.Description, { ref: ref, className: cn("text-[14px] text-[var(--color-text-3)]", className), ...props })));
+DialogDescription.displayName = DialogPrimitive.Description.displayName;
+export { Dialog, DialogPortal, DialogOverlay, DialogTrigger, DialogClose, DialogContent, DialogHeader, DialogFooter, DialogTitle, DialogDescription, };
+//# sourceMappingURL=dialog.js.map

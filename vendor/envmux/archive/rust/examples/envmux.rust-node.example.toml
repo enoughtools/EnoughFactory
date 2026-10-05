@@ -1,0 +1,50 @@
+[meta]
+schema = 2
+namespace = "rust-node"
+
+[image]
+dockerfile = "images/rust-node.Dockerfile"
+context = "."
+
+[workspace]
+workdir = "/work"
+user = "user"
+naming = "branch"
+
+[tasks.fetch]
+command = "cargo fetch"
+
+# CARGO_HOME is /usr/local/cargo in the image, not a home directory: the
+# toolchain has to be readable by whichever account the workspace runs as.
+[volumes.named.cargo-registry]
+class = "cache"
+path = "/usr/local/cargo/registry"
+
+[volumes.named.cargo-git]
+class = "cache"
+path = "/usr/local/cargo/git"
+
+[volumes.named.npm]
+class = "cache"
+path = "/home/user/.npm"
+
+[volumes.named.claude]
+class = "sync"
+path = "/home/user/.claude"
+
+[volumes.named.codex]
+class = "sync"
+path = "/home/user/.codex"
+
+[routes]
+app = 8000
+
+[lease]
+initial = "7d"
+attach_extension = "24h"
+max_workspaces = 8
+
+[env]
+CARGO_INCREMENTAL = "0"
+CLAUDE_CONFIG_DIR = "/home/user/.claude"
+CODEX_HOME = "/home/user/.codex"

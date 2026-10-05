@@ -1,0 +1,8 @@
+---
+import type { HTMLAttributes } from 'astro/types';
+import { cn } from '../lib/utils.js';
+import { typographyVariants } from '../lib/variants.js';
+type Props = HTMLAttributes<'p'>;
+const {class: className, ...attributes} = Astro.props;
+---
+<p {...attributes} data-slot="typography-p" class={cn(typographyVariants({variant:"p"}),className)}><slot /></p>

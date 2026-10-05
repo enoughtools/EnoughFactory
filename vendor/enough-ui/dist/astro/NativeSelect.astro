@@ -1,0 +1,73 @@
+---
+import type { HTMLAttributes } from 'astro/types';
+import { cn } from '../lib/utils.js';
+import {
+  nativeSelectContainerClassName,
+  nativeSelectIconClassName,
+  nativeSelectIconSvgClassName,
+  nativeSelectVariants,
+} from '../lib/native-select.js';
+
+type Props = Omit<HTMLAttributes<'select'>, 'size'> & {
+  size?: 'default' | 'sm' | number;
+  variantSize?: 'default' | 'sm';
+  containerClassName?: string;
+  className?: string;
+};
+
+const {
+  size,
+  variantSize,
+  class: className,
+  className: reactClassName,
+  containerClassName,
+  multiple,
+  ...attributes
+} = Astro.props;
+
+const isNumeric =
+  typeof size === 'number' || (typeof size === 'string' && /^\d+$/.test(size));
+const numericSize = isNumeric ? Number(size) : undefined;
+const visualSize: 'default' | 'sm' =
+  variantSize ?? (size === 'sm' || size === 'default' ? size : 'default');
+const isListBox =
+  Boolean(multiple) || (typeof numericSize === 'number' && numericSize > 1);
+
+const selectClasses = cn(
+  nativeSelectVariants({ size: visualSize, isListBox }),
+  reactClassName,
+  className
+);
+---
+<div
+  class={cn(nativeSelectContainerClassName, containerClassName)}
+  data-slot="native-select-container"
+>
+  <select
+    {...attributes}
+    size={numericSize}
+    multiple={multiple}
+    data-slot="native-select"
+    data-size={visualSize}
+    class={selectClasses}
+  >
+    <slot />
+  </select>
+  {!isListBox && (
+    <span aria-hidden="true" data-slot="native-select-icon" class={nativeSelectIconClassName}>
+      <svg
+        aria-hidden="true"
+        focusable="false"
+        class={nativeSelectIconSvgClassName}
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        stroke-width="2"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+      >
+        <polyline points="6 9 12 15 18 9" />
+      </svg>
+    </span>
+  )}
+</div>

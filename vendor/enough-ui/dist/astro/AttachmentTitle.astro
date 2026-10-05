@@ -1,0 +1,8 @@
+---
+import type { HTMLAttributes } from 'astro/types';
+import { conversation } from '../lib/conversation.js';
+import { cn } from '../lib/utils.js';
+type Props = HTMLAttributes<'span'>;
+const { class: className, ...attributes } = Astro.props;
+---
+<span {...attributes} data-slot="attachment-title" class={cn(conversation.AttachmentTitle, className)}><slot /></span>

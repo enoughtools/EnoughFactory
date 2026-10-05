@@ -1,0 +1,7 @@
+{
+  "name": "@enoughfactory/peers", "version": "0.1.0", "type": "module", "license": "MIT",
+  "exports": { ".": "./src/index.ts", "./browser": "./src/browser.ts" },
+  "scripts": { "build": "tsc --noEmit", "typecheck": "tsc --noEmit", "test": "tsx --test tests/*.test.ts" },
+  "dependencies": { "@enoughfactory/contracts": "workspace:*", "node-datachannel": "0.33.4", "ws": "^8.18.3" },
+  "devDependencies": { "@types/ws": "^8.18.1" }
+}

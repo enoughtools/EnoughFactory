@@ -1,0 +1,21 @@
+# cargo-audit reads Cargo.lock, which lists every crate the resolver could
+# conceivably need — including crates that no feature of ours turns on. That
+# makes it noisier than cargo-deny, which resolves the real dependency graph
+# and reports this same tree as clean. Where the two disagree, this file
+# records why, so an ignored advisory is a decision rather than a silence.
+
+[advisories]
+ignore = [
+    # RUSTSEC-2023-0071 — Marvin attack, a timing sidechannel in `rsa`.
+    #
+    # `rsa` reaches the lockfile through sqlx's MySQL driver. envmux enables
+    # only sqlite (`default-features = false, features = ["sqlite", ...]`), so
+    # the crate is never compiled into anything we ship: `cargo tree -i rsa`
+    # finds no path to it on any target, which is why cargo-deny does not
+    # report it. There is also no fixed version to move to.
+    #
+    # Revisit if a MySQL service type is ever added — that would put this code
+    # in the build for real, and the advisory would then need answering rather
+    # than explaining.
+    "RUSTSEC-2023-0071",
+]

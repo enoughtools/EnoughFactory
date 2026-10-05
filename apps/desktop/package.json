@@ -1,0 +1,24 @@
+{
+  "name": "@enoughfactory/desktop",
+  "version": "0.1.0",
+  "private": true,
+  "description": "EnoughFactory — your devices, one software factory",
+  "author": "Enough Tools",
+  "license": "MIT",
+  "type": "module",
+  "main": "dist/main.cjs",
+  "scripts": {
+    "build": "node build.mjs",
+    "typecheck": "tsc --noEmit",
+    "start": "node build.mjs && electron .",
+    "dev": "node build.mjs && electron . --dev",
+    "package": "node ../../scripts/package-desktop.mjs"
+  },
+  "devDependencies": {
+    "electron": "44.5.1",
+    "electron-builder": "26.15.3",
+    "esbuild": "^0.25.10",
+    "typescript": "^5.9.3",
+    "@types/node": "^22.18.6"
+  }
+}

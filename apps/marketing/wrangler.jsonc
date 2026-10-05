@@ -1,0 +1,16 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "enoughfactory",
+  "account_id": "2b770eb5992d931c6468f98024f8f5b7",
+  "compatibility_date": "2026-10-05",
+  "workers_dev": true,
+  "main": "src/worker.ts",
+  "assets": {
+    "directory": "./dist",
+    "binding": "ASSETS",
+    "not_found_handling": "404-page",
+    "html_handling": "drop-trailing-slash",
+    "run_worker_first": true
+  },
+  "routes": [{ "pattern": "factory.enoughtools.com", "custom_domain": true }]
+}

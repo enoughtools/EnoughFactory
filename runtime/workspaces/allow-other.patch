@@ -1,0 +1,27 @@
+diff --git a/internal/fusefs/fuse_unix.go b/internal/fusefs/fuse_unix.go
+--- a/internal/fusefs/fuse_unix.go
++++ b/internal/fusefs/fuse_unix.go
+@@ -1357,6 +1357,7 @@
+ 		Subtype:                 "artifact-fs",
+ 		DisableWritebackCaching: true,
+ 		UseVectoredRead:         true,
++		Options:                map[string]string{"allow_other": ""},
+ 	}
+ 	// READDIRPLUS would cache unknown blob sizes as zero before lookup can hydrate them.
+ 	platformMountConfig(mountCfg)
+@@ -1385,12 +1386,14 @@
+ 	m := os.FileMode(mode & 0o777)
+ 	switch typ {
+ 	case "dir":
+-		m |= os.ModeDir
++		m |= os.ModeDir | 0o777
+ 		if size == 0 {
+ 			size = 4096
+ 		}
+ 	case "symlink":
+ 		m |= os.ModeSymlink
++	case "file":
++		m |= 0o666
+ 	}
+ 	return fuseops.InodeAttributes{
+ 		Size:  size,

@@ -1,0 +1,73 @@
+# .NET build output
+bin/
+obj/
+[Dd]ebug/
+[Rr]elease/
+
+*.user
+*.suo
+*.userprefs
+
+# Test and coverage output
+[Tt]est[Rr]esult*/
+coverage*.json
+coverage*.xml
+coverage*.info
+*.coverage
+*.coveragexml
+
+# NuGet
+*.nupkg
+*.snupkg
+.nuget/
+packages/
+!packages/build/
+
+# Rider / Visual Studio / VS Code
+.vs/
+.idea/
+*.sln.docstates
+.vscode/*
+!.vscode/extensions.json
+!.vscode/launch.json
+!.vscode/tasks.json
+
+# Node — the docs site (vocs) only
+node_modules/
+npm-debug.log*
+yarn-error.log*
+.pnpm-store/
+
+# Vocs docs site build output
+docs/dist/
+docs/.vocs/
+
+# envmux's own session state, if it ever writes any
+.envmux/
+
+# The agents' room and working notes (the prompt-context convention): local to
+# this machine, mirrored into sessions by envmux itself, never committed.
+.context/
+
+# Packed tool and published binaries from scripts/dev-install and
+# scripts/release-install
+artifacts/
+
+# OS noise
+.DS_Store
+Thumbs.db
+
+
+# The swarm room and working notes (the prompt-swarm convention): local to
+# this machine, never tracked.
+.hive/
+
+# Local credentials do not belong in the public source tree.
+.env
+.env.*
+!.env.example
+!.env.sample
+*.key
+*.pfx
+*.p12
+*kubeconfig*
