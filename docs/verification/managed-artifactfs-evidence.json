@@ -1,0 +1,35 @@
+{
+  "recordedAt": "2026-10-05T20:52:23.601Z",
+  "runtime": {
+    "host": "unix://<EnoughFactory state>/container/lima/factory/sock/docker.sock",
+    "cliPath": "<EnoughFactory prepared runtime>/docker/bin/docker",
+    "configDirectory": "<EnoughFactory state>/docker/config"
+  },
+  "image": {
+    "id": "sha256:78d7e3c2e87c9e3fec157484869aee420355b2e1333b3191138415e063f52f07",
+    "name": "enoughfactory/artifactfs:6a62f2f34aeb",
+    "labels": {
+      "org.opencontainers.image.licenses": "Apache-2.0",
+      "org.opencontainers.image.revision": "6a62f2f34aebe75da3d8b917131a6ace185928e5",
+      "org.opencontainers.image.source": "https://github.com/enoughtools/reporeach"
+    }
+  },
+  "build": {
+    "sessionId": 44919,
+    "exitCode": 0
+  },
+  "journey": {
+    "sessionId": 14095,
+    "exitCode": 0,
+    "script": "runtime/workspaces/envmux-verify.mts",
+    "candidate": "e98e70e6bbe346008c9c675a33d01ba596ffb4a5",
+    "integrated": "761acea8506e17d9a173979a6665b260827e40c4"
+  },
+  "cleanup": {
+    "retainedContainers": "",
+    "retainedManagers": "",
+    "retainedVolumes": "",
+    "retainedFixtures": []
+  },
+  "scope": "Recorded native Mac ArtifactFS image build and real envmux workspace handoff through EnoughFactory’s explicitly owned Lima/Docker endpoint. This existing run verifies a writable trusted FUSE mount, candidate capture and host Git integration; it is separate from distributed factory, desktop packaging and provider inference evidence. Local account paths are redacted."
+}

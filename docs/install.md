@@ -79,6 +79,8 @@ If your SDK is outside `PATH`, set `ENOUGHFACTORY_DOTNET` to its executable. `EN
 
 ## Your first environment
 
+The [status board example](../examples/status-board/README.md) gives you a small working Node app, a cache service, configured checks and a web preview. Copy it into its own Git repository using the example's instructions, then select that repository below. It also includes a representative goal to try after connecting an agent.
+
 1. Open EnoughFactory and use **Add project** to select a local Git repository.
 2. Open project settings to inspect or edit `.envmux.json`. Enough validates the configuration; environment changes apply to the next session.
 3. Choose **Start environment**, give it a name, and follow preparation in Activity.
@@ -156,4 +158,8 @@ This removes startup and copied resources while preserving state. Add `--purge` 
 
 Very long state paths can exceed the operating system's Unix socket limit. Mac then keeps its VM in a private, user-owned directory under `/Users/Shared` and records the actual location in `container/runtime-location.json`. Linux can place its socket in a guarded user runtime or temporary directory while retaining persistent data in the state directory. The runtime status shows its actual data location. Preserve the location record when moving or backing up state; ordinary uninstall retains the runtime and its work.
 
-Back up the state directory after stopping work, its private runtime and the device service so VM/engine storage and the SQLite database remain consistent. Back up project repositories separately. Never synchronize a live database across devices or start two coordinators against the same state directory. After a restart, environments reattach where supported; interrupted provider turns need supported conversation resume, and uncertain worker attempts are reconciled before replacement.
+At startup, the device service checks `factory.sqlite`'s schema version before accepting work. This build supports schema version 1. A new database receives the baseline schema; an older database without version metadata is adopted in one transaction, preserving records, event sequence numbers and history. An existing version 1 database is checked and reopened without replaying the migration. Future migrations apply in version order and commit their schema changes and version marker together; a failed migration rolls back and startup closes the database.
+
+A database with a newer schema version, malformed version metadata or inconsistent tables stops startup with an error. EnoughFactory does not downgrade or reset it. Use a build that supports its version, or restore a known consistent backup after stopping the service. Do not manually change the version marker to force an older build to open it.
+
+Before upgrading, back up the entire state directory after stopping work, its private runtime and the device service so VM/engine storage and the SQLite database remain consistent. Keep `factory.sqlite` and any `factory.sqlite-wal`/`factory.sqlite-shm` files together in the backup, along with device keys, artifacts and runtime-location records. Back up project repositories separately. To restore, stop the service and runtime, preserve the current directory, and restore the backup as a unit using a compatible application build. Never synchronize a live database across devices or start two coordinators against the same state directory. After a restart, environments reattach where supported; interrupted provider turns need supported conversation resume, and uncertain worker attempts are reconciled before replacement.

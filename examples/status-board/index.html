@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Enough status board</title>
+  <style>
+    :root { color-scheme: light; font-family: system-ui, sans-serif; color: #24231f; background: #f5f2e9; }
+    body { max-width: 640px; margin: 64px auto; padding: 0 24px; }
+    h1 { font-size: clamp(32px, 6vw, 48px); letter-spacing: -.04em; }
+    p { line-height: 1.5; }
+    dl { border-top: 1px solid #b8b3a7; }
+    dl > div { display: flex; justify-content: space-between; gap: 16px; padding: 16px 0; border-bottom: 1px solid #b8b3a7; }
+    dd { margin: 0; text-align: right; }
+    button { background: #24231f; color: #fff; border: 0; padding: 12px 20px; font: inherit; cursor: pointer; }
+    button:focus-visible { outline: 3px solid #15755b; outline-offset: 4px; }
+    button:disabled { opacity: .65; cursor: wait; }
+    #message { min-height: 24px; }
+  </style>
+</head>
+<body>
+  <main>
+    <p>EnoughFactory example</p>
+    <h1>Your app is running.</h1>
+    <p>A small Node app, an isolated cache service, and room for your next goal.</p>
+    <dl>
+      <div><dt>Application</dt><dd id="state">Checking…</dd></div>
+      <div><dt>Cache service</dt><dd id="cache">Checking…</dd></div>
+      <div><dt>Uptime</dt><dd id="uptime">—</dd></div>
+      <div><dt>Last checked</dt><dd id="checked">—</dd></div>
+    </dl>
+    <button id="refresh" type="button">Refresh status</button>
+    <p id="message" role="status" aria-live="polite"></p>
+  </main>
+  <script>
+    const button = document.getElementById('refresh');
+    const message = document.getElementById('message');
+    async function refresh() {
+      button.disabled = true;
+      message.textContent = 'Checking application and cache…';
+      try {
+        const response = await fetch('api/status', { cache: 'no-store' });
+        const status = await response.json();
+        document.getElementById('state').textContent = status.state === 'ready' ? 'Ready' : 'Needs attention';
+        document.getElementById('cache').textContent = { connected: 'Connected', unavailable: 'Unavailable', 'not-configured': 'Standalone mode' }[status.cache];
+        document.getElementById('uptime').textContent = `${status.uptimeSeconds} seconds`;
+        document.getElementById('checked').textContent = new Date(status.checkedAt).toLocaleTimeString();
+        message.textContent = response.ok ? 'Status is up to date.' : 'The cache is unavailable. Restore it and refresh to retry.';
+      } catch {
+        document.getElementById('state').textContent = 'Unavailable';
+        document.getElementById('cache').textContent = 'Unknown';
+        message.textContent = 'The application could not be reached. Restore it and refresh to retry.';
+      } finally {
+        button.disabled = false;
+      }
+    }
+    button.addEventListener('click', refresh);
+    refresh();
+  </script>
+</body>
+</html>

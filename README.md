@@ -39,6 +39,7 @@ For live interface development, run `pnpm dev`, then `pnpm --filter @enoughfacto
 ## Documentation
 
 - [Install, connect an agent and create a goal](docs/install.md)
+- [Try a complete example project](examples/status-board/README.md)
 - [Self-host signaling, relays and browser previews](docs/self-hosting.md)
 - [Desktop distribution and native packaging](docs/desktop-distribution.md)
 - [Build plan and product architecture](docs/build-plan.md)

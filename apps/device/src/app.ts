@@ -118,7 +118,7 @@ export class DeviceApp {
     this.runtimeOperations.set(operationId,{controller,promise});return promise;
   }
   state(): FactoryState {
-    return {product:PRODUCT,version:'0.1.1',device:{...this.device,lastSeen:now()},devices:this.devices,projects:this.store.list<Project>('projects').filter(p=>!p.internal),sessions:this.store.list('sessions'),chats:this.store.list('chats'),approvals:this.store.list('approvals'),goals:this.store.list('goals'),tasks:this.store.list('tasks'),attempts:this.store.list('attempts'),diagnostics:this.diagnostics,settings:{...this.settings,turnCredential:undefined},...this.catalog?.()};
+    return {product:PRODUCT,version:'0.1.2',device:{...this.device,lastSeen:now()},devices:this.devices,projects:this.store.list<Project>('projects').filter(p=>!p.internal),sessions:this.store.list('sessions'),chats:this.store.list('chats'),approvals:this.store.list('approvals'),goals:this.store.list('goals'),tasks:this.store.list('tasks'),attempts:this.store.list('attempts'),diagnostics:this.diagnostics,settings:{...this.settings,turnCredential:undefined},...this.catalog?.()};
   }
   emit(topic: string,data: unknown): void {
     if(this.closing)return;
@@ -130,7 +130,7 @@ export class DeviceApp {
   async dispatch(call: ApiCall): Promise<unknown> {
     const {method,url,body}=call;const route=url.pathname;
     if(this.routeRemote){const remote=await this.routeRemote(call);if(remote!==undefined)return remote;}
-    if(method==='GET' && route==='/api/health')return {ok:true,product:PRODUCT,version:'0.1.1',deviceId:this.device.id};
+    if(method==='GET' && route==='/api/health')return {ok:true,product:PRODUCT,version:'0.1.2',deviceId:this.device.id};
     if(method==='GET' && route==='/api/state')return this.state();
     if(method==='POST' && route==='/api/service/shutdown'){setTimeout(()=>{void this.close().then(()=>process.exit(0));},200);return {ok:true};}
     if(method==='GET'&&route==='/api/runtime')return this.refreshRuntime();
@@ -240,7 +240,7 @@ export class DeviceApp {
   async refreshDiagnostics():Promise<void>{const [info,status]=await Promise.all([this.sessions.engine.detect(),this.runtime.status()]);this.diagnostics={...this.diagnostics,containerRuntime:status,docker:{available:status.state==='ready',version:status.dockerVersion,error:status.error},envmux:{available:info.available,version:info.version,error:info.error}};this.syncRuntimeCapacity();this.changed();}
   async listen():Promise<void>{
     await new Promise<void>((resolve,reject)=>{this.server.once('error',reject);this.server.listen(this.port,'127.0.0.1',()=>resolve());});
-    writeFileSync(path.join(this.dataDir,'connection.json'),JSON.stringify({url:`http://127.0.0.1:${this.port}`,token:this.token,pid:process.pid,version:'0.1.1'},null,2),{mode:0o600});
+    writeFileSync(path.join(this.dataDir,'connection.json'),JSON.stringify({url:`http://127.0.0.1:${this.port}`,token:this.token,pid:process.pid,version:'0.1.2'},null,2),{mode:0o600});
     void this.refreshDiagnostics();await this.sessions.recover();
   }
   async close():Promise<void>{if(this.closing)return;this.closing=true;if(this.changeTimer)clearTimeout(this.changeTimer);for(const close of this.closers)await close();this.sessions.close();for(const res of this.sse)res.end();this.socketServer.close();await new Promise<void>(resolve=>this.server.close(()=>{this.store.close();resolve();}));}

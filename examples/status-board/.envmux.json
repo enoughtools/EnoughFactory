@@ -1,0 +1,21 @@
+{
+  "name": "status-board",
+  "features": {
+    "ghcr.io/devcontainers/features/node:1": { "version": "22.22.0" }
+  },
+  "env": { "HOST": "0.0.0.0", "PORT": "3000" },
+  "services": {
+    "cache": { "type": "redis", "image": "valkey/valkey:8.1.10-alpine" }
+  },
+  "tasks": {
+    "checks": { "command": "npm test", "kind": "once" },
+    "web": {
+      "command": "npm start",
+      "dependsOn": ["checks", "cache"],
+      "ready": 3000,
+      "restart": "on-failure"
+    }
+  },
+  "routes": { "web": 3000 },
+  "browser": { "open": "web" }
+}

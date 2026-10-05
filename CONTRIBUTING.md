@@ -21,6 +21,8 @@ pnpm --filter @enoughfactory/desktop dev
 
 Use a disposable repository for changes to session teardown, integration or agent execution. Development uses the private runtime and real provider accounts when connected. Use a separate `ENOUGHFACTORY_HOME` if you need independent application state. Every engine call must receive the managed endpoint and private client configuration; a missing runtime must never fall back to the user's Docker socket or context.
 
+The [status board example](examples/status-board/README.md) is a small starting repository for a real environment, preview and agent goal. Its dependency-free HTTP checks run with `npm test` from the example directory; copy it into a separate Git repository before using it for factory work.
+
 ## Verification
 
 Run `pnpm typecheck` and `pnpm build` for changes affecting the shared application. Add or run focused checks for behavior that can lose work, accept stale authority, misroute approval decisions or confuse unknown execution with failure. The relevant package README documents its test commands and optional Docker journeys.
