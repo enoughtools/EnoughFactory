@@ -82,3 +82,11 @@ It revalidates every public package receipt and its runtime journey against the 
 Official Wrangler refreshed the existing OAuth grant after the dashboard endpoint became reachable. Its account check succeeds, and authenticated API reads confirm the configured Enough account, the active `enoughtools.com` zone and existing Enough custom domains. The grant’s existing permissions remain unchanged.
 
 The factory subdomain is not yet configured. No project, domain or DNS mutations were made during the access check. The release can use the established account and custom-domain deployment flow when the product artifacts are ready.
+
+## Published release on October 5 2026
+
+The authorized release is now public at [factory.enoughtools.com](https://factory.enoughtools.com). Cloudflare configured its custom domain during deployment. Worker `enoughfactory` serves the home page, guide, downloads, published catalog and actual shared browser application. All five HTTPS routes returned 200. The catalog exposes six unsigned 0.1.1 installer archives and thirteen runtime source files whose public bytes matched their local release artifacts. Mac packages are not notarized. [GitHub release](https://github.com/enoughtools/EnoughFactory/releases/tag/v0.1.1).
+
+The initial deployment was `66323ecc-0742-4ebe-a1c7-003a46ab917f`. A browser-only onboarding correction is deployed in version `2ed99f20-da8d-4597-980f-5e028d98a541`: new visitors receive a clear device-connection prompt without requesting the marketing site's API or displaying an HTML error page. The web typecheck and staging build passed; browser assets changed without altering the static marketing pages, catalog or immutable desktop archives. Public installer and source bytes were not needlessly downloaded again.
+
+The public download page and installation guide were inspected in a real browser, including the Mac DMG checksum and linked verification record. A clean visitor at the same deployment's alternate HTTPS origin received the corrected onboarding. Device execution remains owned by its installed service. See [the release ledger](../release-progress.md) for the final device-connection observation and its scope.

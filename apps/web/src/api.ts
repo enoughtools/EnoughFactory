@@ -18,6 +18,18 @@ export interface DesktopBridge {
 declare global { interface Window { enoughFactory?: DesktopBridge } }
 
 const CONNECTION_KEY = 'enoughfactory.connection';
+const CONNECT_DEVICE_MESSAGE = 'Connect your device service or pair a device to open your workspace.';
+const WEB_PAGE_MESSAGE = 'This address returned a web page. Use a device service URL or pair a device.';
+function canConnect(connection: Connection): boolean {
+  if (connection.mode === 'peer') return Boolean(connection.deviceId);
+  // Only the development server proxies relative API requests to a device service.
+  return Boolean(connection.url.trim()) || import.meta.env.DEV;
+}
+function deviceErrorMessage(value: unknown, fallback: string): string {
+  if (typeof value !== 'string' || !value.trim()) return fallback;
+  if (/<\/?[a-z][^>]*>/i.test(value)) return WEB_PAGE_MESSAGE;
+  return value.trim().slice(0, 600);
+}
 export function initialConnection(): Connection {
   try {
     const saved = JSON.parse(localStorage.getItem(CONNECTION_KEY) ?? 'null') as Connection | null;
@@ -31,11 +43,12 @@ export class DeviceClient {
   constructor(readonly connection: Connection) {}
   url(path: string) { return `${this.connection.url.replace(/\/$/, '')}${path}`; }
   async request<T>(path: string, options: RequestInit = {}, lane: 'control' | 'bulk' = 'control'): Promise<T> {
+    if (!canConnect(this.connection)) throw new Error(CONNECT_DEVICE_MESSAGE);
     if (this.connection.mode === 'peer') {
       if (!this.connection.deviceId) throw new Error('Choose a paired device.');
       const peers = await browserPeerClient();
       const response = await peers.request(this.connection.deviceId, { method: options.method ?? 'GET', path, ...(options.body ? { body: JSON.parse(String(options.body)) } : {}) }, 30_000, lane);
-      if (response.status < 200 || response.status >= 300) throw new Error((response.body as { error?: string })?.error || `The device returned ${response.status}.`);
+      if (response.status < 200 || response.status >= 300) throw new Error(deviceErrorMessage((response.body as { error?: string })?.error, `The device returned ${response.status}.`));
       if (path === '/api/state') {
         const state = response.body as FactoryState;
         const owner = peers.devices().find(device => device.id === this.connection.deviceId);
@@ -47,14 +60,18 @@ export class DeviceClient {
       ...options,
       headers: { Accept: 'application/json', ...(options.body ? { 'Content-Type': 'application/json' } : {}), ...(this.connection.token ? { Authorization: `Bearer ${this.connection.token}` } : {}), ...options.headers },
     });
+    if (response.headers.get('content-type')?.includes('text/html')) throw new Error(WEB_PAGE_MESSAGE);
     if (!response.ok) {
       const body = await response.text();
-      let message = body;
+      let message: unknown = body;
       try { message = (JSON.parse(body) as { error?: string }).error ?? body; } catch { /* Plain engine errors are useful too. */ }
-      throw new Error(message || `The device returned ${response.status}.`);
+      throw new Error(deviceErrorMessage(message, `The device returned ${response.status}.`));
     }
     if (response.status === 204) return undefined as T;
-    return (response.headers.get('content-type')?.includes('json') ? response.json() : response.text()) as Promise<T>;
+    if (response.headers.get('content-type')?.includes('json')) return response.json() as Promise<T>;
+    const body = await response.text();
+    if (/<\/?(?:html|head|body)\b/i.test(body)) throw new Error(WEB_PAGE_MESSAGE);
+    return body as T;
   }
   get<T>(path: string) { return this.request<T>(path); }
   getBulk<T>(path: string) { return this.request<T>(path, {}, 'bulk'); }
@@ -63,6 +80,7 @@ export class DeviceClient {
   put<T>(path: string, body: unknown) { return this.request<T>(path, { method: 'PUT', body: JSON.stringify(body) }); }
   delete<T>(path: string) { return this.request<T>(path, { method: 'DELETE' }); }
   socket(path: string): ClientSocket {
+    if (!canConnect(this.connection)) throw new Error(CONNECT_DEVICE_MESSAGE);
     if (this.connection.mode === 'peer' && this.connection.deviceId) return new PeerSocket(this.connection.deviceId, path);
     const url = new URL(this.url(path), location.href);
     url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -74,14 +92,15 @@ export class DeviceClient {
 export function useFactory() {
   const [connection, setConnectionState] = useState(initialConnection);
   const [state, setState] = useState<FactoryState | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(() => !window.enoughFactory && !canConnect(connection) ? CONNECT_DEVICE_MESSAGE : null);
+  const [loading, setLoading] = useState(() => Boolean(window.enoughFactory) || canConnect(connection));
   const [bootstrapped, setBootstrapped] = useState(() => !window.enoughFactory);
   const bootstrappedRef = useRef(bootstrapped);
   const requestGeneration = useRef(0);
   const client = useRef(new DeviceClient(connection));
   const refresh = useCallback(async () => {
     if (!bootstrappedRef.current) return;
+    if (!canConnect(client.current.connection)) { setError(CONNECT_DEVICE_MESSAGE); setLoading(false); return; }
     const generation = requestGeneration.current;
     try {
       const next = await client.current.get<FactoryState>('/api/state');
@@ -94,7 +113,7 @@ export function useFactory() {
   const setConnection = useCallback((next: Connection) => {
     bootstrappedRef.current = true; setBootstrapped(true);
     storeConnection(next); requestGeneration.current++;
-    client.current = new DeviceClient(next); setConnectionState(next); setLoading(true); setState(null);
+    client.current = new DeviceClient(next); setConnectionState(next); setLoading(true); setState(null); setError(null);
   }, []);
   useEffect(() => {
     let active = true;
@@ -105,6 +124,7 @@ export function useFactory() {
   }, [setConnection]);
   useEffect(() => {
     if (!bootstrapped) return;
+    if (!canConnect(connection)) { setError(CONNECT_DEVICE_MESSAGE); setLoading(false); return; }
     const abort = new AbortController();
     void refresh();
     const fallback = setInterval(() => void refresh(), 15_000);
