@@ -15,6 +15,7 @@
     "build": "pnpm -r --if-present build",
     "typecheck": "pnpm -r --if-present typecheck",
     "verify": "pnpm -r --if-present verify",
+    "runtime:prepare": "node scripts/prepare-container-runtime.mjs",
     "desktop": "pnpm --filter @enoughfactory/desktop start",
     "package": "pnpm --filter @enoughfactory/desktop package"
   },

@@ -10,8 +10,8 @@
   "scripts": {
     "build": "node build.mjs",
     "typecheck": "tsc --noEmit",
-    "start": "node build.mjs && electron .",
-    "dev": "node build.mjs && electron . --dev",
+    "start": "node ensure-electron.mjs && node build.mjs && electron .",
+    "dev": "node ensure-electron.mjs && node build.mjs && electron . --dev",
     "package": "node ../../scripts/package-desktop.mjs"
   },
   "devDependencies": {

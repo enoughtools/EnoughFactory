@@ -1,6 +1,6 @@
 # Install EnoughFactory
 
-EnoughFactory runs on Mac and Linux. Windows is not a current distribution target. Each device needs Git and a running Docker-compatible engine for environments. You supply the agent provider accounts you want to use.
+EnoughFactory runs on Mac and Linux. Windows is not a current distribution target. It bundles its own container-runtime tools and owns a private engine, socket and storage on each device. Git must be available for local source operations. You supply repositories and the agent provider accounts you want to use.
 
 ## Desktop builds
 
@@ -8,7 +8,40 @@ Use the published release's architecture and signing information to choose an ar
 
 On Mac, open the DMG and drag EnoughFactory into Applications, or extract the app ZIP. On Linux, make the AppImage executable and open it, or extract the tar archive and run its application executable. Keep the archive's `resources` directory with the application. Linux AppImages can require the distribution's FUSE compatibility package; `--appimage-extract` is available when that package is unavailable.
 
-Packaged applications carry their Node runtime and self-contained envmux executable. They do not need a Node or .NET SDK. Docker Desktop or Colima/Lima is suitable on Mac; Docker Engine is suitable on Linux. Start that engine before opening an environment. EnoughFactory does not automatically install or start it.
+Packaged applications carry Node, a self-contained envmux executable and the container-runtime tools for their OS. They do not need a Node/.NET SDK or an existing Docker installation. Mac uses a private Lima VM with Apple's virtualization framework; Linux uses a dedicated rootless Docker Engine. The device service starts and recovers this runtime independently of the desktop window. Existing Docker contexts, daemons, images and volumes are separate from EnoughFactory.
+
+## Prepare the private runtime
+
+Open **Settings → EnoughFactory runtime → Prepare runtime** to start EnoughFactory's engine. It can also start when you open an environment. The app shows preparation, readiness, resource limits and actionable prerequisites. Mac bundles a pinned Ubuntu guest image and prepares a private writable VM disk from it on first start. Allow space for the application, that disk, container images and your workspace data. Container base images and provider tools still need a network connection when first prepared.
+
+Mac CPU and memory allocations can be changed through runtime resource settings after the runtime stops; the disk capacity is shown alongside them. Linux runs directly in its own rootless namespace, with goal concurrency configured separately. Closing the window leaves running work intact. Stopping the runtime with active environments requires **Stop environments & runtime**, which interrupts their tools, waits for source recovery and then stops the engine.
+
+## Linux runtime prerequisites
+
+Run the device service as your regular user. The private rootless engine needs host UID/GID mapping helpers, at least 65,536 subordinate IDs in both `/etc/subuid` and `/etc/subgid`, and permitted user namespaces. Containers still have root permissions inside their namespace. [Docker rootless prerequisites](https://docs.docker.com/engine/security/rootless/).
+
+On Debian/Ubuntu, install the host prerequisites:
+
+```sh
+sudo apt install uidmap iptables util-linux procps
+```
+
+On Fedora:
+
+```sh
+sudo dnf install shadow-utils iptables util-linux procps-ng
+```
+
+These supply host helpers; EnoughFactory supplies its private daemon and client. Inspect the subordinate ranges already assigned to your account:
+
+```sh
+getent passwd "$(id -u)"
+cat /etc/subuid /etc/subgid
+```
+
+If either file lacks a range of at least 65,536 IDs for your account, have the administrator assign a free, non-overlapping range in each file using `usermod --add-subuids START-END --add-subgids START-END USERNAME`. Choose ranges after inspecting existing allocations; do not reuse another account's IDs. Restart the private runtime afterward.
+
+If setup reports that user namespaces are disabled, the host administrator must enable them according to the host policy. Ubuntu 24.04 and newer can additionally require an AppArmor rule for the **actual bundled RootlessKit path** shown by the app. Use the application-specific profile described by [Docker's rootless troubleshooting](https://docs.docker.com/engine/security/rootless/troubleshoot/) rather than disabling AppArmor globally. The runtime keeps its failure details visible until the prerequisite is resolved.
 
 ## Build and open from source
 
@@ -19,11 +52,14 @@ git clone https://github.com/enoughtools/EnoughFactory.git
 cd EnoughFactory
 pnpm install --frozen-lockfile
 pnpm --filter @enoughfactory/envmux build:engine
+node scripts/prepare-container-runtime.mjs
 pnpm build
 pnpm desktop
 ```
 
-The engine build targets your current OS and architecture. If your SDK is outside `PATH`, set `ENOUGHFACTORY_DOTNET` to its executable. `ENOUGHFACTORY_ENVMUX_BINARY` can select an already-built engine. See [desktop distribution](desktop-distribution.md) for native release builds.
+The engine build and runtime preparation target your current OS and architecture. The runtime script downloads pinned archives, verifies their SHA-256 values and prepares `.cache/container-runtime/<platform>-<arch>`. It accepts explicit platform, architecture and destination arguments for release assembly. Mac preparation includes the host CLI, Lima, guest engine and Ubuntu image. The included guest image is verified before creating the VM; first launch does not fetch an operating system.
+
+If your SDK is outside `PATH`, set `ENOUGHFACTORY_DOTNET` to its executable. `ENOUGHFACTORY_ENVMUX_BINARY` can select an already-built engine. See [desktop distribution](desktop-distribution.md) for native release preparation.
 
 ## Your first environment
 
@@ -45,7 +81,7 @@ Choose approval policy in project settings. **Approve all** runs full-access wor
 
 ## Create a factory goal
 
-Choose **New goal**, describe the complete outcome, and add completion criteria if you have specific ones. Choose the agent, concurrency, autonomy and approval policy independently.
+Choose **New goal**, describe the complete outcome, and add completion criteria if you have specific ones. Choose the agent, concurrency, autonomy and approval policy independently. **Repository workspace** selects Git or ArtifactFS where the runtime supports it; an unavailable mount capability remains visible with the compatible Git route.
 
 **Autonomous** keeps planning, executing, checking, repairing and evaluating after individual agent turns finish. **Assisted** prepares work for you to start. **Manual** leaves the next action with you. Decisions and evidence stay attached to the goal. Pause, resume or cancel from the goal workspace; unknown remote execution remains visible until reconciled.
 
@@ -96,10 +132,12 @@ FACTORY_SERVICE="$HOME/Library/Application Support/EnoughFactory/service"
   "$FACTORY_SERVICE/install/uninstall-device-service.mjs"
 ```
 
-This removes startup and copied resources while preserving state. Add `--purge` only to remove the state directory too. Stop goals and explicitly stop environments before removal; uninstalling the service is not a request to discard or harvest every Docker session. Removing the desktop app does not remove the optional user service automatically.
+This removes startup and copied resources while preserving state. Add `--purge` only to remove the state directory too. Stop goals, environments and the private runtime before removal; uninstalling the service is not a request to discard unharvested work. Removing the desktop app does not remove the optional user service automatically.
 
 ## Local state and recovery
 
-`ENOUGHFACTORY_HOME` selects the state directory; the default is `~/.enoughfactory`. It holds a private SQLite database, event history, device keys, connection settings, workspace artifacts and logs. A custom state path must be shared by the desktop and its installed service.
+`ENOUGHFACTORY_HOME` selects the state directory; the default is `~/.enoughfactory`. It holds a private SQLite database, event history, device keys, connection settings, workspace artifacts and logs. Mac's VM normally lives under `container/lima`; Linux keeps its private engine's persistent data and configuration under `docker/data` and `docker/config`. A custom state path must be shared by the desktop and its installed service.
 
-Back up the state directory only after shutting down its device service so the SQLite database and journal remain consistent. Back up project repositories separately. Never synchronize a live database across devices or start two coordinators against the same state directory. After a restart, environments reattach where supported; interrupted provider turns need supported conversation resume, and uncertain worker attempts are reconciled before replacement.
+Very long state paths can exceed the operating system's Unix socket limit. Mac then keeps its VM in a private, user-owned directory under `/Users/Shared` and records the actual location in `container/runtime-location.json`. Linux can place its socket in a guarded user runtime or temporary directory while retaining persistent data in the state directory. The runtime status shows its actual data location. Preserve the location record when moving or backing up state; ordinary uninstall retains the runtime and its work.
+
+Back up the state directory after stopping work, its private runtime and the device service so VM/engine storage and the SQLite database remain consistent. Back up project repositories separately. Never synchronize a live database across devices or start two coordinators against the same state directory. After a restart, environments reattach where supported; interrupted provider turns need supported conversation resume, and uncertain worker attempts are reconciled before replacement.

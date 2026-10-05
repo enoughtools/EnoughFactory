@@ -4,6 +4,7 @@ import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, openSync, closeSync, readFileSync } from 'node:fs';
 import { access, cp, mkdir, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
+import { createConnection } from 'node:net';
 import { delimiter, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
@@ -46,16 +47,30 @@ function readConnection(): Connection | undefined {
   } catch { return; }
 }
 
-async function availableConnection(): Promise<Connection | undefined> {
+async function availableConnection(requireManagedRuntime = true): Promise<Connection | undefined> {
   const candidate = readConnection();
   if (!candidate) return;
+  let healthy = false;
   try {
     const response = await fetch(`${candidate.url}/api/health`, {
       headers: { Authorization: `Bearer ${candidate.token}` }, signal: AbortSignal.timeout(900),
     });
     const health = await response.json() as { ok?: boolean; product?: string };
-    if (response.ok && health.ok && health.product === 'EnoughFactory') return candidate;
+    healthy = response.ok && Boolean(health.ok) && health.product === 'EnoughFactory';
   } catch { /* A stale connection is replaced only after readiness is checked. */ }
+  if (!healthy) return;
+  if (requireManagedRuntime) {
+    const response = await fetch(`${candidate.url}/api/runtime`, {
+      headers: { Authorization: `Bearer ${candidate.token}` }, signal: AbortSignal.timeout(20_000),
+    });
+    if (response.status === 404 || response.status === 405) throw new Error('[DEVICE_SERVICE_UPDATE_REQUIRED] Update the device service to use EnoughFactory’s private runtime. Existing environments and work records are retained.');
+    if (!response.ok) throw new Error('The running device service could not inspect its private runtime. Its details are in the device log.');
+    const runtime = await response.json() as { kind?: string; dataDirectory?: string; socketPath?: string };
+    if (!response.ok || !['lima', 'rootless'].includes(runtime.kind ?? '') || runtime.dataDirectory !== resolve(dataDirectory) || typeof runtime.socketPath !== 'string' || !runtime.socketPath.startsWith('/') || runtime.socketPath === '/var/run/docker.sock') {
+      throw new Error('[DEVICE_SERVICE_UPDATE_REQUIRED] Update the device service to use EnoughFactory’s private runtime. Existing environments and work records are retained.');
+    }
+  }
+  return candidate;
 }
 
 async function serviceResources(): Promise<string> {
@@ -119,6 +134,39 @@ function getConnection(): Promise<Connection> {
   return connectionPromise;
 }
 
+async function servicePortOpen(connection: Connection): Promise<boolean> {
+  const url = new URL(connection.url);
+  return await new Promise<boolean>(resolveOpen => {
+    const socket = createConnection({ host: url.hostname, port: Number(url.port || 80) });
+    let finished = false;
+    const finish = (open: boolean) => { if (finished) return; finished = true; socket.destroy(); resolveOpen(open); };
+    socket.once('connect', () => finish(true));
+    socket.once('error', () => finish(false));
+    socket.setTimeout(700, () => finish(true));
+  });
+}
+
+function restartDeviceService(): Promise<Connection> {
+  if (connectionPromise) return connectionPromise;
+  connectionPromise = (async () => {
+    await closePreview();
+    const existing = await availableConnection(false);
+    if (existing) {
+      const response = await fetch(`${existing.url}/api/service/shutdown`, {
+        method: 'POST', headers: { Authorization: `Bearer ${existing.token}` }, signal: AbortSignal.timeout(20_000),
+      });
+      if (!response.ok) throw new Error('The older device service could not stop. Stop it before updating EnoughFactory.');
+      const deadline = Date.now() + 20_000;
+      while (await servicePortOpen(existing)) {
+        if (Date.now() >= deadline) throw new Error('The prior device service is still stopping. Try the update again after it exits.');
+        await new Promise(resolveWait => setTimeout(resolveWait, 250));
+      }
+    }
+    return await startOrConnectService();
+  })().finally(() => { connectionPromise = undefined; });
+  return connectionPromise;
+}
+
 function assertFactorySender(event: IpcMainInvokeEvent): void {
   if (!mainWindow || event.sender !== mainWindow.webContents || event.senderFrame !== mainWindow.webContents.mainFrame) throw new Error('This operation belongs to the EnoughFactory workbench.');
   const address = event.senderFrame?.url;
@@ -144,7 +192,8 @@ function previewBounds(value: unknown, owner: BrowserWindow): Rectangle {
 }
 
 async function deviceRequest<T>(path: string, method: string, body?: unknown, timeout = 15_000): Promise<T> {
-  const connection = method === 'DELETE' && path.startsWith('/api/previews/') ? readConnection() : await getConnection();
+  const connection = path === '/api/service/shutdown' ? await availableConnection(false)
+    : method === 'DELETE' && path.startsWith('/api/previews/') ? readConnection() : await getConnection();
   if (!connection) throw new Error('The device service is unavailable.');
   const response = await fetch(`${connection.url}${path}`, {
     method, headers: { Authorization: `Bearer ${connection.token}`, 'Content-Type': 'application/json' },
@@ -277,6 +326,7 @@ function createWindow(): void {
 
 function installBridge(): void {
   ipcMain.handle('factory:connection', async event => { assertFactorySender(event); const { url, token } = await getConnection(); return { url, token }; });
+  ipcMain.handle('factory:service-restart', async event => { assertFactorySender(event); const { url, token } = await restartDeviceService(); return { url, token }; });
   ipcMain.handle('factory:directory', async event => {
     assertFactorySender(event);
     const result = await dialog.showOpenDialog(mainWindow!, { title: 'Choose a project repository', properties: ['openDirectory', 'createDirectory'] });

@@ -5,6 +5,7 @@ Read `docs/build-plan.md` before product implementation. It records the agreed s
 ## Product and sequence
 
 - Build the shared React/EnoughUI web app with Electron desktop bundles and an independent Mac/Linux device service. Windows is optional.
+- Bundle an EnoughFactory-owned container runtime with a private Docker socket, configuration and storage. Do not rely on the user's Docker installation or mutate their contexts, daemon, images or volumes. Runtime lifecycle belongs to the device service.
 - Begin with a polished, functional envmux workbench. Continue through agent execution/policy, connected devices, coordinated work, autonomous goals and product distribution in that order.
 - A request to build the full product covers every layer. Do not stop after the workbench, a demo change or a research spike. Do not ask for approval between layers.
 - Extend one coherent interface throughout. Implement real loading, error, offline and intervention behavior alongside each capability.

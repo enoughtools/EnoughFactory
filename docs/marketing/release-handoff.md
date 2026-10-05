@@ -23,9 +23,13 @@ The local preview runs at `http://127.0.0.1:4174`. The site can also be hosted a
 node release/marketing/prepare-release.mjs /absolute/path/to/release-specification.json
 ```
 
-The specification contains `product`, `version`, `status`, the actual public `sourceUrl`, and an `artifacts` array. Each artifact supplies its local `path`, `platform` (`darwin` or `linux`), `arch` (`arm64` or `x64`), `format`, accurate `signing` (`signed` or `unsigned`), and an optional HTTPS `url` for its published download. Paths are relative to the specification file.
+The specification contains `product`, `version`, `status`, the actual public `sourceUrl`, and an `artifacts` array. Each artifact supplies its local `path`, `platform` (`darwin` or `linux`), `arch` (`arm64` or `x64`), `format`, accurate `signing` (`unsigned` for the initial packages), an actual extracted-package `verificationPath`, and an optional HTTPS `url` for its published download. Paths are relative to the specification file. An optional `sourceCommit` must match every package receipt. The format must match the filename and actual extraction record. Signed catalog claims require native signing verification to be implemented first.
 
 The preparation step hashes actual nonempty local files, records their sizes and checks any supplied checksum. A published catalog requires Apple Silicon Mac, Linux x64 and Linux ARM64 packages, an accessible source repository and external downloads whose actual contents match the local artifacts. Files larger than 25 MiB need a real external release URL because they exceed the Workers individual asset limit. Small local downloads can be copied into the site. [Workers asset limits](https://developers.cloudflare.com/workers/platform/limits/#static-assets).
+
+Each published archive also requires its actual native verification receipt. Generate it with `scripts/check-desktop-archive.mjs` after packaging. The receipt binds the extracted archive’s exact digest to verified installed resource hashes, native runtimes, the private engine’s pinned assets and an actual platform runtime journey. The journey must match the archive’s bundle provenance, runtime assets, envmux executable and release source commit. Receipts for prepared folders or another archive do not satisfy this check.
+
+The catalog links a public package verification record beside each checksum. Its public copy omits the runtime journey’s local proof-directory path. All packages must match one publicly accessible source commit. Keep the catalog in `preparing` until the archive and runtime evidence are available; source implementation alone does not establish a shipped runtime.
 
 Rebuild the site after updating the manifest. The prerendered download page and embedded initial state will then match the release catalog.
 
@@ -51,7 +55,7 @@ Use the release command after the complete product release and its published cat
 pnpm --filter @enoughfactory/marketing deploy
 ```
 
-It rebuilds the marketing pages, stages the real browser application, deploys with authenticated Wrangler and checks the public routes and release version. Verify the browser’s actual connection journey and packages as well. Record the deployed version and checksums with the release.
+It revalidates every public package receipt and its runtime journey against the catalog, rebuilds the marketing pages, stages the real browser application, deploys with authenticated Wrangler and checks the public routes and release version. Verify the browser’s actual connection journey and packages as well. Record the deployed version and checksums with the release.
 
 ## Verified access on October 5 2026
 

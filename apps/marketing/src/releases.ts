@@ -7,6 +7,7 @@ export interface ReleaseArtifact {
   sha256: string;
   bytes: number;
   signing: 'signed' | 'unsigned';
+  verificationUrl?: string;
 }
 
 export interface ReleaseManifest {
@@ -16,6 +17,7 @@ export interface ReleaseManifest {
   status: 'preparing' | 'published';
   publishedAt: string | null;
   sourceUrl: string | null;
+  sourceCommit?: string;
   artifacts: ReleaseArtifact[];
 }
 
@@ -36,9 +38,10 @@ export function parseReleaseManifest(value: unknown): ReleaseManifest {
     if (!['darwin', 'linux'].includes(artifact.platform) || !['arm64', 'x64'].includes(artifact.arch) || !isPublicLink(artifact.url) || !/^[a-f0-9]{64}$/.test(artifact.sha256) || !Number.isSafeInteger(artifact.bytes) || artifact.bytes <= 0 || !['signed', 'unsigned'].includes(artifact.signing)) {
       throw new Error('A release download could not be verified.');
     }
+    if (artifact.verificationUrl !== undefined && !isPublicLink(artifact.verificationUrl)) throw new Error('The package verification record is unavailable.');
   }
   if (manifest.sourceUrl !== null && !isPublicLink(manifest.sourceUrl)) throw new Error('The source address is unavailable.');
-  if (manifest.status === 'published' && (manifest.artifacts.length === 0 || !manifest.publishedAt || !manifest.sourceUrl)) throw new Error('The release is not ready to download.');
+  if (manifest.status === 'published' && (manifest.artifacts.length === 0 || !manifest.publishedAt || !manifest.sourceUrl || !/^[a-f0-9]{40}$/.test(manifest.sourceCommit ?? '') || manifest.artifacts.some(artifact => !artifact.verificationUrl))) throw new Error('The release is not ready to download.');
   return manifest as ReleaseManifest;
 }
 

@@ -9,6 +9,7 @@ The first deliverable is the envmux workbench. A future instruction to build the
 - React and EnoughUI supply the shared web interface. Electron is the desktop shell. Mac and Linux are required; Windows is optional.
 - A small device service owns environments, runtime connections and device-local history. Window lifetime does not own execution lifetime.
 - Envmux supplies the first environment engine. Start with a pinned, narrowly patched release; preserve its MIT notices and keep the adapter replaceable.
+- EnoughFactory owns its container runtime. Bundle the OSS host tools and Docker Engine with a private socket, configuration, images, volumes and storage. On Mac, use a private Lima VM with Apple virtualization; on Linux, use a dedicated rootless engine. The product must not use the user's default Docker socket, change Docker contexts or take over an existing daemon. Report host prerequisites and workspace-provider capabilities explicitly.
 - Agent processes receive full filesystem, process and network access inside their containers. Root access and tool installation are available there. Do not substitute a restricted runtime sandbox or a provider's automatic reviewer for this mode.
 - Enough owns approval policy. Approve all is the initial factory setting; selective rules and manual review are available choices. Approval policy and autonomy are separate controls.
 - WebRTC is the preferred remote transport. Local connections use the same application protocol without WebRTC. Self-hosted signaling and relay services support remote connectivity.
@@ -43,6 +44,10 @@ Use EnoughUI's paper/ink surfaces, fine rules, square geometry and existing typo
 ### Runtime integration
 
 The device service initially acts as a thin envmux bridge. It owns session processes and brokers the existing state API, event streams, task output and terminal connections. Its small catalog holds project paths, display preferences and references to sessions. Envmux remains the authority for environment state; there is no goal scheduler or duplicate task ledger at this layer.
+
+The device service also starts and recovers the private container runtime. Every envmux, agent, workspace and check operation receives its explicit owned endpoint and bundled client. Missing runtime assets or an unavailable private socket produce a setup state; they must never fall back to the user's Docker. The UI shows preparation, readiness, resource limits, failure details and explicit start/stop actions. Stopping the runtime while environments are active requires an explicit stop-environments action. Closing a window leaves the runtime and work running.
+
+Keep Mac VM host shares limited to EnoughFactory-owned workspace and runtime directories; ordinary repository import and returned Git work remain host operations. The initial pinned guest OS image may be fetched on first start with verified digests and visible progress. Linux rootless setup uses its own engine and socket while retaining root permissions inside containers; any host UID-mapping prerequisites are explained in setup. ArtifactFS requires its trusted mount manager: enable it only on runtimes verified to support those mounts, and retain ordinary Git workspaces on other runtimes.
 
 Envmux already exposes state/events, task output/logs, task controls, session controls, agents, chat and a shell WebSocket. The shared React client uses a typed Enough interface over those operations, rather than embedding the old portal as the product UI. Desktop native operations go through a narrow preload bridge; the web client connects to the device service's authenticated local API. [Existing portal routes](https://github.com/envmux/envmux/blob/38914dd0fb49682a062dc17eb3427f6b4f27c5fe/src/Envmux/Portal/PortalHost.cs#L265).
 
@@ -183,7 +188,7 @@ Completion comes from the goal's configured criteria. Time, spend and concurrenc
 
 Finish the product across the same web client, Electron bundles and headless device service. Required distribution targets are Apple Silicon Mac and Linux x64/ARM64; add Intel Mac where the chosen bundled dependencies support it. Windows remains optional.
 
-Ship onboarding for runtime detection, repository setup, provider connection, device pairing and a first session/goal. Bundle the required application runtimes and fonts so users do not need development SDKs to open the app. Support existing Docker-compatible engines, including the OSS Colima/Lima route on Mac. Expose useful connection, session and agent diagnostics in the app.
+Ship onboarding for the bundled private runtime, repository setup, provider connection, device pairing and a first session/goal. Bundle the required application runtimes and fonts so users do not need development SDKs or their own Docker installation to open the app. Package Mac Lima/virtualization and Linux rootless engine assets with pinned provenance and required notices. Expose useful connection, session and agent diagnostics in the app.
 
 Provide install/service startup and removal, versioned migrations, release provenance, dependency notices, contributor setup, example projects and self-hosted signaling/TURN instructions. Signing and notarization use available credentials; otherwise label the unsigned build accurately. Define an explicit OSS license for Enough code and retain envmux, EnoughUI and other upstream notices.
 
@@ -201,6 +206,7 @@ Use one TypeScript workspace for the React application, Electron shell, device s
 | packages/contracts | Typed requests, events and identifiers |
 | packages/envmux | Engine lifecycle/API adapter |
 | packages/agents | Codex, Antigravity and compatible runtime adapters |
+| packages/runtime | Owned container engine, private socket, lifecycle and bundled runtime assets |
 | packages/factory | Coordination and autonomy introduced in Layers 4 and 5 |
 | packages/workspaces | Git and ArtifactFS workspace providers |
 | services/signaling | Self-hosted peer negotiation and presence |

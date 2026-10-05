@@ -4,7 +4,7 @@
 
 EnoughFactory brings isolated development environments, agent conversations and autonomous goals into one desktop workspace. Run it on your Mac and Linux machines, connect the devices you own, and give the factory an outcome to work toward.
 
-The shared React interface uses [EnoughUI](https://github.com/enoughtools/enough-ui). Electron provides desktop integration; an independent device service keeps environments, agent connections and coordination running after the window closes. The environment engine is a pinned, narrowly patched [envmux](https://github.com/envmux/envmux).
+The shared React interface uses [EnoughUI](https://github.com/enoughtools/enough-ui). Electron provides desktop integration; an independent device service keeps environments, agent connections and coordination running after the window closes. EnoughFactory owns its container runtime: a private Lima VM on Mac and a private rootless Docker Engine on Linux. The environment engine is a pinned, narrowly patched [envmux](https://github.com/envmux/envmux).
 
 ## What it does
 
@@ -20,18 +20,19 @@ Chats stay on their owning device. If that device is offline, its conversations 
 
 ## Run from source
 
-You need Node 22.14 or newer, pnpm **10.34.5**, Git, the **.NET 10 SDK**, and a running Docker-compatible engine. Docker Engine works on Linux; Docker Desktop or Colima/Lima works on Mac. The application does not install a container engine for you.
+Source builds need Node 22.14 or newer, pnpm **10.34.5**, Git and the **.NET 10 SDK**. Desktop distributions bundle their application and container-runtime tools; Mac includes its pinned guest OS image and uses Apple virtualization. Linux needs the host's user-namespace and UID-mapping prerequisites described in [installation](docs/install.md#linux-runtime-prerequisites). An existing Docker installation is not required.
 
 ```sh
 git clone https://github.com/enoughtools/EnoughFactory.git
 cd EnoughFactory
 pnpm install --frozen-lockfile
 pnpm --filter @enoughfactory/envmux build:engine
+node scripts/prepare-container-runtime.mjs
 pnpm build
 pnpm desktop
 ```
 
-The desktop starts or reconnects to your local device service. Add a Git repository, create an environment, and connect the selected agent's credentials in that environment. The service stores local state under `~/.enoughfactory` by default.
+The desktop starts or reconnects to your local device service. Prepare and start the private container runtime, add a Git repository, create an environment, and connect the selected agent's credentials in that environment. The service stores local state under `~/.enoughfactory` by default. Asset preparation verifies pinned archive digests and does not invoke a host Docker daemon.
 
 For live interface development, run `pnpm dev`, then `pnpm --filter @enoughfactory/desktop dev` in another terminal. This starts the device service on port 4317 and Vite on port 4318. See [installation and first use](docs/install.md) for browser connections, startup service installation and removal.
 

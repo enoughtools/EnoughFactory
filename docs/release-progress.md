@@ -41,3 +41,13 @@ The release owner should append authoritative command results, artifact URLs, si
 - The distribution notice was prepared from contributing production bundle modules and native runtime resources. It preserves full texts for the embedded JavaScript, .NET, native WebRTC, fonts and upstream components, including MPL source availability. Final artifacts must retain it alongside Electron's Chromium and Node's complete original notices.
 
 These entries reflect the integration owners' actual completed observations at assembly time. The complete factory journey, per-platform packaged desktop checks and public deployment/download checks are tracked independently.
+
+## Owned-runtime scope update
+
+The product now requires EnoughFactory's own container engine, private socket, configuration and storage. Existing Docker installations are not a prerequisite or fallback. Mac uses bundled Lima 2.2.1 with Apple virtualization and Docker 29.8.2; Linux uses bundled Docker 29.8.2 plus rootless extras. [Pinned inputs](../runtime/container/pins.json) include architecture-specific archive digests and Ubuntu 24.04 cloud image digests. The Mac archive includes the pinned OS image; first start creates a private writable VM disk from it.
+
+Earlier Mac archives and factory journeys were produced before this owned-runtime requirement. They remain useful evidence for their tested code paths, but are not release artifacts or proof of the new execution boundary. The assembled factory journey is recorded in [product-journey.md](verification/product-journey.md); it must be exercised against the owned runtime for final release evidence.
+
+Required additional evidence is tracked explicitly: bundled asset/provenance/license inspection, complete source companions for redistributed operating-system packages and relink materials for linked LGPL libraries; private engine start, recovery and stop; ordinary source/agent/check work through its endpoint; no mutation or fallback to existing Docker state; Mac ArtifactFS behavior; Linux rootless host prerequisites and visible compatible Git fallback; and rebuilt Mac/Linux desktop bundles. Website/download publication follows those actual artifacts and verified URLs.
+
+The [private Linux runtime evidence](verification/private-linux-runtime.json) records a real ARM64 Linux run in the application-owned VM: root writes inside containers, private socket and data root, envmux source retention, engine restart and volume retention, and an unchanged user's Docker configuration. This establishes the Linux runtime behavior on that host; it does not substitute for a packaged Linux desktop check or final source-build runtime checks.

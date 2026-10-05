@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { cleanup } from 'node-datachannel';
-import { PeerManager } from '../src/index.js';
+import { PeerManager, bridgePeerStreams } from '../src/index.js';
 import { createSignalingService, configFromEnvironment } from '../../../services/signaling/src/server.ts';
 after(()=>cleanup());
 const delay=(ms:number)=>new Promise(resolve=>setTimeout(resolve,ms));
@@ -16,7 +16,8 @@ test('Clean stream EOF follows final RTC bytes and targeted events reach only th
   const signaling=createSignalingService(configFromEnvironment({PORT:'0',ENOUGH_SIGNALING_HOST:'127.0.0.1',STUN_URLS:''}));
   const address=await signaling.listen();const signalingUrl=`ws://127.0.0.1:${address.port}/ws`;
   const payload=randomBytes(512*1024);const receivedByB:unknown[]=[];const receivedByC:unknown[]=[];
-  const a=await PeerManager.create({dataDir:join(directory,'a'),name:'Coordinator',signalingUrl,transport:'webrtc'});
+  const a:PeerManager=await PeerManager.create({dataDir:join(directory,'a'),name:'Coordinator',signalingUrl,transport:'webrtc',
+    onStreamOpen:async(_id,options,stream):Promise<void>=>{bridgePeerStreams(stream,await a.openStream(b.localDevice.id,options));}});
   const b=await PeerManager.create({dataDir:join(directory,'b'),name:'Worker',signalingUrl,transport:'webrtc',onEvent:(_id,event)=>receivedByB.push(event),
     onStreamOpen:(_id,_options,stream)=> {stream.once('data',()=>{void stream.send(payload).then(()=>stream.close(undefined,'events'));});}});
   const c=await PeerManager.create({dataDir:join(directory,'c'),name:'Other worker',signalingUrl,transport:'webrtc',onEvent:(_id,event)=>receivedByC.push(event)});
@@ -28,6 +29,11 @@ test('Clean stream EOF follows final RTC bytes and targeted events reach only th
     const ended=new Promise<void>((resolve,reject)=>stream.once('end',error=>error?reject(new Error(error)):resolve()));
     await stream.send('finish');await ended;
     assert.deepEqual(Buffer.concat(parts),payload,'EOF must not overtake data on its ordered event channel');
+    const nested=await c.openStream(a.localDevice.id,{kind:'terminal',path:'/nested-final-output'});
+    const nestedParts:Buffer[]=[];nested.on('data',(bytes:Buffer)=>nestedParts.push(bytes));
+    const nestedEnded=new Promise<void>((resolve,reject)=>nested.once('end',error=>error?reject(new Error(error)):resolve()));
+    await nested.send('finish');await nestedEnded;
+    assert.deepEqual(Buffer.concat(nestedParts),payload,'Coordinator proxy must flush worker bytes before clean EOF');
     await a.publishTo(b.localDevice.id,'state',{revision:4},91);await until(()=>receivedByB.length===1);await delay(50);
     assert.deepEqual(receivedByB,[{v:1,type:'event',topic:'state',cursor:91,data:{revision:4}}]);assert.equal(receivedByC.length,0);
   }finally{await Promise.all([a.stop(),b.stop(),c.stop()]);await signaling.close();await rm(directory,{recursive:true,force:true});}

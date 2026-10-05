@@ -140,6 +140,7 @@ internal static class DockerEndpoint
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
             };
+            MachineBridge.PrepareChild(info);
             // A framework-dependent invocation runs inside dotnet, whose first
             // argument must be this assembly rather than the subcommand.
             if (string.Equals(Path.GetFileNameWithoutExtension(exe), "dotnet", StringComparison.OrdinalIgnoreCase))

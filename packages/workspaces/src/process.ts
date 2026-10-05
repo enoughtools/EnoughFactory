@@ -2,9 +2,9 @@ import { spawn } from "node:child_process";
 
 export interface ProcessOutput { exitCode: number; stdout: string; stderr: string; timedOut: boolean }
 
-export async function run(file: string, args: string[], options: { cwd?: string; timeoutMs?: number; signal?: AbortSignal; env?: NodeJS.ProcessEnv } = {}): Promise<ProcessOutput> {
+export async function run(file: string, args: string[], options: { cwd?: string; timeoutMs?: number; signal?: AbortSignal; env?: NodeJS.ProcessEnv; inheritEnv?: boolean } = {}): Promise<ProcessOutput> {
   return new Promise((resolve, reject) => {
-    const child = spawn(file, args, { cwd: options.cwd, env: { ...process.env, ...options.env }, stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(file, args, { cwd: options.cwd, env: options.inheritEnv === false ? options.env : { ...process.env, ...options.env }, stdio: ["ignore", "pipe", "pipe"] });
     let stdout = "", stderr = "", timedOut = false;
     // Evidence stays bounded; commands can create larger files as separate artifacts.
     const limit = 8 * 1024 * 1024;

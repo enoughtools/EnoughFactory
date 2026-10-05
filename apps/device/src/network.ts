@@ -7,7 +7,7 @@ import type { Approval, Attempt, Chat, Device, FactoryState, FactoryTask, Goal, 
 import { DeviceApp, type ApiCall } from './app.ts';
 import { HttpError, now } from './util.ts';
 
-type Catalog = Pick<FactoryState,'projects'|'sessions'|'chats'|'goals'|'tasks'|'attempts'> & { id: string; updatedAt: string };
+type Catalog = Pick<FactoryState,'projects'|'sessions'|'chats'|'goals'|'tasks'|'attempts'> & { id: string; updatedAt: string; capacity?: number };
 type Packet = Record<string,unknown>;
 const maxStreamBuffer = 1024 * 1024;
 
@@ -18,7 +18,7 @@ function records<T>(value: unknown, predicate: (item: Record<string,unknown>)=>b
   return Array.isArray(value) ? value.filter(item=>predicate(object(item))).slice(0,10000) as T[] : [];
 }
 function publicCatalog(app: DeviceApp): Catalog {
-  return { id:app.device.id,updatedAt:now(),projects:app.store.list<Project>('projects').filter(project=>!project.internal),
+  return { id:app.device.id,updatedAt:now(),capacity:app.device.capacity,projects:app.store.list<Project>('projects').filter(project=>!project.internal),
     sessions:app.store.list<Session>('sessions').map(({enginePid,...session})=>session),
     chats:app.store.list<Chat>('chats').map(({threadId,...chat})=>chat),
     goals:app.store.list<Goal>('goals').filter(goal=>goal.coordinatorId===app.device.id),
@@ -37,7 +37,8 @@ function receiveCatalog(peerId: string, value: unknown): Catalog {
   const tasks=records<FactoryTask>(data.tasks,item=>typeof item.id==='string'&&goalIds.has(String(item.goalId)));
   const taskIds=new Set(tasks.map(task=>task.id));
   const attempts=records<Attempt>(data.attempts,item=>typeof item.id==='string'&&taskIds.has(String(item.taskId)));
-  return {id:peerId,updatedAt:now(),projects,sessions,chats,goals,tasks,attempts};
+  const capacity=Number(data.capacity??object(data.device).capacity);
+  return {id:peerId,updatedAt:now(),...(Number.isInteger(capacity)&&capacity>=0&&capacity<=64?{capacity}:{}),projects,sessions,chats,goals,tasks,attempts};
 }
 function iceServers(settings: Settings): IceServer[] {
   return settings.turnUrls?.length ? [{urls:settings.turnUrls,username:settings.turnUsername,credential:settings.turnCredential}] : [];
@@ -120,7 +121,8 @@ export async function initializeNetwork(app: DeviceApp): Promise<{
     ...publicCatalog(app),approvals:app.store.list('approvals'),diagnostics:app.diagnostics,
     settings:{...app.settings,turnCredential:undefined}});
   const saveCatalog=(peerId:string,value:unknown)=>{
-    const catalog=receiveCatalog(peerId,value);remoteCatalogs.set(peerId,catalog);app.store.set('remote-catalog',catalog);app.changed();
+    const catalog=receiveCatalog(peerId,value);remoteCatalogs.set(peerId,catalog);app.store.set('remote-catalog',catalog);
+    if(catalog.capacity!==undefined)app.devices=app.devices.map(device=>device.id===peerId?{...device,capacity:device.platform==='browser'?0:catalog.capacity}:device);app.changed();
   };
   const browserEvent=(topic:string,data:unknown,cursor?:number)=>{for(const device of app.devices)if(device.platform==='browser'&&device.online)void peers.publishTo(device.id,topic,data,cursor).catch(()=>{});};
   const refreshPeer=async(peerId:string)=>{
@@ -162,9 +164,11 @@ export async function initializeNetwork(app: DeviceApp): Promise<{
   const request=async(peerId:string,rpc:RpcRequest):Promise<RpcResponse>=>{
     try{
       const url=new URL(rpc.path,'http://enoughfactory.local');
-      if(url.origin!=='http://enoughfactory.local'||!['GET','POST','PATCH','DELETE'].includes(rpc.method))throw new HttpError(400,'Invalid peer operation.');
+      if(url.origin!=='http://enoughfactory.local'||!['GET','POST','PUT','PATCH','DELETE'].includes(rpc.method))throw new HttpError(400,'Invalid peer operation.');
       if(rpc.method==='GET'&&url.pathname==='/api/state')return {v:1,id:rpc.id,status:200,body:url.searchParams.get('local')==='1'?localState():app.state()};
-      if(!/^\/api\/(health|diagnostics|projects|sessions|chats|approvals|goals|tasks|attempts|artifacts)(?:\/|$)/.test(url.pathname)&&!url.pathname.startsWith('/api/factory/worker/'))throw new HttpError(403,'This operation is private to its device.');
+      const controller=peers.devices().find(device=>device.id===peerId)?.platform==='browser';
+      const controllerRoute=controller&&(/^\/api\/(settings|devices|previews|runtime)(?:\/|$)/.test(url.pathname)||url.pathname==='/api/service/shutdown');
+      if(!controllerRoute&&!/^\/api\/(health|diagnostics|projects|sessions|chats|approvals|goals|tasks|attempts|artifacts)(?:\/|$)/.test(url.pathname)&&!url.pathname.startsWith('/api/factory/worker/'))throw new HttpError(403,'This operation is private to its device.');
       if(url.pathname.endsWith('/preview')||url.pathname.endsWith('/desktop-preview'))throw new HttpError(403,'Preview grants are issued by the viewing device.');
       const call:ApiCall={method:rpc.method,url,body:object(rpc.body),peerId};
       if(rpc.method==='POST'&&url.pathname.endsWith('/browser-preview'))return {v:1,id:rpc.id,status:200,body:await createPreview(call)};
@@ -176,10 +180,10 @@ export async function initializeNetwork(app: DeviceApp): Promise<{
     iceServers:iceServers(app.settings),relayFallback:true,onRequest:request,
     onDevices(devices){
       const old=new Map(app.devices.map(device=>[device.id,device.online]));
-      app.devices=devices.map(device=>device.local?{...app.device,...device,capacity:app.device.capacity}:device.platform==='browser'?{...device,capacity:0}:device);
+      app.devices=devices.map(device=>device.local?{...app.device,...device,capacity:app.device.capacity}:device.platform==='browser'?{...device,capacity:0}:{...device,capacity:remoteCatalogs.get(device.id)?.capacity??device.capacity});
       const paired=new Set(devices.filter(device=>!device.local).map(device=>device.id));
       for(const peerId of remoteCatalogs.keys())if(!paired.has(peerId)){remoteCatalogs.delete(peerId);app.store.delete('remote-catalog',peerId);liveApprovals.delete(peerId);}
-      for(const device of devices){if(!device.online)liveApprovals.delete(device.id);else if(!device.local&&!old.get(device.id))void refreshPeer(device.id);}
+      for(const device of devices){if(!device.online)liveApprovals.delete(device.id);else if(!device.local&&device.platform!=='browser'&&!old.get(device.id))void refreshPeer(device.id);}
       app.changed();
     },
     onEvent(peerId,event){
@@ -210,7 +214,7 @@ export async function initializeNetwork(app: DeviceApp): Promise<{
   });
   // Replace the provisional install ID before creating any environments and migrate
   // existing owner references once. The signing identity survives window/service restarts.
-  const previousId=app.device.id;const device={...peers.localDevice,capacity:app.device.capacity||2};
+  const previousId=app.device.id;const device={...peers.localDevice,capacity:app.device.capacity??2};
   if(previousId!==device.id)app.store.transaction(()=>{
     for(const bucket of ['projects','sessions','chats','tasks','attempts'])for(const saved of app.store.list<Record<string,unknown>&{id:string}>(bucket))if(saved.deviceId===previousId)app.store.set(bucket,{...saved,deviceId:device.id});
     for(const goal of app.store.list<Goal>('goals'))if(goal.coordinatorId===previousId)app.store.set('goals',{...goal,coordinatorId:device.id});
@@ -274,27 +278,38 @@ export async function initializeNetwork(app: DeviceApp): Promise<{
     }else if(!['network-error','peer-artifact'].includes(topic))void peers.publish(topic,data);
   };
   app.listeners.add(listener);
-  const timer=setInterval(()=>{for(const device of app.devices)if(!device.local&&device.online)void refreshPeer(device.id);},30000);timer.unref();
+  const timer=setInterval(()=>{for(const device of app.devices)if(!device.local&&device.platform!=='browser'&&device.online)void refreshPeer(device.id);},30000);timer.unref();
   app.closers.push(async()=>{closed=true;clearInterval(timer);app.listeners.delete(listener);await configureChain;await gateway.close();await peers.stop();});
   await peers.start();app.changed();
   return {peers,gateway,async connectTerminal(sessionId,url,client){
     const deviceId=catalogOwner('sessions',sessionId);if(!deviceId||deviceId===app.device.id)return false;
+    let stream:PeerStream|undefined;let detach:(()=>void)|undefined;let ready=false;let inputBytes=0;let inputChain=Promise.resolve();
+    const pending:Packet[]=[];
+    const fail=(error:Error)=>{if(client.readyState===WebSocket.OPEN)client.send(JSON.stringify({type:'error',data:error.message}));client.close();stream?.close(error.message);};
+    const sendInput=(packet:Packet)=>{const size=Buffer.byteLength(JSON.stringify(packet));
+      inputChain=inputChain.then(()=>sendPacket(stream!,packet)).catch(fail).finally(()=>{inputBytes-=size;});};
+    // Resize and input can arrive as soon as the local socket opens, before RTC
+    // and the owning terminal are ready. Preserve their order through attachment.
+    client.on('message',(data,binary)=>{
+      let packet:Packet;try{packet=binary?{type:'input',data:data.toString()}:object(JSON.parse(data.toString()));terminalInput(packet);}catch{packet={type:'input',data:data.toString()};}
+      inputBytes+=Buffer.byteLength(JSON.stringify(packet));if(inputBytes>maxStreamBuffer){fail(new Error('Terminal input queue is full'));return;}
+      if(ready)sendInput(packet);else pending.push(packet);
+    });
+    client.on('close',()=>{detach?.();stream?.close();pending.length=0;});client.on('error',()=>stream?.close());
     try{requireOnline(app,deviceId);const terminalId=url.searchParams.get('terminalId')||'main';
-      const stream=await peers.openStream(deviceId,{kind:'terminal',path:`/api/sessions/${encodeURIComponent(sessionId)}/terminal`,
+      stream=await peers.openStream(deviceId,{kind:'terminal',path:`/api/sessions/${encodeURIComponent(sessionId)}/terminal`,
         body:{terminalId,cols:Number(url.searchParams.get('cols')||80),rows:Number(url.searchParams.get('rows')||24)},cursor:Number(url.searchParams.get('cursor')||0)});
-      let cursor=Number(url.searchParams.get('cursor')||0);const detach=parsePackets(stream,packet=>{
+      if(client.readyState!==WebSocket.OPEN){stream.close();return true;}
+      let cursor=Number(url.searchParams.get('cursor')||0);detach=parsePackets(stream,packet=>{
         if(packet.type==='output'){const sequence=Number(packet.cursor||0);if(sequence&&sequence<=cursor)return;cursor=sequence||cursor;
-          if(client.bufferedAmount>maxStreamBuffer){stream.close('Terminal viewer fell behind');client.close(1013,'Terminal viewer fell behind');return;}
+          if(client.bufferedAmount>maxStreamBuffer){stream!.close('Terminal viewer fell behind');client.close(1013,'Terminal viewer fell behind');return;}
           if(client.readyState===WebSocket.OPEN)client.send(JSON.stringify(packet));}
         else if(packet.type==='error'&&client.readyState===WebSocket.OPEN)client.send(JSON.stringify(packet));
       });
-      client.on('message',(data,binary)=>{
-        let packet:Packet;try{packet=binary?{type:'input',data:data.toString()}:object(JSON.parse(data.toString()));terminalInput(packet);}catch{packet={type:'input',data:data.toString()};}
-        void sendPacket(stream,packet).catch(error=>{if(client.readyState===WebSocket.OPEN)client.send(JSON.stringify({type:'error',data:error.message}));client.close();});});
-      client.on('close',()=>{detach();stream.close();});client.on('error',()=>stream.close());
       stream.on('end',(error?:string)=>{if(error&&client.readyState===WebSocket.OPEN)client.send(JSON.stringify({type:'error',data:error}));client.close();});
-      await sendPacket(stream,{type:'attach'});if(client.readyState!==WebSocket.OPEN)stream.close();
-    }catch(error){if(client.readyState===WebSocket.OPEN)client.send(JSON.stringify({type:'error',data:(error as Error).message}));client.close();}
+      await sendPacket(stream,{type:'attach'});for(const packet of pending.splice(0))sendInput(packet);ready=true;
+      if(client.readyState!==WebSocket.OPEN)stream.close();
+    }catch(error){fail(error as Error);}
     return true;
   }};
 }
@@ -303,14 +318,14 @@ async function serveTerminal(app:DeviceApp,sessionId:string,shellUrl:(terminalId
   const body=object(options.body);const terminalId=String(body.terminalId||'main');
   const url=new URL(shellUrl.call(app.sessions.get(sessionId),terminalId));
   for(const field of ['cols','rows'])if(Number(body[field])>0)url.searchParams.set(field,String(body[field]));
-  const socket=new WebSocket(url,{headers:shellHeaders.call(app.sessions.get(sessionId))});
+  const socket=new WebSocket(url,{headers:shellHeaders.call(app.sessions.get(sessionId)),handshakeTimeout:15000,maxPayload:maxStreamBuffer});
   let attached=false;let closePending=false;let queuedBytes=0;let sequence=Number(options.cursor||0);let sendChain=Promise.resolve();
-  const queue:Packet[]=[];
+  const queue:Packet[]=[];const attachTimeout=setTimeout(()=>{if(!attached)stream.close('Terminal viewer did not attach');},15000);attachTimeout.unref();
   const send=(packet:Packet)=>{const size=Buffer.byteLength(String(packet.data||''));
     sendChain=sendChain.then(()=>sendPacket(stream,packet)).catch(error=>{socket.close();stream.close(error.message);})
       .finally(()=>{queuedBytes-=size;if(queuedBytes<64*1024&&socket.readyState===WebSocket.OPEN)socket.resume();});};
   const detach=parsePackets(stream,packet=>{
-    if(packet.type==='attach'){attached=true;for(const item of queue.splice(0))send(item);if(closePending)finish();return;}
+    if(packet.type==='attach'){clearTimeout(attachTimeout);attached=true;for(const item of queue.splice(0))send(item);if(closePending)finish();return;}
     if(socket.readyState!==WebSocket.OPEN)throw new Error('Terminal is not connected');
     if(socket.bufferedAmount>maxStreamBuffer)throw new Error('Terminal input queue is full');
     socket.send(terminalInput(packet));
@@ -322,6 +337,6 @@ async function serveTerminal(app:DeviceApp,sessionId:string,shellUrl:(terminalId
   });
   function finish(){if(!attached){closePending=true;return;}void sendChain.finally(()=>stream.close(undefined,'events'));}
   socket.on('error',error=>stream.close(error.message));socket.on('close',finish);
-  stream.on('end',()=>{detach();socket.close();});
+  stream.on('end',()=>{clearTimeout(attachTimeout);detach();socket.close();});
   await new Promise<void>((resolve,reject)=>{socket.once('open',resolve);socket.once('error',reject);socket.once('close',()=>reject(new Error('Terminal closed before connecting')));});
 }

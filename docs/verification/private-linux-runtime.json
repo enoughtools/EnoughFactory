@@ -1,0 +1,29 @@
+{
+  "formatVersion": 1,
+  "product": "EnoughFactory",
+  "suite": "private-linux-runtime",
+  "status": "passed",
+  "startedAt": "2026-10-05T20:48:12.042Z",
+  "completedAt": "2026-10-05T20:48:56.156Z",
+  "platform": "linux",
+  "arch": "arm64",
+  "nodeVersion": "v22.22.0",
+  "dockerVersion": "29.8.2",
+  "runtimeProvenanceSha256": "71888d5adb609af9a3361a23e1a017707231d2bd88582e6fa72279d598f3bf5a",
+  "envmuxSha256": "33a0fb79e9b14b3770cd7375ef1ff80ed9a3d525bbd9286ef570598f21c4c7a6",
+  "checks": [
+    "private socket, labeled daemon and data root",
+    "rootless Engine 29.8.2",
+    "container uid0 and root filesystem writes",
+    "container reaches the device service host loopback bridge",
+    "container HTTP port forwarding",
+    "service reconnect adopts the existing owned engine",
+    "native envmux workbench readiness",
+    "native envmux full root execution",
+    "native envmux stop returns exact source commit",
+    "private engine stop and restart retain named volume contents",
+    "inherited user Docker context and TLS settings ignored",
+    "user Docker configuration unchanged"
+  ],
+  "proofDirectory": "/home/enoughfactory.guest/.cache/ef-gCgxDr"
+}

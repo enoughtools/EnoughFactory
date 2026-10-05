@@ -28,6 +28,11 @@ internal enum EngineTransport
 /// containers has a <c>docker_engine</c> pipe that is a different engine.
 /// </para>
 /// <para>
+/// EnoughFactory's managed mode instead requires its explicit private engine
+/// endpoint and never consults a backend record, ambient Docker settings,
+/// the user's context or a platform default.
+/// </para>
+/// <para>
 /// Not to be confused with <see cref="Envmux.Docker.ShimEndpoint"/>, which is
 /// the pipe envmux <em>serves</em> for VS Code. This is the one it dials.
 /// </para>
@@ -68,6 +73,17 @@ internal sealed record EngineEndpoint(EngineTransport Transport, string Address)
     /// <exception cref="DockerEngineException">An endpoint envmux cannot speak to, said plainly.</exception>
     public static EngineEndpoint Resolve(string? endpoint, Func<string, string?> environment, string home, bool windows)
     {
+        var managed = environment("ENVMUX_MANAGED_DOCKER");
+        if (!string.IsNullOrEmpty(managed))
+        {
+            if (managed != "1")
+            {
+                throw new DockerEngineException("ENVMUX_MANAGED_DOCKER must be 1 when EnoughFactory owns the engine; unset it for ordinary envmux resolution.");
+            }
+
+            return Managed(environment("ENVMUX_DOCKER_HOST"), windows);
+        }
+
         if (!string.IsNullOrWhiteSpace(endpoint))
         {
             return Parse(endpoint, "the configured endpoint");
@@ -91,6 +107,31 @@ internal sealed record EngineEndpoint(EngineTransport Transport, string Address)
         return windows
             ? new EngineEndpoint(EngineTransport.Pipe, DefaultPipe)
             : new EngineEndpoint(EngineTransport.Unix, DefaultSocket);
+    }
+
+    /// <summary>Read the required manager endpoint without Docker's fallback resolution.</summary>
+    private static EngineEndpoint Managed(string? endpoint, bool windows)
+    {
+        const string Scheme = "unix://";
+        if (windows)
+        {
+            throw new DockerEngineException("EnoughFactory's managed Docker engine currently requires Mac or Linux and an absolute unix socket.");
+        }
+
+        if (string.IsNullOrWhiteSpace(endpoint) || endpoint != endpoint.Trim() ||
+            !endpoint.StartsWith(Scheme, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new DockerEngineException("ENVMUX_DOCKER_HOST is required in managed mode and must name an absolute unix socket; Docker configuration and defaults are not used.");
+        }
+
+        var path = endpoint[Scheme.Length..];
+        if (!path.StartsWith('/') || path.Length < 2 || path.Any(char.IsControl) ||
+            path.Contains('?') || path.Contains('#') || path.Split('/').Skip(1).Any(part => part.Length == 0 || part is "." or ".."))
+        {
+            throw new DockerEngineException("ENVMUX_DOCKER_HOST must name an absolute, unambiguous unix socket path; managed mode has no default endpoint.");
+        }
+
+        return new EngineEndpoint(EngineTransport.Unix, path);
     }
 
     /// <summary>Read one <c>DOCKER_HOST</c>-shaped value.</summary>

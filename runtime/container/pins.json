@@ -1,0 +1,19 @@
+{
+  "formatVersion": 1,
+  "dockerVersion": "29.8.2",
+  "limaVersion": "2.2.1",
+  "archives": {
+    "docker-darwin-arm64": { "url": "https://download.docker.com/mac/static/stable/aarch64/docker-29.8.2.tgz", "sha256": "5ffa2bafbabe073470f0333f4a129599230b73d1170bb61146b3d9b08e1d1325" },
+    "docker-darwin-x64": { "url": "https://download.docker.com/mac/static/stable/x86_64/docker-29.8.2.tgz", "sha256": "384d9b259c1efd2265e6a0ff05512d5998035df0877053cb7763405caf17ca23" },
+    "docker-linux-x64": { "url": "https://download.docker.com/linux/static/stable/x86_64/docker-29.8.2.tgz", "sha256": "995d1ef289677f74fd58d8d2c35727b6a4ee389c69db8638a3e42d0487aa5b0f" },
+    "docker-linux-arm64": { "url": "https://download.docker.com/linux/static/stable/aarch64/docker-29.8.2.tgz", "sha256": "76a624e4a8e5da654d1150e808175125efb5a6f1b6aa1cbd9caee18f51047a50" },
+    "rootless-linux-x64": { "url": "https://download.docker.com/linux/static/stable/x86_64/docker-rootless-extras-29.8.2.tgz", "sha256": "707ebf6a5afd88104086e7b6749997b2366e816aeaf2c3ef2305b08fde9ee007" },
+    "rootless-linux-arm64": { "url": "https://download.docker.com/linux/static/stable/aarch64/docker-rootless-extras-29.8.2.tgz", "sha256": "f8f759dfeecb5bbe2c963232a1b9380e133f677dc0579263e4ca04c69f40aa47" },
+    "lima-darwin-arm64": { "url": "https://github.com/lima-vm/lima/releases/download/v2.2.1/lima-2.2.1-Darwin-arm64.tar.gz", "sha256": "9e9eacce88f37e185c346bad73aa6136f738d8cdf8c3bb23cd42b071824bc66e" },
+    "lima-darwin-x64": { "url": "https://github.com/lima-vm/lima/releases/download/v2.2.1/lima-2.2.1-Darwin-x86_64.tar.gz", "sha256": "6b776e4bc41f358e6ee01fefcc78e2eb26f11635a0fcff632234af77a566c6c4" }
+  },
+  "images": {
+    "arm64": { "url": "https://cloud-images.ubuntu.com/releases/noble/release-20260926/ubuntu-24.04-server-cloudimg-arm64.img", "sha256": "1d6bffe64b848468ac97f821d369a4846d983de1800ccf6b5ec8853e85cefc55", "arch": "aarch64" },
+    "x64": { "url": "https://cloud-images.ubuntu.com/releases/noble/release-20260926/ubuntu-24.04-server-cloudimg-amd64.img", "sha256": "6a81c37564db9b1ee84e141922625e1d7c5b389b99bb3c572e0243607d5bb4d2", "arch": "x86_64" }
+  }
+}

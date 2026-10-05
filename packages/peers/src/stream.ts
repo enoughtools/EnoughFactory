@@ -25,25 +25,32 @@ export class PeerStream extends EventEmitter {
 
 /** Proxy an enrolled worker's stream through its coordinator, retaining cursor metadata. */
 export function bridgePeerStreams(a: PeerStream,b: PeerStream):()=>void {
-  let closed=false;
+  let closed=false;let cleanSource:PeerStream|undefined;
   const remove: Array<()=>void>=[];
-  const finish=(error?:string)=> {
-    if(closed)return;closed=true;for(const cleanup of remove)cleanup();a.close(error);b.close(error);
+  const finish=(error?:string,lane:Lane='control')=> {
+    if(closed)return;closed=true;for(const cleanup of remove)cleanup();a.close(error,lane);b.close(error,lane);
   };
   for(const [source,target] of [[a,b],[b,a]]) {
-    let bytes=0;let draining=false;const pending:Array<{data:Buffer;cursor?:number;binary?:boolean}>=[];
-    const drain=async()=> {
-      if(draining)return;draining=true;
-      try{while(!closed && pending.length){const item=pending.shift()!;await target.send(item.data,item.cursor,item.binary);bytes-=item.data.length;}}
-      catch(error){finish((error as Error).message);}finally{draining=false;}
-    };
+    let bytes=0;let sendChain:Promise<void>=Promise.resolve();
     const onData=(data:Buffer,meta:{cursor?:number;binary?:boolean}={})=> {
-      if(closed)return;if(bytes+data.length>2*1024*1024){finish('Remote stream proxy exceeded its bounded queue');return;}
-      pending.push({data,cursor:meta.cursor,binary:meta.binary});bytes+=data.length;void drain();
+      if(closed || cleanSource)return;
+      if(bytes+data.length>2*1024*1024){finish('Remote stream proxy exceeded its bounded queue');return;}
+      bytes+=data.length;
+      sendChain=sendChain.then(async()=> {
+        if(closed || cleanSource && cleanSource!==source)return;
+        await target.send(data,meta.cursor,meta.binary);
+      }).catch(error=> {if(!closed && (!cleanSource || cleanSource===source))finish((error as Error).message);})
+        .finally(()=>{bytes-=data.length;});
     };
-    const onEnd=(error?:string)=>finish(error);
+    const onEnd=(error?:string)=> {
+      if(closed)return;if(error){finish(error);return;}if(cleanSource)return;
+      cleanSource=source;
+      // Flush final worker bytes before ordered EOF. The opposite direction may
+      // have stale input queued for an already-ended worker; it cannot abort this flush.
+      void sendChain.then(()=>finish(undefined,'events'));
+    };
     source.on('data',onData);source.on('end',onEnd);
-    remove.push(()=>{source.off('data',onData);source.off('end',onEnd);pending.length=0;});
+    remove.push(()=>{source.off('data',onData);source.off('end',onEnd);});
   }
   return ()=>finish();
 }

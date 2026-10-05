@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Diagnostics;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -19,6 +20,20 @@ internal static class MachineBridge
     private static readonly Lock Gate = new();
 
     public static bool Active => Writer is not null;
+
+    /// <summary>Private startup descriptors and workspace authority belong to one process.</summary>
+    /// <remarks>
+    /// Self-spawned agents and editor endpoints retain the managed daemon, but
+    /// Process.Start does not transfer the supervisor's descriptor or create a
+    /// new writable ArtifactFS attempt. Never let their inherited environment
+    /// claim either resource belongs to the new child.
+    /// </remarks>
+    public static void PrepareChild(ProcessStartInfo info)
+    {
+        info.Environment.Remove("ENVMUX_BOOTSTRAP_FD");
+        info.Environment.Remove("ENVMUX_WORKSPACE_BIND");
+        info.Environment.Remove("ENVMUX_ARTIFACT_STATE_VOLUME");
+    }
 
     private static StreamWriter? Open()
     {
@@ -87,6 +102,7 @@ internal sealed record MachineEvent(
     string? Endpoint = null,
     string? Token = null,
     string? Proxy = null,
+    string? DockerHost = null,
     string? Project = null,
     string? Session = null,
     string? Instance = null,
@@ -102,5 +118,9 @@ internal sealed record MachineEvent(
 [JsonSourceGenerationOptions(PropertyNamingPolicy = JsonKnownNamingPolicy.CamelCase,
     DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull)]
 [JsonSerializable(typeof(MachineEvent))]
+[JsonSerializable(typeof(MachineCapabilities))]
 [JsonSerializable(typeof(List<Commands.DiscoveredSession>))]
 internal sealed partial class MachineJsonContext : JsonSerializerContext;
+
+/// <summary>A supervisor checks the managed endpoint contract before creating anything.</summary>
+internal sealed record MachineCapabilities(int ProtocolVersion, bool ManagedDocker);

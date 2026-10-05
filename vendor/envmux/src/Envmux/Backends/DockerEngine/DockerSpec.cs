@@ -203,7 +203,9 @@ internal static class DockerSpec
                 .. workspace?.BindMounts ?? Array.Empty<MountSpec>()],
             Network = network,
             NetworkAliases = AliasesFor(spec),
-            ExtraHosts = [HostGateway],
+            ExtraHosts = [BridgeHost(
+                Environment.GetEnvironmentVariable("ENVMUX_MANAGED_DOCKER") == "1",
+                Environment.GetEnvironmentVariable("ENVMUX_DOCKER_BRIDGE_HOST"))],
             MemoryBytes = memory,
             NanoCpus = cpus,
         };
@@ -217,6 +219,22 @@ internal static class DockerSpec
         }
 
         return container;
+    }
+
+    /// <summary>A managed VM may reach its host through a gateway distinct from Docker's own bridge.</summary>
+    public static string BridgeHost(bool managed, string? address)
+    {
+        if (!managed || string.IsNullOrEmpty(address))
+        {
+            return HostGateway;
+        }
+
+        if (!System.Net.IPAddress.TryParse(address, out var parsed))
+        {
+            throw new BackendException("the managed Docker bridge requires an explicit host IP address");
+        }
+
+        return $"host.docker.internal:{parsed}";
     }
 
     /// <summary>

@@ -62,8 +62,17 @@ export interface Attempt {
 }
 export interface Decision { id: string; goalId: string; at: string; kind: string; text: string; data?: unknown; }
 export interface Artifact { id: string; goalId?: string; taskId?: string; attemptId?: string; name: string; mime: string; sha256: string; size: number; deviceId: string; createdAt: string; }
+export interface ContainerRuntimeStatus {
+  kind: "lima" | "rootless";
+  state: "unavailable" | "stopped" | "starting" | "ready" | "stopping" | "failed";
+  version?: string; dockerVersion?: string; socketPath: string; dataDirectory: string;
+  cpus?: number; memoryGiB?: number; diskGiB?: number; phase?: string; error?: string;
+  requiredActions?: { label: string; detail: string; command?: string }[];
+  artifactFsSupported: boolean;
+}
 export interface Diagnostics {
   docker: { available: boolean; version?: string; error?: string };
+  containerRuntime?: ContainerRuntimeStatus;
   envmux: { available: boolean; version?: string; error?: string };
   runtimes: RuntimeCapability[];
 }

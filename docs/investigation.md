@@ -6,6 +6,8 @@ Investigated October 5, 2026. This report evaluates envmux, current agent collab
 
 The product promise should be: give the factory a goal, inspect its plan and progress, steer work, and review a verified result. Devices and agent products become execution choices within that experience.
 
+**Later runtime decision:** EnoughFactory bundles and owns its container engine, socket and storage. The Mac runtime uses a private Lima VM; Linux uses a dedicated rootless engine. The original recommendation to detect an existing Docker installation is superseded by the build plan and implementation.
+
 ## Scope and assumptions
 
 The initial target is one owner with several intermittently available devices, macOS and Linux support, and isolated Docker workloads. Windows can follow. “Premium” is interpreted as quality, coherence and reliability, while the factory itself remains OSS. Multi-user permissions and hosted operations should remain possible without becoming the first release's infrastructure burden.

@@ -1,10 +1,11 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { delimiter, dirname, isAbsolute, join, resolve } from 'node:path';
 import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
 import type { Readable } from 'node:stream';
+import { isIP } from 'node:net';
 
 export const ENVMUX_REVISION = '38914dd0fb49682a062dc17eb3427f6b4f27c5fe';
 
@@ -24,6 +25,7 @@ export interface EnvmuxState {
 export interface EnvmuxReady {
   type: 'ready'; version: 1; endpoint: string; token: string; proxy?: string;
   project: string; session: string; instance: string; workdir: string; user: string; branch: string;
+  dockerHost: string;
 }
 export interface EnvmuxLifecycleEvent {
   type: string; version: number; phase?: string; error?: string; exitCode?: number;
@@ -37,7 +39,12 @@ export interface RepositoryStatus {
   entries: { path: string; originalPath?: string; indexStatus: string; workingTreeStatus: string }[];
 }
 export interface RepositoryDiff { path?: string; staged: boolean; diff: string; truncated: boolean }
-export interface EngineOptions { binary?: string; dotnet?: string; dll?: string; workspaceRoot?: string }
+export interface DockerRuntimeEndpoint { host: string; cliPath: string; configDirectory: string }
+export interface EngineOptions {
+  binary?: string; dotnet?: string; dll?: string; workspaceRoot?: string;
+  dockerRuntime?: DockerRuntimeEndpoint;
+  containerHostAddress?: string;
+}
 export interface StartOptions {
   projectPath: string; name: string; signal?: AbortSignal;
   workspace?: { bindSource: string; stateVolume: string };
@@ -49,9 +56,9 @@ export interface StartOptions {
 function message(error: unknown): string { return error instanceof Error ? error.message : String(error); }
 function boundedText(text: string, added: string): string { return (text + added).slice(-32_768); }
 
-async function command(program: string, args: string[], cwd?: string): Promise<{ code: number; stdout: string; stderr: string }> {
+async function command(program: string, args: string[], cwd?: string, env: NodeJS.ProcessEnv = process.env): Promise<{ code: number; stdout: string; stderr: string }> {
   return await new Promise((accept, reject) => {
-    const child = spawn(program, args, { cwd, stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn(program, args, { cwd, env, stdio: ['ignore', 'pipe', 'pipe'] });
     let stdout = ''; let stderr = '';
     const timer = setTimeout(() => { child.kill('SIGTERM'); reject(new Error(`${program} did not answer within 30 seconds`)); }, 30_000);
     child.stdout.on('data', (chunk: Buffer) => {
@@ -186,8 +193,24 @@ export class EnvmuxSession {
 export class EnvmuxEngine {
   private readonly program: string;
   private readonly prefix: string[];
+  readonly dockerRuntime?: DockerRuntimeEndpoint;
+  private readonly containerHostAddress?: string;
+  private capabilityCheck?: Promise<void>;
 
   constructor(options: EngineOptions = {}) {
+    if (options.containerHostAddress && !isIP(options.containerHostAddress)) {
+      throw new Error('The managed container bridge requires an explicit IP address');
+    }
+    this.containerHostAddress = options.containerHostAddress;
+    if (options.dockerRuntime) {
+      const { host, cliPath, configDirectory } = options.dockerRuntime;
+      const socket = host.startsWith('unix://') ? host.slice('unix://'.length) : '';
+      if (!socket.startsWith('/') || socket === '/' || socket.split('/').some(part => part === '.' || part === '..')
+        || /[\x00-\x1f\x7f]/.test(socket) || !isAbsolute(cliPath) || !isAbsolute(configDirectory)) {
+        throw new Error('EnoughFactory requires an explicit managed Unix socket and absolute bundled CLI/config paths');
+      }
+      this.dockerRuntime = { host, cliPath, configDirectory };
+    }
     const root = options.workspaceRoot ?? resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
     const platform = process.platform === 'darwin' ? 'osx' : process.platform;
     const native = join(root, 'artifacts', 'envmux', `${platform}-${process.arch}`, 'envmux');
@@ -198,9 +221,46 @@ export class EnvmuxEngine {
     this.prefix = [options.dll ?? process.env.ENOUGHFACTORY_ENVMUX_DLL ?? join(root, 'vendor/envmux/src/Envmux/bin/Release/net10.0/envmux.dll')];
   }
 
+  private requireRuntime(): DockerRuntimeEndpoint {
+    if (!this.dockerRuntime) throw new Error('EnoughFactory managed container runtime is not configured');
+    return this.dockerRuntime;
+  }
+
+  private environment(): NodeJS.ProcessEnv {
+    const env = { ...process.env };
+    for (const name of ['DOCKER_CONTEXT', 'DOCKER_TLS_VERIFY', 'DOCKER_CERT_PATH', 'DOCKER_API_VERSION']) delete env[name];
+    env.ENVMUX_MANAGED_DOCKER = '1';
+    env.ENVMUX_DOCKER_HOST = this.dockerRuntime?.host ?? '';
+    env.DOCKER_HOST = this.dockerRuntime?.host ?? '';
+    env.DOCKER_CONFIG = this.dockerRuntime?.configDirectory ?? '';
+    env.ENVMUX_DOCKER_BRIDGE_HOST = this.containerHostAddress ?? '';
+    if (this.dockerRuntime) env.PATH = `${dirname(this.dockerRuntime.cliPath)}${delimiter}${env.PATH ?? ''}`;
+    return env;
+  }
+
+  private verifyEngineCapability(): Promise<void> {
+    this.capabilityCheck ??= (async () => {
+      const result = await command(this.program, [...this.prefix, '--factory-capabilities'], undefined, this.environment());
+      if (result.code) throw new Error('This Envmux build does not support EnoughFactory managed runtime isolation; install the bundled engine');
+      const capabilities = JSON.parse(result.stdout) as { protocolVersion?: number; managedDocker?: boolean };
+      if (capabilities.protocolVersion !== 1 || capabilities.managedDocker !== true) {
+        throw new Error('This Envmux build does not support EnoughFactory managed runtime isolation');
+      }
+    })();
+    const check = this.capabilityCheck;
+    return check.catch(error => {
+      if (this.capabilityCheck === check) this.capabilityCheck = undefined;
+      throw error;
+    });
+  }
+
   async detect(): Promise<{ available: boolean; version?: string; error?: string; docker: { available: boolean; version?: string; error?: string } }> {
     const [engine, docker] = await Promise.allSettled([
-      command(this.program, [...this.prefix, '--version']), command('docker', ['info', '--format', '{{.ServerVersion}}']),
+      (async () => { await this.verifyEngineCapability(); return await command(this.program, [...this.prefix, '--version'], undefined, this.environment()); })(),
+      this.dockerRuntime
+        ? command(this.dockerRuntime.cliPath, ['--host', this.dockerRuntime.host, '--config', this.dockerRuntime.configDirectory,
+          'info', '--format', '{{.ServerVersion}}'], undefined, this.environment())
+        : Promise.reject(new Error('EnoughFactory managed container runtime is not configured')),
     ]);
     const availability = (result: PromiseSettledResult<Awaited<ReturnType<typeof command>>>) => result.status === 'rejected'
       ? { available: false, error: message(result.reason) }
@@ -211,18 +271,25 @@ export class EnvmuxEngine {
 
   async validate(projectPath: string): Promise<{ valid: boolean; error?: string }> {
     try {
-      const result = await command(this.program, [...this.prefix, '-C', projectPath, 'config', 'validate']);
+      await this.verifyEngineCapability();
+      const result = await command(this.program, [...this.prefix, '-C', projectPath, 'config', 'validate'], undefined, this.environment());
       return result.code === 0 ? { valid: true } : { valid: false, error: result.stderr.trim() || result.stdout.trim() };
     } catch (error) { return { valid: false, error: message(error) }; }
   }
   async discover(projectPath: string): Promise<DiscoveredSession[]> {
-    const result = await command(this.program, [...this.prefix, '-C', projectPath, 'sessions', '--backend', 'docker']);
+    this.requireRuntime();
+    await this.verifyEngineCapability();
+    const result = await command(this.program, [...this.prefix, '-C', projectPath, 'sessions', '--backend', 'docker'], undefined, this.environment());
     if (result.code) throw new Error(result.stderr.trim() || 'Envmux session discovery failed');
     return JSON.parse(result.stdout) as DiscoveredSession[];
   }
 
   /** Reconnect to an engine owned by this service before a daemon restart. */
   async attach(options: { ready: EnvmuxReady; projectPath: string; pid?: number }): Promise<EnvmuxSession> {
+    const runtime = this.requireRuntime();
+    if (options.ready.dockerHost !== runtime.host) {
+      throw new Error('Saved Envmux session belongs to a different container runtime; its status remains unknown');
+    }
     if (options.pid) {
       try { process.kill(options.pid, 0); }
       catch (error) { throw new Error(`The owning Envmux process is unavailable: ${message(error)}`); }
@@ -236,6 +303,8 @@ export class EnvmuxEngine {
   }
 
   async start(options: StartOptions): Promise<EnvmuxSession> {
+    const runtime = this.requireRuntime();
+    await this.verifyEngineCapability();
     if (options.signal?.aborted) throw new Error('Session startup was canceled');
     if (options.workspace) {
       const identity = /^\/var\/lib\/enoughfactory\/workspaces\/([A-Za-z0-9_-]{1,80})\/repo$/.exec(options.workspace.bindSource)?.[1];
@@ -245,7 +314,7 @@ export class EnvmuxEngine {
     }
     const child = spawn(this.program, [...this.prefix, '-C', options.projectPath, options.name, '--headless', '--backend', 'docker'], {
       cwd: options.projectPath, stdio: ['ignore', 'pipe', 'pipe', 'pipe'],
-      env: { ...process.env, ENVMUX_BOOTSTRAP_FD: '3',
+      env: { ...this.environment(), ENVMUX_BOOTSTRAP_FD: '3',
         ENVMUX_WORKSPACE_BIND: options.workspace?.bindSource ?? '',
         ENVMUX_ARTIFACT_STATE_VOLUME: options.workspace?.stateVolume ?? '',
       },
@@ -272,6 +341,9 @@ export class EnvmuxEngine {
         try {
           const event = JSON.parse(line) as EnvmuxLifecycleEvent | EnvmuxReady;
           if (event.type === 'ready') {
+            if ((event as EnvmuxReady).dockerHost !== runtime.host) {
+              cancel(); fail(new Error('Envmux connected to a container runtime outside its managed endpoint')); return;
+            }
             const endpoint = new URL((event as EnvmuxReady).endpoint);
             if (endpoint.hostname !== '127.0.0.1' || endpoint.protocol !== 'http:' || !endpoint.port || endpoint.port === '0') {
               cancel(); fail(new Error('Envmux requires its authenticated loopback portal to be enabled')); return;

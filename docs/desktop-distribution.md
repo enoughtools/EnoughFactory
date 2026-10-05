@@ -1,14 +1,18 @@
 # EnoughFactory desktop and device service distribution
 
-EnoughFactory ships the React workbench in Electron, a separate device service, a pinned native envmux engine and Node 22.22.0. Opening the application does not require a Node or .NET SDK. Required release targets are Apple Silicon Mac and Linux x64/ARM64. Intel Mac is supported by the runtime and packaging configuration. Windows is not currently a release target.
+EnoughFactory ships the React workbench in Electron, a separate device service, a pinned native envmux engine, Node 22.22.0 and its own private container runtime. Opening the application does not require a Node or .NET SDK or an existing Docker installation. Required release targets are Apple Silicon Mac and Linux x64/ARM64. Intel Mac is supported by the runtime and packaging configuration. Windows is not currently a release target.
 
 The device service owns sessions and continues after the desktop window closes. The desktop can start it on demand. Install the user startup service below when this device should be available after login without opening the desktop first. Startup service installation uses the current user's account; it does not require or create a system service.
 
-## Runtime prerequisites
+## Bundled container runtime
 
-Install a running Docker-compatible engine before starting environments. Docker Engine is suitable on Linux. Docker Desktop or the OSS Colima/Lima route is suitable on Mac. EnoughFactory does not silently install a Docker engine or expose the host Docker socket inside agent containers. Agent credentials remain a separate onboarding step.
+On Mac, EnoughFactory bundles Lima 2.2.1, Docker 29.8.2 and a verified Ubuntu 24.04 guest image from the 2026-09-26 release. Apple Virtualization supplies the private Linux VM. First start prepares the VM from the bundled image; it does not download or install an operating system. Subsequent agent/container images and provider connections can require network access. Agent sign-in remains a separate onboarding step.
 
-The installer captures the current command search path and includes standard Homebrew, Docker and user binary locations for login startup. For a Docker installation in a custom location, include it in `PATH` when running the installer; login services do not inherit an interactive shell's startup scripts. The Docker daemon must also be running when an environment is started.
+On Linux, EnoughFactory bundles Docker 29.8.2 and its rootless runtime tools. It starts an engine under your normal user account, with a private socket and data directory. Containers retain root access inside their namespaces. The host needs subordinate user/group ID ranges and standard namespace/network utilities: `newuidmap`, `newgidmap`, `iptables`, `nsenter` and `sysctl`. On Debian/Ubuntu these are provided by `uidmap iptables util-linux procps`; Fedora uses `shadow-utils iptables util-linux procps-ng`. The app reports missing host setup, disabled user namespaces or an AppArmor restriction. Install these host prerequisites and configure non-overlapping subordinate ID ranges as the host administrator; running the device service as root does not replace rootless setup.
+
+The runtime uses EnoughFactory's own sockets, ownership labels and state. It does not select a user Docker context, operate Docker Desktop/Colima, or stop a system Docker service. Closing the desktop or shutting down the device service leaves the private engine running. Runtime start/stop and Mac CPU, memory and disk settings are available in the app.
+
+Mac VM disks and caches live under `~/.enoughfactory/container`; Linux engine images, volumes and runtime state live under `~/.enoughfactory/docker`. A custom `ENOUGHFACTORY_HOME` moves those paths together. Mac's socket is under `container/lima/factory/sock/docker.sock`; Linux uses `docker/run/docker.sock` within that same device state directory.
 
 Linux desktop bundles require a graphical desktop and the system libraries required by Electron. An AppImage may require the distribution's FUSE compatibility package; its extraction option is available when FUSE is unavailable. The headless device service itself does not require a display server.
 
@@ -30,7 +34,7 @@ The application contains both the installer and its Node runtime. After placing 
 
 This copies service resources into `~/Library/Application Support/EnoughFactory/service`, writes `~/Library/LaunchAgents/com.enoughtools.factory.device.plist` and enables login startup with launchd. It uses `~/.enoughfactory` for state and port 4317 for local connections. Re-run the command after installing an updated app to update the service copy.
 
-An update retains the installed state directory, port and startup location unless you explicitly change those options. The installer stops a previously managed or desktop-started device service through its authenticated local API before replacing resources. Envmux sessions remain recoverable; restarting the device service is not an explicit session stop.
+An update retains the installed state directory, port and startup location unless you explicitly change those options. Before replacing resources, the installer authenticates the running EnoughFactory service, requests a private runtime stop, verifies it is stopped, and then shuts down the device service. Active goals, chats or environments block the operation; stop them in the app and retry. It does not force-stop work or send an automatic confirmation to discard environments. VM disks, images and volumes remain available after the update. Start the private runtime again from the app when you resume work.
 
 To inspect startup status and logs:
 
@@ -65,7 +69,7 @@ For an always-on Linux worker that must run after logout, the host administrator
 
 ## Remove a user service
 
-Use the uninstall script from the installed stable service copy. It stops user startup and removes the copied application resources while preserving device state, conversations and project references:
+Use the uninstall script from the installed stable service copy. It verifies and stops the owned private runtime, shuts down the device service, removes user startup and removes the copied application resources. By default it preserves VM disks, images, volumes, conversations and project references:
 
 ```sh
 # Mac
@@ -75,9 +79,11 @@ FACTORY_SERVICE="$HOME/Library/Application Support/EnoughFactory/service"
   "$FACTORY_SERVICE/install/uninstall-device-service.mjs"
 ```
 
-Add `--purge` only when you also want to remove the device's state directory, including chats, goal records, cached candidates and device-local workspace data. Repositories outside that directory remain independent. Stop active factory work and explicitly stop environments before uninstalling; removing the device service is not a request to discard or harvest every Docker session.
+Add `--purge` only when you also want to remove the device's state directory, including private VM disks, container images and volumes, chats, goal records, cached candidates and device-local workspace data. Purge runs only after the app has confirmed its runtime stopped. Repositories outside that directory remain independent. Stop active goals, chats and environments before uninstalling; an in-use runtime returns an error and leaves startup, resources and data intact.
 
-Advanced installation supports `--home`, `--port`, `--service-dir`, `--unit-dir` and `--no-start`. A custom state path must also be supplied to the desktop through `ENOUGHFACTORY_HOME` so it can discover the same connection. Use the matching `--service-dir` when removing a custom installation. `--no-stop` is available for removing a staged installation that was never started.
+If the device service is offline but private runtime state remains, the installer and uninstaller refuse to replace resources or purge data because they cannot prove the engine stopped. Reopen EnoughFactory with the same state directory and retry while its service is online. They do not kill recorded PIDs, run user Docker commands or delete potentially active engine state.
+
+Advanced installation supports `--home`, `--port`, `--service-dir`, `--unit-dir` and `--no-start`. A custom state path must also be supplied to the desktop through `ENOUGHFACTORY_HOME` so it can discover the same connection. Use the matching `--service-dir` when removing a custom installation. `--no-stop` is only for removing a never-started staged installation; it cannot bypass private runtime checks or purge an unverified runtime.
 
 ## Build a release
 
@@ -92,12 +98,14 @@ The script builds the web/device/desktop packages, prepares resources, then invo
 
 Node archives come directly from `https://nodejs.org/dist/v22.22.0/`. Packaging checks the archive SHA-256 against both the official HTTPS `SHASUMS256.txt` and the checksum pinned in the packaging script. A changed checksum fails packaging. Cached archives are checked again, not blindly reused. The bundle includes Node's license and a `runtime/provenance.json` with the source URL, target and verified digest.
 
-Resources contain `runtime/node`, `device/service.cjs` and its native assets, `envmux/envmux`, the built web app, complete `workspaces` container runtime helpers, the `agents` Antigravity bridge, installers and upstream notices. Agent Python code runs in its container; a host Python installation is not required. The Electron renderer does not run the device service. A missing native engine, built web client, workspace runtime, agent bridge, bundled service or distribution notice fails packaging rather than producing a partial desktop release.
+Container runtime archive and guest-image versions, source URLs and SHA-256 digests are pinned in `runtime/container/pins.json`. Preparation stages the matching target into `resources/runtime/container`, including Docker executables, Linux rootless tools or Mac Lima and `images/guest.img`. Mac's complete guest image is bundled and verified before release. The staged pins, provenance and upstream notices travel with the private runtime; an existing host Docker installation is not used as a packaging or startup fallback.
+
+Resources contain `runtime/node`, the private `runtime/container` engine/VM payload, `device/service.cjs` and its native assets, `envmux/envmux`, the built web app, complete `workspaces` container runtime helpers, the `agents` Antigravity bridge, installers and upstream notices. Agent Python code runs in its container; a host Python installation is not required. The Electron renderer does not run the device service. Missing required runtime or application assets fail packaging rather than producing a partial desktop release.
 
 `bundle-provenance.json` identifies the product version, platform, architecture, Node version and native module integrity pins, and records SHA-256 hashes for every prepared resource. The desktop uses this identity when staging resources into a stable device-service directory. This is required for AppImage builds, whose temporary mount disappears after the desktop exits. The installer retains the same bundle provenance in its stable copy.
 
 ## Release verification and notices
 
-For each required target, open its packaged application, confirm the bundled device service answers the authenticated `/api/health` request, open a real Docker-backed session, and close/reopen the desktop while the session continues. Verify user startup installation and removal on that OS. Use one complete factory journey for the assembled release rather than repeating extensive checks for every packaging change.
+For each required target, open its packaged application, confirm the bundled device service answers authenticated `/api/health` and `/api/runtime` requests, start its private engine, open a real session, and close/reopen the desktop while the session continues. Confirm a separate user/system Docker engine was untouched. Verify user startup installation and removal on that OS, including active-work refusal and preservation of runtime data. Use one complete factory journey for the assembled release rather than repeating extensive checks for every packaging change.
 
 Publish the built archives, their SHA-256 hashes, architecture and actual signing status through the release manifest used by `factory.enoughtools.com`. Never label an archive available before its download URL has been verified. Include `LICENSE`, `THIRD_PARTY_NOTICES.md`, the Node runtime license and the original envmux and EnoughUI notices with the distribution. The Enough application icon is the supplied brand mark; its separate license is included in `apps/desktop/assets/LICENSE`.

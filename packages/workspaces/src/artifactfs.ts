@@ -2,6 +2,7 @@ import { mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { git, run } from "./process.ts";
+import { resolveDockerRuntime, runManagedDocker, managedDockerInvocation, type DockerRuntimeEndpoint } from "./docker.ts";
 import type { Candidate, ManagedWorkspaceProvider, WorkspaceRecord } from "./types.ts";
 
 export const ARTIFACTFS_REVISION = "6a62f2f34aebe75da3d8b917131a6ace185928e5";
@@ -27,7 +28,7 @@ export interface ArtifactFsMountRecord {
 export interface ArtifactFsProviderOptions {
   rootDirectory: string;
   image?: string;
-  dockerCommand?: string;
+  dockerRuntime?: DockerRuntimeEndpoint;
   /** Packaging places the five runtime build resources in this directory. */
   runtimeDirectory?: string;
   /** Optional committed source checkout; uncommitted changes are never built. */
@@ -46,20 +47,18 @@ export interface ArtifactFsProviderOptions {
 export class ArtifactFsWorkspaceProvider implements ManagedWorkspaceProvider {
   private readonly root: string;
   private readonly image: string;
-  private readonly docker: string;
   private imageBuild?: Promise<void>;
 
   constructor(private readonly options: ArtifactFsProviderOptions) {
     this.root = resolve(options.rootDirectory);
     this.image = options.image ?? ARTIFACTFS_IMAGE;
-    this.docker = options.dockerCommand ?? "docker";
   }
 
   async available(): Promise<{ available: boolean; reason?: string }> {
     try {
-      const result = await run(this.docker, ["info", "--format", "{{.OSType}}"], { timeoutMs: 10_000 });
-      if (result.exitCode !== 0 || result.stdout.trim() !== "linux") return { available: false, reason: "ArtifactFS requires a running Linux Docker engine." };
-      const image = await run(this.docker, ["image", "inspect", this.image], { timeoutMs: 10_000 });
+      const backend = await this.backendSupport();
+      if (!backend.available) return backend;
+      const image = await this.docker(["image", "inspect", this.image], { timeoutMs: 10_000 });
       if (image.exitCode !== 0 && this.options.buildImage === false) return { available: false, reason: `ArtifactFS runtime image ${this.image} is not installed.` };
       return { available: true };
     } catch (error) {
@@ -68,6 +67,8 @@ export class ArtifactFsWorkspaceProvider implements ManagedWorkspaceProvider {
   }
 
   async prepare(record: WorkspaceRecord): Promise<Record<string, unknown>> {
+    const backend = await this.backendSupport();
+    if (!backend.available) throw new Error(backend.reason);
     const attempt = attemptId(record.attemptId);
     const baseCommit = await git(record.path, "rev-parse", "--verify", "--end-of-options", `${record.baseCommit}^{commit}`);
     if (!/^[a-f0-9]{40,64}$/.test(baseCommit)) throw new Error("Invalid ArtifactFS source commit");
@@ -202,12 +203,12 @@ export class ArtifactFsWorkspaceProvider implements ManagedWorkspaceProvider {
   /** Explicit storage removal, only after the engine released its bind mount. */
   async remove(id: string): Promise<void> {
     const mount = await this.requiredMount(id);
-    const state = await run(this.docker, ["inspect", "--format", "{{.State.Running}}", mount.containerName]);
+    const state = await this.docker(["inspect", "--format", "{{.State.Running}}", mount.containerName]);
     if (state.exitCode === 0) {
       if (state.stdout.trim() === "true") await this.command(["stop", "--time", "30", mount.containerName], 45_000);
       await this.command(["rm", mount.containerName]);
     }
-    const volume = await run(this.docker, ["volume", "inspect", mount.stateVolume]);
+    const volume = await this.docker(["volume", "inspect", mount.stateVolume]);
     if (volume.exitCode === 0) await this.command(["volume", "rm", mount.stateVolume]);
     else if (!/no such volume/i.test(volume.stderr)) throw new Error(`Cannot inspect ArtifactFS state: ${volume.stderr.trim()}`);
     await this.prepareSharedMount(id, "remove");
@@ -241,25 +242,29 @@ export class ArtifactFsWorkspaceProvider implements ManagedWorkspaceProvider {
     while (Date.now() - started < 200_000) {
       const status = await this.command(["inspect", "--format", "{{.State.Running}}", mount.containerName]);
       if (status.stdout.trim() !== "true") {
-        const logs = await run(this.docker, ["logs", "--tail", "30", mount.containerName]);
+        const logs = await this.docker(["logs", "--tail", "30", mount.containerName]);
         throw new Error(`ArtifactFS manager exited before readiness: ${logs.stderr.trim() || logs.stdout.trim()}`);
       }
-      const ready = await run(this.docker, ["exec", mount.containerName, "sh", "-c", "test -f /var/lib/artifact-fs/ready && mountpoint -q /mount/repo && git -c safe.directory='*' -C /mount/repo rev-parse HEAD"], { timeoutMs: 10_000 });
+      const ready = await this.docker(["exec", mount.containerName, "sh", "-c", "test -f /var/lib/artifact-fs/ready && mountpoint -q /mount/repo && git -c safe.directory='*' -C /mount/repo rev-parse HEAD"], { timeoutMs: 10_000 });
       if (ready.exitCode === 0) return;
       await new Promise((resolve) => setTimeout(resolve, 400));
     }
     throw new Error("ArtifactFS manager readiness timed out; its state is retained for recovery");
   }
   private async ensureImage(): Promise<void> {
-    const inspect = await run(this.docker, ["image", "inspect", this.image], { timeoutMs: 10_000 });
+    const inspect = await this.docker(["image", "inspect", this.image], { timeoutMs: 10_000 });
     if (inspect.exitCode === 0) return;
     if (this.options.buildImage === false) throw new Error(`ArtifactFS runtime image ${this.image} is not installed`);
     if (!this.imageBuild) this.imageBuild = (async () => {
       const runtime = this.options.runtimeDirectory ?? resolve(dirname(fileURLToPath(import.meta.url)), "../../../runtime/workspaces");
       await stat(join(runtime, "build.sh"));
+      const endpoint = resolveDockerRuntime(this.options.dockerRuntime);
+      const invocation = managedDockerInvocation(endpoint, []);
       const result = await run("bash", [join(runtime, "build.sh")], {
         timeoutMs: 20 * 60_000,
-        env: { ENOUGHFACTORY_ARTIFACTFS_IMAGE: this.image,
+        inheritEnv: false,
+        env: { ...invocation.env, ENOUGHFACTORY_DOCKER_HOST: endpoint.host, ENOUGHFACTORY_DOCKER_CLI: endpoint.cliPath,
+          ENOUGHFACTORY_DOCKER_CONFIG: endpoint.configDirectory, ENOUGHFACTORY_ARTIFACTFS_IMAGE: this.image,
           ...(this.options.sourceDirectory ? { ENOUGHFACTORY_ARTIFACTFS_SOURCE: this.options.sourceDirectory } : {}) },
       });
       if (result.exitCode !== 0) throw new Error(`ArtifactFS runtime build failed: ${result.stderr.trim()}`);
@@ -269,7 +274,7 @@ export class ArtifactFsWorkspaceProvider implements ManagedWorkspaceProvider {
   private async workspaceCommand(mount: ArtifactFsMountRecord, args: string[], timeoutMs = 60_000) {
     // Author-controlled Git configuration and filters must never execute with
     // the FUSE manager's mount capabilities. Use a separate ordinary container.
-    return run(this.docker, ["run", "--rm", "--mount", `type=bind,src=${mount.bindSource},dst=/mount/repo,bind-propagation=rslave`,
+    return this.docker(["run", "--rm", "--mount", `type=bind,src=${mount.bindSource},dst=/mount/repo,bind-propagation=rslave`,
       "--mount", `type=volume,src=${mount.stateVolume},dst=/var/lib/artifact-fs`, "--entrypoint", "git", mount.image,
       "-c", "safe.directory=*", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-C", "/mount/repo", ...args], { timeoutMs });
   }
@@ -279,9 +284,22 @@ export class ArtifactFsWorkspaceProvider implements ManagedWorkspaceProvider {
     return result;
   }
   private async command(args: string[], timeoutMs = 60_000) {
-    const result = await run(this.docker, args, { timeoutMs });
+    const result = await this.docker(args, { timeoutMs });
     if (result.exitCode !== 0) throw new Error(`ArtifactFS ${args[0]} failed: ${result.stderr.trim() || result.stdout.trim()}`);
     return result;
+  }
+  private docker(args: string[], options: { timeoutMs?: number; signal?: AbortSignal } = {}) {
+    return runManagedDocker(resolveDockerRuntime(this.options.dockerRuntime), args, options);
+  }
+  private async backendSupport(): Promise<{ available: boolean; reason?: string }> {
+    const result = await this.docker(["info", "--format", "{{json .}}"], { timeoutMs: 10_000 });
+    if (result.exitCode !== 0) return { available: false, reason: "EnoughFactory's managed container engine is unavailable." };
+    const info = JSON.parse(result.stdout) as { OSType?: string; SecurityOptions?: string[] };
+    if (info.OSType !== "linux") return { available: false, reason: "ArtifactFS requires EnoughFactory's Linux container engine." };
+    if (info.SecurityOptions?.some(option => option === "name=rootless" || option.startsWith("name=rootless,"))) {
+      return { available: false, reason: "ArtifactFS needs shared FUSE mounts in EnoughFactory's private Linux VM. Its native rootless engine supports Git workspaces; mounting into the host namespace is unavailable." };
+    }
+    return { available: true };
   }
 }
 

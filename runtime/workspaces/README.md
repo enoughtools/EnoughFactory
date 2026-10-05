@@ -1,18 +1,29 @@
 # ArtifactFS workspaces
 
 EnoughFactory can use a real writable ArtifactFS mount for each author attempt.
-Ordinary Git workspaces are the compatible fallback when a device's engine
-cannot support FUSE or shared Linux mounts. Choosing ArtifactFS preserves the
-same envmux workbench, candidate and integration flow.
+Ordinary Git workspaces are the fallback when the managed engine cannot support
+FUSE or shared Linux mounts. Choosing ArtifactFS preserves the same envmux
+workbench, candidate and integration flow.
 
 ## Install the optional runtime
 
-Docker must be running with a Linux engine, either natively or in its Linux VM
-on Mac. Build the image from the pinned OSS source:
+Start EnoughFactory's managed container runtime. The device service supplies an
+explicit descriptor for its private Linux engine: `host`, bundled `cliPath` and
+private `configDirectory`. Its runtime calls carry that descriptor through
+`resolveDockerRuntime()` and `managedDockerInvocation()`.
+
+For a direct image build, supply the same descriptor through
+`ENOUGHFACTORY_DOCKER_HOST`, `ENOUGHFACTORY_DOCKER_CLI` and
+`ENOUGHFACTORY_DOCKER_CONFIG`, then build the pinned OSS source:
 
 ```sh
 bash runtime/workspaces/build.sh
 ```
+
+These three variables are required. The script invokes the absolute bundled CLI
+with explicit `--host` and `--config` arguments and clears inherited Docker
+context, daemon and TLS selection variables. Missing configuration is an error;
+the helper does not discover a personal Docker daemon.
 
 An existing RepoReach checkout can supply that committed source without a clone:
 
@@ -30,11 +41,21 @@ patch allowing envmux's container user to write this private attempt's mount.
 
 ## Ownership and topology
 
-The trusted device service creates an exact Git source bundle and starts a
-manager with `/dev/fuse` and `SYS_ADMIN`. A short, path-bounded helper prepares
+The current ArtifactFS provider requires a rootful Linux engine inside
+EnoughFactory's private Mac Lima VM. The rootful daemon and mount capabilities
+remain inside that VM. EnoughFactory's native Linux runtime is rootless; this
+shared-mount topology cannot use its host mount namespace, so Linux selects
+ordinary Git with a recorded ArtifactFS availability reason. Setting
+`fallbackToGit: false` instead returns a visible error. An image being installed
+does not establish that its engine supports the mount topology.
+
+On the supported managed VM, the trusted device service creates an exact Git
+source bundle and starts a manager with `/dev/fuse` and `SYS_ADMIN`. A short,
+path-bounded helper prepares
 `/var/lib/enoughfactory/workspaces/<attempt-id>` as a shared mount in the Linux
-Docker host. On Mac, this directory lives in the Docker VM; a Mac FUSE installation
-is unnecessary.
+VM. A Mac FUSE installation is unnecessary. Source bundles and runtime records
+stay in the app's managed data/workspace directory, which the VM mounts
+explicitly; arbitrary host directories are not a runtime dependency.
 
 The manager mounts the writable repository at `/mount/repo`. Envmux receives
 that same repository at its configured workdir and at `/mount/repo`, plus the
@@ -56,6 +77,8 @@ writable author attempt because it restores the input HEAD after restart.
 
 ## Integrate and recover
 
+Construct the provider with `{ rootDirectory, dockerRuntime }`, and construct
+`EnvmuxEngine` and the Docker check executor with that same runtime descriptor.
 `ArtifactFsWorkspaceProvider.prepare(record)` returns `bindSource`, `stateVolume`
 and the expected branch. Pass the first two to `EnvmuxEngine.start({ workspace })`.
 Use `providerState.sessionName` and `providerState.workspaceBranch` when the
@@ -83,7 +106,11 @@ delete these volumes manually when recovering work.
 
 ## Verify the real journeys
 
-With the image installed, run the focused mount/recovery scenario:
+The real ArtifactFS journeys require the managed VM topology, the installed image
+and the descriptor variables above. Set `ENOUGHFACTORY_WORKSPACE_ROOT` to the
+app's managed workspace directory; fixtures are created there rather than in an
+arbitrary operating-system temporary directory. Then run the focused
+mount/recovery scenario:
 
 ```sh
 pnpm exec tsx runtime/workspaces/verify.mts
@@ -97,5 +124,10 @@ cleanup. With the pinned envmux binary installed, verify the product integration
 pnpm exec tsx runtime/workspaces/envmux-verify.mts
 ```
 
-That journey checks a real envmux session, Git status/diff through its API,
-reattachment and source harvesting. Both create isolated temporary repositories.
+Both scripts resolve the explicit runtime and use its bundled CLI, private config
+and managed endpoint for every Docker call, including teardown. They refuse to
+fall back to a user daemon. The envmux journey creates the attempt through `WorkspaceManager`, checks a real
+envmux session, Git status/diff through its API, reattachment and source
+harvesting, then captures the immutable candidate and integrates it after
+configured checks in the actual engine image. Both create isolated repositories
+under the managed workspace root and remove their own runtime storage.

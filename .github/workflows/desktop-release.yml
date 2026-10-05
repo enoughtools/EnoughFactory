@@ -16,7 +16,7 @@ jobs:
   bundle:
     name: ${{ matrix.platform }} ${{ matrix.arch }}
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 35
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -55,7 +55,54 @@ jobs:
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: 'false'
       - name: Verify installed runtime on its native architecture
-        run: node scripts/check-desktop-bundle.mjs --resources "${{ matrix.installedResources }}"
+        run: node scripts/check-desktop-bundle.mjs --resources "${{ matrix.installedResources }}" --receipt "releases/${{ matrix.platform }}-${{ matrix.arch }}.installed.verification.json" --source-commit "$GITHUB_SHA"
+      - name: Prepare Linux user namespaces in this disposable runner
+        if: matrix.platform == 'linux'
+        env:
+          INSTALLED_RESOURCES: ${{ matrix.installedResources }}
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y uidmap iptables
+          node --input-type=module <<'NODE'
+          import { readFile } from 'node:fs/promises';
+          import { execFileSync } from 'node:child_process';
+          import { userInfo } from 'node:os';
+          const user = userInfo();
+          for (const [file, flag] of [['/etc/subuid', '--add-subuids'], ['/etc/subgid', '--add-subgids']]) {
+            const entries = (await readFile(file, 'utf8')).trim().split('\n').filter(Boolean).map(line => line.split(':'));
+            if (entries.some(([owner, , count]) => (owner === user.username || owner === String(user.uid)) && Number(count) >= 65536)) continue;
+            const start = Math.max(100000, ...entries.map(([, first, count]) => Number(first) + Number(count)));
+            execFileSync('sudo', ['usermod', flag, `${start}-${start + 65535}`, user.username]);
+          }
+          NODE
+          cat <<EOF | sudo tee /etc/apparmor.d/enoughfactory-ci-rootlesskit >/dev/null
+          abi <abi/4.0>,
+          include <tunables/global>
+          profile enoughfactory-ci-rootlesskit "$GITHUB_WORKSPACE/$INSTALLED_RESOURCES/runtime/container/docker/bin/rootlesskit" flags=(unconfined) {
+            userns,
+          }
+          EOF
+          sudo apparmor_parser -r /etc/apparmor.d/enoughfactory-ci-rootlesskit
+      - name: Verify the bundled private Linux engine and source retention
+        if: matrix.platform == 'linux'
+        run: |
+          pnpm exec esbuild scripts/check-linux-runtime.ts --bundle --platform=node --format=esm --outfile=.cache/check-linux-runtime.mjs
+          "${{ matrix.installedResources }}/runtime/node" .cache/check-linux-runtime.mjs --assets "${{ matrix.installedResources }}/runtime/container" --envmux "${{ matrix.installedResources }}/envmux/envmux" --bundle-provenance "${{ matrix.installedResources }}/bundle-provenance.json" --receipt "releases/${{ matrix.platform }}-${{ matrix.arch }}.runtime.verification.json"
+      - name: Verify the exact downloadable archives
+        env:
+          RUNTIME_RECEIPT: releases/${{ matrix.platform }}-${{ matrix.arch }}.runtime.verification.json
+        run: |
+          node --input-type=module <<'NODE'
+          import { readdir, access } from 'node:fs/promises';
+          import { execFileSync } from 'node:child_process';
+          let runtimeReceipt;
+          try { await access(process.env.RUNTIME_RECEIPT); runtimeReceipt = process.env.RUNTIME_RECEIPT; } catch {}
+          for (const name of (await readdir('releases')).filter(name => /\.(dmg|zip|AppImage|tar\.gz)$/.test(name)).sort()) {
+            const args = ['scripts/check-desktop-archive.mjs', '--artifact', `releases/${name}`, '--receipt', `releases/${name}.verification.json`, '--source-commit', process.env.GITHUB_SHA];
+            if (runtimeReceipt) args.push('--runtime-receipt', runtimeReceipt);
+            execFileSync(process.execPath, args, { stdio: 'inherit' });
+          }
+          NODE
       - name: Upload desktop artifacts
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
@@ -65,6 +112,7 @@ jobs:
             releases/*.zip
             releases/*.AppImage
             releases/*.tar.gz
+            releases/*.verification.json
           if-no-files-found: error
           retention-days: 30
 
@@ -104,6 +152,6 @@ jobs:
           GH_REPO: ${{ github.repository }}
         run: |
           if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            gh release create "$RELEASE_TAG" --verify-tag --title "EnoughFactory $RELEASE_TAG" --notes "Mac Apple Silicon and Linux x64/ARM64 desktop bundles. These initial builds are unsigned. Bundles include the device service, Node runtime, envmux engine, web interface and dependency notices. Docker-compatible engine and provider sign-in are configured during onboarding."
+            gh release create "$RELEASE_TAG" --verify-tag --title "EnoughFactory $RELEASE_TAG" --notes "Mac Apple Silicon and Linux x64/ARM64 desktop bundles. These initial builds are unsigned. Bundles include a private container runtime, device service, Node runtime, envmux engine, web interface and dependency notices. First launch prepares EnoughFactory's own runtime and dedicated socket. Provider sign-in is configured during onboarding."
           fi
-          gh release upload "$RELEASE_TAG" releases/*.dmg releases/*.zip releases/*.AppImage releases/*.tar.gz releases/SHA256SUMS releases/provenance.json --clobber
+          gh release upload "$RELEASE_TAG" releases/*.dmg releases/*.zip releases/*.AppImage releases/*.tar.gz releases/*.verification.json releases/SHA256SUMS releases/provenance.json --clobber

@@ -207,6 +207,11 @@ internal static class Program
                     Console.WriteLine(ThisAssembly.Version);
                     return 0;
 
+                case "--factory-capabilities":
+                    Console.WriteLine(System.Text.Json.JsonSerializer.Serialize(
+                        new MachineCapabilities(1, ManagedDocker: true), MachineJsonContext.Default.MachineCapabilities));
+                    return 0;
+
                 case "--dry-run":
                     dryRun = true;
                     break;
@@ -455,7 +460,8 @@ internal static class Program
                 await session.StartAsync(shutdown.Token).ConfigureAwait(false);
                 MachineBridge.Emit(new MachineEvent("ready",
                     Endpoint: $"http://127.0.0.1:{session.Port}", Token: plan.Portal.Token,
-                    Proxy: session.BrowserProxyUrl, Project: plan.Project, Session: plan.Session,
+                    Proxy: session.BrowserProxyUrl, DockerHost: session.Backend.Name,
+                    Project: plan.Project, Session: plan.Session,
                     Instance: plan.InstanceName, Workdir: plan.Workdir, User: session.ContainerUser,
                     Branch: plan.Branch));
                 Console.WriteLine("running — interrupt to stop");

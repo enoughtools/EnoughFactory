@@ -5,6 +5,7 @@ import { browserPeerClient, PeerSocket, peerChanges, type ClientSocket } from '.
 export interface Connection { url: string; token: string; mode?: 'http' | 'peer'; deviceId?: string }
 export interface DesktopBridge {
   getConnection(): Promise<Connection>;
+  restartDeviceService?(): Promise<Connection>;
   pickDirectory(): Promise<string | null>;
   openExternal(url: string): Promise<void>;
   openPreview?(options: { sessionId: string; url: string; bounds?: { x: number; y: number; width: number; height: number } }): Promise<void>;

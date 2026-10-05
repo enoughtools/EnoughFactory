@@ -1,27 +1,33 @@
 import assert from 'node:assert/strict';
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
-import { mkdtemp, mkdir, readFile, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, writeFile, lstat } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import type { Attempt, Decision, FactoryTask, Goal, Project, Session } from '../packages/contracts/src/index.ts';
+import { DatabaseSync } from 'node:sqlite';
+import type { Attempt, ContainerRuntimeStatus, Decision, FactoryTask, Goal, Project, Session } from '../packages/contracts/src/index.ts';
 
 // One assembled, real-model product journey. It costs inference and requires
-// Docker plus an authenticated host Codex account; it is deliberately not CI.
+// EnoughFactory's bundled owned runtime plus an authenticated host Codex account;
+// it is deliberately not CI and never invokes the user's Docker client or engine.
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const savedFixture = process.env.ENOUGHFACTORY_SMOKE_FIXTURE;
-const fixture = savedFixture || await mkdtemp(path.join(tmpdir(), 'enoughfactory-product-'));
+// Short app paths also leave room for Lima's private Unix socket names on Mac.
+const fixture = savedFixture || await mkdtemp(path.join(process.env.ENOUGHFACTORY_SMOKE_TMPDIR || (process.platform==='darwin'?'/tmp':tmpdir()), 'enoughfactory-product-'));
 const repository = path.join(fixture, 'repository');
 const home = path.join(fixture, 'device');
 const port = Number(process.env.ENOUGHFACTORY_SMOKE_PORT || 4327);
 const url = `http://127.0.0.1:${port}`;
-const checkImage = process.env.ENOUGHFACTORY_SMOKE_CHECK_IMAGE || 'envmux-golden:8fb7c6fd4f3f';
+const checkImage = process.env.ENOUGHFACTORY_SMOKE_CHECK_IMAGE || 'debian:bookworm-slim';
+const exerciseRecovery = process.env.ENOUGHFACTORY_SMOKE_RECOVERY === '1';
 const deadline = Date.now() + 30 * 60_000;
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 let service: ChildProcess | undefined;
 let token = '';
 let serviceLog = '';
 let goalId: string | undefined;
+let ownedRuntime: ContainerRuntimeStatus | undefined;
 const steps: Array<{ at: string; event: string; detail?: unknown }> = [];
 function record(event: string, detail?: unknown) { steps.push({ at: new Date().toISOString(), event, detail }); console.log(event, detail === undefined ? '' : JSON.stringify(detail)); }
 function command(program: string, args: string[], cwd?: string): string {
@@ -51,7 +57,12 @@ async function observe<T>(label: string, read: () => Promise<T>, ready: (value: 
 }
 async function start() {
   serviceLog = '';
-  service = spawn(process.execPath, ['--import', 'tsx', path.join(root, 'apps/device/src/index.ts')], { cwd: root, env: { ...process.env, ENOUGHFACTORY_HOME: home, ENOUGHFACTORY_PORT: String(port), ENOUGHFACTORY_REPO: root, ENOUGHFACTORY_CHECK_IMAGE: checkImage }, stdio: ['ignore','pipe','pipe'] });
+  service = spawn(process.execPath, ['--import', 'tsx', path.join(root, 'apps/device/src/index.ts')], { cwd: root, env: { ...process.env,
+    ENOUGHFACTORY_HOME: home, ENOUGHFACTORY_PORT: String(port), ENOUGHFACTORY_REPO: root, ENOUGHFACTORY_CHECK_IMAGE: checkImage,
+    // A nonexistent context/socket proves the product does not use inherited
+    // Docker settings. These fixture paths never point at a user's daemon.
+    DOCKER_HOST: `unix://${path.join(fixture,'unowned-runtime.sock')}`, DOCKER_CONTEXT: 'enoughfactory-unowned', DOCKER_CONFIG: path.join(fixture,'unowned-docker-config')
+  }, stdio: ['ignore','pipe','pipe'] });
   for (const stream of [service.stdout, service.stderr]) stream?.on('data', value => { serviceLog += value.toString(); });
   const live = service;
   for (let tries = 0; tries < 100; tries++) {
@@ -63,6 +74,82 @@ async function start() {
     await sleep(200);
   }
   throw new Error(`Service did not start: ${serviceLog}`);
+}
+async function prepareOwnedRuntime(): Promise<ContainerRuntimeStatus> {
+  const status = await api<ContainerRuntimeStatus>('/api/runtime');
+  if (status.state !== 'ready') await api('/api/runtime/start','POST',{});
+  let ready = status;
+  let previous = '';
+  while (Date.now()<deadline) {
+    ready = await api<ContainerRuntimeStatus>('/api/runtime');
+    const progress = JSON.stringify({state:ready.state,phase:ready.phase,error:ready.error});
+    if (previous!==progress) { record('owned-runtime-preparation',JSON.parse(progress)); previous=progress; }
+    assert.ok(!['failed','unavailable'].includes(ready.state),ready.error||JSON.stringify(ready.requiredActions));
+    if (ready.state==='ready') break;
+    await sleep(1000);
+  }
+  assert.equal(ready.state,'ready',ready.error||ready.phase);
+  assert.ok(path.isAbsolute(ready.socketPath));
+  assert.notEqual(ready.socketPath,'/var/run/docker.sock');
+  assert.notEqual(ready.socketPath,path.join(fixture,'unowned-runtime.sock'));
+  await verifyOwnedStorage(ready);
+  record('owned-container-runtime-ready',{kind:ready.kind,socketPath:ready.socketPath,dataDirectory:ready.dataDirectory,dockerVersion:ready.dockerVersion});
+  ownedRuntime = ready; return ready;
+}
+async function verifyOwnedStorage(runtime: ContainerRuntimeStatus): Promise<void> {
+  const directory = path.resolve(runtime.dataDirectory);
+  if (directory.startsWith(path.resolve(home)+path.sep)) return;
+  // A long Mac app path uses a persistent short socket directory. Verify the
+  // app's private location receipt and its user-owned allocation instead of
+  // requiring VM disks to sit beneath the application home in that case.
+  assert.equal(process.platform,'darwin','External runtime storage is supported only by the Mac short-path allocation.');
+  assert.equal(runtime.kind,'lima');
+  const uid = process.getuid?.(); assert.equal(typeof uid,'number');
+  const stateHash = createHash('sha256').update(path.resolve(home)).digest('hex').slice(0,24);
+  const allocation = path.join('/Users/Shared',`.enoughfactory-runtime-${uid}-${stateHash}`);
+  assert.equal(directory,path.join(allocation,'lima'),'Runtime storage must belong to this fixture’s private short-path allocation.');
+  const receiptPath = path.join(home,'container/runtime-location.json');
+  const receiptStat = await lstat(receiptPath);
+  assert.ok(receiptStat.isFile()&&!receiptStat.isSymbolicLink()); assert.equal(receiptStat.uid,uid); assert.equal(receiptStat.mode&0o077,0);
+  const receipt = JSON.parse(await readFile(receiptPath,'utf8')) as {kind?:string;directory?:string};
+  assert.equal(receipt.kind,'lima'); assert.equal(path.resolve(receipt.directory||''),directory);
+  const allocationStat = await lstat(allocation);
+  assert.ok(allocationStat.isDirectory()&&!allocationStat.isSymbolicLink()); assert.equal(allocationStat.uid,uid); assert.equal(allocationStat.mode&0o777,0o700);
+  record('owned-runtime-short-path-receipt',{directory,allocation,receiptPath});
+}
+async function stopOwnedRuntimeIfIdle(): Promise<void> {
+  if (!ownedRuntime||!service||service.exitCode!==null||service.signalCode!==null) return;
+  const state = await api<{sessions:Session[]}>('/api/state');
+  if (state.sessions.some(s=>!['stopped','failed'].includes(s.status))) {
+    record('owned-runtime-retained-for-diagnosis'); return;
+  }
+  const current = await api<ContainerRuntimeStatus>('/api/runtime');
+  assert.equal(current.socketPath,ownedRuntime.socketPath,'Cleanup must stay on this fixture’s owned runtime.');
+  assert.equal(current.dataDirectory,ownedRuntime.dataDirectory);
+  await api('/api/runtime/stop','POST',{});
+  record('owned-runtime-stop-requested',{socketPath:current.socketPath});
+  const stopDeadline = Date.now()+120_000;
+  while (Date.now()<stopDeadline) {
+    const status = await api<ContainerRuntimeStatus>('/api/runtime');
+    assert.equal(status.socketPath,ownedRuntime.socketPath);
+    if (status.state==='stopped') { record('owned-runtime-stopped',{socketPath:status.socketPath}); return; }
+    assert.notEqual(status.state,'failed',status.error);
+    await sleep(1000);
+  }
+  throw new Error('The fixture’s private container runtime did not confirm stopping; its state was retained.');
+}
+function verifyReadyEndpoints(): string[] {
+  assert.ok(ownedRuntime);
+  const store = new DatabaseSync(path.join(home,'factory.sqlite'),{readOnly:true});
+  try {
+    const hosts = store.prepare('SELECT value FROM records WHERE bucket=?').all('session-private').map(row=>{
+      const record = JSON.parse(String(row.value)) as {ready:{dockerHost?:string}};
+      return record.ready.dockerHost;
+    });
+    assert.ok(hosts.length>=3,'The planner, worker and evaluator must each record real envmux readiness.');
+    for (const host of hosts) assert.equal(host,`unix://${ownedRuntime.socketPath}`,'An envmux session used an endpoint outside EnoughFactory’s owned runtime.');
+    return hosts as string[];
+  } finally { store.close(); }
 }
 async function stop() {
   const current = service;
@@ -86,9 +173,10 @@ const initialHead = command('git', ['rev-list','--max-parents=0','HEAD'], reposi
 record('fixture-ready', {fixture, repository, initialHead});
 try {
   await start();
+  await prepareOwnedRuntime();
   const diagnostics = await api<{docker:{available:boolean};envmux:{available:boolean;error?:string}}>('/api/diagnostics');
   assert.equal(diagnostics.docker.available, true); assert.equal(diagnostics.envmux.available,true,diagnostics.envmux.error);
-  const unauthorized = await fetch(`${url}/api/state`); assert.equal(unauthorized.status,401);
+  if (exerciseRecovery) { const unauthorized = await fetch(`${url}/api/state`); assert.equal(unauthorized.status,401); }
   const project = await api<Project>('/api/projects','POST',{path:repository,name:'Factory product journey',runtime:'codex',approvalMode:'approve-all'});
   assert.equal((await api<{valid:boolean}>(`/api/projects/${project.id}/validate`)).valid,true);
   const criteria = [
@@ -112,24 +200,27 @@ try {
   const dispatched = await observe('factory-progress',read,s => s.attempts.some(a=>a.status==='running'));
   assert.equal(dispatched.tasks.length,1,'This bounded product fixture should remain one compact task.');
   firstAttempt = dispatched.attempts[0]!;
+  if (exerciseRecovery) {
   await api(`/api/goals/${goal.id}/pause`,'POST',{}); record('coordination-paused-while-owner-runs',{attemptId:firstAttempt.id,generation:firstAttempt.generation});
   const retained = await observe('retaining-candidate',read,s => s.goal.status==='paused' && s.attempts.some(a=>a.id===firstAttempt.id&&Boolean(a.candidate)));
   assert.equal(retained.tasks[0]!.status,'review'); assert.equal(command('git',['rev-parse','HEAD'],repository),initialHead,'Paused coordination must not integrate work.');
   const beforeRestart = {goalId:retained.goal.id,revision:retained.goal.revision,taskIds:retained.tasks.map(t=>t.id),attempts:retained.attempts.map(a=>({id:a.id,generation:a.generation,candidate:a.candidate}))};
   await stop(); await start();
+  await prepareOwnedRuntime();
   const recovered = await read();
   assert.equal(recovered.goal.status,'paused'); assert.equal(recovered.goal.revision,beforeRestart.revision);
   assert.deepEqual(recovered.tasks.map(t=>t.id),beforeRestart.taskIds);
   assert.deepEqual(recovered.attempts.map(a=>({id:a.id,generation:a.generation,candidate:a.candidate})),beforeRestart.attempts);
   record('durable-coordinator-recovered',beforeRestart);
   await api(`/api/goals/${goal.id}/resume`,'POST',{});
+  }
   completed = await observe('factory-resumed',read,s=>s.goal.status==='completed');
   }
   assert.equal(completed.attempts.length,1,'Recovery must not launch a duplicate worker.');
   assert.equal(completed.attempts[0]!.id,firstAttempt.id); assert.equal(completed.attempts[0]!.generation,firstAttempt.generation);
   assert.ok(completed.tasks.every(t=>t.status==='completed'));
   assert.equal(completed.decisions.filter(d=>d.kind==='integrated').length,1,'The candidate should integrate exactly once.');
-  assert.ok(completed.decisions.some(d=>d.kind==='attempt-recovered'));
+  if (exerciseRecovery) assert.ok(completed.decisions.some(d=>d.kind==='attempt-recovered'));
   const head = command('git',['rev-parse','HEAD'],repository); assert.notEqual(head,initialHead);
   assert.equal(command('git',['status','--porcelain'],repository),'');
   const tests = command('bash',['tests/slug.test.sh'],repository);
@@ -145,13 +236,14 @@ try {
     assert.ok(detail.threadId); assert.equal(detail.status,'idle');
   }
   assert.ok(state.sessions.every(s=>s.status==='stopped'));
+  const readyHosts = verifyReadyEndpoints();
   record('real-goal-completed',{goalId:goal.id,head,attemptId:firstAttempt.id,tests,criteria:completed.goal.criteria});
-  const evidence = {verifiedAt:new Date().toISOString(),fixture,repository,initialHead,head,goal:completed.goal,tasks:completed.tasks,attempts:completed.attempts,decisions:completed.decisions,evaluations:completed.evaluations,steps,scope:'Real Codex planner, worker and evaluator in envmux Docker sessions via authenticated device HTTP API. Paused candidate retained across a clean device-service restart; same attempt integrated once. No browser/Electron packaging, multi-device transport or selective approval coverage claimed by this script.'};
+  const evidence = {verifiedAt:new Date().toISOString(),fixture,repository,initialHead,head,ownedRuntime,readyHosts,exerciseRecovery,goal:completed.goal,tasks:completed.tasks,attempts:completed.attempts,decisions:completed.decisions,evaluations:completed.evaluations,steps,scope:`Real Codex planner, worker and evaluator in envmux Docker sessions on EnoughFactory’s explicitly owned container runtime via authenticated device HTTP API. All readiness descriptors use its private socket despite poisoned inherited Docker settings. Candidate checked and integrated once.${exerciseRecovery?' Paused candidate retained across a clean device-service restart; same attempt recovered.':''} No browser/Electron packaging, multi-device transport or selective approval coverage claimed by this script.`};
   const evidenceDir = path.join(root,'docs/verification'); await mkdir(evidenceDir,{recursive:true});
-  await writeFile(path.join(evidenceDir,'factory-smoke-evidence.json'),JSON.stringify(evidence,null,2)+'\n');
-  console.log(`Factory journey passed. Source: ${repository}. Evidence: docs/verification/factory-smoke-evidence.json`);
+  await writeFile(path.join(evidenceDir,'factory-managed-runtime-evidence.json'),JSON.stringify(evidence,null,2)+'\n');
+  console.log(`Factory journey passed. Source: ${repository}. Evidence: docs/verification/factory-managed-runtime-evidence.json`);
 } catch(error) {
   await writeFile(path.join(fixture,'service.log'),serviceLog);
   console.error(`Journey failed; preserved ${fixture}${goalId?`; goal ${goalId}`:''}`);
   throw error;
-} finally { await stop(); }
+} finally { try { await stopOwnedRuntimeIfIdle(); } finally { await stop(); } }

@@ -11,6 +11,7 @@
   },
   "dependencies": {
     "@enoughfactory/contracts": "workspace:*",
+    "@enoughfactory/runtime": "workspace:*",
     "@enoughfactory/envmux": "workspace:*",
     "ws": "^8.18.3",
     "@enoughfactory/agents": "workspace:*",

@@ -1,12 +1,13 @@
 # EnoughFactory agents
 
 The device service owns these runtime connections. All model/tool execution is
-inside an existing Docker container; there is no host execution fallback.
+inside an existing container on EnoughFactory's dedicated managed Docker runtime;
+there is no host execution or user-Docker fallback.
 Containers receive full root access, networking and unsandboxed tools. They do
 not receive the host Docker socket through this package.
 
 ```ts
-const agents = new AgentManager({ copyHostAuth: true });
+const agents = new AgentManager({ dockerEndpoint: managedRuntime.endpoint, copyHostAuth: true });
 const result = await agents.runTurn({
   chatId, sessionId, containerId, runtime: "codex",
   approvalMode: "approve-all", rules: [], prompt,
@@ -29,6 +30,14 @@ container process group, including tools. `shutdown()` interrupts this manager's
 live turns. Closing a renderer does neither. The container command wrapper uses
 `setsid --wait`, because Docker can make its exec process a process-group leader;
 without `--wait` setsid forks and Docker loses a live protocol connection.
+
+Every operation requires `dockerEndpoint: {host,cliPath,configDirectory}` from
+EnoughFactory's runtime manager. The shared runtime invocation supplies explicit
+`--host` and `--config` flags and clears inherited context/TLS selectors. This
+includes provisioning, private credential writes and cancellation. An absent
+descriptor fails with `MANAGED_RUNTIME_UNCONFIGURED`; it cannot select Docker
+Desktop, Colima's default profile or the user's current CLI context. The caller
+starts the owned runtime before launching a session or agent.
 
 `availability(containerId)` reports real executable/package versions.
 `provision(containerId, runtime, {copyHostAuth})` installs pinned runtime packages
@@ -77,12 +86,20 @@ application resource and pass its directory as `runtimeAssetsDir`.
 ```sh
 pnpm --filter @enoughfactory/agents typecheck
 pnpm --filter @enoughfactory/agents verify
-ENOUGHFACTORY_AGENT_CONTAINER=your-disposable-container pnpm --filter @enoughfactory/agents verify
+ENOUGHFACTORY_AGENT_CONTAINER=your-disposable-container \
+ENOUGHFACTORY_AGENT_TEST_ENDPOINT=managed \
+ENOUGHFACTORY_AGENT_TEST_DOCKER_HOST=unix:///path/to/enoughfactory/docker.sock \
+ENOUGHFACTORY_AGENT_TEST_DOCKER_CLI=/path/to/bundled/docker \
+ENOUGHFACTORY_AGENT_TEST_DOCKER_CONFIG=/path/to/private/docker-config \
+pnpm --filter @enoughfactory/agents verify
 ```
 
 The focused suite covers service-owned Approve all, deny rules, stale manual
 answers, native request resolution and generated Codex response shapes. The
 optional Docker check covers connection lifetime and descendant interruption.
+For an existing external development fixture, explicitly select
+`ENOUGHFACTORY_AGENT_TEST_ENDPOINT=external-development` and its full descriptor.
+This test opt-in does not alter product runtime selection.
 
 On 2026-10-05 a real pinned Codex app-server turn, authenticated inside a
 disposable envmux container, wrote files to `/root` and `/work` as uid 0 and

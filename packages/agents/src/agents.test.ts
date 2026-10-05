@@ -3,6 +3,8 @@ import test from "node:test";
 import { ApprovalRouter, matchPolicyRule } from "./policy.ts";
 import { codexApprovalResponse } from "./codex.ts";
 import type { AgentEvent, TurnInput } from "./types.ts";
+import { ContainerProcess, containerCommand } from "./process.ts";
+import { spawn } from "node:child_process";
 
 const input: TurnInput = { chatId: "chat-a", sessionId: "session-a", containerId: "container-a", runtime: "codex", approvalMode: "approve-all", rules: [], prompt: "Work toward the goal", attemptId: "attempt-a", policyRevision: 3 };
 test("Approve all owns the decision without waiting for a UI callback", async () => {
@@ -43,4 +45,22 @@ test("Pinned Codex approvals preserve schema and never activate provider review"
   const permissions = { network: { enabled: true }, fileSystem: { write: ["/opt"] } };
   assert.deepEqual(codexApprovalResponse("item/permissions/requestApproval", { permissions }, true), { permissions, scope: "turn", strictAutoReview: false });
   assert.deepEqual(codexApprovalResponse("item/permissions/requestApproval", { permissions }, false).permissions, {});
+});
+test("An unconfigured runtime cannot fall back to a user's Docker context", async () => {
+  assert.throws(() => new ContainerProcess("container-a", ["true"]), { code: "MANAGED_RUNTIME_UNCONFIGURED" });
+  await assert.rejects(containerCommand("container-a", ["true"]), { code: "MANAGED_RUNTIME_UNCONFIGURED" });
+});
+test("Provision and credential commands preserve the explicitly selected runtime", async () => {
+  const calls: Array<{ command: string; args: string[]; environment: NodeJS.ProcessEnv }> = [];
+  const spawnProcess: typeof spawn = ((command: string, args: readonly string[], options: { env?: NodeJS.ProcessEnv }) => {
+    calls.push({ command, args: [...args], environment: options.env ?? {} });
+    return spawn(process.execPath, ["-e", "process.stdin.resume(); process.stdin.on('end',()=>console.log('selected'));"], { stdio: "pipe" });
+  }) as typeof spawn;
+  const dockerEndpoint = { cliPath: "/managed/runtime/bin/docker", host: "unix:///managed/runtime/docker.sock", configDirectory: "/managed/runtime/config" };
+  assert.equal(await containerCommand("container-a", ["sh", "-s"], { dockerEndpoint, spawnProcess, input: "private payload" }), "selected");
+  assert.equal(calls[0].command, dockerEndpoint.cliPath);
+  assert.deepEqual(calls[0].args.slice(0, 4), ["--host", dockerEndpoint.host, "--config", dockerEndpoint.configDirectory]);
+  assert.equal(calls[0].environment.DOCKER_HOST, dockerEndpoint.host);
+  assert.equal(calls[0].environment.DOCKER_CONFIG, dockerEndpoint.configDirectory);
+  assert.equal(calls[0].environment.DOCKER_CONTEXT, undefined);
 });

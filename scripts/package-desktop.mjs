@@ -7,6 +7,8 @@ import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
 import { createRequire } from 'node:module';
+import { ensureElectron } from '../apps/desktop/ensure-electron.mjs';
+import { prepareContainerRuntime } from './prepare-container-runtime.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const nodeVersion = '22.22.0';
@@ -152,9 +154,11 @@ async function writeBundleProvenance(platform, arch, resources) {
   const desktop = JSON.parse(await readFile(join(root, 'apps', 'desktop', 'package.json'), 'utf8'));
   const manifest = {
     formatVersion: 1, product: 'EnoughFactory', version: desktop.version, platform, arch,
+    sourceCommit: process.env.GITHUB_SHA ?? execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' }).trim(),
     nodeVersion,
     engineSha256: files['envmux/envmux'], serviceSha256: files['device/service.cjs'], webIndexSha256: files['web/index.html'],
     nativeModules: JSON.parse(await readFile(join(resources, 'device', 'native-provenance.json'), 'utf8')).modules,
+    containerRuntime: JSON.parse(await readFile(join(resources, 'runtime', 'container', 'provenance.json'), 'utf8')),
     files,
   };
   await writeFile(join(resources, 'bundle-provenance.json'), `${JSON.stringify(manifest, null, 2)}\n`);
@@ -190,8 +194,7 @@ await mkdir(join(resources, 'notices'), { recursive: true });
 await cp(join(root, 'apps', 'desktop', 'assets', 'LICENSE'), join(resources, 'notices', 'Enough-brand-LICENSE'));
 await cp(join(root, 'vendor', 'enough-ui', 'LICENSE'), join(resources, 'notices', 'EnoughUI-LICENSE'));
 await cp(join(root, 'vendor', 'enough-ui', 'THIRD_PARTY_NOTICES.md'), join(resources, 'notices', 'EnoughUI-THIRD_PARTY_NOTICES.md'));
-const desktopRequire = createRequire(join(root, 'apps', 'desktop', 'package.json'));
-const electronDist = join(dirname(desktopRequire.resolve('electron/package.json')), 'dist');
+const electronDist = await ensureElectron();
 await cp(join(electronDist, 'LICENSE'), join(resources, 'notices', 'Electron-LICENSE'));
 await cp(join(electronDist, 'LICENSES.chromium.html'), join(resources, 'notices', 'LICENSES.chromium.html'));
 for (const notice of ['LICENSE', 'THIRD_PARTY_NOTICES.md']) {
@@ -200,8 +203,9 @@ for (const notice of ['LICENSE', 'THIRD_PARTY_NOTICES.md']) {
 }
 await prepareRuntime(opt.platform, opt.arch, resources);
 await prepareNative(opt.platform, opt.arch, resources);
+await prepareContainerRuntime(opt.platform, opt.arch, join(resources, 'runtime', 'container'));
 await writeBundleProvenance(opt.platform, opt.arch, resources);
-console.log(`Prepared EnoughFactory resources for ${opt.platform}/${opt.arch} with verified Node ${nodeVersion}.`);
+console.log(`Prepared EnoughFactory resources for ${opt.platform}/${opt.arch} with verified Node ${nodeVersion} and its private container runtime.`);
 if (!opt.prepareOnly) {
   if (opt.platform === 'darwin' && process.platform !== 'darwin') throw new Error('Build Mac bundles on a Mac release worker.');
   const args = ['--filter', '@enoughfactory/desktop', 'exec', 'electron-builder', '--config', 'electron-builder.mjs', opt.platform === 'darwin' ? '--mac' : '--linux', `--${opt.arch}`, '--publish', 'never'];

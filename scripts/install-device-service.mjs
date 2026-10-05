@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { cp, mkdir, readFile, writeFile, rename, rm, mkdtemp, access } from 'node:fs/promises';
+import { cp, mkdir, readFile, writeFile, rename, rm, mkdtemp, access, lstat } from 'node:fs/promises';
 import { constants } from 'node:fs';
 import { homedir } from 'node:os';
 import { resolve, join, dirname, parse } from 'node:path';
@@ -50,7 +50,8 @@ for (const key of ['home', 'serviceDir']) {
   if (options[key] === parse(options[key]).root || options[key] === userHome) throw new Error(`Refusing to use a filesystem root or home directory as ${key}.`);
 }
 if (options.home === options.serviceDir || options.home.startsWith(`${options.serviceDir}/`)) throw new Error('Device state must be outside the installed service directory so ordinary removal preserves it.');
-for (const file of ['runtime/node', 'device/service.cjs', 'envmux/envmux', 'web/index.html', 'workspaces/Dockerfile', 'agents/antigravity_bridge.py']) {
+const containerFiles = mac ? ['runtime/container/lima/bin/limactl', 'runtime/container/docker/guest-engine.tgz', 'runtime/container/images/guest.img'] : ['runtime/container/docker/bin/dockerd', 'runtime/container/docker/bin/rootlesskit'];
+for (const file of ['runtime/node', 'runtime/container/pins.json', 'runtime/container/docker/bin/docker', ...containerFiles, 'device/service.cjs', 'envmux/envmux', 'web/index.html', 'workspaces/Dockerfile', 'agents/antigravity_bridge.py']) {
   try { await access(join(options.resources, file), constants.R_OK); }
   catch { throw new Error(`Installed application resources are incomplete: ${file}`); }
 }
@@ -64,9 +65,17 @@ function run(command, args, optional = false) {
   catch (error) { if (!optional) throw error; }
 }
 async function stopDetached(home) {
+  async function requireNoUnverifiedRuntime() {
+    const paths = mac ? ['container/lima/factory'] : ['docker/run', 'docker/data', 'docker/daemon.json'];
+    for (const path of paths) {
+      try { await lstat(join(home, path)); }
+      catch (error) { if (error.code === 'ENOENT') continue; throw error; }
+      throw new Error('The device service is offline and its private container runtime cannot be verified stopped. Reopen EnoughFactory using this state directory, stop active goals, chats and environments, then retry with its service still online. Resources and runtime data were preserved.');
+    }
+  }
   let connection;
   try { connection = JSON.parse(await readFile(join(home, 'connection.json'), 'utf8')); }
-  catch (error) { if (error.code === 'ENOENT') return; throw error; }
+  catch (error) { if (error.code === 'ENOENT') { await requireNoUnverifiedRuntime(); return; } throw error; }
   const url = new URL(connection.url);
   if (!['http:', 'https:'].includes(url.protocol) || !['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname) || typeof connection.token !== 'string' || !connection.token) throw new Error('Invalid local device connection record.');
   const headers = { Authorization: `Bearer ${connection.token}` };
@@ -79,8 +88,34 @@ async function stopDetached(home) {
   });
   let health;
   try { health = await fetch(new URL('/api/health', url), { headers, signal: AbortSignal.timeout(1500) }); }
-  catch { if (!await portOpen()) return; throw new Error('A local service is still reachable but its identity could not be verified. Resources were not replaced.'); }
+  catch { if (!await portOpen()) { await requireNoUnverifiedRuntime(); return; } throw new Error('A local service is still reachable but its identity could not be verified. Resources were not replaced.'); }
   if (!health.ok || (await health.json()).product !== 'EnoughFactory') throw new Error('A live service does not match this EnoughFactory connection. Stop it explicitly before replacing resources.');
+  async function runtimeStatus() {
+    const response = await fetch(new URL('/api/runtime', url), { headers, signal: AbortSignal.timeout(5000) });
+    if (!response.ok) throw new Error(`This service cannot verify its private runtime (${response.status}). Reopen the updated EnoughFactory app before replacing resources.`);
+    const status = await response.json();
+    if (status.dataDirectory && resolve(status.dataDirectory) !== resolve(home)) throw new Error('The runtime status does not belong to this device state directory. Resources were preserved.');
+    return status;
+  }
+  await runtimeStatus();
+  console.log('Stopping EnoughFactory’s private container runtime before updating its resources…');
+  const deadline = Date.now() + 180_000;
+  let stopped;
+  try { stopped = await fetch(new URL('/api/runtime/stop', url), { method: 'POST', headers: { ...headers, 'Content-Type': 'application/json' }, body: '{}', signal: AbortSignal.timeout(150_000) }); }
+  catch { /* A timed-out request is not proof of failure or completion. Verify through the runtime status. */ }
+  if (stopped && !stopped.ok) {
+    const detail = await stopped.json().catch(() => ({}));
+    throw new Error(stopped.status === 409 ? `Stop active goals, chats and environments in EnoughFactory, then retry. ${detail.error || detail.message || 'The private runtime is still in use.'} Resources and runtime data were preserved.` : `The private runtime could not stop safely (${stopped.status}). Resources and runtime data were preserved.`);
+  }
+  let confirmed = false;
+  do {
+    const status = await runtimeStatus();
+    if (status.state === 'stopped' || status.phase === 'stopped') { confirmed = true; break; }
+    if (['failed', 'unavailable'].includes(status.state) || ['error', 'missing', 'unsupported'].includes(status.phase)) throw new Error('The private runtime did not confirm it stopped. Inspect EnoughFactory runtime diagnostics before retrying; resources and runtime data were preserved.');
+    if (Date.now() >= deadline) break;
+    await new Promise(resolve => setTimeout(resolve, 500));
+  } while (Date.now() < deadline);
+  if (!confirmed) throw new Error('The private runtime stop is still pending or unknown. Wait for EnoughFactory to confirm it stopped, then retry. Resources and runtime data were preserved.');
   const shutdown = await fetch(new URL('/api/service/shutdown', url), { method: 'POST', headers, signal: AbortSignal.timeout(5000) });
   if (!shutdown.ok) throw new Error(`The running service could not shut down safely (${shutdown.status}). Update or stop it before replacing resources.`);
   for (let i = 0; i < 40; i++) {
@@ -89,12 +124,12 @@ async function stopDetached(home) {
   }
   throw new Error('The device service is still running after shutdown; resources were not replaced.');
 }
+if (previous?.home && previous.home !== options.home) await stopDetached(previous.home);
+await stopDetached(options.home);
 if (options.start || previous) {
   if (mac) run('launchctl', ['bootout', `gui/${process.getuid()}`, previous?.unitPath || unitPath], true);
   else run('systemctl', ['--user', 'disable', '--now', unit], true);
 }
-if (previous?.home && previous.home !== options.home) await stopDetached(previous.home);
-await stopDetached(options.home);
 if (previous?.unitPath && previous.unitPath !== unitPath) await rm(previous.unitPath, { force: true });
 await mkdir(dirname(options.serviceDir), { recursive: true });
 await mkdir(options.home, { recursive: true, mode: 0o700 });
@@ -125,7 +160,7 @@ try {
   await rename(staged, options.serviceDir);
 } finally { await rm(staged, { recursive: true, force: true }); }
 const env = {
-  PATH: [...new Set([...(process.env.PATH || '').split(':').filter(Boolean), join(userHome, '.docker', 'bin'), join(userHome, '.local', 'bin'), '/opt/homebrew/bin', '/usr/local/bin', '/usr/bin', '/bin', '/usr/sbin', '/sbin'])].join(':'),
+  PATH: [...new Set([...(process.env.PATH || '').split(':').filter(Boolean), join(userHome, '.local', 'bin'), '/opt/homebrew/bin', '/usr/local/bin', '/usr/bin', '/bin', '/usr/sbin', '/sbin'])].join(':'),
   ENOUGHFACTORY_HOME: options.home,
   ENOUGHFACTORY_PORT: String(options.port),
   ENOUGHFACTORY_RESOURCES: options.serviceDir,

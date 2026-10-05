@@ -1,6 +1,8 @@
 #!/bin/sh
 set -eu
-# Executed only by the trusted service in the Docker host's mount namespace.
+# Executed only by the trusted service in the private, rootful Linux VM's mount
+# namespace. Native rootless Linux engines cannot use this topology and select
+# the ordinary Git workspace provider instead.
 # A named Docker volume is rprivate and cannot share a FUSE submount.
 workspace_attempt_id=${1:?attempt ID is required}
 workspace_mount_action=${2:-prepare}

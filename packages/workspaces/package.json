@@ -4,6 +4,7 @@
   "private": true,
   "type": "module",
   "exports": "./src/index.ts",
+  "dependencies": { "@enoughfactory/runtime": "workspace:*" },
   "scripts": {
     "typecheck": "tsc -p tsconfig.json",
     "test": "tsx --test tests/*.test.ts"

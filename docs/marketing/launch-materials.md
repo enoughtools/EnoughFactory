@@ -16,6 +16,8 @@ Your devices. One software factory. EnoughFactory brings isolated development en
 
 EnoughFactory gives agentic development a place to happen. Create an isolated environment for a project, follow its services, open a terminal or preview, talk to an agent and inspect the resulting changes—all in the same workspace.
 
+The app includes its own container runtime: a private Lima VM on Mac and a dedicated rootless engine on Linux. EnoughFactory manages the runtime, socket and storage independently of your existing Docker setup. First startup explains preparation and any host prerequisites. Agents retain full access inside their containers.
+
 Pair the Mac and Linux devices you own to use their capacity together. Each device keeps its sessions and conversations local, while the app gives you one view of the work. Its independent device service keeps execution alive when the window closes.
 
 Start with a task or define an outcome and completion criteria. In autonomous mode, the factory owns the next action: it plans, dispatches agents, evaluates evidence and continues through repair or replanning. Choose approvals separately, from automatic acceptance to your own rules or manual review. Agents run with full permissions inside their provisioned containers.
@@ -32,6 +34,8 @@ In autonomous mode, the factory keeps choosing its next action after an agent tu
 
 You bring your own machines and agent accounts. The app, device service, protocols and coordination logic are open source.
 
+EnoughFactory supplies the container engine too, with a private socket and storage. Mac bundles a verified Linux guest image and prepares its private writable VM disk on first startup; Linux setup explains the host helpers and ID mappings its rootless engine needs.
+
 [Get EnoughFactory and read the guide](https://factory.enoughtools.com).
 
 ## Short launch post draft
@@ -40,7 +44,7 @@ Your devices. One software factory.
 
 EnoughFactory brings isolated environments, coding agents and autonomous goals into one open-source workspace for Mac and Linux.
 
-Bring your own machines and agent accounts. Choose the autonomy. Own the approvals.
+Bring your own machines and agent accounts. The factory includes its own container runtime. Choose the autonomy. Own the approvals.
 
 https://factory.enoughtools.com
 
@@ -61,6 +65,8 @@ Use a real project and actual product state. Keep provider credentials, local pr
 
 Keep the finished video concise enough to show the complete journey. Pause only where a viewer needs time to read a decision or result. Describe observed behavior; do not imply that a synthetic conversation is real agent execution.
 
+For installation footage, show the actual managed-runtime setup state. On Mac, capture verified guest-image preparation and the runtime becoming ready. On Linux, show missing prerequisites only when the host actually needs them, then the private engine starting. Keep host engine credentials and sockets outside the capture.
+
 ## Brand and assets
 
 The launch site uses Enough’s supplied square mark, paper `#f4f5f8`, ink `#12151c` and indigo `#3b4fe4`. It loads the supplied Space Grotesk and Libre Caslon Text variable fonts locally. Keep the mark unchanged and leave at least half its height clear on every side.
@@ -73,6 +79,9 @@ Product screenshots must come from the current app. Capture the workbench, an ag
 
 - State signing accurately. An unsigned package is an unsigned package.
 - Show only packages that exist and have recorded checksums.
+- Verify the owned runtime inside each actual archive before treating the catalog, tag or publication as ready. A source implementation or prepared resource folder alone does not prove a downloadable package contains it.
+- Packaged apps supply their own container runtime. Describe Linux user-namespace helpers and ID mappings as host prerequisites; do not tell users to install Docker or change a default Docker context.
+- Mac’s guest image is bundled, pinned and digest-verified; show the private disk preparation and startup progress. Initial provisioning, container base images and provider tools can still require network access, so do not claim a fully offline first start.
 - Publish supported platform names from the actual package catalog.
 - Explain device-local history: chats and live tools are unavailable while their owning device is offline.
 - Explain approval coverage: adapters expose supported typed requests; full-access routes may emit no requests, and an allowed command does not produce a separate prompt for each effect.

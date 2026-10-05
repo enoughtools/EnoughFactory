@@ -5,7 +5,8 @@ import path from 'node:path';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { createReadStream } from 'node:fs';
 import WebSocket, { WebSocketServer } from 'ws';
-import type { FactoryState, Project, Session, Settings, Device, Diagnostics } from '@enoughfactory/contracts';
+import type { FactoryState, Project, Session, Settings, Device, Diagnostics, ContainerRuntimeStatus } from '@enoughfactory/contracts';
+import { ManagedRuntimeManager, type DockerRuntimeEndpoint } from '@enoughfactory/runtime';
 import { PRODUCT } from '@enoughfactory/contracts';
 import { Store } from './store.ts';
 import { SessionController } from './sessions.ts';
@@ -16,10 +17,13 @@ export type Extension = (call: ApiCall) => Promise<unknown | undefined>;
 const MIME: Record<string,string> = {'.html':'text/html; charset=utf-8','.js':'text/javascript; charset=utf-8','.css':'text/css; charset=utf-8','.svg':'image/svg+xml','.woff2':'font/woff2','.png':'image/png','.json':'application/json'};
 export class DeviceApp {
   readonly dataDir = process.env.ENOUGHFACTORY_HOME || path.join(homedir(), '.enoughfactory');
+  readonly repositoryRoot = process.env.ENOUGHFACTORY_REPO || path.resolve(process.cwd(),process.cwd().endsWith('/apps/device')?'../..':'.');
   readonly port = Number(process.env.ENOUGHFACTORY_PORT || 4317);
   readonly store = new Store(this.dataDir);
   readonly token: string;
   readonly sessions: SessionController;
+  readonly runtime: ManagedRuntimeManager;
+  readonly runtimeStopHooks: Array<()=>Promise<void>> = [];
   readonly server: http.Server;
   readonly extensions: Extension[] = [];
   readonly listeners = new Set<(topic:string,data:unknown)=>void>();
@@ -33,6 +37,10 @@ export class DeviceApp {
   private sse = new Set<ServerResponse>();
   private changeTimer?: ReturnType<typeof setTimeout>;
   private closing = false;
+  private runtimeStarting?:Promise<DockerRuntimeEndpoint>;
+  private runtimeStopping = false;
+  private runtimeSuspended = false;
+  private runtimeOperations = new Map<string,{controller:AbortController;promise:Promise<unknown>}>();
   private socketServer = new WebSocketServer({noServer:true, maxPayload:1024*1024});
   settings: Settings;
 
@@ -45,7 +53,12 @@ export class DeviceApp {
     this.device=this.store.get<Device>('devices','local') || {id:id('device'),name:this.settings.deviceName,platform:process.platform,arch:process.arch,online:true,lastSeen:now(),local:true,transport:'local',capacity:2};
     this.device={...this.device,name:this.settings.deviceName,online:true,lastSeen:now()};
     this.devices=[this.device];
-    this.sessions=new SessionController(this.store,this.device.id,()=>this.changed(),(topic,data)=>this.emit(topic,data));
+    this.runtimeSuspended=Boolean(this.store.get<{id:string;suspended:boolean}>('private','runtime-control')?.suspended);
+    this.syncRuntimeCapacity();
+    this.runtime=new ManagedRuntimeManager({dataDir:this.dataDir,resourcesDirectory:process.env.ENOUGHFACTORY_CONTAINER_ASSETS||
+      (process.env.ENOUGHFACTORY_RESOURCES?path.join(process.env.ENOUGHFACTORY_RESOURCES,'runtime/container'):path.join(this.repositoryRoot,'.cache/container-runtime',`${process.platform}-${process.arch}`)),onStatus:status=>this.runtimeStatus(status)});
+    this.sessions=new SessionController(this.store,this.device.id,()=>this.changed(),(topic,data)=>this.emit(topic,data),{
+      endpoint:this.runtime.endpoint,ensureReady:()=>this.ensureRuntimeReady(),bridgeHostAddress:()=>this.runtime.bridgeHostAddress()});
     this.server=http.createServer((req,res)=>{void this.handle(req,res);});
     this.server.on('upgrade',(req,socket,head)=>{
       const url=new URL(req.url||'/',`http://127.0.0.1:${this.port}`);
@@ -74,7 +87,36 @@ export class DeviceApp {
       }catch {socket.write('HTTP/1.1 409 Conflict\r\n\r\n');socket.destroy();}
     });
   }
-  setDevice(device: Device): void {this.device=device;this.devices=[device,...this.devices.filter(d=>!d.local)];this.sessions.setDeviceId(device.id);}
+  private syncRuntimeCapacity():void {
+    const state=this.diagnostics.containerRuntime?.state;
+    const unavailable=this.runtimeSuspended||this.runtimeStopping||state==='stopping'||state==='unavailable'||state==='failed';
+    this.device={...this.device,capacity:unavailable?0:2};
+    this.devices=[this.device,...this.devices.filter(device=>!device.local&&device.id!==this.device.id)];
+  }
+  setDevice(device: Device): void {this.device=device;this.syncRuntimeCapacity();this.sessions.setDeviceId(device.id);}
+  private runtimeStatus(status:ContainerRuntimeStatus):void {
+    this.diagnostics={...this.diagnostics,containerRuntime:status,docker:{available:status.state==='ready',version:status.dockerVersion,error:status.error}};
+    this.syncRuntimeCapacity();
+    this.sessions?.runtimeProgress(status);this.emit('runtime',status);this.changed();
+  }
+  async refreshRuntime():Promise<ContainerRuntimeStatus>{const actual=await this.runtime.status();const status=this.runtimeStopping&&actual.state==='ready'?{...actual,state:'stopping' as const,phase:'Stopping environments and preserving their work'}:actual;this.runtimeStatus(status);return status;}
+  assertRuntimeCanRun():void {if(this.runtimeStopping||this.runtimeSuspended)throw new HttpError(409,'Start EnoughFactory’s runtime to continue.','RUNTIME_PAUSED');}
+  allowRuntimeStart():void {if(this.runtimeStopping)throw new HttpError(409,'EnoughFactory is stopping its container runtime.');this.runtimeSuspended=false;this.store.set('private',{id:'runtime-control',suspended:false});this.syncRuntimeCapacity();}
+  async ensureRuntimeReady():Promise<DockerRuntimeEndpoint>{
+    if(this.runtimeStopping||this.runtimeSuspended)throw new HttpError(409,'EnoughFactory’s container runtime is stopped. Start it to continue.','RUNTIME_PAUSED');
+    if(!this.runtimeStarting){
+      const operation=this.runtime.ensureReady().then(async endpoint=>{await this.refreshRuntime();if(this.runtimeStopping||this.runtimeSuspended)throw new HttpError(409,'The container runtime was stopped while preparing work.','RUNTIME_PAUSED');return endpoint;})
+        .catch(async error=>{await this.refreshRuntime().catch(()=>{});throw error;}).finally(()=>{if(this.runtimeStarting===operation)this.runtimeStarting=undefined;});
+      this.runtimeStarting=operation;
+    }
+    return this.runtimeStarting;
+  }
+  async withRuntimeOperation<T>(operation:(signal:AbortSignal)=>Promise<T>):Promise<T>{
+    this.assertRuntimeCanRun();
+    const operationId=id('runtime-op'),controller=new AbortController();
+    const promise=operation(controller.signal).finally(()=>this.runtimeOperations.delete(operationId));
+    this.runtimeOperations.set(operationId,{controller,promise});return promise;
+  }
   state(): FactoryState {
     return {product:PRODUCT,version:'0.1.0',device:{...this.device,lastSeen:now()},devices:this.devices,projects:this.store.list<Project>('projects').filter(p=>!p.internal),sessions:this.store.list('sessions'),chats:this.store.list('chats'),approvals:this.store.list('approvals'),goals:this.store.list('goals'),tasks:this.store.list('tasks'),attempts:this.store.list('attempts'),diagnostics:this.diagnostics,settings:{...this.settings,turnCredential:undefined},...this.catalog?.()};
   }
@@ -91,6 +133,33 @@ export class DeviceApp {
     if(method==='GET' && route==='/api/health')return {ok:true,product:PRODUCT,version:'0.1.0',deviceId:this.device.id};
     if(method==='GET' && route==='/api/state')return this.state();
     if(method==='POST' && route==='/api/service/shutdown'){setTimeout(()=>{void this.close().then(()=>process.exit(0));},200);return {ok:true};}
+    if(method==='GET'&&route==='/api/runtime')return this.refreshRuntime();
+    if(method==='POST'&&route==='/api/runtime/start'){
+      this.allowRuntimeStart();const status=await this.refreshRuntime();
+      void this.ensureRuntimeReady().catch(error=>this.emit('runtime-error',{error:error.message}));
+      return {...status,state:status.state==='ready'?'ready':'starting',accepted:true};
+    }
+    if(method==='POST'&&route==='/api/runtime/stop'){
+      const active=this.store.list<Session>('sessions').filter(session=>this.sessions.needsTermination(session.id));
+      const workers=this.store.list<{id:string;status:string;attempt?:{deviceId?:string}}>('factory-workers').filter(worker=>worker.attempt?.deviceId===this.device.id&&['preparing','prepared','running','unknown'].includes(worker.status));
+      if((active.length||workers.length||this.runtimeOperations.size)&&body.confirmStopEnvironments!==true)throw new HttpError(409,'Environments are using EnoughFactory’s runtime. Stop them first, or explicitly confirm stopping all environments.','RUNTIME_IN_USE');
+      if(this.runtimeStopping)throw new HttpError(409,'EnoughFactory is already stopping its container runtime.');
+      this.runtimeStopping=true;this.runtimeSuspended=true;this.store.set('private',{id:'runtime-control',suspended:true});
+      this.syncRuntimeCapacity();this.changed();
+      try {
+        for(const operation of this.runtimeOperations.values())operation.controller.abort();
+        for(const hook of this.runtimeStopHooks)await hook();
+        await Promise.allSettled([...this.runtimeOperations.values()].map(operation=>operation.promise));
+        for(const session of this.store.list<Session>('sessions').filter(session=>this.sessions.needsTermination(session.id))){await this.sessions.stop(session.id);await this.sessions.waitStopped(session.id);}
+        await this.runtime.stop();return await this.refreshRuntime();
+      }catch(error){await this.refreshRuntime().catch(()=>{});throw new HttpError(409,`Could not confirm all work stopped: ${(error as Error).message}`,'RUNTIME_STOP_UNCONFIRMED');}
+      finally{this.runtimeStopping=false;this.syncRuntimeCapacity();this.changed();}
+    }
+    if(method==='PATCH'&&route==='/api/runtime'){
+      const status=await this.refreshRuntime();
+      const limits={cpus:body.cpus===undefined?status.cpus||4:Number(body.cpus),memoryGiB:body.memoryGiB===undefined?status.memoryGiB||4:Number(body.memoryGiB),diskGiB:body.diskGiB===undefined?status.diskGiB||40:Number(body.diskGiB)};
+      try {const updated=await this.runtime.configure(limits);this.runtimeStatus(updated);return updated;}catch(error){throw new HttpError(409,(error as Error).message);}
+    }
     if(method==='GET' && route==='/api/diagnostics'){await this.refreshDiagnostics();return this.diagnostics;}
     if(method==='GET' && route==='/api/projects')return this.store.list('projects');
     if(method==='POST' && route==='/api/projects'){
@@ -118,6 +187,7 @@ export class DeviceApp {
     }
     if(method==='POST'&&route==='/api/sessions'){
       const project=this.store.get<Project>('projects',String(body.projectId));if(!project)throw new HttpError(404,'Project not found.');
+      this.allowRuntimeStart();
       return this.sessions.create(project,String(body.name||`work-${Date.now().toString(36)}`));
     }
     const sessionRoute=route.match(/^\/api\/sessions\/([^/]+)(?:\/(.+))?$/);
@@ -127,7 +197,7 @@ export class DeviceApp {
       if(method==='GET'&&action==='changes')return this.sessions.changes(sid);
       if(method==='GET'&&action==='output'){const task=url.searchParams.get('task');return task?this.sessions.get(sid).logs(task):this.sessions.output(sid);}
       if(method==='POST'&&action==='stop'){void this.sessions.stop(sid).catch(error=>this.emit('error',{sessionId:sid,error:error.message}));return {ok:true};}
-      if(method==='POST'&&action==='restart'){await this.sessions.restart(sid);return {ok:true};}
+      if(method==='POST'&&action==='restart'){if(this.sessions.owns(sid))this.allowRuntimeStart();await this.sessions.restart(sid);return {ok:true};}
       const service=action?.match(/^services\/([^/]+)\/(start|stop|restart)$/);
       if(method==='POST'&&service){await this.sessions.get(sid).task(decodeURIComponent(service[1]),service[2] as 'start'|'stop'|'restart');return {ok:true};}
     }
@@ -167,7 +237,7 @@ export class DeviceApp {
     if(!existsSync(target)){res.writeHead(503,{'Content-Type':'text/plain'});res.end('EnoughFactory is starting. Build the web application or run the development server.');return;}
     res.writeHead(200,{'Content-Type':MIME[path.extname(target)]||'application/octet-stream'});const stream=createReadStream(target);stream.on('error',()=>res.end());stream.pipe(res);
   }
-  async refreshDiagnostics():Promise<void>{const info=await this.sessions.engine.detect();this.diagnostics={...this.diagnostics,docker:info.docker,envmux:{available:info.available,version:info.version,error:info.error}};this.changed();}
+  async refreshDiagnostics():Promise<void>{const [info,status]=await Promise.all([this.sessions.engine.detect(),this.runtime.status()]);this.diagnostics={...this.diagnostics,containerRuntime:status,docker:{available:status.state==='ready',version:status.dockerVersion,error:status.error},envmux:{available:info.available,version:info.version,error:info.error}};this.syncRuntimeCapacity();this.changed();}
   async listen():Promise<void>{
     await new Promise<void>((resolve,reject)=>{this.server.once('error',reject);this.server.listen(this.port,'127.0.0.1',()=>resolve());});
     writeFileSync(path.join(this.dataDir,'connection.json'),JSON.stringify({url:`http://127.0.0.1:${this.port}`,token:this.token,pid:process.pid,version:'0.1.0'},null,2),{mode:0o600});

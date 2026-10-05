@@ -11,6 +11,7 @@ import {
 import { WorkspaceManager, ArtifactFsWorkspaceProvider, dockerCheckExecutor, type ArtifactManifest, type Candidate, type CheckReport, type WorkspaceRecord } from '@enoughfactory/workspaces';
 import type { PeerManager } from '@enoughfactory/peers';
 import type { TurnResult } from '@enoughfactory/agents';
+import { dockerInvocation } from '@enoughfactory/runtime';
 import type { DeviceApp, ApiCall } from './app.ts';
 import type { ChatController } from './chats.ts';
 import { exec, HttpError, now } from './util.ts';
@@ -28,14 +29,16 @@ const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, m
 
 /** The service owns execution and the supervisor; no open window is required. */
 export async function initializeFactory(app: DeviceApp, chats: ChatController, network?: { peers: PeerManager }) {
+  const checkExecutor=dockerCheckExecutor({ image:process.env.ENOUGHFACTORY_CHECK_IMAGE,dockerRuntime:app.runtime.endpoint });
   const workspaces = new WorkspaceManager({
     dataDir: path.join(app.dataDir, 'workspace-data'), deviceId: app.device.id,
-    checkExecutor: dockerCheckExecutor({ image: process.env.ENOUGHFACTORY_CHECK_IMAGE }),
+    checkExecutor:context=>app.withRuntimeOperation(async signal=>{await app.ensureRuntimeReady();await app.runtime.prepareWorkspace(context.path);return checkExecutor({...context,signal:context.signal?AbortSignal.any([signal,context.signal]):signal});}),
     artifactFs: new ArtifactFsWorkspaceProvider({
       rootDirectory: path.join(app.dataDir, 'workspace-data'),
+      dockerRuntime:app.runtime.endpoint,
       runtimeDirectory: process.env.ENOUGHFACTORY_RESOURCES
         ? path.join(process.env.ENOUGHFACTORY_RESOURCES, 'workspaces')
-        : path.resolve(process.env.ENOUGHFACTORY_REPO || process.cwd(), 'runtime/workspaces'),
+        : path.join(app.repositoryRoot, 'runtime/workspaces'),
     }),
   });
   const jobs = new Map<string, Promise<void>>();
@@ -126,6 +129,8 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
   }
   function candidateRef(candidate: Candidate): CandidateRef { return { ...candidate }; }
   async function prepareLocal(record: WorkerRecord, project = record.project, previousCandidate?: CandidateRef): Promise<void> {
+    return app.withRuntimeOperation(async()=>{
+    await app.ensureRuntimeReady();
     const name = sessionName(record.id);
     const config = await projectConfig(project);
     let workspace = await workspaces.create({ projectPath: project.path, goalId: record.goal.id,
@@ -146,6 +151,7 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
     await app.sessions.waitReady(session.id);
     if (worker(record.id).status === 'canceled') { await app.sessions.stop(session.id); return; }
     patchWorker(record.id, { status: 'prepared' });
+    });
   }
   function beginWorker(input: Omit<WorkerRecord, 'status' | 'updatedAt'>): WorkerRecord {
     const previous = app.store.get<WorkerRecord>(journal, input.id);
@@ -210,15 +216,17 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
     if (record.candidate) return record.candidate;
     if (!['succeeded', 'failed'].includes(record.status) || !record.workspace || !record.sessionId) throw new Error('Capture requires a confirmed ended execution and workspace.');
     const existing = captureJobs.get(id); if (existing) return existing;
-    const operation = (async () => {
+    const operation = app.withRuntimeOperation(async () => {
       const session = app.sessions.record(record.sessionId!);
       let commit = app.store.get<{ id: string; commit: string }>('factory-capture-input', id)?.commit;
       if (session.status !== 'stopped') {
         if (record.workspace!.provider === 'git') {
           // The application owns preservation; a provider final answer need not have committed its work.
           const engine = app.sessions.get(session.id);
-          const containerGit = async (...args: string[]) => (await exec('docker', ['exec', engine.ready.instance,
-            'git', '-c', 'safe.directory=*', '-c', 'core.hooksPath=/dev/null', '-C', engine.ready.workdir, ...args], { maxBuffer: 16 * 1024 * 1024 })).stdout.trim();
+          const containerGit = async (...args: string[]) => {
+            const invocation=dockerInvocation(app.runtime.endpoint,['exec',engine.ready.instance,'git','-c','safe.directory=*','-c','core.hooksPath=/dev/null','-C',engine.ready.workdir,...args]);
+            return (await exec(invocation.command,invocation.args,{env:invocation.env,maxBuffer:16*1024*1024})).stdout.trim();
+          };
           await containerGit('add', '--all');
           const staged = await containerGit('diff', '--cached', '--name-only');
           if (staged) await containerGit('-c', 'user.name=EnoughFactory', '-c', 'user.email=factory@enoughtools.com', 'commit', '-m', `Preserve EnoughFactory attempt ${id}`);
@@ -232,7 +240,7 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
         ...(record.workspace!.provider === 'git' ? { reference: commit || session.branch || `envmux/${session.name}` } : {}) });
       rememberArtifacts(candidate.bundleArtifact, candidate.diffArtifact);
       const value = candidateRef(candidate); patchWorker(id, { candidate: value }); return value;
-    })().finally(() => captureJobs.delete(id));
+    }).finally(() => captureJobs.delete(id));
     captureJobs.set(id, operation); return operation;
   }
   async function acceptRemoteCandidate(peerId: string, candidate: CandidateRef): Promise<void> {
@@ -322,7 +330,10 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
   };
   const runtime: FactoryRuntimePort = {
     async complete({ goal, role, prompt, project, signal }) {
+      return app.withRuntimeOperation(async runtimeSignal=>{
+      signal=signal?AbortSignal.any([signal,runtimeSignal]):runtimeSignal;
       if (signal?.aborted) throw new Error('The controller decision was revoked.');
+      await app.ensureRuntimeReady();
       const operation = randomUUID();
       const workspace = await workspaces.create({ projectPath: project.path, goalId: goal.id, taskId: `control-${role}`, attemptId: operation });
       await configureHandoff(workspace);
@@ -350,11 +361,12 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
       } finally {
         signal?.removeEventListener('abort', cancel);
         const current = app.sessions.record(session.id);
-        if (!['failed', 'stopped'].includes(current.status)) {
+        if (app.sessions.needsTermination(session.id)) {
           if (current.status !== 'stopping') await app.sessions.stop(session.id);
           await app.sessions.waitStopped(session.id);
         }
       }
+      });
     },
     async execute({ attempt, goal, project, prompt }) {
       const currentProject = app.store.get<Project>('projects', project.id) || project;
@@ -379,7 +391,7 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
   };
   async function cancelLocal(id: string): Promise<void> {
     const record = worker(id); patchWorker(id, { status: 'canceled' });
-    if (record.chatId) await chats.interrupt(record.chatId);
+    if (record.chatId) {await chats.interrupt(record.chatId);await chats.waitForIdle(record.chatId);}
     if (record.sessionId && !['stopped', 'stopping', 'failed'].includes(app.sessions.record(record.sessionId).status)) await app.sessions.stop(record.sessionId);
     const running = jobs.get(id);
     if (running) await running;
@@ -399,6 +411,7 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
       const workspaceProvider = body.workspaceProvider === undefined
         ? process.env.ENOUGHFACTORY_WORKSPACE_PROVIDER === 'artifactfs' ? 'artifactfs' : 'git'
         : body.workspaceProvider as 'git' | 'artifactfs';
+      if(workspaceProvider==='artifactfs'&&!(await app.refreshRuntime()).artifactFsSupported)throw new HttpError(400,'ArtifactFS mounting is unavailable on this owned runtime. Choose Git workspaces.');
       const input = createGoalInput(body); const goal = { ...coordinator.create(input), workspaceProvider };
       app.store.set('goals', goal);
       app.store.set<GoalOptions>('factory-options', { id: goal.id, workspaceProvider });
@@ -471,6 +484,7 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
     const peerId = (call as ApiCall & { peerId?: string }).peerId;
     if (!peerId) throw new HttpError(403, 'Factory worker commands require a paired coordinator connection.');
     if (method === 'POST' && route === '/api/factory/worker/prepare') {
+      app.assertRuntimeCanRun();
       const goal = body.goal as Goal, task = body.task as FactoryTask, attempt = body.attempt as Attempt, project = body.project as Project;
       if (!goal || !task || !attempt || !project || attempt.deviceId !== app.device.id || task.goalId !== goal.id || attempt.taskId !== task.id || goal.coordinatorId !== peerId)
         throw new HttpError(400, 'The worker assignment does not match its coordinator, task and device.');
@@ -478,6 +492,7 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
       const source = body.source as ArtifactManifest; await importReceived(peerId, source);
       const previousCandidate = body.previousCandidate as CandidateRef | undefined;
       if (previousCandidate) await acceptRemoteCandidate(peerId, previousCandidate);
+      app.assertRuntimeCanRun();
       const record = beginWorker({ id: attempt.id, coordinatorId: peerId, goal, task, attempt, project });
       app.store.set<GoalOptions>('factory-options', { id: goal.id, workspaceProvider: body.workspaceProvider === 'artifactfs' ? 'artifactfs' : 'git' });
       if (record.status === 'preparing') track(record.id, async () => {
@@ -524,6 +539,13 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
       if (record.workspace) await workspaces.dispose(record.workspace.id); return { ok: true };
     }
     return undefined;
+  });
+  app.runtimeStopHooks.unshift(async()=>{
+    for(const goal of app.store.list<Goal>('goals').filter(goal=>goal.coordinatorId===app.device.id&&!['completed','canceled','failed'].includes(goal.status)))coordinator.pause(goal.id);
+    for(const record of app.store.list<WorkerRecord>(journal).filter(record=>record.attempt.deviceId===app.device.id&&['preparing','prepared','running','unknown'].includes(record.status))){
+      const attempt=app.store.get<Attempt>('attempts',record.id);
+      if(attempt&&attempt.status!=='retired')await coordinator.retireAttempt(record.id);else await cancelLocal(record.id);
+    }
   });
   app.closers.unshift(() => coordinator.stop());
   await coordinator.start();

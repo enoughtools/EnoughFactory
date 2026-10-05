@@ -1,0 +1,65 @@
+name: Private Linux runtime
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  runtime:
+    name: Linux ${{ matrix.arch }} private Engine
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x64, rid: linux-x64, runner: ubuntu-24.04 }
+          - { arch: arm64, rid: linux-arm64, runner: ubuntu-24.04-arm }
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa # v4
+        with:
+          version: 10.34.5
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 22.22.0
+          cache: pnpm
+      - uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5
+        with:
+          dotnet-version: 10.0.x
+      - name: Install locked source dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Prepare the app-owned Engine assets
+        run: node scripts/prepare-container-runtime.mjs linux "${{ matrix.arch }}" ".cache/container-runtime/linux-${{ matrix.arch }}"
+      - name: Prepare Linux user namespaces in this disposable runner
+        env:
+          RUNTIME_ARCH: ${{ matrix.arch }}
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y uidmap iptables
+          node --input-type=module <<'NODE'
+          import { readFile } from 'node:fs/promises';
+          import { execFileSync } from 'node:child_process';
+          import { userInfo } from 'node:os';
+          const user = userInfo();
+          for (const [file, flag] of [['/etc/subuid', '--add-subuids'], ['/etc/subgid', '--add-subgids']]) {
+            const entries = (await readFile(file, 'utf8')).trim().split('\n').filter(Boolean).map(line => line.split(':'));
+            if (entries.some(([owner, , count]) => (owner === user.username || owner === String(user.uid)) && Number(count) >= 65536)) continue;
+            const start = Math.max(100000, ...entries.map(([, first, count]) => Number(first) + Number(count)));
+            execFileSync('sudo', ['usermod', flag, `${start}-${start + 65535}`, user.username]);
+          }
+          NODE
+          cat <<EOF | sudo tee /etc/apparmor.d/enoughfactory-ci-rootlesskit >/dev/null
+          abi <abi/4.0>,
+          include <tunables/global>
+          profile enoughfactory-ci-rootlesskit "$GITHUB_WORKSPACE/.cache/container-runtime/linux-$RUNTIME_ARCH/docker/bin/rootlesskit" flags=(unconfined) {
+            userns,
+          }
+          EOF
+          sudo apparmor_parser -r /etc/apparmor.d/enoughfactory-ci-rootlesskit
+      - name: Publish the native envmux adapter
+        run: node scripts/envmux-build.mjs "${{ matrix.rid }}"
+      - name: Run one private Engine and workbench journey
+        run: pnpm exec tsx scripts/check-linux-runtime.ts --assets ".cache/container-runtime/linux-${{ matrix.arch }}" --envmux "artifacts/envmux/${{ matrix.rid }}/envmux"

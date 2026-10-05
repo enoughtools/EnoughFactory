@@ -2,9 +2,17 @@
 
 The device service owns execution and local history. The signaling service exchanges presence and authenticated negotiation, issues optional temporary TURN credentials, and can forward encrypted relay frames. It stores no conversations or goals. A local-only factory needs no signaling service.
 
+## Private container runtime
+
+Every installed device service owns its execution engine. Mac bundles Lima 2.2.1 and Docker 29.8.2 for a private VM using Apple virtualization. Linux bundles Docker 29.8.2 and its rootless extras for a dedicated per-user engine. Host tools, endpoints and client configuration are explicit; the service does not reuse a default Docker context or daemon.
+
+Prepare source-run assets with `node scripts/prepare-container-runtime.mjs`. The exact archive URLs, architecture-specific SHA-256 values and Ubuntu image pins are recorded in [runtime/container/pins.json](../runtime/container/pins.json). The prepared runtime records those inputs in its own `provenance.json`. Mac includes the pinned Ubuntu guest image in the desktop archive and creates its private writable VM disk from that image. Container images and agent tools can require downloads after the runtime starts.
+
+Start, stop and resource configuration belong to the device service's runtime controls. The engine remains independent of window lifetime. Explicitly stop active environments before stopping the engine. Linux needs the host prerequisites in the [installation guide](install.md#linux-runtime-prerequisites); run the service as a regular user. Private state and images are retained for recovery until explicitly removed.
+
 ## Signaling with Docker and TLS
 
-On a server you control:
+For these optional public networking services, use a server and container engine you control. This deployment is independent of each device's private execution engine:
 
 ```sh
 git clone https://github.com/enoughtools/EnoughFactory.git
@@ -75,17 +83,11 @@ See [preview implementation notes](../packages/previews/README.md) for the actua
 
 ## ArtifactFS workspaces
 
-Ordinary Git is the default workspace provider. The optional ArtifactFS manager runs inside the Linux Docker engine, including a Mac's Linux VM. The trusted manager holds FUSE/mount capability; agent containers consume the attempt's private mount and state volume without receiving the host Docker socket or mount capability.
+Ordinary Git is the compatible workspace provider. The optional ArtifactFS manager requires trusted FUSE and shared-mount capability; the private Mac VM can provide that boundary. Linux's rootless engine does not currently provide the required host shared mounts, so it reports that capability and retains the explicit Git fallback. This is a provider limitation, not reduced permissions inside agent containers. Agents consume an attempt's private mount and state volume without receiving the engine socket or mount capability.
 
-Build the pinned image from source:
+The managed provider builds its pinned image through the explicitly owned endpoint when selected. It fetches the committed RepoReach/ArtifactFS source, applies the documented private mount patch and builds `enoughfactory/artifactfs:6a62f2f34aeb`. Developer helper invocations must use that same owned CLI, socket and private config. Follow the [workspace runtime instructions](../runtime/workspaces/README.md) for the helper's endpoint inputs. Image provenance and Apache-2.0 notices are recorded in [runtime/workspaces/NOTICE.md](../runtime/workspaces/NOTICE.md); dependency licenses are retained in the image.
 
-```sh
-bash runtime/workspaces/build.sh
-```
-
-This fetches the committed RepoReach/ArtifactFS source, applies the documented private mount patch and builds `enoughfactory/artifactfs:6a62f2f34aeb`. Image provenance and Apache-2.0 notices are recorded in [runtime/workspaces/NOTICE.md](../runtime/workspaces/NOTICE.md); dependency licenses are retained in the image.
-
-Use `workspaceProvider: "artifactfs"` in the goal creation API to select this provider explicitly. Selection and fallback are recorded with the workspace. If the provider is unavailable, the compatible Git fallback remains visible; integrations using the workspace manager can request strict provider behavior instead.
+Use **Repository workspace** when creating a goal, or `workspaceProvider: "artifactfs"` in the goal creation API, to select this provider explicitly. Selection and fallback are recorded with the workspace. If the provider is unavailable, the compatible Git fallback remains visible; integrations using the workspace manager can request strict provider behavior instead.
 
 ArtifactFS is source/workspace storage. SQLite coordination, device-local chats and immutable evidence manifests remain separate. Do not use a mounted repository as a transactional scheduler database.
 
@@ -97,6 +99,6 @@ The goal's autonomy and approval policy are independent. Autonomous with Approve
 
 ## Updating and recovery
 
-Update the source or desktop package, retain the device state directory and reinstall the optional user service from the updated application resources. Keep signing status and native architecture explicit. Back up state only while the service is shut down; back up project repositories separately.
+Update the source or desktop package, retain the device state directory and reinstall the optional user service from the updated application resources. Keep signing status and native architecture explicit. Stop work, the private runtime and the device service before backing up their state; back up project repositories separately.
 
 To update signaling, rebuild it with the same enabled Compose profiles. Rotate `TURN_SECRET` in both signaling and coturn together. Preserve Caddy certificate volumes. `docker compose --profile tls --profile turn down` stops the services without deleting those volumes.

@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { mkdtemp, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { homedir, tmpdir } from 'node:os';
+import { basename, join } from 'node:path';
 import { EnvmuxEngine } from '../packages/envmux/src/index.ts';
+import { ManagedRuntimeManager } from '../packages/runtime/src/index.ts';
 
 function run(program: string, args: string[], cwd?: string): string {
   const result = spawnSync(program, args, { cwd, encoding: 'utf8' });
@@ -19,12 +20,14 @@ run('git', ['config', 'user.name', 'EnoughFactory'], directory);
 run('git', ['config', 'user.email', 'factory@enoughtools.com'], directory);
 await writeFile(join(directory, 'README.md'), 'Engine source-retention fixture\n');
 await writeFile(join(directory, '.envmux.json'), JSON.stringify({
-  name: 'enoughfactory-engine-proof', portal: { open: false }, tools: {},
+  name: `ef-engine-${basename(directory).split('-').at(-1)?.toLowerCase()}`, portal: { open: false }, tools: {},
   tasks: { proof: { command: 'printf "factory-runtime-ready\\n"', kind: 'once' } },
 }));
 run('git', ['add', '.'], directory); run('git', ['commit', '-m', 'Fixture'], directory);
 
-const engine = new EnvmuxEngine();
+const runtime = new ManagedRuntimeManager({ dataDir: process.env.ENOUGHFACTORY_DATA_DIR ?? join(homedir(), '.enoughfactory') });
+await runtime.ensureReady();
+const engine = new EnvmuxEngine({ dockerRuntime: runtime.endpoint, containerHostAddress: runtime.bridgeHostAddress() });
 const detected = await engine.detect();
 assert.equal(detected.available, true, detected.error);
 assert.equal(detected.docker.available, true, detected.docker.error);
@@ -42,7 +45,8 @@ try {
   for await (const event of session.events(stream.signal)) {
     assert.equal(event.instanceName, session.id); stream.abort(); break;
   }
-  const exec = (...args: string[]) => run('docker', ['exec', '-u', 'root', '--workdir', session.ready.workdir, session.ready.instance, ...args]);
+  const exec = (...args: string[]) => run(runtime.endpoint.cliPath, ['--host', runtime.endpoint.host,
+    '--config', runtime.endpoint.configDirectory, 'exec', '-u', 'root', '--workdir', session.ready.workdir, session.ready.instance, ...args]);
   exec('bash', '-lc', 'printf "Recovered from a real container\\n" > RESULT.txt');
   assert.equal((await session.repositoryStatus()).entries.some(entry => entry.path === 'RESULT.txt'), true);
   assert.match((await session.repositoryDiff('RESULT.txt')).diff, /Recovered from a real container/);

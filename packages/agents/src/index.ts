@@ -62,7 +62,7 @@ export class AgentManager {
       const selected = { ...input, cwd };
       let result: TurnResult;
       if (input.runtime === "codex" && input.codexTransport !== "exec") {
-        const process = new ContainerProcess(input.containerId, ["codex", "app-server", "--listen", "stdio://"], this.options.docker, this.options.spawnProcess, cwd, input.runtime);
+        const process = new ContainerProcess(input.containerId, ["codex", "app-server", "--listen", "stdio://"], this.options.dockerEndpoint, this.options.spawnProcess, cwd, input.runtime);
         live.process = process;
         const turn = new CodexTurn(selected, callbacks, process, router, controller.signal); live.codex = turn;
         result = await turn.run();
@@ -96,7 +96,7 @@ export class AgentManager {
   async shutdown(): Promise<void> { await Promise.allSettled([...this.live.keys()].map((id) => this.interrupt(id))); }
 
   private async runAntigravitySdk(input: TurnInput, callbacks: TurnCallbacks, live: LiveTurn): Promise<TurnResult> {
-    const process = new ContainerProcess(input.containerId, ["/opt/enoughfactory/antigravity/bin/python", "-u", "/opt/enoughfactory/agents/antigravity_bridge.py"], this.options.docker, this.options.spawnProcess, input.cwd, input.runtime);
+    const process = new ContainerProcess(input.containerId, ["/opt/enoughfactory/antigravity/bin/python", "-u", "/opt/enoughfactory/agents/antigravity_bridge.py"], this.options.dockerEndpoint, this.options.spawnProcess, input.cwd, input.runtime);
     live.process = process;
     return new Promise<TurnResult>((resolve, reject) => {
       let settled = false;
@@ -147,7 +147,7 @@ export class AgentManager {
       ? ["codex", "exec", ...(input.threadId ? ["resume", input.threadId] : []), "--json", "--dangerously-bypass-approvals-and-sandbox", ...(input.model ? ["--model", input.model] : []), "-"]
       : input.runtime === "claude" ? ["claude", "-p", "--output-format", "stream-json", "--verbose", "--dangerously-skip-permissions", ...(input.threadId ? ["--resume", input.threadId] : []), ...(input.model ? ["--model", input.model] : []), prompt]
       : ["agy", "-p", prompt, "--output-format", "stream-json", "--dangerously-skip-permissions", ...(input.threadId ? ["--conversation", input.threadId] : []), ...(input.model ? ["--model", input.model] : [])];
-    const process = new ContainerProcess(input.containerId, args, this.options.docker, this.options.spawnProcess, input.cwd, input.runtime); live.process = process;
+    const process = new ContainerProcess(input.containerId, args, this.options.dockerEndpoint, this.options.spawnProcess, input.cwd, input.runtime); live.process = process;
     let threadId = input.threadId, text = "", usage: Record<string, unknown> | undefined, runtimeError: string | undefined;
     let eventChain = Promise.resolve();
     const emit = (event: Parameters<TurnCallbacks["onEvent"]>[0]) => { eventChain = eventChain.then(() => callbacks.onEvent(event)); };

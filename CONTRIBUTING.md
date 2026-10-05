@@ -4,11 +4,12 @@ Read the [build plan](docs/build-plan.md) and [implementation instructions](AGEN
 
 ## Development
 
-Install Node 22.14+, pnpm 10.34.5, the .NET 10 SDK and a running Docker-compatible engine. Clone the repository, then:
+Install Node 22.14+, pnpm 10.34.5 and the .NET 10 SDK. Prepare EnoughFactory's pinned container-runtime assets for the development target and satisfy its host prerequisites; an existing Docker daemon is not a product dependency. Clone the repository, then:
 
 ```sh
 pnpm install --frozen-lockfile
 pnpm --filter @enoughfactory/envmux build:engine
+node scripts/prepare-container-runtime.mjs
 pnpm dev
 ```
 
@@ -18,7 +19,7 @@ Open the desktop during development in another terminal:
 pnpm --filter @enoughfactory/desktop dev
 ```
 
-Use a disposable repository for changes to session teardown, integration or agent execution. Development uses real Docker environments and real provider accounts when connected. Use a separate `ENOUGHFACTORY_HOME` if you need independent application state.
+Use a disposable repository for changes to session teardown, integration or agent execution. Development uses the private runtime and real provider accounts when connected. Use a separate `ENOUGHFACTORY_HOME` if you need independent application state. Every engine call must receive the managed endpoint and private client configuration; a missing runtime must never fall back to the user's Docker socket or context.
 
 ## Verification
 

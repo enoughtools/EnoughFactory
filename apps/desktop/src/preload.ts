@@ -3,6 +3,7 @@ import { contextBridge, ipcRenderer } from 'electron';
 contextBridge.exposeInMainWorld('enoughFactory', Object.freeze({
   platform: process.platform,
   getConnection: () => ipcRenderer.invoke('factory:connection'),
+  restartDeviceService: () => ipcRenderer.invoke('factory:service-restart'),
   pickDirectory: () => ipcRenderer.invoke('factory:directory'),
   openExternal: (url: string) => ipcRenderer.invoke('factory:external', url),
   openPreview: (options: unknown) => ipcRenderer.invoke('factory:preview-open', options),

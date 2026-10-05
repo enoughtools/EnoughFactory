@@ -3,10 +3,17 @@ import { readFile } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
+import { verifyArchiveReceipt, verifyPublishedCatalog, verifyRuntimeJourney } from './verify-receipt.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
-const manifest = JSON.parse(await readFile(resolve(root, 'apps/marketing/public/downloads/manifest.json'), 'utf8'));
-if (manifest.status !== 'published') throw new Error('Prepare the actual published product release catalog before deploying the launch site.');
+const publicRoot = resolve(root, 'apps/marketing/public');
+const manifest = verifyPublishedCatalog(JSON.parse(await readFile(resolve(publicRoot, 'downloads/manifest.json'), 'utf8')));
+const pins = JSON.parse(await readFile(resolve(root, 'runtime/container/pins.json'), 'utf8'));
+for (const artifact of manifest.artifacts) {
+  const receipt = verifyArchiveReceipt(JSON.parse(await readFile(resolve(publicRoot, `.${artifact.verificationUrl}`), 'utf8')), { ...artifact, version: manifest.version }, pins);
+  if (receipt.sourceCommit !== manifest.sourceCommit) throw new Error(`Package verification source differs from the catalog: ${artifact.filename}.`);
+  verifyRuntimeJourney(receipt);
+}
 const execute = promisify(execFile);
 const commands = [
   ['pnpm', ['--filter', '@enoughfactory/marketing', 'build']],

@@ -379,6 +379,7 @@ internal static class AgentRegistry
                 CreateNoWindow = true,
                 WorkingDirectory = repository,
             };
+            MachineBridge.PrepareChild(info);
 
             foreach (var argument in arguments)
             {
@@ -407,6 +408,7 @@ internal static class AgentRegistry
             RedirectStandardOutput = true,
             WorkingDirectory = repository,
         };
+        MachineBridge.PrepareChild(info);
 
         info.ArgumentList.Add("-c");
         info.ArgumentList.Add("nohup \"$@\" </dev/null >/dev/null 2>&1 & echo $!");

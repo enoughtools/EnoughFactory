@@ -1,0 +1,122 @@
+{
+  "formatVersion": 1,
+  "modules": [
+    {
+      "module": "github.com/cyphar/filepath-securejoin",
+      "version": "v0.6.0",
+      "license": "MPL-2.0 (see package source headers and full notices)",
+      "url": "https://proxy.golang.org/github.com/cyphar/filepath-securejoin/@v/v0.6.0.zip",
+      "sha256": "ea65899eb360982a060471c6213e7acbe0f9a0fd0b604bd24f6f0286a1cb6f00",
+      "fileName": "github.com_cyphar_filepath-securejoin@v0.6.0.zip",
+      "moduleH1": "h1:BtGB77njd6SVO6VztOHfPxKitJvd/VPT+OFBFMOi1Is="
+    },
+    {
+      "module": "github.com/cyphar/filepath-securejoin",
+      "version": "v0.6.1",
+      "license": "MPL-2.0 (see package source headers and full notices)",
+      "url": "https://proxy.golang.org/github.com/cyphar/filepath-securejoin/@v/v0.6.1.zip",
+      "sha256": "bb04848c968a45eb74ca7e9236d10579c4612b40cf5cd78203ee3f604b05f9e9",
+      "fileName": "github.com_cyphar_filepath-securejoin@v0.6.1.zip",
+      "moduleH1": "h1:5CeZ1jPXEiYt3+Z6zqprSAgSWiggmpVyciv8syjIpVE="
+    },
+    {
+      "module": "github.com/cyphar/filepath-securejoin",
+      "version": "v0.7.0",
+      "license": "MPL-2.0 (see package source headers and full notices)",
+      "url": "https://proxy.golang.org/github.com/cyphar/filepath-securejoin/@v/v0.7.0.zip",
+      "sha256": "601684f1d3cfc8391cbaf7e5973b0485db6a5037426d9cccf47935ca0a4d65dd",
+      "fileName": "github.com_cyphar_filepath-securejoin@v0.7.0.zip",
+      "moduleH1": "h1:s0Y3ITPy6sQn5xt54DuYvTF8hu134ooYLUb58DX/HjE="
+    },
+    {
+      "module": "github.com/hashicorp/errwrap",
+      "version": "v1.1.0",
+      "license": "MPL-2.0 (see package source headers and full notices)",
+      "url": "https://proxy.golang.org/github.com/hashicorp/errwrap/@v/v1.1.0.zip",
+      "sha256": "209ae99bc039443e28e4d6bb66517d1756d9468b7578d31f1b63a28103d8e18c",
+      "fileName": "github.com_hashicorp_errwrap@v1.1.0.zip",
+      "moduleH1": "h1:OxrOeh75EUXMY8TBjag2fzXGZ40LB6IKw45YeGUDY2I="
+    },
+    {
+      "module": "github.com/hashicorp/go-immutable-radix",
+      "version": "v1.3.1",
+      "license": "MPL-2.0 (see package source headers and full notices)",
+      "url": "https://proxy.golang.org/github.com/hashicorp/go-immutable-radix/@v/v1.3.1.zip",
+      "sha256": "47f3d79b57082d5db3f966547ad4de2a00544dfb362790fbf2cef1a161b4de3f",
+      "fileName": "github.com_hashicorp_go-immutable-radix@v1.3.1.zip",
+      "moduleH1": "h1:DKHmCUm2hRBK510BaiZlwvpD40f8bJFeZnpfm2KLowc="
+    },
+    {
+      "module": "github.com/hashicorp/go-immutable-radix/v2",
+      "version": "v2.1.0",
+      "license": "MPL-2.0 (see package source headers and full notices)",
+      "url": "https://proxy.golang.org/github.com/hashicorp/go-immutable-radix/v2/@v/v2.1.0.zip",
+      "sha256": "60e7f581c8055e474b1ff5a9d88a68a9f755d0b3dc6d8e05fc0556b6e86de995",
+      "fileName": "github.com_hashicorp_go-immutable-radix_v2@v2.1.0.zip",
+      "moduleH1": "h1:CUW5RYIcysz+D3B+l1mDeXrQ7fUvGGCwJfdASSzbrfo="
+    },
+    {
+      "module": "github.com/hashicorp/go-memdb",
+      "version": "v1.3.5",
+      "license": "MPL-2.0 (see package source headers and full notices)",
+      "url": "https://proxy.golang.org/github.com/hashicorp/go-memdb/@v/v1.3.5.zip",
+      "sha256": "650d4b48f84a028141ec34a6408a9771ac57ab12afd89b40a2bdaef17bfdfe77",
+      "fileName": "github.com_hashicorp_go-memdb@v1.3.5.zip",
+      "moduleH1": "h1:b3taDMxCBCBVgyRrS1AZVHO14ubMYZB++QpNhBg+Nyo="
+    },
+    {
+      "module": "github.com/hashicorp/go-multierror",
+      "version": "v1.1.1",
+      "license": "MPL-2.0 (see package source headers and full notices)",
+      "url": "https://proxy.golang.org/github.com/hashicorp/go-multierror/@v/v1.1.1.zip",
+      "sha256": "972cd841ee51fdeac69c5a301e57f8ea27aebf15fddd7f621d5c240f28c3000c",
+      "fileName": "github.com_hashicorp_go-multierror@v1.1.1.zip",
+      "moduleH1": "h1:H5DkEtf6CXdFp0N0Em5UCwQpXMWke8IA0+lD48awMYo="
+    },
+    {
+      "module": "github.com/hashicorp/go-sockaddr",
+      "version": "v1.0.7",
+      "license": "MPL-2.0 (see package source headers and full notices)",
+      "url": "https://proxy.golang.org/github.com/hashicorp/go-sockaddr/@v/v1.0.7.zip",
+      "sha256": "53ea8d77b68056fe7f40a53338aa73ed6ddca9558fe1156804070a060f1a930f",
+      "fileName": "github.com_hashicorp_go-sockaddr@v1.0.7.zip",
+      "moduleH1": "h1:G+pTkSO01HpR5qCxg7lxfsFEZaG+C0VssTy/9dbT+Fw="
+    },
+    {
+      "module": "github.com/hashicorp/golang-lru",
+      "version": "v1.0.2",
+      "license": "MPL-2.0 (see package source headers and full notices)",
+      "url": "https://proxy.golang.org/github.com/hashicorp/golang-lru/@v/v1.0.2.zip",
+      "sha256": "175d78ffe7391f3f6369cf58ddb87fc51016ba61f2de25bf4ea3962a0b4a0fac",
+      "fileName": "github.com_hashicorp_golang-lru@v1.0.2.zip",
+      "moduleH1": "h1:dV3g9Z/unq5DpblPpw+Oqcv4dU/1omnb4Ok8iPY6p1c="
+    },
+    {
+      "module": "github.com/hashicorp/golang-lru/v2",
+      "version": "v2.0.7",
+      "license": "MPL-2.0 (see package source headers and full notices)",
+      "url": "https://proxy.golang.org/github.com/hashicorp/golang-lru/v2/@v/v2.0.7.zip",
+      "sha256": "2eb92ff13970bccd460efae14255bfc03bb51474da0137e477a60f95561acc30",
+      "fileName": "github.com_hashicorp_golang-lru_v2@v2.0.7.zip",
+      "moduleH1": "h1:a+bsQ5rvGLjzHuww6tVxozPZFVghXaHOwFs4luLUK2k="
+    },
+    {
+      "module": "github.com/hashicorp/memberlist",
+      "version": "v0.6.0",
+      "license": "MPL-2.0 (see package source headers and full notices)",
+      "url": "https://proxy.golang.org/github.com/hashicorp/memberlist/@v/v0.6.0.zip",
+      "sha256": "b2c7ebd03f36b0dd22604e65b73b1e87ee1ce75eb36a333b1b6666b1f54497ff",
+      "fileName": "github.com_hashicorp_memberlist@v0.6.0.zip",
+      "moduleH1": "h1:hhVDLQUzWkLaitLLSrxLLqSD2l2+qiOz1DMr5zb9EQQ="
+    },
+    {
+      "module": "github.com/hashicorp/serf",
+      "version": "v0.10.4",
+      "license": "MPL-2.0 (see package source headers and full notices)",
+      "url": "https://proxy.golang.org/github.com/hashicorp/serf/@v/v0.10.4.zip",
+      "sha256": "f009201887ef8d3cb7df13b99bc92ba85bab1621fd649878817d56dc01aef526",
+      "fileName": "github.com_hashicorp_serf@v0.10.4.zip",
+      "moduleH1": "h1:TCQOrJXHZ1Xf80c4WBhMM9OwUFgDaIP0R+YvoQUKadI="
+    }
+  ]
+}

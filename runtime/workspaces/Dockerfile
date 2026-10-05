@@ -4,13 +4,13 @@ ARG TARGETOS=linux
 ARG TARGETARCH
 WORKDIR /src
 COPY source/go.mod source/go.sum ./
-RUN --mount=type=cache,target=/go/pkg/mod go mod download
+RUN go mod download
 COPY source/ .
 COPY allow-other.patch /tmp/allow-other.patch
 COPY license-notices.go /tmp/license-notices.go
 RUN git apply /tmp/allow-other.patch
-RUN --mount=type=cache,target=/go/pkg/mod go run /tmp/license-notices.go /licenses
-RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build \
+RUN go run /tmp/license-notices.go /licenses
+RUN \
     CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags='-s -w' -o /artifact-fs ./cmd/artifact-fs
 
 FROM debian:bookworm-slim
@@ -22,7 +22,8 @@ COPY --from=build /artifact-fs /usr/local/bin/artifact-fs
 COPY source/LICENSE source/NOTICE /usr/share/licenses/artifact-fs/
 COPY --from=build /licenses /usr/share/licenses/artifact-fs/dependencies/
 COPY source.json /usr/share/enoughfactory/artifact-fs-source.json
-COPY --chmod=0755 manager.sh /usr/local/bin/enoughfactory-workspace-manager
-COPY --chmod=0755 shared-mount.sh /usr/local/bin/enoughfactory-shared-mount
+COPY manager.sh /usr/local/bin/enoughfactory-workspace-manager
+COPY shared-mount.sh /usr/local/bin/enoughfactory-shared-mount
+RUN chmod 0755 /usr/local/bin/enoughfactory-workspace-manager /usr/local/bin/enoughfactory-shared-mount
 ENV ARTIFACT_FS_ROOT=/var/lib/artifact-fs
 ENTRYPOINT ["/usr/local/bin/enoughfactory-workspace-manager"]

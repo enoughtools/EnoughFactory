@@ -14,7 +14,7 @@ const executor: CheckExecutor = async (context) => {
 };
 
 async function fixture() {
-  const root = await mkdtemp(join(tmpdir(), "enough-workspaces-"));
+  const root = await mkdtemp(join(process.env.ENOUGHFACTORY_WORKSPACE_ROOT ?? tmpdir(), "enough-workspaces-"));
   const project = join(root, "project");
   await mkdir(project);
   await run("git", ["init", "-b", "main", project]);
