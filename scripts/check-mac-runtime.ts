@@ -61,6 +61,7 @@ checks.push("bundled verified Ubuntu guest image");
 // and avoids macOS's Unix socket path limit without borrowing another VM.
 const proof = await mkdtemp("/private/tmp/efm-");
 const stateDirectory = join(proof, "state");
+console.log(`Private Mac runtime proof state: ${proof}`);
 const userDockerConfiguration = join(homedir(), ".docker", "config.json");
 const originalConfiguration = await digest(userDockerConfiguration);
 // None of these developer preferences may redirect private runtime calls.
@@ -159,7 +160,7 @@ try {
     assert.equal(detected.available, true, detected.error);
     assert.equal(detected.docker.available, true, detected.docker.error);
     workbench = await engine.start({ projectPath: project, name: "private-proof", startupTimeoutMs: 15 * 60_000,
-      onLog: line => console.log(line) });
+      onEvent: event => { if (event.type === "phase") console.log(`Private workbench: ${event.phase}`); } });
     assert.equal((await workbench.state()).ready, true);
     assert.equal(workbench.ready.dockerHost, endpoint.host);
     checks.push("native envmux workbench readiness");

@@ -53,7 +53,7 @@ const completeEvaluation: EvaluationResponse = {
   criteria: criteria.map((criterion, index) => ({ criterion, satisfied: true, evidence: [`artifact:proof-${index}`] })),
 };
 
-function harness() {
+function harness(devices: Device[] = [device]) {
   const store = new MemoryStore();
   const calls = { planner: 0, evaluator: 0, diagnosis: 0, execute: 0, reconcile: 0, cancel: 0, prepare: 0, capture: 0, check: 0, integrate: 0, integrationFences: 0, reconcileIntegration: 0 };
   const executionPrompts: string[] = [];
@@ -102,11 +102,11 @@ function harness() {
     },
     async release() {},
   };
-  const options = { store, runtime, workspaces, deviceId: device.id, devices: () => [device], project: (id: string) => id === project.id ? project : undefined };
+  const options = { store, runtime, workspaces, deviceId: device.id, devices: () => devices, project: (id: string) => id === project.id ? project : undefined };
   const coordinator = new FactoryCoordinator(options);
   const goal = () => coordinator.create({ projectId: project.id, objective: "Build the feature and publish its release", criteria, autonomy: "autonomous", approvalMode: "approve-all", concurrency: 1 });
   return {
-    store, calls, coordinator, goal, executionPrompts, recover: () => new FactoryCoordinator(options),
+    store, calls, coordinator, goal, executionPrompts, workspaces, recover: () => new FactoryCoordinator(options),
     planning(fn: typeof planning) { planning = fn; },
     evaluating(fn: typeof evaluating) { evaluating = fn; },
     executing(fn: typeof executing) { executing = fn; },
@@ -149,6 +149,50 @@ function retainedAttempt(factory: ReturnType<typeof harness>, goal: Goal, retain
   });
   return attempt;
 }
+
+test("fail-fast verification retains the actual failed command without diagnosing unrun checks as omitted", async () => {
+  const factory = harness();
+  factory.planning(async () => ({ ...plan, checks: ["npm run verify", "npm run release"] }));
+  const stderr = "Error: regression route /health returned 503";
+  factory.workspaces.check = async (_project, candidate) => {
+    factory.calls.check++;
+    return [{ command: "npm run verify", passed: false, output: stderr, exitCode: 1, candidateCommit: candidate.commit }];
+  };
+  await planGoal(factory);
+  await factory.coordinator.tick();
+  await factory.coordinator.waitForIdle();
+
+  const attempt = factory.store.list<Attempt>("attempts")[0]!;
+  assert.equal(attempt.status, "failed");
+  assert.match(attempt.error!, /Candidate checks failed/);
+  assert.match(attempt.error!, /npm run verify/);
+  assert.ok(attempt.error!.includes(stderr), "repair must receive the real command error");
+  assert.doesNotMatch(attempt.error!, /omitted/);
+  const detail = factory.store.get<AttemptDetail>("factory-attempt-details", attempt.id)!;
+  assert.deepEqual(detail.checks, [{ command: "npm run verify", passed: false, output: stderr, exitCode: 1, candidateCommit: "candidate-commit" }]);
+  assert.equal(factory.calls.integrate, 0, "a partial failed report cannot authorize integration");
+});
+
+test("ArtifactFS work waits for a capable device and wakes when one connects", async () => {
+  const devices: Device[] = [{ ...device, workspaceProviders: ["git"] }];
+  const factory = harness(devices);
+  const goal = await planGoal(factory);
+  factory.store.set("goals", { ...factory.store.get<Goal>("goals", goal.id)!, workspaceProvider: "artifactfs" });
+  await factory.coordinator.tick();
+  await factory.coordinator.waitForIdle();
+  assert.equal(factory.store.get<Goal>("goals", goal.id)!.status, "waiting");
+  assert.equal(factory.calls.execute, 0);
+  assert.equal(factory.store.list<Attempt>("attempts").length, 0);
+
+  devices.push({ ...device, id: "mount-capable-worker", platform: "darwin", local: false, workspaceProviders: ["git", "artifactfs"] });
+  await factory.coordinator.tick();
+  await factory.coordinator.waitForIdle();
+  const attempt = factory.store.list<Attempt>("attempts")[0]!;
+  assert.equal(attempt.deviceId, "mount-capable-worker");
+  assert.equal(factory.calls.execute, 1);
+  assert.equal(factory.calls.integrate, 1);
+  assert.equal(factory.store.list<FactoryTask>("tasks")[0]!.status, "completed");
+});
 
 test("late success from a retired attempt cannot capture or integrate source", async () => {
   const factory = harness();
@@ -286,6 +330,47 @@ test("service recovery observes the previous running attempt without busy pollin
     execution.resolve({ status: "unknown", text: "The previous connection also lost its observation" });
     await Promise.all([recovered.waitForIdle(), factory.coordinator.waitForIdle()]);
   }
+});
+
+test("restart preserves failed repair history and recovers only the current successful candidate", async () => {
+  const factory = harness();
+  const goal = await planGoal(factory);
+  const current = retainedAttempt(factory, goal, {
+    phase: "checking", workspace: { id: "retained-workspace", path: "/workspace/retained", baseCommit: "initial-head", provider: "git" },
+    candidate: { id: "retained-candidate", commit: "candidate-commit", baseCommit: "initial-head" },
+    result: { status: "succeeded", text: "The third repair completed before restart" },
+  });
+  factory.store.set("attempts", { ...current, generation: 4, status: "succeeded" });
+  const history = [
+    { ...current, id: "first-failed", generation: 1, status: "failed" as const, error: "npm run verify failed: missing route", endedAt: device.lastSeen },
+    { ...current, id: "second-failed", generation: 2, status: "failed" as const, error: "combined check failed: missing artifact", endedAt: device.lastSeen },
+    { ...current, id: "retired-repair", generation: 3, status: "retired" as const, endedAt: device.lastSeen },
+  ];
+  for (const [index, attempt] of history.entries()) {
+    factory.store.set("attempts", attempt);
+    factory.store.set<AttemptDetail>("factory-attempt-details", {
+      ...factory.store.get<AttemptDetail>("factory-attempt-details", current.id)!, id: attempt.id,
+      phase: index === 1 ? "integrating" : "checking", cancellation: attempt.status === "retired" ? "acknowledged" : "none",
+    });
+  }
+  factory.coordinator.pause(goal.id);
+  const recovered = factory.recover();
+  try {
+    await recovered.start();
+    await recovered.waitForIdle();
+    for (const attempt of history) assert.deepEqual(factory.store.get<Attempt>("attempts", attempt.id), attempt);
+    assert.equal(factory.store.get<Attempt>("attempts", current.id)!.status, "succeeded");
+    assert.equal(factory.store.list<FactoryTask>("tasks")[0]!.currentAttemptId, current.id);
+    const recoveredDecisions = factory.store.list<Decision>("decisions").filter(decision => decision.kind === "attempt-recovered");
+    assert.equal(recoveredDecisions.length, 1, "only current execution authority needs reconciliation");
+    assert.equal((recoveredDecisions[0]!.data as { attemptId: string }).attemptId, current.id);
+    assert.equal(factory.calls.execute, 0);
+    assert.equal(factory.calls.capture, 0);
+    assert.equal(factory.calls.check, 0);
+    assert.equal(factory.calls.integrate, 0);
+    assert.equal(factory.calls.diagnosis, 0);
+    assert.equal(factory.calls.planner, 1, "restart does not request fresh planning");
+  } finally { recovered.stop(); }
 });
 
 test("a lost integration acknowledgement stays unknown until recovery confirms the original commit", async () => {

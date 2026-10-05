@@ -51,3 +51,31 @@ Earlier Mac archives and factory journeys were produced before this owned-runtim
 Required additional evidence is tracked explicitly: bundled asset/provenance/license inspection, complete source companions for redistributed operating-system packages and relink materials for linked LGPL libraries; private engine start, recovery and stop; ordinary source/agent/check work through its endpoint; no mutation or fallback to existing Docker state; Mac ArtifactFS behavior; Linux rootless host prerequisites and visible compatible Git fallback; and rebuilt Mac/Linux desktop bundles. Website/download publication follows those actual artifacts and verified URLs.
 
 The [private Linux runtime evidence](verification/private-linux-runtime.json) records a real ARM64 Linux run in the application-owned VM: root writes inside containers, private socket and data root, envmux source retention, engine restart and volume retention, and an unchanged user's Docker configuration. This establishes the Linux runtime behavior on that host; it does not substitute for a packaged Linux desktop check or final source-build runtime checks.
+
+## Source and license assembly
+
+The engine's [source and relink kit](../runtime/container/relink-kit/README.md) pins Moby, runc, libseccomp, Tini and their build toolchains. The source-built daemon/proxy use cgo-disabled Go; runc and Tini use musl, with libseccomp retained. [Native verification](../runtime/container/relink-kit/verification/native-verification.json) records static replacement binaries and a relocated x64 object relink. The [ARM64 engine exercise](../runtime/container/relink-kit/verification/docker-engine-verification.json) records init and seccomp using a dedicated inner Docker daemon in the application-owned runtime. This proves those components' behavior; final managed-engine and factory journeys must bind the installed replacement hashes.
+
+The [guest-image evidence](../runtime/container/os-source-kit/image-evidence/summary.json) records 663 installed apt packages on ARM64 and 664 on x64, copyright paths for every installed package, no preinstalled snap payload and unchanged image hashes after read-only extraction. Original copyright/common-license archives and exact package-to-source mappings are retained in the [Ubuntu source kit](../runtime/container/os-source-kit/README.md). Signed archive indexes resolve exact package versions and their additional embedded source payloads.
+
+The engine's [source-artifact receipt](../runtime/container/relink-kit/verification/source-artifact-verification.json) independently verifies 18 source archives, 31 retained runc objects and 76 native retained files per architecture, the root MIT license and eight implementation scripts/pins. Its generic companion is 63,940,781 bytes with SHA-256 `e8c4dc37f18d0137e4a0dbfc5b3a4fe62d95f85c4543997919959609afee4684`. Release copies qualify host platform and architecture; each final prepared runtime retains its own matching receipt.
+
+The Ubuntu source companion is locally complete and verified for 442 source package versions and 1,357 source files. Seven prepared assets are under `dist/ubuntu-source-companion`. Both source parts are required:
+
+| Asset | Bytes | SHA-256 |
+| --- | ---: | --- |
+| `EnoughFactory-Ubuntu-24.04-20260926-sources-part01.tar.gz` | 766,180,065 | `de08b49f7ab2882b803f2b3bff3b44feaf193f4e7a75eb5ad8a0ff7f191d3704` |
+| `EnoughFactory-Ubuntu-24.04-20260926-sources-part02.tar.gz` | 611,450,171 | `6b27dc2436620fdc7e057facfc454d4b504b983e603c7fe5d079116ffcebaa86` |
+| `Ubuntu-archive-evidence.tar.gz` | 99,066,216 | `fc6d93e8ebd64963b2993f96e7ba6ef8f51a0c4e7d975128d2c36fbb25040643` |
+
+The other required assets are `Ubuntu-sources.lock.json`, `Ubuntu-source-companion.json`, `Ubuntu-source-companion-SHA256SUMS` and `Ubuntu-source-companion-README.md`. Upload all seven to the same public release as the installers and retain them while those installers remain available. Local assembly is complete; public download access remains a release-owner action.
+
+The combined notice is frozen for packaging at 6,248,559 bytes, SHA-256 `574a0671f4628e09ea6f47d50c477601af72cfdb42a7d605a0fb4470b081b4ac`, with 92 component entries and 57 preserved full-text groups. Local document links, notice references and fenced text blocks passed their focused checks.
+
+## Current owned-runtime product journey
+
+The [real factory receipt](verification/factory-managed-runtime-evidence.json) records a fresh private Mac VM using the rebuilt engine, poisoned inherited Docker configuration, real Codex planning, execution, diagnosis and evaluation, retained candidate recovery across a service update, and exactly one integration. All ten retained completion criteria were satisfied at source `371b6e36bc6e91a051da20dfcceda40706fc1c3e`; the CLI passed 28 focused checks. The fixture's engine and service stopped cleanly after completion.
+
+The initial smoke override selected Debian slim without Git. Its fail-fast reports exposed a misleading coordinator diagnostic; the corrected coordinator retains the failed command output, and the fixture resumed using the product's normal Git-capable Node check image. This receipt preserves the actual earlier attempts rather than presenting the journey as an uninterrupted pass. Confirmed failed attempts are protected separately by the recovery regression.
+
+The current source Electron shell was opened and inspected on the unlocked Mac. Workbench and Settings rendered correctly; runtime details showed Lima 2.2.1, Docker 29.8.2 and the application-owned socket. This source UI observation is separate from the final packaged GUI, startup/removal and archive receipts required for publication.

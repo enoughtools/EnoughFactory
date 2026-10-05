@@ -25,6 +25,7 @@ const nativePins = JSON.parse(await readFile(join(here, 'native-pins.json'), 'ut
 const dependencies = JSON.parse(await readFile(join(here, 'dependency-sources.json'), 'utf8'));
 await mkdir(cache, { recursive: true });
 await mkdir(root, { recursive: true });
+await cp(join(resolve(here, '../../..'), 'LICENSE'), join(root, 'LICENSE'));
 const retained = [];
 async function source(url, digest, local, fileName, subdirectory = 'sources') {
   let bytes;
@@ -59,6 +60,18 @@ for (const entry of await readdir(here, { withFileTypes: true })) {
 await mkdir(join(root, 'provenance'), { recursive: true });
 await cp(join(build, 'go-engine-provenance.json'), join(root, 'provenance', 'go-engine-provenance.json'));
 await cp(join(build, 'native-build-manifest.json'), join(root, 'provenance', 'native-build-manifest.json'));
+await mkdir(join(root, 'notices'), { recursive: true });
+for (const [component, names] of Object.entries({ runc: ['LICENSE', 'NOTICE'], libseccomp: ['LICENSE'], tini: ['LICENSE'] })) {
+  for (const name of names) {
+    const file = join(nativeManifest.sourceDirectories[component], name);
+    try { await cp(file, join(root, 'notices', `${component}-${name}`)); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+  }
+}
+await cp(join(nativeManifest.toolchains.zig.directory, 'LICENSE'), join(root, 'notices', 'Zig-LICENSE'));
+await cp(join(nativeManifest.toolchains.zig.directory, 'lib', 'libc', 'musl', 'COPYRIGHT'), join(root, 'notices', 'musl-COPYRIGHT'));
+for (const name of ['native-verification.json', 'docker-engine-verification.json']) {
+  try { await cp(join(build, name), join(root, 'provenance', name)); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+}
 const artifacts = [];
 for (const row of goManifest.artifacts) {
   if (hash(await readFile(row.file)) !== row.sha256) throw new Error(`Go artifact changed after its build: ${row.file}`);
@@ -70,7 +83,9 @@ for (const row of nativeManifest.builds) {
   await cp(join(build, architecture, 'relink'), join(root, 'relink', architecture), { recursive: true });
   for (const name of ['runc', 'docker-init']) {
     const file = join(build, architecture, name);
-    artifacts.push({ name, platform: `linux-${architecture}`, sha256: hash(await readFile(file)) });
+    const digest = hash(await readFile(file));
+    if (row.binaries?.[name]?.sha256 !== digest) throw new Error(`Native artifact changed after its build: ${file}`);
+    artifacts.push({ name, platform: `linux-${architecture}`, sha256: digest });
   }
 }
 const receipt = { formatVersion: 1, product: 'EnoughFactory', sourceInputs: retained, artifacts, scope: 'Exact source archives, pinned build recipes, native library objects and application relink objects for the bundled source-built engine components; unmodified MPL module source archives for the remaining runtime components.' };

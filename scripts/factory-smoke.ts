@@ -13,13 +13,14 @@ import type { Attempt, ContainerRuntimeStatus, Decision, FactoryTask, Goal, Proj
 // it is deliberately not CI and never invokes the user's Docker client or engine.
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const savedFixture = process.env.ENOUGHFACTORY_SMOKE_FIXTURE;
+const resumeFixture = Boolean(savedFixture) && process.env.ENOUGHFACTORY_SMOKE_RESUME === '1';
 // Short app paths also leave room for Lima's private Unix socket names on Mac.
 const fixture = savedFixture || await mkdtemp(path.join(process.env.ENOUGHFACTORY_SMOKE_TMPDIR || (process.platform==='darwin'?'/tmp':tmpdir()), 'enoughfactory-product-'));
 const repository = path.join(fixture, 'repository');
 const home = path.join(fixture, 'device');
 const port = Number(process.env.ENOUGHFACTORY_SMOKE_PORT || 4327);
 const url = `http://127.0.0.1:${port}`;
-const checkImage = process.env.ENOUGHFACTORY_SMOKE_CHECK_IMAGE || 'debian:bookworm-slim';
+const checkImage = process.env.ENOUGHFACTORY_SMOKE_CHECK_IMAGE || 'node:22-bookworm';
 const exerciseRecovery = process.env.ENOUGHFACTORY_SMOKE_RECOVERY === '1';
 const deadline = Date.now() + 30 * 60_000;
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
@@ -185,21 +186,27 @@ try {
     'README.md documents invoking the CLI, the normalization contract, the empty-result exit status and running the tests; all source is integrated into this repository.'
   ];
   const goal = savedFixture
-    ? (await api<Goal[]>('/api/goals')).find(g=>g.projectId===project.id&&g.status==='completed')!
+    ? (await api<Goal[]>('/api/goals')).find(g=>g.projectId===project.id&&(resumeFixture ? ['paused','running','waiting'].includes(g.status) : g.status==='completed'))!
     : await api<Goal>('/api/goals','POST',{projectId:project.id,title:'Ship the slug CLI',objective:'Build and document a useful dependency-free POSIX shell slug CLI in bin/slug.sh. Implement its focused shell tests in tests/slug.test.sh. Use one compact implementation task covering code, tests and docs; this is a small utility. Run checks with bash tests/slug.test.sh, using standard shell tools only (no Node/Python/packages). Preserve .envmux.json unchanged. Make the actual source executable and finish the full goal. Do not stop at a proposal.',criteria,runtime:'codex',approvalMode:'approve-all',autonomy:'autonomous',concurrency:1,maxDurationMs:25*60_000});
-  assert.ok(goal, 'Saved-fixture verification requires an already completed goal; it never reruns inference.');
+  assert.ok(goal, 'Saved-fixture verification requires a completed goal, or an explicit resume of its retained active goal.');
   goalId = goal.id; record(savedFixture?'completed-autonomous-goal-opened':'autonomous-goal-created',{goalId,approvalMode:goal.approvalMode,autonomy:goal.autonomy});
   const read = () => api<Snapshot>(`/api/goals/${goal.id}`);
   let completed: Snapshot;
   let firstAttempt: Attempt;
-  if (savedFixture) {
+  if (savedFixture && !resumeFixture) {
     completed = await read(); firstAttempt = completed.attempts[0]!;
     assert.equal(completed.goal.status,'completed');
     record('completed-fixture-reverification',{goalId});
   } else {
+  if (resumeFixture) {
+    const retained = await read(); firstAttempt = retained.attempts.at(-1)!;
+    if (retained.goal.status === 'paused') await api(`/api/goals/${goal.id}/resume`,'POST',{});
+    record('retained-goal-resumed',{goalId:goal.id,attemptId:firstAttempt.id});
+  } else {
   const dispatched = await observe('factory-progress',read,s => s.attempts.some(a=>a.status==='running'));
   assert.equal(dispatched.tasks.length,1,'This bounded product fixture should remain one compact task.');
   firstAttempt = dispatched.attempts[0]!;
+  }
   if (exerciseRecovery) {
   await api(`/api/goals/${goal.id}/pause`,'POST',{}); record('coordination-paused-while-owner-runs',{attemptId:firstAttempt.id,generation:firstAttempt.generation});
   const retained = await observe('retaining-candidate',read,s => s.goal.status==='paused' && s.attempts.some(a=>a.id===firstAttempt.id&&Boolean(a.candidate)));
@@ -216,8 +223,12 @@ try {
   }
   completed = await observe('factory-resumed',read,s=>s.goal.status==='completed');
   }
-  assert.equal(completed.attempts.length,1,'Recovery must not launch a duplicate worker.');
-  assert.equal(completed.attempts[0]!.id,firstAttempt.id); assert.equal(completed.attempts[0]!.generation,firstAttempt.generation);
+  if (exerciseRecovery) {
+    assert.equal(completed.attempts.length,1,'Recovery must not launch a duplicate worker.');
+    assert.equal(completed.attempts[0]!.id,firstAttempt.id); assert.equal(completed.attempts[0]!.generation,firstAttempt.generation);
+  }
+  assert.ok(completed.tasks.every(task=>completed.attempts.some(attempt=>attempt.id===task.currentAttemptId&&attempt.status==='succeeded')),'Each completed task needs a successful authoritative attempt.');
+  assert.equal(new Set(completed.attempts.map(attempt=>attempt.id)).size,completed.attempts.length);
   assert.ok(completed.tasks.every(t=>t.status==='completed'));
   assert.equal(completed.decisions.filter(d=>d.kind==='integrated').length,1,'The candidate should integrate exactly once.');
   if (exerciseRecovery) assert.ok(completed.decisions.some(d=>d.kind==='attempt-recovered'));

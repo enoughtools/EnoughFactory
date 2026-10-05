@@ -1,0 +1,17 @@
+{
+  "archiveMappingPath": "/tmp/enoughfactory-ubuntu-source-cache/all-binary-source-mappings.json",
+  "architectures": {
+    "arm64": {
+      "imagePackageCount": 663,
+      "archiveMappingCount": 663,
+      "missingFromArchiveMapping": [],
+      "mismatches": []
+    },
+    "x64": {
+      "imagePackageCount": 664,
+      "archiveMappingCount": 664,
+      "missingFromArchiveMapping": [],
+      "mismatches": []
+    }
+  }
+}

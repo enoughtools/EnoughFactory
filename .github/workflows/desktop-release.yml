@@ -13,6 +13,31 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  os-sources:
+    name: Bundled Ubuntu corresponding sources
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: Resolve and verify the locked Ubuntu source set
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y gpgv
+          python3 runtime/container/os-source-kit/prepare-source-companion.py resolve --cache .cache/ubuntu-source-companion --lock .cache/ubuntu-source-companion/Ubuntu-sources.resolved.json --output dist/ubuntu-source-companion
+          cmp runtime/container/os-source-kit/Ubuntu-sources.lock.json .cache/ubuntu-source-companion/Ubuntu-sources.resolved.json
+      - name: Deliver exact source archives and signed metadata
+        run: |
+          python3 runtime/container/os-source-kit/prepare-source-companion.py download --cache .cache/ubuntu-source-companion --output dist/ubuntu-source-companion
+          python3 runtime/container/os-source-kit/prepare-source-companion.py archive --cache .cache/ubuntu-source-companion --output dist/ubuntu-source-companion
+          python3 runtime/container/os-source-kit/prepare-source-companion.py verify --cache .cache/ubuntu-source-companion --output dist/ubuntu-source-companion
+      - name: Upload the complete OS source companion
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: EnoughFactory-Ubuntu-sources
+          path: dist/ubuntu-source-companion/*
+          if-no-files-found: error
+          retention-days: 30
+
   bundle:
     name: ${{ matrix.platform }} ${{ matrix.arch }}
     runs-on: ${{ matrix.runner }}
@@ -62,7 +87,13 @@ jobs:
           INSTALLED_RESOURCES: ${{ matrix.installedResources }}
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y uidmap iptables
+          sudo apt-get install -y uidmap iptables dbus-user-session xvfb xauth
+          sudo loginctl enable-linger "$USER"
+          for attempt in $(seq 1 25); do
+            if test -S "/run/user/$(id -u)/bus"; then break; fi
+            sleep 0.2
+          done
+          test -S "/run/user/$(id -u)/bus"
           node --input-type=module <<'NODE'
           import { readFile } from 'node:fs/promises';
           import { execFileSync } from 'node:child_process';
@@ -83,6 +114,16 @@ jobs:
           }
           EOF
           sudo apparmor_parser -r /etc/apparmor.d/enoughfactory-ci-rootlesskit
+          sudo "$INSTALLED_RESOURCES/runtime/node" "$INSTALLED_RESOURCES/install/configure-linux-desktop-sandbox.mjs" --executable "$GITHUB_WORKSPACE/${INSTALLED_RESOURCES%/resources}/enoughfactory"
+      - name: Verify the native Linux desktop with its Chromium sandbox
+        if: matrix.platform == 'linux'
+        run: node scripts/check-desktop-gui.mjs --resources "${{ matrix.installedResources }}" --receipt "releases/${{ matrix.platform }}-${{ matrix.arch }}.gui.verification.json" --source-commit "$GITHUB_SHA"
+      - name: Verify native Linux login service installation and removal
+        if: matrix.platform == 'linux'
+        run: |
+          export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+          export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
+          node scripts/check-installed-service.mjs --resources "${{ matrix.installedResources }}" --receipt "releases/${{ matrix.platform }}-${{ matrix.arch }}.service.verification.json" --source-commit "$GITHUB_SHA"
       - name: Verify the bundled private Linux engine and source retention
         if: matrix.platform == 'linux'
         run: |
@@ -97,7 +138,7 @@ jobs:
           import { execFileSync } from 'node:child_process';
           let runtimeReceipt;
           try { await access(process.env.RUNTIME_RECEIPT); runtimeReceipt = process.env.RUNTIME_RECEIPT; } catch {}
-          for (const name of (await readdir('releases')).filter(name => /\.(dmg|zip|AppImage|tar\.gz)$/.test(name)).sort()) {
+          for (const name of (await readdir('releases')).filter(name => /^EnoughFactory-.+-(mac|linux)-(arm64|x64)\.(dmg|zip|AppImage|tar\.gz)$/.test(name)).sort()) {
             const args = ['scripts/check-desktop-archive.mjs', '--artifact', `releases/${name}`, '--receipt', `releases/${name}.verification.json`, '--source-commit', process.env.GITHUB_SHA];
             if (runtimeReceipt) args.push('--runtime-receipt', runtimeReceipt);
             execFileSync(process.execPath, args, { stdio: 'inherit' });
@@ -113,12 +154,14 @@ jobs:
             releases/*.AppImage
             releases/*.tar.gz
             releases/*.verification.json
+            releases/*.verification.json.png
+            releases/*container-sources.tar.gz.json
           if-no-files-found: error
           retention-days: 30
 
   publish:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: bundle
+    needs: [bundle, os-sources]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -135,12 +178,14 @@ jobs:
           RELEASE_COMMIT: ${{ github.sha }}
         run: |
           node --input-type=module <<'NODE'
-          import { readdir, readFile, writeFile } from 'node:fs/promises';
+          import { readdir, writeFile } from 'node:fs/promises';
+          import { createReadStream } from 'node:fs';
           import { createHash } from 'node:crypto';
           const files = (await readdir('releases')).filter(name => /\.(dmg|zip|AppImage|tar\.gz)$/.test(name)).sort();
           const entries = await Promise.all(files.map(async name => {
-            const bytes = await readFile(`releases/${name}`);
-            return { name, size: bytes.length, sha256: createHash('sha256').update(bytes).digest('hex'), signing: 'unsigned' };
+            const hash = createHash('sha256'); let size = 0;
+            for await (const chunk of createReadStream(`releases/${name}`)) { hash.update(chunk); size += chunk.length; }
+            return { name, size, sha256: hash.digest('hex'), kind: /container-sources\.tar\.gz$/.test(name) ? 'container-sources' : /Ubuntu/.test(name) ? 'os-sources' : 'desktop', signing: 'unsigned' };
           }));
           await writeFile('releases/SHA256SUMS', entries.map(file => `${file.sha256}  ${file.name}`).join('\n') + '\n');
           await writeFile('releases/provenance.json', JSON.stringify({ version: process.env.RELEASE_TAG, commit: process.env.RELEASE_COMMIT, artifacts: entries }, null, 2) + '\n');
@@ -154,4 +199,4 @@ jobs:
           if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             gh release create "$RELEASE_TAG" --verify-tag --title "EnoughFactory $RELEASE_TAG" --notes "Mac Apple Silicon and Linux x64/ARM64 desktop bundles. These initial builds are unsigned. Bundles include a private container runtime, device service, Node runtime, envmux engine, web interface and dependency notices. First launch prepares EnoughFactory's own runtime and dedicated socket. Provider sign-in is configured during onboarding."
           fi
-          gh release upload "$RELEASE_TAG" releases/*.dmg releases/*.zip releases/*.AppImage releases/*.tar.gz releases/*.verification.json releases/SHA256SUMS releases/provenance.json --clobber
+          gh release upload "$RELEASE_TAG" releases/*.dmg releases/*.zip releases/*.AppImage releases/*.tar.gz releases/*container-sources.tar.gz.json releases/*.verification.json releases/*.verification.json.png releases/Ubuntu-source-companion* releases/Ubuntu-sources.lock.json releases/SHA256SUMS releases/provenance.json --clobber

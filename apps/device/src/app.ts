@@ -90,7 +90,7 @@ export class DeviceApp {
   private syncRuntimeCapacity():void {
     const state=this.diagnostics.containerRuntime?.state;
     const unavailable=this.runtimeSuspended||this.runtimeStopping||state==='stopping'||state==='unavailable'||state==='failed';
-    this.device={...this.device,capacity:unavailable?0:2};
+    this.device={...this.device,capacity:unavailable?0:2,workspaceProviders:this.diagnostics.containerRuntime?.artifactFsSupported?['git','artifactfs']:['git']};
     this.devices=[this.device,...this.devices.filter(device=>!device.local&&device.id!==this.device.id)];
   }
   setDevice(device: Device): void {this.device=device;this.syncRuntimeCapacity();this.sessions.setDeviceId(device.id);}

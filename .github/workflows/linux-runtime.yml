@@ -38,7 +38,13 @@ jobs:
           RUNTIME_ARCH: ${{ matrix.arch }}
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y uidmap iptables
+          sudo apt-get install -y uidmap iptables dbus-user-session
+          sudo loginctl enable-linger "$USER"
+          for attempt in $(seq 1 25); do
+            if test -S "/run/user/$(id -u)/bus"; then break; fi
+            sleep 0.2
+          done
+          test -S "/run/user/$(id -u)/bus"
           node --input-type=module <<'NODE'
           import { readFile } from 'node:fs/promises';
           import { execFileSync } from 'node:child_process';

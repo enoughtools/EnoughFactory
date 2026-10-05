@@ -411,7 +411,6 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
       const workspaceProvider = body.workspaceProvider === undefined
         ? process.env.ENOUGHFACTORY_WORKSPACE_PROVIDER === 'artifactfs' ? 'artifactfs' : 'git'
         : body.workspaceProvider as 'git' | 'artifactfs';
-      if(workspaceProvider==='artifactfs'&&!(await app.refreshRuntime()).artifactFsSupported)throw new HttpError(400,'ArtifactFS mounting is unavailable on this owned runtime. Choose Git workspaces.');
       const input = createGoalInput(body); const goal = { ...coordinator.create(input), workspaceProvider };
       app.store.set('goals', goal);
       app.store.set<GoalOptions>('factory-options', { id: goal.id, workspaceProvider });

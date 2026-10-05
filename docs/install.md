@@ -18,18 +18,18 @@ Mac CPU and memory allocations can be changed through runtime resource settings 
 
 ## Linux runtime prerequisites
 
-Run the device service as your regular user. The private rootless engine needs host UID/GID mapping helpers, at least 65,536 subordinate IDs in both `/etc/subuid` and `/etc/subgid`, and permitted user namespaces. Containers still have root permissions inside their namespace. [Docker rootless prerequisites](https://docs.docker.com/engine/security/rootless/).
+Run the device service as your regular user. The private rootless engine needs host UID/GID mapping helpers, at least 65,536 subordinate IDs in both `/etc/subuid` and `/etc/subgid`, permitted user namespaces, and a systemd user session with D-Bus and cgroup v2 for enforced resource limits. Containers still have root permissions inside their namespace. [Docker rootless prerequisites](https://docs.docker.com/engine/security/rootless/).
 
 On Debian/Ubuntu, install the host prerequisites:
 
 ```sh
-sudo apt install uidmap iptables util-linux procps
+sudo apt install uidmap iptables util-linux procps dbus-user-session
 ```
 
 On Fedora:
 
 ```sh
-sudo dnf install shadow-utils iptables util-linux procps-ng
+sudo dnf install shadow-utils iptables util-linux procps-ng dbus-daemon
 ```
 
 These supply host helpers; EnoughFactory supplies its private daemon and client. Inspect the subordinate ranges already assigned to your account:
@@ -43,9 +43,11 @@ If either file lacks a range of at least 65,536 IDs for your account, have the a
 
 If setup reports that user namespaces are disabled, the host administrator must enable them according to the host policy. Ubuntu 24.04 and newer can additionally require an AppArmor rule for the **actual bundled RootlessKit path** shown by the app. Use the application-specific profile described by [Docker's rootless troubleshooting](https://docs.docker.com/engine/security/rootless/troubleshoot/) rather than disabling AppArmor globally. The runtime keeps its failure details visible until the prerequisite is resolved.
 
+If the user D-Bus session is missing, install the package above and log into an ordinary user session. For a headless device, an administrator can enable its user manager with `sudo loginctl enable-linger "$USER"`, then start the user session/service. EnoughFactory uses the UID-owned user bus and reports unavailable cgroup support; it does not silently discard configured memory limits.
+
 ## Build and open from source
 
-Install Node 22.14+, pnpm 10.34.5 and the .NET 10 SDK, then run:
+Install Node 22.14+, pnpm 10.34.5, Git, the .NET 10 SDK, Python 3.10+ and POSIX build tools (`make`, `tar`, `file`; Xcode Command Line Tools on Mac), then run:
 
 ```sh
 git clone https://github.com/enoughtools/EnoughFactory.git
@@ -57,7 +59,9 @@ pnpm build
 pnpm desktop
 ```
 
-The engine build and runtime preparation target your current OS and architecture. The runtime script downloads pinned archives, verifies their SHA-256 values and prepares `.cache/container-runtime/<platform>-<arch>`. It accepts explicit platform, architecture and destination arguments for release assembly. Mac preparation includes the host CLI, Lima, guest engine and Ubuntu image. The included guest image is verified before creating the VM; first launch does not fetch an operating system.
+The engine build and runtime preparation target your current OS and architecture. The runtime script downloads pinned archives and Go/Zig toolchains, builds the native engine components, verifies their hashes and prepares `.cache/container-runtime/<platform>-<arch>`. It retains the source/relink companion with the runtime assets and accepts explicit platform, architecture and destination arguments for release assembly.
+
+Mac preparation includes the host CLI, Lima, guest engine and Ubuntu image. The included guest image is verified before creating the VM; first launch does not fetch an operating system.
 
 If your SDK is outside `PATH`, set `ENOUGHFACTORY_DOTNET` to its executable. `ENOUGHFACTORY_ENVMUX_BINARY` can select an already-built engine. See [desktop distribution](desktop-distribution.md) for native release preparation.
 

@@ -77,7 +77,7 @@ export class FactoryCoordinator {
           this.options.store.set(TABLE.control, { ...control, operation: undefined });
           this.decision(goal.id, "controller-recovered", "An interrupted controller decision will be recomputed from current records.");
         }
-        for (const attempt of this.attempts(goal.id).filter(item => activeAttempts.has(item.status) || this.task(item.taskId).status === "review")) {
+        for (const attempt of this.attempts(goal.id).filter(item => this.isCurrent(item) && (activeAttempts.has(item.status) || (item.status === "succeeded" && this.task(item.taskId).status === "review")))) {
           this.options.store.set(TABLE.attempts, { ...attempt, status: "unknown" as const });
           this.decision(goal.id, "attempt-recovered", "Execution status is unknown after service recovery; reconcile with its owner before continuing.", { attemptId: attempt.id });
         }
@@ -358,7 +358,7 @@ export class FactoryCoordinator {
       this.track(this.execute(attempt).finally(() => this.busyAttempts.delete(attempt.id)));
     }
     if (placed) this.changed();
-    else if (eligible && !running) this.wait(goal.id, "Waiting for an online worker with capacity.", "device-online");
+    else if (eligible && !running) this.wait(goal.id, goal.workspaceProvider === "artifactfs" ? "Waiting for an online worker with ArtifactFS support and capacity." : "Waiting for an online worker with capacity.", "device-online");
     else if (!running && goal.autonomy !== "autonomous") this.writeGoal(goal.id, { nextAction: "Select the next tasks to execute" });
   }
 
@@ -442,10 +442,10 @@ export class FactoryCoordinator {
         checkResults = await this.options.workspaces.check(project, candidate, checks);
         if (!this.isCurrent(attempt)) return;
         if (checkResults.some(check => check.candidateCommit !== candidate!.commit)) throw new Error("Verification returned evidence for a different candidate.");
-        if (checks.some(command => !checkResults!.some(check => check.command === command))) throw new Error("Verification omitted a configured check.");
         this.options.store.set(TABLE.attemptDetails, { ...this.attemptDetail(attempt.id), checks: checkResults });
       }
       if (checkResults.some(check => !check.passed)) throw new Error(`Candidate checks failed:\n${checkResults.filter(check => !check.passed).map(check => `${check.command}\n${check.output}`).join("\n")}`);
+      if (checks.some(command => !checkResults!.some(check => check.command === command))) throw new Error("Verification omitted a configured check.");
       if (!this.integrationAllowed(attempt)) { this.changed(); return; }
       this.options.store.set(TABLE.attemptDetails, { ...this.attemptDetail(attempt.id), phase: "integrating" as const });
       const integration = await this.options.workspaces.integrate(project, candidate, { checks, isCurrent: () => this.integrationAllowed(attempt) });
@@ -726,7 +726,8 @@ export class FactoryCoordinator {
   }
   private place(task: FactoryTask) {
     const load = this.options.store.list<Attempt>(TABLE.attempts).filter(attempt => activeAttempts.has(attempt.status));
-    return this.options.devices().filter(device => device.online && (!task.deviceId || task.deviceId === device.id) && load.filter(attempt => attempt.deviceId === device.id).length < (device.capacity ?? 2))
+    const provider = this.goal(task.goalId).workspaceProvider ?? 'git';
+    return this.options.devices().filter(device => device.online && (provider === 'git' || device.workspaceProviders?.includes(provider)) && (!task.deviceId || task.deviceId === device.id) && load.filter(attempt => attempt.deviceId === device.id).length < (device.capacity ?? 2))
       .sort((a, b) => load.filter(attempt => attempt.deviceId === a.id).length - load.filter(attempt => attempt.deviceId === b.id).length || Number(b.local) - Number(a.local))[0];
   }
   private hasAvailableDevice(goal: Goal): boolean {

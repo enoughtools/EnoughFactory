@@ -31,6 +31,16 @@ Each published archive also requires its actual native verification receipt. Gen
 
 The catalog links a public package verification record beside each checksum. Its public copy omits the runtime journey’s local proof-directory path. All packages must match one publicly accessible source commit. Keep the catalog in `preparing` until the archive and runtime evidence are available; source implementation alone does not establish a shipped runtime.
 
+### Corresponding runtime sources
+
+The published specification also supplies `releaseBaseUrl`, such as `https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.0`, and `sourceArtifacts: [{ "path": "releases/EnoughFactory-0.1.0-darwin-arm64-container-sources.tar.gz" }, { "path": "releases/EnoughFactory-0.1.0-darwin-arm64-container-sources.tar.gz.json" }]`. Supply the archive and JSON for every packaged platform/architecture. These paths are relative to the specification file; the filename and hash must match each archive receipt’s embedded `containerRuntime.engineSourceBuild.sourceCompanion`. A supplied source `url` must equal its filename beneath the actual release base.
+
+Ubuntu files default to `dist/ubuntu-source-companion`. An optional `ubuntuSourceDirectory` selects another directory relative to the specification file, including the final files downloaded from CI. Preparation reads the actual index and hashes its listed source parts, archive evidence, lock, index, README and checksums. The current release requires all seven files. The index must cover every package in the audited source lock, and its image hashes must match the verified bundled Mac guest. Regenerated archive hashes are taken from the final index and files; prior local gzip hashes are not assumed.
+
+Publish these companions as public assets on the same GitHub release before preparing the catalog. The preparer streams the public bytes and verifies their exact hashes and sizes. The publisher repeats this check before deploying executable download links. A missing, unavailable or mismatched source asset prevents publication. The `sources` catalog entries contain their kind, role, filename, public URL, hash, size and target when applicable. The downloads page exposes engine source archives/build records and every Ubuntu companion file; the guide links to that section.
+
+Keep all corresponding source assets available for as long as the executable packages are distributed. The catalog’s combined `SHA256SUMS.txt` includes installers and source assets.
+
 Rebuild the site after updating the manifest. The prerendered download page and embedded initial state will then match the release catalog.
 
 ## Hosted browser application
@@ -55,7 +65,7 @@ Use the release command after the complete product release and its published cat
 pnpm --filter @enoughfactory/marketing deploy
 ```
 
-It revalidates every public package receipt and its runtime journey against the catalog, rebuilds the marketing pages, stages the real browser application, deploys with authenticated Wrangler and checks the public routes and release version. Verify the browser’s actual connection journey and packages as well. Record the deployed version and checksums with the release.
+It revalidates every public package receipt and its runtime journey against the catalog, checks the complete runtime source catalog and public asset bytes, rebuilds the marketing pages, stages the real browser application, deploys with authenticated Wrangler and checks the public routes and release version. Verify the browser’s actual connection journey and packages as well. Record the deployed version and checksums with the release.
 
 ## Verified access on October 5 2026
 

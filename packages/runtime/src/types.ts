@@ -16,7 +16,7 @@ export interface RuntimeStatus extends RuntimeProgress {
 }
 export interface ContainerRuntimeStatus {
   kind: 'lima' | 'rootless'; state: 'unavailable' | 'stopped' | 'starting' | 'ready' | 'stopping' | 'failed';
-  version?: string; dockerVersion?: string; socketPath: string; dataDirectory: string;
+  version?: string; dockerVersion?: string; socketPath: string; dataDirectory: string; stateDirectory: string;
   cpus?: number; memoryGiB?: number; diskGiB?: number; phase?: string; error?: string;
   requiredActions?: Array<{ label: string; detail: string; command?: string }>;
   artifactFsSupported: boolean;

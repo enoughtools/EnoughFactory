@@ -14,7 +14,7 @@ interface PreviewGrant { id: string; proxyUrl: string; url: string; proxyAuth?: 
 interface Preview { view: WebContentsView; grant: PreviewGrant; window?: BrowserWindow; owner: BrowserWindow; sessionId: string; popups: Set<BrowserWindow> }
 
 const repository = resolve(__dirname, '../../..');
-const dataDirectory = process.env.ENOUGHFACTORY_HOME ?? join(homedir(), '.enoughfactory');
+const dataDirectory = resolve(process.env.ENOUGHFACTORY_HOME ?? join(homedir(), '.enoughfactory'));
 const resources = app.isPackaged ? process.resourcesPath : repository;
 const development = process.argv.includes('--dev') || Boolean(process.env.ENOUGHFACTORY_DEV_URL);
 const developmentUrl = process.env.ENOUGHFACTORY_DEV_URL ?? 'http://127.0.0.1:4318';
@@ -65,8 +65,8 @@ async function availableConnection(requireManagedRuntime = true): Promise<Connec
     });
     if (response.status === 404 || response.status === 405) throw new Error('[DEVICE_SERVICE_UPDATE_REQUIRED] Update the device service to use EnoughFactory’s private runtime. Existing environments and work records are retained.');
     if (!response.ok) throw new Error('The running device service could not inspect its private runtime. Its details are in the device log.');
-    const runtime = await response.json() as { kind?: string; dataDirectory?: string; socketPath?: string };
-    if (!response.ok || !['lima', 'rootless'].includes(runtime.kind ?? '') || runtime.dataDirectory !== resolve(dataDirectory) || typeof runtime.socketPath !== 'string' || !runtime.socketPath.startsWith('/') || runtime.socketPath === '/var/run/docker.sock') {
+    const runtime = await response.json() as { kind?: string; stateDirectory?: string; socketPath?: string };
+    if (!response.ok || !['lima', 'rootless'].includes(runtime.kind ?? '') || runtime.stateDirectory !== resolve(dataDirectory) || typeof runtime.socketPath !== 'string' || !runtime.socketPath.startsWith('/') || runtime.socketPath === '/var/run/docker.sock') {
       throw new Error('[DEVICE_SERVICE_UPDATE_REQUIRED] Update the device service to use EnoughFactory’s private runtime. Existing environments and work records are retained.');
     }
   }
@@ -111,9 +111,13 @@ async function startOrConnectService(): Promise<Connection> {
         PATH: executablePath,
         ENOUGHFACTORY_HOME: dataDirectory,
         ENOUGHFACTORY_PORT: process.env.ENOUGHFACTORY_PORT ?? '4317',
-        ENOUGHFACTORY_RESOURCES: durable,
+        ENOUGHFACTORY_RESOURCES: app.isPackaged ? durable : undefined,
+        ENOUGHFACTORY_REPO: app.isPackaged ? undefined : repository,
+        ENOUGHFACTORY_CONTAINER_ASSETS: app.isPackaged ? join(durable, 'runtime/container')
+          : (process.env.ENOUGHFACTORY_CONTAINER_ASSETS ?? join(repository, '.cache/container-runtime', `${process.platform}-${process.arch}`)),
         ENOUGHFACTORY_WEB_PATH: app.isPackaged ? join(durable, 'web') : join(repository, 'apps/web/dist'),
-        ...(app.isPackaged ? { ENOUGHFACTORY_ENVMUX_PATH: join(durable, 'envmux/envmux') } : {}),
+        ENOUGHFACTORY_ENVMUX_PATH: app.isPackaged ? join(durable, 'envmux/envmux')
+          : (process.env.ENOUGHFACTORY_ENVMUX_PATH ?? join(repository, 'artifacts/envmux', `${process.platform === 'darwin' ? 'osx' : 'linux'}-${process.arch}`, 'envmux')),
       },
     });
     child.once('error', error => { launchError = error; });
@@ -137,7 +141,7 @@ function getConnection(): Promise<Connection> {
 async function servicePortOpen(connection: Connection): Promise<boolean> {
   const url = new URL(connection.url);
   return await new Promise<boolean>(resolveOpen => {
-    const socket = createConnection({ host: url.hostname, port: Number(url.port || 80) });
+    const socket = createConnection({ host: url.hostname === '[::1]' ? '::1' : url.hostname, port: Number(url.port || 80) });
     let finished = false;
     const finish = (open: boolean) => { if (finished) return; finished = true; socket.destroy(); resolveOpen(open); };
     socket.once('connect', () => finish(true));
@@ -313,7 +317,13 @@ function createWindow(): void {
     icon: app.isPackaged ? join(resources, 'icon.png') : join(repository, 'apps/desktop/assets/icon.png'),
     webPreferences: { preload: join(__dirname, 'preload.cjs'), contextIsolation: true, nodeIntegration: false, sandbox: true },
   });
-  mainWindow.once('ready-to-show', () => mainWindow?.show());
+  mainWindow.once('ready-to-show', () => {
+    mainWindow?.show();
+    if (app.commandLine.hasSwitch('enoughfactory-verify-desktop')) {
+      const window = mainWindow!;
+      void verifyNativeWindow(window).catch(error => { console.error('Desktop verification failed:', error); app.exit(1); });
+    }
+  });
   mainWindow.webContents.setWindowOpenHandler(({ url }) => { try { void shell.openExternal(webUrl(url)); } catch { /* Ignore unsupported URL schemes. */ } return { action: 'deny' }; });
   mainWindow.webContents.on('will-navigate', (event, destination) => {
     const allowed = development ? new URL(destination).origin === trustedUi : destination.split('#')[0].split('?')[0] === trustedUi;
@@ -322,6 +332,36 @@ function createWindow(): void {
   mainWindow.on('closed', () => { void closePreview(); mainWindow = undefined; });
   if (development) void mainWindow.loadURL(developmentUrl);
   else void mainWindow.loadFile(uiFile).catch(error => dialog.showErrorBox('EnoughFactory could not open', `${error.message}\nBuild the shared web app before opening the desktop bundle.`));
+}
+
+async function verifyNativeWindow(window: BrowserWindow): Promise<void> {
+  const output = process.env.ENOUGHFACTORY_GUI_VERIFICATION_RECEIPT;
+  if (!app.isPackaged || !output || app.commandLine.hasSwitch('no-sandbox') || app.commandLine.hasSwitch('disable-sandbox')) throw new Error('Native desktop verification requires a packaged application with Chromium sandbox enabled.');
+  await getConnection();
+  await new Promise(resolveWait => setTimeout(resolveWait, 3_000));
+  if (window.isDestroyed() || !window.isVisible() || window.webContents.isDestroyed()) throw new Error('The native workbench did not render.');
+  const contentDeadline = Date.now() + 10_000;
+  while (!await window.webContents.executeJavaScript("Boolean(document.querySelector('#root main'))")) {
+    if (Date.now() >= contentDeadline) throw new Error('The shared workbench did not mount in the native renderer.');
+    await new Promise(resolveWait => setTimeout(resolveWait, 250));
+  }
+  const rendererPid = window.webContents.getOSProcessId();
+  let rendererSandbox: { enabled: true; seccomp?: number; noNewPrivileges?: true };
+  if (process.platform === 'linux') {
+    const status = await readFile(`/proc/${rendererPid}/status`, 'utf8');
+    if (!/^Seccomp:\s+2$/m.test(status) || !/^NoNewPrivs:\s+1$/m.test(status)) throw new Error('The rendered workbench process lacks the Chromium seccomp sandbox.');
+    rendererSandbox = { enabled: true, seccomp: 2, noNewPrivileges: true };
+  } else {
+    if (!app.getAppMetrics().some(metric => metric.pid === rendererPid && metric.sandboxed === true)) throw new Error('The rendered workbench process lacks its OS sandbox.');
+    rendererSandbox = { enabled: true };
+  }
+  const screenshot = (await window.webContents.capturePage()).toPNG();
+  if (!screenshot.length) throw new Error('The native workbench produced no rendered frame.');
+  const provenanceBytes = await readFile(join(resources, 'bundle-provenance.json'));
+  const provenance = JSON.parse(provenanceBytes.toString('utf8')) as { sourceCommit: string };
+  await writeFile(`${output}.png`, screenshot);
+  await writeFile(output, `${JSON.stringify({ formatVersion: 1, product: 'EnoughFactory', suite: 'desktop-gui', status: 'passed', platform: process.platform, arch: process.arch, sourceCommit: provenance.sourceCommit, bundleProvenanceSha256: createHash('sha256').update(provenanceBytes).digest('hex'), rendererSandbox, screenshotSha256: createHash('sha256').update(screenshot).digest('hex'), checks: ['packaged Electron starts with Chromium sandbox enabled', 'shared workbench mounts in the isolated native renderer', 'isolated native workbench renders a visible frame', 'bundled independent device service answers authenticated health'] }, null, 2)}\n`);
+  app.quit();
 }
 
 function installBridge(): void {

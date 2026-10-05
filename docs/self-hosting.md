@@ -8,6 +8,8 @@ Every installed device service owns its execution engine. Mac bundles Lima 2.2.1
 
 Prepare source-run assets with `node scripts/prepare-container-runtime.mjs`. The exact archive URLs, architecture-specific SHA-256 values and Ubuntu image pins are recorded in [runtime/container/pins.json](../runtime/container/pins.json). The prepared runtime records those inputs in its own `provenance.json`. Mac includes the pinned Ubuntu guest image in the desktop archive and creates its private writable VM disk from that image. Container images and agent tools can require downloads after the runtime starts.
 
+Container engine source builds and library modification instructions live in [the source and relink kit](../runtime/container/relink-kit/README.md). Published binary releases must retain full third-party notices and provide their matching engine and Ubuntu package-source companions alongside application downloads. Preserve those source artifacts when redistributing a release.
+
 Start, stop and resource configuration belong to the device service's runtime controls. The engine remains independent of window lifetime. Explicitly stop active environments before stopping the engine. Linux needs the host prerequisites in the [installation guide](install.md#linux-runtime-prerequisites); run the service as a regular user. Private state and images are retained for recovery until explicitly removed.
 
 ## Signaling with Docker and TLS

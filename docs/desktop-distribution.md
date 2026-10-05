@@ -12,7 +12,7 @@ On Linux, EnoughFactory bundles Docker 29.8.2 and its rootless runtime tools. It
 
 The runtime uses EnoughFactory's own sockets, ownership labels and state. It does not select a user Docker context, operate Docker Desktop/Colima, or stop a system Docker service. Closing the desktop or shutting down the device service leaves the private engine running. Runtime start/stop and Mac CPU, memory and disk settings are available in the app.
 
-Mac VM disks and caches live under `~/.enoughfactory/container`; Linux engine images, volumes and runtime state live under `~/.enoughfactory/docker`. A custom `ENOUGHFACTORY_HOME` moves those paths together. Mac's socket is under `container/lima/factory/sock/docker.sock`; Linux uses `docker/run/docker.sock` within that same device state directory.
+Mac VM disks normally live under `~/.enoughfactory/container/lima`; Linux engine images, volumes and runtime state live under `~/.enoughfactory/docker`. A custom `ENOUGHFACTORY_HOME` selects the device state directory. When a Mac state path exceeds Unix socket limits, its private VM uses an owned directory under `/Users/Shared/.enoughfactory-runtime-<uid>-<stateHash>/lima`; the location is recorded in `container/runtime-location.json`. Default updates/removal preserve this storage as well. Explicit purge removes it only after authenticated stopped-state and directory-ownership checks.
 
 Linux desktop bundles require a graphical desktop and the system libraries required by Electron. An AppImage may require the distribution's FUSE compatibility package; its extraction option is available when FUSE is unavailable. The headless device service itself does not require a display server.
 
@@ -107,5 +107,16 @@ Resources contain `runtime/node`, the private `runtime/container` engine/VM payl
 ## Release verification and notices
 
 For each required target, open its packaged application, confirm the bundled device service answers authenticated `/api/health` and `/api/runtime` requests, start its private engine, open a real session, and close/reopen the desktop while the session continues. Confirm a separate user/system Docker engine was untouched. Verify user startup installation and removal on that OS, including active-work refusal and preservation of runtime data. Use one complete factory journey for the assembled release rather than repeating extensive checks for every packaging change.
+
+The native user-service check runs an isolated installation with its own state directory, port, copied resources and startup definition. It requires a Mac login launchd domain or a Linux systemd user manager and refuses to take over an existing EnoughFactory startup registration or definition:
+
+```sh
+node scripts/check-installed-service.mjs \
+  --resources "/absolute/path/to/installed/resources" \
+  --receipt "/absolute/path/to/user-service-verification.json" \
+  --source-commit "<release source commit>"
+```
+
+This check verifies native startup, authenticated health/catalog access, the runtime's positive stopped state, safe uninstall, removal of startup and resources, and preservation of device state. It does not start a second VM or substitute for the private engine/session journey. Its JSON receipt binds the result to the bundle manifest hash, source commit and native platform/architecture. A failed check keeps its isolated diagnostics for inspection.
 
 Publish the built archives, their SHA-256 hashes, architecture and actual signing status through the release manifest used by `factory.enoughtools.com`. Never label an archive available before its download URL has been verified. Include `LICENSE`, `THIRD_PARTY_NOTICES.md`, the Node runtime license and the original envmux and EnoughUI notices with the distribution. The Enough application icon is the supplied brand mark; its separate license is included in `apps/desktop/assets/LICENSE`.

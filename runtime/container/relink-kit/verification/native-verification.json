@@ -1,0 +1,84 @@
+{
+  "schemaVersion": 1,
+  "binaries": {
+    "x64": {
+      "runc": {
+        "sha256": "a8c35850e2cd165496b62a69e2d5ae8319b78062761a55ff2e8c3db0e74bf2e6",
+        "elfClass": 64,
+        "endianness": "little",
+        "type": 2,
+        "hasInterpreter": false,
+        "hasDynamicSection": false
+      },
+      "docker-init": {
+        "sha256": "223de60329703ef12f2e2453db6a002ace798de82114a95f70b6b7e10b99c7cc",
+        "elfClass": 64,
+        "endianness": "little",
+        "type": 2,
+        "hasInterpreter": false,
+        "hasDynamicSection": false
+      }
+    },
+    "arm64": {
+      "runc": {
+        "sha256": "544aa392cb084b697ad846a233b3ea2d66fbbca419892742be3362ae9302eeaa",
+        "elfClass": 64,
+        "endianness": "little",
+        "type": 2,
+        "hasInterpreter": false,
+        "hasDynamicSection": false
+      },
+      "docker-init": {
+        "sha256": "48be8b21eb4483ade336448aa7031fd2941a8b7b3e2bc8e2d45b1e4bbae77b56",
+        "elfClass": 64,
+        "endianness": "little",
+        "type": 2,
+        "hasInterpreter": false,
+        "hasDynamicSection": false
+      }
+    }
+  },
+  "relink": {
+    "architecture": "x64",
+    "kitRelocatedTo": "/tmp/enoughfactory-relocated-native-kit/x64/relink",
+    "output": "/tmp/enoughfactory-relocated-native-kit/x64/runc",
+    "outputSha256": "460b45b9ee6c079311d6df939bb88709781b845b2a3c279ae3f070a31294d89e",
+    "elf": {
+      "elfClass": 64,
+      "endianness": "little",
+      "type": 2,
+      "hasInterpreter": false,
+      "hasDynamicSection": false
+    },
+    "passed": true
+  },
+  "runtime": {
+    "architecture": "arm64",
+    "owner": "EnoughFactory private Lima factory VM",
+    "defaultDockerTouched": false,
+    "runcVersion": "1.5.2",
+    "runcCommit": "29dd3dc2b13b4123162e5fe132504bb4b15569f1",
+    "libseccompVersion": "2.6.0",
+    "tiniVersion": "0.19.0",
+    "filteredProbe": {
+      "output": "getppid=-1 errno=1",
+      "exitCode": 0,
+      "passed": true
+    },
+    "tiniFilteredProbe": {
+      "output": "getppid=-1 errno=1",
+      "exitCode": 0,
+      "passed": true
+    },
+    "unfilteredControl": {
+      "output": "getppid=0 errno=0",
+      "expectedProbeExitCode": 1,
+      "passed": true
+    },
+    "guestBundleDirectory": "/tmp/enoughfactory-native-proof",
+    "guestRuncRoot": "/tmp/enoughfactory-native-relink-runc-state"
+  },
+  "limitations": [
+    "x64 kernel execution was not performed on this ARM64 host; x64 static ELF and relocated relink checks passed."
+  ]
+}

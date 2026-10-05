@@ -4,6 +4,7 @@ import { copyFile, mkdir, readFile, stat, writeFile } from 'node:fs/promises';
 import { dirname, resolve, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { verifyArchiveReceipt, verifyPublishedCatalog, verifyRuntimeJourney } from './verify-receipt.mjs';
+import { engineSourceRequirements, hashBytes, hashFile, releaseAssetUrl, ubuntuSourceRequirements, verifyPublicAsset, verifySourceCatalog } from './source-companions.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const specification = process.argv[2];
@@ -17,6 +18,8 @@ const downloadRoot = resolve(root, 'apps/marketing/public/downloads');
 const pins = JSON.parse(await readFile(resolve(root, 'runtime/container/pins.json'), 'utf8'));
 const artifacts = [];
 const receipts = [];
+const sources = [];
+let ubuntuSourceIndexSha256;
 for (const artifact of spec.artifacts) {
   if (!['darwin', 'linux'].includes(artifact.platform) || !['x64', 'arm64'].includes(artifact.arch) || !['signed', 'unsigned'].includes(artifact.signing)) throw new Error('Each artifact needs its platform, architecture and accurate signing status.');
   const path = resolve(dirname(specPath), artifact.path);
@@ -73,15 +76,42 @@ if (spec.status === 'published') {
   for (const target of ['darwin-arm64', 'linux-x64', 'linux-arm64']) {
     if (!artifacts.some(a => `${a.platform}-${a.arch}` === target)) throw new Error(`Release is missing the required ${target} package.`);
   }
+  if (!Array.isArray(spec.sourceArtifacts)) throw new Error('Provide the actual per-target engine source archives and JSON receipts as sourceArtifacts.');
+  const ubuntuDirectory = spec.ubuntuSourceDirectory ? resolve(dirname(specPath), spec.ubuntuSourceDirectory) : resolve(root, 'dist/ubuntu-source-companion');
+  const indexBytes = await readFile(resolve(ubuntuDirectory, 'Ubuntu-source-companion.json'));
+  const lockBytes = await readFile(resolve(root, 'runtime/container/os-source-kit/Ubuntu-sources.lock.json'));
+  const required = new Map();
+  for (const entry of [...receipts.flatMap(engineSourceRequirements), ...ubuntuSourceRequirements(JSON.parse(indexBytes), receipts, pins, lockBytes)]) {
+    const previous = required.get(entry.filename);
+    if (previous && previous.sha256 !== entry.sha256) throw new Error('Archives for one target contain different source companions.');
+    required.set(entry.filename, entry);
+  }
+  for (const requirement of required.values()) {
+    const supplied = spec.sourceArtifacts.find(source => typeof source.path === 'string' && basename(source.path) === requirement.filename);
+    const path = requirement.kind === 'ubuntu' ? resolve(ubuntuDirectory, requirement.filename) : supplied ? resolve(dirname(specPath), supplied.path) : undefined;
+    if (!path) throw new Error(`Provide the actual embedded source companion file: ${requirement.filename}.`);
+    const content = await hashFile(path);
+    if ((requirement.sha256 && content.sha256 !== requirement.sha256) || (requirement.bytes && content.bytes !== requirement.bytes)) throw new Error(`Runtime source asset does not match the verified bundle or Ubuntu index: ${requirement.filename}.`);
+    const url = releaseAssetUrl(spec.releaseBaseUrl, requirement.filename, spec.sourceUrl);
+    if (supplied?.url && supplied.url !== url) throw new Error('Runtime source assets must be on the same actual public GitHub release.');
+    const source = { ...requirement, ...content, url };
+    console.log(`Verifying public runtime source: ${source.filename}`);
+    await verifyPublicAsset(source);
+    sources.push(source);
+  }
+  ubuntuSourceIndexSha256 = hashBytes(indexBytes);
+  await mkdir(resolve(downloadRoot, spec.version), { recursive: true });
+  await writeFile(resolve(downloadRoot, spec.version, 'Ubuntu-source-companion.json'), indexBytes);
+  verifySourceCatalog({ ...spec, sources, ubuntuSourceIndexSha256 }, receipts, pins, indexBytes, lockBytes);
   const response = await fetch(spec.sourceUrl, { method: 'HEAD' });
   if (!response.ok) throw new Error('The source repository is not publicly available.');
   const sourceResponse = await fetch(`${spec.sourceUrl.replace(/\/$/, '')}/commit/${receipts[0].sourceCommit}`, { method: 'HEAD' });
   if (!sourceResponse.ok) throw new Error('The verified package source commit is not publicly available.');
 }
-const manifest = { schemaVersion: 1, product: 'EnoughFactory', version: spec.version, status: spec.status, publishedAt: spec.status === 'published' ? new Date().toISOString() : null, sourceUrl: spec.sourceUrl, ...(receipts[0] ? { sourceCommit: receipts[0].sourceCommit } : {}), artifacts };
+const manifest = { schemaVersion: 1, product: 'EnoughFactory', version: spec.version, status: spec.status, publishedAt: spec.status === 'published' ? new Date().toISOString() : null, sourceUrl: spec.sourceUrl, ...(receipts[0] ? { sourceCommit: receipts[0].sourceCommit } : {}), artifacts, ...(sources.length ? { releaseBaseUrl: spec.releaseBaseUrl, ubuntuSourceIndexSha256, sources } : {}) };
 if (manifest.status === 'published') verifyPublishedCatalog(manifest);
 await mkdir(downloadRoot, { recursive: true });
 await writeFile(resolve(downloadRoot, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`);
-const checksums = artifacts.map(a => `${a.sha256}  ${a.filename}`).join('\n');
+const checksums = [...artifacts, ...sources].map(a => `${a.sha256}  ${a.filename}`).join('\n');
 await writeFile(resolve(downloadRoot, 'SHA256SUMS.txt'), `${checksums}\n`);
 console.log(`Prepared ${manifest.status} release ${manifest.version} with ${artifacts.length} verified local artifacts.`);

@@ -1,0 +1,48 @@
+{
+  "scope": "ARM64 Docker-in-Docker on EnoughFactory-owned runtime; only dedicated temporary proof container created/removed. No user/default Docker used.",
+  "host": "unix:///Users/russell/.enoughfactory/container/lima/factory/sock/docker.sock",
+  "outerImage": "docker@sha256:7dcdfc4a20246236f558175182ccace1eb15a41bd3eb119dd2284f393498b7c1",
+  "containerID": "0ea731f5ed47f6cddaf7105d776746df03df6585f7f32827691a8cae0c6a68dd",
+  "serverVersion": "29.8.2",
+  "securityOptions": [
+    "name=apparmor,profile=default",
+    "name=seccomp,profile=builtin",
+    "name=cgroupns"
+  ],
+  "storageDriver": "overlayfs",
+  "runcVersion": "runc version 1.5.2\ncommit: 29dd3dc2b13b4123162e5fe132504bb4b15569f1\nspec: 1.3.0\ngo: go1.26.8\nlibseccomp: 2.6.0",
+  "seccompAndInitOutput": "Seccomp: 2\nSeccomp_filters: 1\nenoughfactory-owned-engine-init-ok",
+  "runCommand": [
+    "docker",
+    "run",
+    "--rm",
+    "--init",
+    "busybox:1.37.0",
+    "sh",
+    "-ec",
+    "grep Seccomp /proc/self/status; grep -Eq \"^Seccomp:[[:space:]]+2$\" /proc/self/status; test \"$(cat /proc/1/comm)\" = docker-init; echo enoughfactory-owned-engine-init-ok"
+  ],
+  "passed": true,
+  "limitations": [
+    "Linux x64 actual kernel execution remains CI packaging verification; both binaries compiled and x64 recipient relink passed.",
+    "CGO0 daemon does not support filesystem project quotas or optional Btrfs driver; configured factory runtime uses overlay."
+  ],
+  "boundArtifacts": [
+    {
+      "name": "dockerd",
+      "sha256": "8c8b788a53d39ca65af35c294f1fb9b67a15d53236001520ac95d8c13f538710"
+    },
+    {
+      "name": "docker-proxy",
+      "sha256": "c59ed73fe1060a4627ea9994ce72de3e3abd3b7284a4495caa0679170f6d9cb2"
+    },
+    {
+      "name": "runc",
+      "sha256": "544aa392cb084b697ad846a233b3ea2d66fbbca419892742be3362ae9302eeaa"
+    },
+    {
+      "name": "docker-init",
+      "sha256": "48be8b21eb4483ade336448aa7031fd2941a8b7b3e2bc8e2d45b1e4bbae77b56"
+    }
+  ]
+}

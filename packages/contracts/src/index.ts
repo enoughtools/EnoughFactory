@@ -21,6 +21,7 @@ export interface Session {
 export interface Device {
   id: string; name: string; platform: string; arch: string; online: boolean; lastSeen: string;
   local: boolean; publicKey?: string; transport?: "local" | "webrtc" | "relay"; capacity?: number;
+  workspaceProviders?: ("git" | "artifactfs")[];
 }
 export interface RuntimeCapability {
   kind: RuntimeKind; available: boolean; version?: string; fullAccess: boolean;
@@ -65,7 +66,7 @@ export interface Artifact { id: string; goalId?: string; taskId?: string; attemp
 export interface ContainerRuntimeStatus {
   kind: "lima" | "rootless";
   state: "unavailable" | "stopped" | "starting" | "ready" | "stopping" | "failed";
-  version?: string; dockerVersion?: string; socketPath: string; dataDirectory: string;
+  version?: string; dockerVersion?: string; socketPath: string; dataDirectory: string; stateDirectory: string;
   cpus?: number; memoryGiB?: number; diskGiB?: number; phase?: string; error?: string;
   requiredActions?: { label: string; detail: string; command?: string }[];
   artifactFsSupported: boolean;

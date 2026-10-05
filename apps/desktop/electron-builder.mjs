@@ -18,6 +18,7 @@ export default {
   },
   dmg: { title: 'EnoughFactory ${version}', backgroundColor: '#f7f5f0', iconSize: 96, window: { width: 540, height: 360 } },
   linux: {
+    executableName: 'enoughfactory',
     icon: 'assets/icon.png',
     category: 'Development',
     synopsis: 'One software factory across your devices',

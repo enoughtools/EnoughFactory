@@ -76,9 +76,12 @@ export function useFactory() {
   const [state, setState] = useState<FactoryState | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const [bootstrapped, setBootstrapped] = useState(() => !window.enoughFactory);
+  const bootstrappedRef = useRef(bootstrapped);
   const requestGeneration = useRef(0);
   const client = useRef(new DeviceClient(connection));
   const refresh = useCallback(async () => {
+    if (!bootstrappedRef.current) return;
     const generation = requestGeneration.current;
     try {
       const next = await client.current.get<FactoryState>('/api/state');
@@ -89,11 +92,19 @@ export function useFactory() {
     } finally { if (generation === requestGeneration.current) setLoading(false); }
   }, []);
   const setConnection = useCallback((next: Connection) => {
+    bootstrappedRef.current = true; setBootstrapped(true);
     storeConnection(next); requestGeneration.current++;
     client.current = new DeviceClient(next); setConnectionState(next); setLoading(true); setState(null);
   }, []);
-  useEffect(() => { void window.enoughFactory?.getConnection().then(setConnection).catch(cause => setError(String(cause))); }, [setConnection]);
   useEffect(() => {
+    let active = true;
+    void window.enoughFactory?.getConnection().then(next => { if (active) setConnection(next); }).catch(cause => {
+      if (active) { setError(cause instanceof Error ? cause.message : String(cause)); setLoading(false); }
+    });
+    return () => { active = false; };
+  }, [setConnection]);
+  useEffect(() => {
+    if (!bootstrapped) return;
     const abort = new AbortController();
     void refresh();
     const fallback = setInterval(() => void refresh(), 15_000);
@@ -121,6 +132,6 @@ export function useFactory() {
     if (connection.mode === 'peer') { peerChanges.addEventListener('change', peerUpdated); peerChanges.addEventListener('devices', peerUpdated); }
     else void subscribe();
     return () => { abort.abort(); clearInterval(fallback); clearTimeout(debounce); peerChanges.removeEventListener('change', peerUpdated); peerChanges.removeEventListener('devices', peerUpdated); };
-  }, [connection, refresh]);
+  }, [bootstrapped, connection, refresh]);
   return { state, error, loading, client: client.current, refresh, connection, setConnection };
 }

@@ -16,6 +16,7 @@ export function verifyArchiveReceipt(receipt, artifact, pins) {
   const runtime = receipt.containerRuntime;
   const components = [`docker-${artifact.platform}-${artifact.arch}`, ...(artifact.platform === 'darwin' ? [`lima-darwin-${artifact.arch}`, `docker-linux-${artifact.arch}`] : [`rootless-linux-${artifact.arch}`])];
   if (runtime?.assetsVerified !== true || runtime.dedicatedSocket !== 'inside-isolated-device-state' || runtime.dockerVersion !== pins.dockerVersion || (artifact.platform === 'darwin' && runtime.limaVersion !== pins.limaVersion) || !Array.isArray(runtime.archivePins) || runtime.archivePins.length !== components.length || components.some(component => !runtime.archivePins.some(pin => pin.component === component && pin.url === pins.archives[component].url && pin.sha256 === pins.archives[component].sha256))) throw new Error(`Pinned private runtime assets were not verified: ${artifact.filename}.`);
+  engineSourceRequirements(receipt);
   return receipt;
 }
 
@@ -33,7 +34,7 @@ export function verifyRuntimeJourney(receipt) {
 }
 
 export function verifyPublishedCatalog(manifest) {
-  if (manifest?.schemaVersion !== 1 || manifest.product !== 'EnoughFactory' || manifest.status !== 'published' || !/^\d+\.\d+\.\d+(?:-[a-zA-Z0-9.-]+)?$/.test(manifest.version ?? '') || !/^[a-f0-9]{40}$/.test(manifest.sourceCommit ?? '') || !/^https:\/\/github\.com\/[a-zA-Z0-9_-]+\/[a-zA-Z0-9_.-]+\/?$/.test(manifest.sourceUrl ?? '') || !Number.isFinite(Date.parse(manifest.publishedAt)) || !Array.isArray(manifest.artifacts) || manifest.artifacts.length === 0) throw new Error('Prepare the verified published product release catalog before deploying the launch site.');
+  if (manifest?.schemaVersion !== 1 || manifest.product !== 'EnoughFactory' || manifest.status !== 'published' || !/^\d+\.\d+\.\d+(?:-[a-zA-Z0-9.-]+)?$/.test(manifest.version ?? '') || !/^[a-f0-9]{40}$/.test(manifest.sourceCommit ?? '') || !/^https:\/\/github\.com\/[a-zA-Z0-9_-]+\/[a-zA-Z0-9_.-]+\/?$/.test(manifest.sourceUrl ?? '') || !Number.isFinite(Date.parse(manifest.publishedAt)) || !Array.isArray(manifest.artifacts) || manifest.artifacts.length === 0 || !Array.isArray(manifest.sources) || !manifest.sources.length || !digest(manifest.ubuntuSourceIndexSha256) || typeof manifest.releaseBaseUrl !== 'string') throw new Error('Prepare the verified published product release catalog before deploying the launch site.');
   for (const artifact of manifest.artifacts) {
     if (!packageFormats[artifact.platform] || !['arm64', 'x64'].includes(artifact.arch) || !packageFormats[artifact.platform].includes(artifact.format?.toLowerCase()) || !/^[a-zA-Z0-9._-]+$/.test(artifact.filename ?? '') || !artifact.filename.includes(manifest.version) || !artifact.filename.toLowerCase().endsWith(`.${artifact.format.toLowerCase()}`) || !digest(artifact.sha256) || !Number.isSafeInteger(artifact.bytes) || artifact.bytes <= 0 || artifact.signing !== 'unsigned' || artifact.verificationUrl !== `/downloads/${manifest.version}/${artifact.filename}.verification.json`) throw new Error('A published catalog package is incomplete or has an invalid verification record.');
     if (artifact.url !== `/downloads/${manifest.version}/${artifact.filename}`) {
@@ -45,3 +46,4 @@ export function verifyPublishedCatalog(manifest) {
   for (const target of ['darwin-arm64', 'linux-x64', 'linux-arm64']) if (!manifest.artifacts.some(artifact => `${artifact.platform}-${artifact.arch}` === target)) throw new Error(`Release is missing the required ${target} package.`);
   return manifest;
 }
+import { engineSourceRequirements } from './source-companions.mjs';

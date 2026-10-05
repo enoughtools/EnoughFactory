@@ -4,7 +4,8 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { EnvmuxSession, type EnvmuxReady, type EnvmuxState } from '@enoughfactory/envmux';
-import type { Session } from '@enoughfactory/contracts';
+import type { ContainerRuntimeStatus, Device, Session } from '@enoughfactory/contracts';
+import { DeviceApp } from './app.ts';
 import { SessionController } from './sessions.ts';
 import { Store } from './store.ts';
 
@@ -127,4 +128,42 @@ test('a failed live environment requires termination, while a failed environment
   store.set('session-launch', { id: 'never-started', projectPath: directory, generation: 1, dockerHost: endpoint.host });
   assert.equal(controller.owns('never-started'), true);
   assert.equal(controller.needsTermination('never-started'), false);
+});
+
+test('worker capacity follows the owned runtime and preserves remote device capacity', () => {
+  interface CapacityFixture {
+    diagnostics: { containerRuntime: { state: ContainerRuntimeStatus['state'] } };
+    runtimeSuspended: boolean;
+    runtimeStopping: boolean;
+    device: Device;
+    devices: Device[];
+  }
+  const sync = (DeviceApp.prototype as unknown as { syncRuntimeCapacity(this: CapacityFixture): void }).syncRuntimeCapacity;
+  const local: Device = {
+    id: 'local', name: 'Local device', platform: 'darwin', arch: 'arm64', online: true,
+    lastSeen: '2026-10-05T00:00:00.000Z', local: true, capacity: 9,
+  };
+  const remote: Device = { ...local, id: 'remote', name: 'Remote device', local: false, capacity: 7 };
+  const cases: Array<{ state: ContainerRuntimeStatus['state']; suspended?: boolean; stopping?: boolean; capacity: number }> = [
+    { state: 'stopped', capacity: 2 },
+    { state: 'ready', suspended: true, capacity: 0 },
+    { state: 'unavailable', capacity: 0 },
+    { state: 'failed', capacity: 0 },
+    { state: 'stopping', capacity: 0 },
+    { state: 'ready', stopping: true, capacity: 0 },
+    { state: 'ready', capacity: 2 },
+  ];
+  for (const scenario of cases) {
+    const fake: CapacityFixture = {
+      diagnostics: { containerRuntime: { state: scenario.state } },
+      runtimeSuspended: scenario.suspended ?? false, runtimeStopping: scenario.stopping ?? false,
+      device: { ...local }, devices: [{ ...local, capacity: 1 }, remote],
+    };
+    sync.call(fake);
+    assert.equal(fake.device.capacity, scenario.capacity, JSON.stringify(scenario));
+    assert.equal(fake.devices.length, 2);
+    assert.equal(fake.devices[0], fake.device, 'the catalog must publish the current local capacity');
+    assert.equal(fake.devices[1], remote, 'runtime changes must leave remote scheduling capacity untouched');
+    assert.equal(remote.capacity, 7);
+  }
 });

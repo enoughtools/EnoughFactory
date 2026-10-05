@@ -20,7 +20,7 @@ Chats stay on their owning device. If that device is offline, its conversations 
 
 ## Run from source
 
-Source builds need Node 22.14 or newer, pnpm **10.34.5**, Git and the **.NET 10 SDK**. Desktop distributions bundle their application and container-runtime tools; Mac includes its pinned guest OS image and uses Apple virtualization. Linux needs the host's user-namespace and UID-mapping prerequisites described in [installation](docs/install.md#linux-runtime-prerequisites). An existing Docker installation is not required.
+Source builds need Node 22.14 or newer, pnpm **10.34.5**, Git, the **.NET 10 SDK**, Python 3.10 or newer, and the usual POSIX build tools (`make`, `tar`, `file`; Xcode Command Line Tools on Mac). Runtime preparation downloads pinned Go/Zig toolchains and builds the engine components with their source and relink materials. Desktop distributions bundle their application and container-runtime tools; Mac includes its pinned guest OS image and uses Apple virtualization. Linux needs the host's user-namespace and UID-mapping prerequisites described in [installation](docs/install.md#linux-runtime-prerequisites). An existing Docker installation is not required.
 
 ```sh
 git clone https://github.com/enoughtools/EnoughFactory.git

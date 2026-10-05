@@ -1,0 +1,113 @@
+{
+  "formatVersion": 1,
+  "binaries": [
+    {
+      "file": "/tmp/enoughfactory-owned-engine-rebuilt/x64/docker-init",
+      "name": "docker-init",
+      "bytes": 1337496,
+      "sha256": "223de60329703ef12f2e2453db6a002ace798de82114a95f70b6b7e10b99c7cc",
+      "format": "ELF64",
+      "architecture": "x64",
+      "interpreter": null,
+      "neededLibraries": [],
+      "linkage": "static",
+      "symbolEvidence": {},
+      "glibcLoaderMarkers": []
+    },
+    {
+      "file": "/tmp/enoughfactory-owned-engine-rebuilt/x64/docker-proxy",
+      "name": "docker-proxy",
+      "bytes": 2478206,
+      "sha256": "ff64e64278a34b19553b993b1f31e1db0b22979aeb077b03b4cfb77c4fd9ecf7",
+      "format": "ELF64",
+      "architecture": "x64",
+      "interpreter": null,
+      "neededLibraries": [],
+      "linkage": "static",
+      "symbolEvidence": {},
+      "glibcLoaderMarkers": []
+    },
+    {
+      "file": "/tmp/enoughfactory-owned-engine-rebuilt/x64/dockerd",
+      "name": "dockerd",
+      "bytes": 88232062,
+      "sha256": "d5886be0ceaee1a188460f7b1ae2b860a7bdbed91bce56853ddaf5d4e5cd1a0e",
+      "format": "ELF64",
+      "architecture": "x64",
+      "interpreter": null,
+      "neededLibraries": [],
+      "linkage": "static",
+      "symbolEvidence": {},
+      "glibcLoaderMarkers": []
+    },
+    {
+      "file": "/tmp/enoughfactory-owned-engine-rebuilt/x64/runc",
+      "name": "runc",
+      "bytes": 13101608,
+      "sha256": "a8c35850e2cd165496b62a69e2d5ae8319b78062761a55ff2e8c3db0e74bf2e6",
+      "format": "ELF64",
+      "architecture": "x64",
+      "interpreter": null,
+      "neededLibraries": [],
+      "linkage": "static",
+      "symbolEvidence": {
+        "libseccompVersion": "2.6.0"
+      },
+      "glibcLoaderMarkers": []
+    },
+    {
+      "file": "/tmp/enoughfactory-owned-engine-rebuilt/arm64/docker-init",
+      "name": "docker-init",
+      "bytes": 1422520,
+      "sha256": "48be8b21eb4483ade336448aa7031fd2941a8b7b3e2bc8e2d45b1e4bbae77b56",
+      "format": "ELF64",
+      "architecture": "arm64",
+      "interpreter": null,
+      "neededLibraries": [],
+      "linkage": "static",
+      "symbolEvidence": {},
+      "glibcLoaderMarkers": []
+    },
+    {
+      "file": "/tmp/enoughfactory-owned-engine-rebuilt/arm64/docker-proxy",
+      "name": "docker-proxy",
+      "bytes": 2424958,
+      "sha256": "c59ed73fe1060a4627ea9994ce72de3e3abd3b7284a4495caa0679170f6d9cb2",
+      "format": "ELF64",
+      "architecture": "arm64",
+      "interpreter": null,
+      "neededLibraries": [],
+      "linkage": "static",
+      "symbolEvidence": {},
+      "glibcLoaderMarkers": []
+    },
+    {
+      "file": "/tmp/enoughfactory-owned-engine-rebuilt/arm64/dockerd",
+      "name": "dockerd",
+      "bytes": 81723518,
+      "sha256": "8c8b788a53d39ca65af35c294f1fb9b67a15d53236001520ac95d8c13f538710",
+      "format": "ELF64",
+      "architecture": "arm64",
+      "interpreter": null,
+      "neededLibraries": [],
+      "linkage": "static",
+      "symbolEvidence": {},
+      "glibcLoaderMarkers": []
+    },
+    {
+      "file": "/tmp/enoughfactory-owned-engine-rebuilt/arm64/runc",
+      "name": "runc",
+      "bytes": 12399704,
+      "sha256": "544aa392cb084b697ad846a233b3ea2d66fbbca419892742be3362ae9302eeaa",
+      "format": "ELF64",
+      "architecture": "arm64",
+      "interpreter": null,
+      "neededLibraries": [],
+      "linkage": "static",
+      "symbolEvidence": {
+        "libseccompVersion": "2.6.0"
+      },
+      "glibcLoaderMarkers": []
+    }
+  ]
+}

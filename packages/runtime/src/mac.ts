@@ -60,10 +60,17 @@ export class MacRuntime {
       }
       return { ...base, phase: 'ready', message: 'EnoughFactory’s private container engine is ready', version: info.ServerVersion };
     } catch { /* A stopped daemon's forwarded socket may still exist. */ }
-    if (this.starting || this.phase?.phase === 'stopping') return { ...base, ...this.phase! };
-    const result = await this.command(['list', '--json', 'factory'], 10_000).catch(() => undefined);
-    const vm = result?.code === 0 ? result.stdout.trim().split('\n').filter(Boolean).map(line => JSON.parse(line)).find(item => item.name === 'factory') : undefined;
+    if (this.starting || this.phase?.phase === 'stopping') return { ...base, ...(this.phase ?? { phase: 'starting', message: 'Checking EnoughFactory’s private container runtime' }) };
+    if (!existsSync(join(this.home, 'factory/lima.yaml'))) return { ...base, phase: 'stopped', message: 'EnoughFactory’s private container engine has not been started' };
+    let vm: { name: string; status: string } | undefined;
+    try {
+      const result = await this.command(['list', '--json', 'factory'], 10_000);
+      if (result.code) throw new Error(result.stderr || 'Lima instance inspection failed');
+      vm = result.stdout.trim().split('\n').filter(Boolean).map(line => JSON.parse(line)).find(item => item.name === 'factory');
+      if (!vm) throw new Error('The saved private VM was not returned by Lima instance inspection');
+    } catch (error) { return { ...base, phase: 'error', message: 'The private runtime’s state could not be confirmed', error: error instanceof Error ? error.message : String(error) }; }
     if (vm?.status === 'Running') return { ...base, phase: 'error', message: 'The private VM is running but its container engine is unavailable', error: this.phase?.phase === 'error' ? this.phase.message : 'Docker did not answer on the app-owned socket. Restart the runtime or inspect its guest logs.' };
+    if (vm.status !== 'Stopped') return { ...base, phase: 'error', message: 'The private runtime’s state could not be confirmed', error: `Lima reported ${vm.status || 'an unknown state'} rather than a stopped VM. Its data was left intact.` };
     return { ...base, phase: this.phase?.phase === 'error' ? 'error' : 'stopped', message: this.phase?.phase === 'error' ? this.phase.message : 'EnoughFactory’s private container engine is stopped', error: this.phase?.phase === 'error' ? this.phase.message : undefined };
   }
   async start(): Promise<DockerRuntimeEndpoint> {
@@ -114,7 +121,11 @@ export class MacRuntime {
   }
   async stop(): Promise<void> {
     if (this.starting) await this.starting.catch(() => {});
-    const status = await this.status(); if (status.phase === 'stopped' || status.phase === 'missing') return;
+    const status = await this.status(); if (status.phase === 'stopped') return;
+    if (status.phase === 'missing') {
+      if (existsSync(join(this.home, 'factory/lima.yaml'))) throw new Error('Restore the bundled runtime assets before stopping this saved private VM. Its state could not be confirmed.');
+      return;
+    }
     this.progress('stopping', 'Stopping EnoughFactory’s private container runtime');
     const result = await this.command(['stop', '--tty=false', 'factory'], 120_000);
     if (result.code) { this.progress('error', result.stderr || 'Private runtime stop failed'); throw new Error(result.stderr || 'Private runtime stop failed'); }

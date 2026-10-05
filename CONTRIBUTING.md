@@ -4,7 +4,7 @@ Read the [build plan](docs/build-plan.md) and [implementation instructions](AGEN
 
 ## Development
 
-Install Node 22.14+, pnpm 10.34.5 and the .NET 10 SDK. Prepare EnoughFactory's pinned container-runtime assets for the development target and satisfy its host prerequisites; an existing Docker daemon is not a product dependency. Clone the repository, then:
+Install Node 22.14+, pnpm 10.34.5, Git, the .NET 10 SDK, Python 3.10+ and POSIX build tools (`make`, `tar`, `file`; Xcode Command Line Tools on Mac). Runtime preparation downloads its pinned Go/Zig toolchains and builds the native engine components. Satisfy the target's host prerequisites; an existing Docker daemon is not a product dependency. Clone the repository, then:
 
 ```sh
 pnpm install --frozen-lockfile
@@ -31,7 +31,7 @@ A representative user journey is usually better evidence than another test mirro
 
 Explain the concrete problem, resulting behavior and meaningful validation. Keep changes scoped enough to review, including coherent documentation and interface states. Preserve runtime request identity, policy revisions, attempt generations and device ownership when touching their boundaries.
 
-If you change an upstream pin, update its provenance and required notices. Changes to `vendor/envmux` should be minimal and listed in `vendor/envmux/ENOUGHFACTORY-PROVENANCE.md`. Do not remove native/font licenses from distributions. See [third-party notices](THIRD_PARTY_NOTICES.md).
+If you change an upstream pin, update its provenance, required notices and matching source companions. The [engine source and relink kit](runtime/container/relink-kit/README.md) records native build inputs; the [Ubuntu source kit](runtime/container/os-source-kit/README.md) resolves the guest's exact package versions. Rebuild those companions before publishing changed binaries or guest images. Changes to `vendor/envmux` should be minimal and listed in `vendor/envmux/ENOUGHFACTORY-PROVENANCE.md`. Preserve native/font licenses in distributions. See [third-party notices](THIRD_PARTY_NOTICES.md).
 
 Bug reports should include the EnoughFactory version, OS/architecture, affected runtime, reproduction steps and a redacted error. Do not upload connection tokens, pairing invitations, provider credentials, private repository contents or unredacted conversations. Report security issues through [SECURITY.md](SECURITY.md).
 

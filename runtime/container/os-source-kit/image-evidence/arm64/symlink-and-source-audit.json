@@ -1,0 +1,129 @@
+{
+  "architecture": "arm64",
+  "mountedRoot": "/tmp/enoughfactory-ubuntu-audit.9psPFL",
+  "checkedPaths": 1684,
+  "escapingPaths": [],
+  "symlinks": [
+    {
+      "path": "usr/share/doc/console-setup",
+      "target": "keyboard-configuration",
+      "absoluteTarget": false
+    },
+    {
+      "path": "usr/share/doc/python3-debconf",
+      "target": "debconf",
+      "absoluteTarget": false
+    },
+    {
+      "path": "usr/share/doc/console-setup-linux",
+      "target": "keyboard-configuration",
+      "absoluteTarget": false
+    },
+    {
+      "path": "usr/share/doc/openssh-sftp-server",
+      "target": "openssh-client",
+      "absoluteTarget": false
+    },
+    {
+      "path": "usr/share/doc/libpython3.12t64",
+      "target": "libpython3.12-stdlib",
+      "absoluteTarget": false
+    },
+    {
+      "path": "usr/share/doc/debconf-i18n",
+      "target": "debconf",
+      "absoluteTarget": false
+    },
+    {
+      "path": "usr/share/doc/libncursesw6",
+      "target": "libtinfo6",
+      "absoluteTarget": false
+    },
+    {
+      "path": "usr/share/doc/parted",
+      "target": "libparted2t64",
+      "absoluteTarget": false
+    },
+    {
+      "path": "usr/share/doc/libstdc++6",
+      "target": "gcc-14-base",
+      "absoluteTarget": false
+    },
+    {
+      "path": "usr/share/doc/libpython3.12-stdlib",
+      "target": "libpython3.12-minimal",
+      "absoluteTarget": false
+    },
+    {
+      "path": "usr/share/doc/libgcc-s1",
+      "target": "gcc-14-base",
+      "absoluteTarget": false
+    },
+    {
+      "path": "usr/share/doc/grub-efi-arm64",
+      "target": "grub-efi-arm64-bin",
+      "absoluteTarget": false
+    },
+    {
+      "path": "usr/share/doc/openssh-server",
+      "target": "openssh-client",
+      "absoluteTarget": false
+    },
+    {
+      "path": "usr/share/doc/grub2-common",
+      "target": "grub-common",
+      "absoluteTarget": false
+    },
+    {
+      "path": "usr/share/doc/klibc-utils",
+      "target": "libklibc",
+      "absoluteTarget": false
+    },
+    {
+      "path": "usr/share/doc/manpages-dev",
+      "target": "manpages",
+      "absoluteTarget": false
+    },
+    {
+      "path": "usr/share/doc/kmod",
+      "target": "libkmod2",
+      "absoluteTarget": false
+    },
+    {
+      "path": "usr/share/doc/libncurses6",
+      "target": "libtinfo6",
+      "absoluteTarget": false
+    },
+    {
+      "path": "usr/share/doc/git/contrib/hooks",
+      "target": "../../../git-core/contrib/hooks",
+      "absoluteTarget": false
+    },
+    {
+      "path": "usr/share/doc/openssl/copyright",
+      "target": "../libssl3t64/copyright",
+      "absoluteTarget": false
+    },
+    {
+      "path": "usr/share/common-licenses/GFDL",
+      "target": "GFDL-1.3",
+      "absoluteTarget": false
+    },
+    {
+      "path": "usr/share/common-licenses/GPL",
+      "target": "GPL-3",
+      "absoluteTarget": false
+    },
+    {
+      "path": "usr/share/common-licenses/LGPL",
+      "target": "LGPL-3",
+      "absoluteTarget": false
+    }
+  ],
+  "absoluteSymlinks": [],
+  "dpkgStatusBytesMatch": true,
+  "packageSourceMappingMatchesDpkg": true,
+  "copyrightBytesMatchImageAndArchive": true,
+  "binaryPackages": 663,
+  "distinctSourceVersions": 433
+}

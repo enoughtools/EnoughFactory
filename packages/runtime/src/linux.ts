@@ -146,6 +146,11 @@ export class LinuxRuntime {
         for (const key of Object.keys(env)) {
           if (key === "DOCKERD" || key.startsWith("DOCKER_") || key.startsWith("DOCKERD_") || key.startsWith("_DOCKERD_") || key.startsWith("ROOTLESSKIT_") || key.startsWith("CONTAINERD_ROOTLESS_")) delete env[key];
         }
+        // runc otherwise derives the user bus from XDG_RUNTIME_DIR, which is
+        // deliberately private here. Never let it fall back to the system bus.
+        delete env.DBUS_SESSION_BUS_ADDRESS;
+        const bus = await userSessionBus();
+        if (bus) env.DBUS_SESSION_BUS_ADDRESS = `unix:path=${bus}`;
         const child = spawn(join(this.binaries, "dockerd-rootless.sh"), ["--config-file", configFile], {
           detached: true,
           stdio: ["ignore", log.fd, log.fd],
@@ -217,6 +222,7 @@ export class LinuxRuntime {
     if (allowed.trim() === "0") requirements.push("This Linux host disables unprivileged user namespaces. Enable them for EnoughFactory before starting the private runtime.");
     const namespaceLimit = await readFile("/proc/sys/user/max_user_namespaces", "utf8").catch(() => "1");
     if (Number(namespaceLimit.trim()) === 0) requirements.push("This Linux host allows no user namespaces. Ask the administrator to configure a non-zero user.max_user_namespaces limit.");
+    if (await usesSystemdCgroupV2() && !await userSessionBus()) requirements.push('This Linux host needs a user D-Bus session to manage private container cgroups. Install dbus-user-session (Debian/Ubuntu) or dbus-daemon (Fedora), then sign into your regular user session. For a headless device service, the administrator can enable the user manager with: sudo loginctl enable-linger "$USER".');
     return requirements;
   }
 
@@ -286,6 +292,18 @@ async function processStart(pid: number): Promise<string> {
 
 async function bootId(): Promise<string> { return (await readFile("/proc/sys/kernel/random/boot_id", "utf8")).trim(); }
 async function delay(ms: number): Promise<void> { await new Promise(resolveDelay => setTimeout(resolveDelay, ms)); }
+
+async function userSessionBus(): Promise<string | undefined> {
+  const path = join("/run/user", String(process.getuid?.() ?? 0), "bus");
+  try { const socket = await lstat(path); if (socket.isSocket() && socket.uid === process.getuid?.()) return path; }
+  catch { /* A user login or administrator setup must establish this bus. */ }
+  return undefined;
+}
+
+async function usesSystemdCgroupV2(): Promise<boolean> {
+  try { await access("/run/systemd/system"); await access("/sys/fs/cgroup/cgroup.controllers"); return true; }
+  catch { return false; }
+}
 
 function privateRunDirectory(directory: string): string {
   const usual = join(directory, "run");

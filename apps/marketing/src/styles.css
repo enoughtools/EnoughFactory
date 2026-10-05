@@ -144,6 +144,19 @@ section[id]{scroll-margin-top:32px}
 .download-info{display:grid;grid-template-columns:1fr 1fr;gap:64px;border-top:1px solid var(--rule);margin-top:52px;padding-top:36px}
 .download-info h3{font-weight:500;font-size:1.25rem;margin-bottom:16px}
 .download-info p{color:#3d4553;font-size:.9375rem;line-height:1.75}
+.runtime-sources{margin:48px 0;padding:36px 0;border-top:1px solid var(--rule);border-bottom:1px solid var(--rule);scroll-margin-top:30px}
+.runtime-sources h2{font-size:2rem;margin:10px 0 16px}
+.runtime-sources>p:not(.eyebrow){max-width:700px;color:#3d4553;line-height:1.75}
+.runtime-source-groups{display:grid;grid-template-columns:1fr 1fr;gap:48px;margin-top:28px}
+.runtime-source-groups h3{font-size:1.25rem;font-weight:500;margin-bottom:12px}
+.runtime-source-groups p{color:#3d4553;font-size:.9375rem;line-height:1.75}
+.runtime-source-groups ul{list-style:none;padding:0;margin:20px 0 0}
+.runtime-source-groups li{padding:14px 0;border-top:1px solid var(--rule);font-size:.875rem}
+.runtime-source-groups a{color:var(--blue);text-decoration:underline;text-underline-offset:3px}
+.runtime-source-groups .source-receipt{margin-left:14px;font-size:.75rem;white-space:nowrap}
+.runtime-source-groups details{margin-top:10px;font-size:.75rem}
+.runtime-source-groups summary{cursor:pointer;color:var(--muted);margin-bottom:6px}
+@media(max-width:700px){.runtime-source-groups{grid-template-columns:1fr;gap:24px}.runtime-sources h2{font-size:1.65rem}}
 .guide-layout{display:grid;grid-template-columns:210px minmax(0,780px);justify-content:space-between;gap:60px;padding:60px 0 85px}
 .guide-navigation{align-self:start;position:sticky;top:30px;border-top:1px solid var(--ink);padding-top:20px}
 .guide-navigation .eyebrow{margin-bottom:18px}

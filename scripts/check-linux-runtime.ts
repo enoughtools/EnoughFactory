@@ -120,8 +120,12 @@ try {
     assert.equal((await workbench.repositoryStatus()).entries.some(entry => entry.path === "RESULT.txt"), true);
     await docker("exec", "-u", "root", "--workdir", workbench.ready.workdir, workbench.ready.instance,
       "bash", "-lc", "git add RESULT.txt && git -c user.name=EnoughFactory -c user.email=factory@enoughtools.com commit -m 'Recover private runtime work'");
+    const candidateCommit = await docker("exec", "-u", "root", "--workdir", workbench.ready.workdir, workbench.ready.instance,
+      "git", "rev-parse", "HEAD");
     await workbench.stop(); workbench = undefined;
     assert.equal(await command("git", ["log", "envmux/private-proof", "-1", "--format=%s"], project), "Recover private runtime work");
+    assert.equal(await command("git", ["rev-parse", "envmux/private-proof"], project), candidateCommit);
+    assert.equal(await command("git", ["show", "envmux/private-proof:RESULT.txt"], project), "Recovered private runtime work");
     checks.push("native envmux workbench readiness", "native envmux full root execution", "native envmux stop returns exact source commit");
     console.log("Private Engine envmux source-retention journey passed.");
   }
