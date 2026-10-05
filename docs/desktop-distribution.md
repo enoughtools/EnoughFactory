@@ -22,6 +22,22 @@ On Mac, open the DMG and drag EnoughFactory into Applications. The ZIP distribut
 
 Release filenames include version, platform and architecture, for example `EnoughFactory-0.1.1-mac-arm64.dmg` and `EnoughFactory-0.1.1-linux-x64.AppImage`. Select the archive matching your device. Mac packaging is unsigned unless release signing credentials have been configured. Unsigned builds are labeled as such in the release manifest; macOS can ask for confirmation when opening them. Signing/notarization status must not be inferred from a successful packaging command.
 
+### Ubuntu desktop namespace setup
+
+Ubuntu 24.04 and newer can restrict the user namespaces used by Electron's Chromium sandbox. On affected hosts, keep the extracted application in a stable directory. For an AppImage, run `./EnoughFactory-0.1.1-linux-x64.AppImage --appimage-extract` (use your architecture's filename), then keep the resulting `squashfs-root` directory where you intend to launch it. A tar archive already supplies an extracted application.
+
+Set `FACTORY_APP` to the absolute directory containing `enoughfactory` and `resources`. The host administrator can install the bundled profile for that exact executable:
+
+```sh
+FACTORY_APP="/absolute/path/to/extracted/application"
+sudo "$FACTORY_APP/resources/runtime/node" \
+  "$FACTORY_APP/resources/install/configure-linux-desktop-sandbox.mjs" \
+  --executable "$FACTORY_APP/enoughfactory"
+"$FACTORY_APP/enoughfactory"
+```
+
+The helper verifies the installed bundle and loads one AppArmor profile for its executable path. Launch the application as your regular user; its Chromium sandbox remains enabled. If you move the application, run the helper for its new path. The RootlessKit prerequisite for the private container engine is configured separately when the runtime reports it.
+
 ## Install the Mac user service
 
 The application contains both the installer and its Node runtime. After placing it in Applications, run:

@@ -196,7 +196,11 @@ try {
     const output = command('hdiutil', ['attach', '-readonly', '-nobrowse', '-noautoopen', '-mountpoint', mountpoint, '-plist', snapshot]);
     const attached = JSON.parse(command('python3', ['-c', 'import json,plistlib,sys; print(json.dumps(plistlib.loads(sys.stdin.buffer.read())))'], { input: output }));
     const entities = attached['system-entities'];
-    const mounted = Array.isArray(entities) && entities.find(entity => entity['mount-point'] && resolve(entity['mount-point']) === mountpoint);
+    const expectedMountpoint = await realpath(mountpoint);
+    let mounted;
+    if (Array.isArray(entities)) for (const entity of entities) {
+      if (typeof entity['mount-point'] === 'string' && await realpath(entity['mount-point']) === expectedMountpoint) { mounted = entity; break; }
+    }
     if (!mounted || typeof mounted['dev-entry'] !== 'string') throw new Error('The DMG did not mount at its private verification location.');
     mountedDevice = mounted['dev-entry'];
     root = mountpoint;

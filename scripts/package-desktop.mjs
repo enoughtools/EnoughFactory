@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { createHash } from 'node:crypto';
-import { cp, mkdir, readFile, rm, writeFile, chmod, mkdtemp, access, readdir } from 'node:fs/promises';
+import { cp, mkdir, readFile, rm, writeFile, chmod, mkdtemp, access, readdir, rename } from 'node:fs/promises';
 import { constants } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -216,4 +216,9 @@ if (!opt.prepareOnly) {
   const args = ['--filter', '@enoughfactory/desktop', 'exec', 'electron-builder', '--config', 'electron-builder.mjs', opt.platform === 'darwin' ? '--mac' : '--linux', `--${opt.arch}`, '--publish', 'never'];
   if (opt.dir) args.push('--dir');
   execFileSync('pnpm', args, { cwd: root, stdio: 'inherit' });
+  if (!opt.dir && opt.platform === 'linux' && opt.arch === 'x64') {
+    const { version } = JSON.parse(await readFile(join(root, 'apps/desktop/package.json'), 'utf8'));
+    // AppImage uses x86_64 for the same target that our release catalog calls x64.
+    await rename(join(root, 'releases', `EnoughFactory-${version}-linux-x86_64.AppImage`), join(root, 'releases', `EnoughFactory-${version}-linux-x64.AppImage`));
+  }
 }

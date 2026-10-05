@@ -10,6 +10,18 @@ On Mac, open the DMG and drag EnoughFactory into Applications, or extract the ap
 
 Packaged applications carry Node, a self-contained envmux executable and the container-runtime tools for their OS. They do not need a Node/.NET SDK or an existing Docker installation. Mac uses a private Lima VM with Apple's virtualization framework; Linux uses a dedicated rootless Docker Engine. The device service starts and recovers this runtime independently of the desktop window. Existing Docker contexts, daemons, images and volumes are separate from EnoughFactory.
 
+On Ubuntu 24.04 and newer, host AppArmor policy can also require permission for Electron's user namespaces. Use a stable extracted tar/AppImage directory and set `FACTORY_APP` to the absolute folder containing `enoughfactory` and `resources`:
+
+```sh
+FACTORY_APP="/absolute/path/to/extracted/application"
+sudo "$FACTORY_APP/resources/runtime/node" \
+  "$FACTORY_APP/resources/install/configure-linux-desktop-sandbox.mjs" \
+  --executable "$FACTORY_APP/enoughfactory"
+"$FACTORY_APP/enoughfactory"
+```
+
+The bundled helper installs a profile scoped to that executable and keeps Chromium's sandbox enabled. Run the application as your regular user. For AppImage extraction and path details, see [Ubuntu desktop namespace setup](desktop-distribution.md#ubuntu-desktop-namespace-setup). The private engine's RootlessKit setup remains a separate runtime prerequisite.
+
 ## Prepare the private runtime
 
 Open **Settings → EnoughFactory runtime → Prepare runtime** to start EnoughFactory's engine. It can also start when you open an environment. The app shows preparation, readiness, resource limits and actionable prerequisites. Mac bundles a pinned Ubuntu guest image and prepares a private writable VM disk from it on first start. Allow space for the application, that disk, container images and your workspace data. Container base images and provider tools still need a network connection when first prepared.
