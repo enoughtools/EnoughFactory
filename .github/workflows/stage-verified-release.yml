@@ -1,0 +1,60 @@
+name: Stage verified 0.1.2 release assets
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: stage-verified-release-0.1.2
+  cancel-in-progress: false
+
+jobs:
+  stage:
+    if: github.repository == 'enoughtools/EnoughFactory'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 22.22.0
+      - name: Check the successful frozen native run and existing draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/stage-verified-release.mjs --verify-run
+      - name: Download verified native Linux ARM64 artifacts
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          artifact-ids: '11384465049'
+          path: .cache/staging-0.1.2/linux-arm64
+          merge-multiple: true
+          run-id: 37396429671
+          github-token: ${{ github.token }}
+      - name: Download verified native Linux x64 artifacts
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          artifact-ids: '11384120421'
+          path: .cache/staging-0.1.2/linux-x64
+          merge-multiple: true
+          run-id: 37396429671
+          github-token: ${{ github.token }}
+      - name: Verify exact Linux and selected Ubuntu bytes, then stage only the matching draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/stage-verified-release.mjs --stage .cache/staging-0.1.2 --report .cache/staging-0.1.2.receipt.json
+      - name: Retain the draft staging receipt
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: EnoughFactory-0.1.2-draft-staging-receipt
+          path: .cache/staging-0.1.2.receipt.json
+          if-no-files-found: error
+          retention-days: 30

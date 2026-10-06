@@ -45,28 +45,11 @@ jobs:
           await appendFile(process.env.GITHUB_OUTPUT, `reuse=${result.status === 0}\n`);
           console.log(JSON.stringify({ status: proof.status, baseline: proof.baseline, sha256: proof.sha256 }));
           NODE
-      - name: Confirm the prior Ubuntu source job succeeded at its pinned revision
+      - name: Download the permanent public Ubuntu source baseline
         if: steps.ubuntu_sources.outputs.reuse == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          gh api "repos/$GITHUB_REPOSITORY/actions/runs/37379810420" > .cache/ubuntu-prior-run.json
-          gh api "repos/$GITHUB_REPOSITORY/actions/runs/37379810420/jobs?per_page=100" > .cache/ubuntu-prior-jobs.json
-          node --input-type=module <<'NODE'
-          import { readFile } from 'node:fs/promises';
-          const run = JSON.parse(await readFile('.cache/ubuntu-prior-run.json', 'utf8'));
-          const { jobs } = JSON.parse(await readFile('.cache/ubuntu-prior-jobs.json', 'utf8'));
-          const job = jobs.find(job => job.name === 'Bundled Ubuntu corresponding sources');
-          if (run.head_sha !== '5252bd83a9082d7711e7e3dcbf426daef0abc165' || run.status !== 'completed' || job?.status !== 'completed' || job.conclusion !== 'success') throw new Error('The selected Ubuntu source job is not a successful run of the pinned baseline.');
-          NODE
-      - name: Download the unchanged verified Ubuntu source companion
-        if: steps.ubuntu_sources.outputs.reuse == 'true'
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
-        with:
-          name: EnoughFactory-Ubuntu-sources
-          path: dist/ubuntu-source-companion
-          run-id: 37379810420
-          github-token: ${{ github.token }}
+        run: node scripts/download-verified-baseline.mjs --ubuntu --output dist/ubuntu-source-companion
       - name: Verify every reused Ubuntu source archive and member against the current lock
         if: steps.ubuntu_sources.outputs.reuse == 'true'
         run: |
@@ -148,29 +131,12 @@ jobs:
           await appendFile(process.env.GITHUB_OUTPUT, `reuse=${result.status === 0}\n`);
           console.log(JSON.stringify({ status: proof.status, baseline: proof.baseline, sha256: proof.sha256 }));
           NODE
-      - name: Confirm the prior native Linux job succeeded at its pinned revision
+      - name: Download the permanent public native Linux baseline
         if: matrix.platform == 'linux' && steps.native_sources.outputs.reuse == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           PRIOR_NATIVE_ARCH: ${{ matrix.arch }}
-        run: |
-          gh api "repos/$GITHUB_REPOSITORY/actions/runs/37379810420" > .cache/native-prior-run.json
-          gh api "repos/$GITHUB_REPOSITORY/actions/runs/37379810420/jobs?per_page=100" > .cache/native-prior-jobs.json
-          node --input-type=module <<'NODE'
-          import { readFile } from 'node:fs/promises';
-          const run = JSON.parse(await readFile('.cache/native-prior-run.json', 'utf8'));
-          const { jobs } = JSON.parse(await readFile('.cache/native-prior-jobs.json', 'utf8'));
-          const job = jobs.find(job => job.name === `linux ${process.env.PRIOR_NATIVE_ARCH}`);
-          if (run.head_sha !== '5252bd83a9082d7711e7e3dcbf426daef0abc165' || run.status !== 'completed' || job?.status !== 'completed' || job.conclusion !== 'success') throw new Error('The selected native Linux job is not a successful run of the pinned baseline.');
-          NODE
-      - name: Download the exact prior native Linux archive and receipts
-        if: matrix.platform == 'linux' && steps.native_sources.outputs.reuse == 'true'
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
-        with:
-          name: EnoughFactory-linux-${{ matrix.arch }}
-          path: .cache/verified-native-prior
-          run-id: 37379810420
-          github-token: ${{ github.token }}
+        run: node scripts/download-verified-baseline.mjs --native "$PRIOR_NATIVE_ARCH" --output .cache/verified-native-prior
       - name: Seed only source-identical verified native Linux assets
         if: matrix.platform == 'linux' && steps.native_sources.outputs.reuse == 'true'
         env:

@@ -1,0 +1,79 @@
+{
+  "formatVersion": 1,
+  "product": "EnoughFactory",
+  "version": "0.1.1",
+  "repository": "enoughtools/EnoughFactory",
+  "releaseId": 404131266,
+  "sourceCommit": "5252bd83a9082d7711e7e3dcbf426daef0abc165",
+  "ubuntuSourceIndexSha256": "70aae28ae71172ff64897506285cf2fd6963fe52bf648c430073ff7e7b63c81b",
+  "native": {
+    "arm64": {
+      "archive": {
+        "filename": "EnoughFactory-0.1.1-linux-arm64.tar.gz",
+        "sha256": "be571a4d31c4e17646ab397cb28e41e6eacb41fa3bf0ce7a100104cdfe71857d",
+        "bytes": 349309826
+      },
+      "receipt": {
+        "filename": "EnoughFactory-0.1.1-linux-arm64.tar.gz.verification.json",
+        "sha256": "7c3f02df86cb765881e6e5d835bd6e571e0ff0a7088e4107a7b5d30263d52bb1",
+        "bytes": 37579
+      }
+    },
+    "x64": {
+      "archive": {
+        "filename": "EnoughFactory-0.1.1-linux-x64.tar.gz",
+        "sha256": "34ad2f3c21840907eef090909de55732e8cc3709e3eae085dc55d6b53f7e9ac5",
+        "bytes": 359570994
+      },
+      "receipt": {
+        "filename": "EnoughFactory-0.1.1-linux-x64.tar.gz.verification.json",
+        "sha256": "cad208ac770592166af7869db93ca363ad8c2544b4603de89628c0d47804c4f1",
+        "bytes": 37551
+      }
+    }
+  },
+  "ubuntu": [
+    {
+      "filename": "EnoughFactory-Ubuntu-24.04-20260926-sources-part01.tar.gz",
+      "sha256": "de08b49f7ab2882b803f2b3bff3b44feaf193f4e7a75eb5ad8a0ff7f191d3704",
+      "bytes": 766180065,
+      "role": "part"
+    },
+    {
+      "filename": "EnoughFactory-Ubuntu-24.04-20260926-sources-part02.tar.gz",
+      "sha256": "6b27dc2436620fdc7e057facfc454d4b504b983e603c7fe5d079116ffcebaa86",
+      "bytes": 611450171,
+      "role": "part"
+    },
+    {
+      "filename": "Ubuntu-archive-evidence.tar.gz",
+      "sha256": "fc6d93e8ebd64963b2993f96e7ba6ef8f51a0c4e7d975128d2c36fbb25040643",
+      "bytes": 99066216,
+      "role": "evidence"
+    },
+    {
+      "filename": "Ubuntu-sources.lock.json",
+      "sha256": "69970920a7e8b558c7b9f762090b8c737106e9d8c2146d36381e707429046522",
+      "bytes": 1444926,
+      "role": "lock"
+    },
+    {
+      "filename": "Ubuntu-source-companion.json",
+      "sha256": "70aae28ae71172ff64897506285cf2fd6963fe52bf648c430073ff7e7b63c81b",
+      "bytes": 41707,
+      "role": "index"
+    },
+    {
+      "filename": "Ubuntu-source-companion-SHA256SUMS",
+      "sha256": "a976eaa483453e488bb724b64a01fe9a05cecea71298c05a738a9a9c3b542248",
+      "bytes": 436,
+      "role": "checksums"
+    },
+    {
+      "filename": "Ubuntu-source-companion-README.md",
+      "sha256": "28bb9839cad63a8883ed4bc256b254c36e87e33687e6caab57172519883d335e",
+      "bytes": 6192,
+      "role": "readme"
+    }
+  ]
+}
