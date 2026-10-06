@@ -1,0 +1,125 @@
+name: Deliver verified EnoughFactory 0.1.3
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Stage Linux files into the draft, or prepare the catalog after publication
+        type: choice
+        options: [stage, prepare]
+        default: stage
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: deliver-release-0.1.3-${{ inputs.mode }}
+  cancel-in-progress: false
+
+jobs:
+  stage:
+    if: github.repository == 'enoughtools/EnoughFactory' && inputs.mode == 'stage'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 22.22.0
+      - name: Check the exact successful native run and matching new draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/stage-verified-release.mjs --delivery .github/release-delivery/0.1.3.json --verify-run
+      - name: Download the verified native Linux ARM64 set
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          artifact-ids: '11387092966'
+          path: .cache/release-0.1.3-ci/linux-arm64
+          merge-multiple: true
+          run-id: 37406143171
+          github-token: ${{ github.token }}
+      - name: Download the verified native Linux x64 set
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          artifact-ids: '11387324042'
+          path: .cache/release-0.1.3-ci/linux-x64
+          merge-multiple: true
+          run-id: 37406143171
+          github-token: ${{ github.token }}
+      - name: Validate exact inputs and stage only missing Linux and Ubuntu assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/stage-verified-release.mjs --delivery .github/release-delivery/0.1.3.json --stage .cache/release-0.1.3-ci --report .cache/release-0.1.3-draft-staging.verification.json
+      - name: Retain the small draft staging receipt
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: EnoughFactory-0.1.3-draft-staging-receipt
+          path: .cache/release-0.1.3-draft-staging.verification.json
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 30
+
+  prepare:
+    if: github.repository == 'enoughtools/EnoughFactory' && inputs.mode == 'prepare'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 22.22.0
+      - name: Read the selected public release and exact tag identity
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p .cache/release-0.1.3-public
+          gh api repos/enoughtools/EnoughFactory/releases/404264185 > .cache/release-0.1.3-public/release.json
+          node scripts/record-public-release-preparation.mjs --phase identity --directory .cache/release-0.1.3-public
+          node --input-type=module <<'NODE'
+          import assert from 'node:assert/strict';
+          import { github } from './scripts/download-verified-baseline.mjs';
+          let object = (await github('/repos/enoughtools/EnoughFactory/git/ref/tags/v0.1.3')).object;
+          for (let depth = 0; object?.type === 'tag' && depth < 5; depth++) object = (await github(`/repos/enoughtools/EnoughFactory/git/tags/${object.sha}`)).object;
+          assert.equal(object?.type, 'commit');
+          assert.equal(object.sha, '6015b2d0feeeff783c091babcf89f8481bf3ab11', 'The public release tag must match the frozen package source.');
+          NODE
+      - name: Download the selected public release inputs in cloud
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release download v0.1.3 --repo enoughtools/EnoughFactory --dir .cache/release-0.1.3-public/files
+      - name: Record exact downloaded input bytes against public server digests
+        run: node scripts/record-public-release-preparation.mjs --phase inputs --directory .cache/release-0.1.3-public
+      - name: Assemble the six native packages and complete source specification
+        run: node release/marketing/assemble-specification.mjs .cache/release-0.1.3-public/files .cache/release-0.1.3-public/specification.json
+      - name: Run the mandatory public package source and proof byte checks once
+        run: node release/marketing/prepare-release.mjs .cache/release-0.1.3-public/specification.json
+      - name: Preserve the successful preparation receipt and catalog hashes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api repos/enoughtools/EnoughFactory/releases/404264185 > .cache/release-0.1.3-public/release.json
+          node scripts/record-public-release-preparation.mjs --phase prepared --directory .cache/release-0.1.3-public
+      - name: Return only the generated catalog proofs and small byte records
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: EnoughFactory-0.1.3-public-catalog
+          path: |
+            .cache/release-0.1.3-public/specification.json
+            .cache/release-0.1.3-public/inputs.verification.json
+            .cache/release-0.1.3-public/prepared.verification.json
+            apps/marketing/public/downloads/manifest.json
+            apps/marketing/public/downloads/SHA256SUMS.txt
+            apps/marketing/public/downloads/0.1.3/**
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 30

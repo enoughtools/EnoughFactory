@@ -59,7 +59,7 @@ The configurable limits are in `wrangler.jsonc`; concurrent/IP/room, daily JSON 
 
 These are capacity controls, not an unlimited service or a promise that every traffic pattern fits the account's free allowance. Presence fanout, replay guards and ACKs consume SQL operations; Cloudflare can reject work before the application cap. Self-generated identity keys prove key possession, not entitlement to funded traffic. Public users share the daily capacity; a device allowlist is available for private deployments. A paid account needs its own billing review before raising limits. The WSS cap does not meter TURN bandwidth or TLS/IP overhead.
 
-`relay_quota` leaves direct WebRTC negotiation available. `service_quota` closes the affected signaling connection until capacity resets; the UI receives a concrete capacity message. Admission returns HTTP 429. Stalled receivers close with 1013. Local execution and durable factory work remain on their owning device through signaling outages.
+`relay_quota` leaves direct WebRTC negotiation available. `service_quota` closes the affected signaling connection until capacity resets; clients receive a concrete capacity code and message. Admission returns HTTP 429. Stalled receivers close with 1013. Local execution and durable factory work remain on their owning device through signaling outages.
 
 ## Client boundary
 
