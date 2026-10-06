@@ -98,6 +98,9 @@ pre { margin: 0; }
 .device-status strong { display: block; font-size: 11px; font-weight: 500; color: var(--factory-ink); }
 .device-status div > span { display: block; margin-top: 2px; font-size: 9px; color: var(--factory-muted); }
 .device-status > svg { margin-left: auto; }
+.build-version { display: block; color: var(--factory-muted); font-size: 10px; line-height: 1.5; overflow-wrap: anywhere; }
+.sidebar-footer > .build-version { margin-top: 14px; }
+.sidebar-header-version { display: none; }
 .main-shell { display: flex; flex-direction: column; flex: 1; min-width: 0; min-height: 0; height: 100%; overflow: hidden; }
 .topbar { min-height: 46px; flex-shrink: 0; padding: 10px 20px; border-bottom: 1px solid var(--factory-line); display: flex; align-items: center; justify-content: space-between; gap: 16px; background: var(--factory-surface); }
 .breadcrumb { display: flex; align-items: center; gap: 9px; color: var(--factory-secondary); font-size: 12px; min-width: 0; }
@@ -533,6 +536,7 @@ button.project-card { width: 100%; }
   .factory-sidebar .nav-item.active { border-bottom-color: var(--factory-accent); }
   .factory-sidebar .nav-count { display: none; }
   .factory-sidebar .sidebar-footer { display: none; }
+  .factory-sidebar .sidebar-header-version { display: block; margin: 0 19px 8px 57px; }
   .topbar { min-height: 49px; padding: 11px 19px; }
   .topbar-actions { gap: 6px; }
   .topbar-actions .keyboard-hint { display: none; }

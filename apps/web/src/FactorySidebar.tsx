@@ -3,6 +3,7 @@ import type { FactoryState, GoalStatus } from '@enoughfactory/contracts';
 import { Sidebar, SidebarContent, SidebarFooter, SidebarHeader } from '@enoughtools/ui-react';
 import { ChevronDown, Folder, Laptop, LayoutGrid, Monitor, Plus, Settings2, ShieldCheck, Target } from 'lucide-react';
 import './factory-sidebar-goals.css';
+import { BuildVersion } from './BuildVersion';
 
 const brandMark = new URL('./assets/mark-ink.svg', import.meta.url).href;
 const navigation = [
@@ -23,6 +24,7 @@ export interface FactorySidebarProps {
   goalId?: string;
   sessionSelected: boolean;
   error?: string | null;
+  desktopVersion?: string;
   onNavigate: (view: string) => void;
   onProject: (id: string) => void;
   onGoal: (id: string) => void;
@@ -31,7 +33,7 @@ export interface FactorySidebarProps {
   onConnect: () => void;
 }
 
-export function FactorySidebar({ state, view, projectId, goalId, sessionSelected, error, onNavigate, onProject, onGoal, onStartGoal, onAddProject, onConnect }: FactorySidebarProps) {
+export function FactorySidebar({ state, view, projectId, goalId, sessionSelected, error, desktopVersion, onNavigate, onProject, onGoal, onStartGoal, onAddProject, onConnect }: FactorySidebarProps) {
   const [collapsed, setCollapsed] = useState<Set<string>>(() => new Set());
   const activeGoal = view === 'goals' && !sessionSelected ? state?.goals.find(goal => goal.id === goalId) : undefined;
   const activeGoalProjectId = activeGoal?.projectId;
@@ -57,6 +59,7 @@ export function FactorySidebar({ state, view, projectId, goalId, sessionSelected
         <span className="brand-mark" aria-hidden="true"><img src={brandMark} width={32} height={32} alt="" /></span>
         <span className="brand-wordmark">Enough<span>Factory</span></span>
       </a>
+      <BuildVersion className="sidebar-header-version" desktopVersion={desktopVersion} serviceVersion={state?.version} serviceOnline={!!state && !error} />
     </SidebarHeader>
     <SidebarContent>
       <nav className="nav-section" aria-label="Workspace">
@@ -109,6 +112,7 @@ export function FactorySidebar({ state, view, projectId, goalId, sessionSelected
         <div><strong>{state?.device.name ?? 'Your device'}</strong><span>{error ? 'Connection unavailable' : state ? 'Device service connected' : 'Connecting…'}</span></div>
         <Laptop size={15} />
       </button>
+      <BuildVersion desktopVersion={desktopVersion} serviceVersion={state?.version} serviceOnline={!!state && !error} />
     </SidebarFooter>
   </Sidebar>;
 }
