@@ -10,6 +10,27 @@ interface ProbeOptions {
 
 const updateRequired = (message: string) => new Error(`[DEVICE_SERVICE_UPDATE_REQUIRED] ${message}`);
 
+function versionNumbers(value: string | undefined): number[] | undefined {
+  const match = value?.match(/^(\d+)\.(\d+)\.(\d+)(?:[-+][0-9A-Za-z.-]+)?$/);
+  return match ? match.slice(1).map(Number) : undefined;
+}
+
+export function compatibleServiceVersions(actual: string | undefined, expected: string): boolean {
+  const left = versionNumbers(actual), right = versionNumbers(expected);
+  // Before 1.0, minor versions define protocol compatibility. Patch updates do
+  // not disconnect an existing workspace or authorize restarting its workers.
+  return !!left && !!right && left[0] === right[0] && (left[0] !== 0 || left[1] === right[1]);
+}
+
+export function serviceUpgradeNeeded(actual: string | undefined, expected: string): boolean {
+  const left = versionNumbers(actual), right = versionNumbers(expected);
+  if (!left || !right || !compatibleServiceVersions(actual, expected)) return false;
+  for (let index = 0; index < 3; index++) {
+    if (right[index] !== left[index]) return right[index]! > left[index]!;
+  }
+  return false;
+}
+
 function assertRuntimeIdentity(runtime: RuntimeIdentity | undefined, stateDirectory: string): void {
   if (!runtime || !['lima', 'rootless'].includes(runtime.kind ?? '') || runtime.stateDirectory !== stateDirectory
       || typeof runtime.socketPath !== 'string' || !runtime.socketPath.startsWith('/') || runtime.socketPath === '/var/run/docker.sock') {
@@ -27,9 +48,10 @@ export async function probeDeviceConnection(connection: DeviceConnection, option
     health = await response.json() as Health;
     if (!response.ok || !health.ok || health.product !== 'EnoughFactory') return undefined;
   } catch { return undefined; }
-  if (options.requireManagedRuntime === false) return connection;
-  if (health.version !== options.serviceVersion) {
-    throw updateRequired(`Update the device service to ${options.serviceVersion} for this app’s factory features. Existing environments and work records are retained.`);
+  const current = { ...connection, version: health.version };
+  if (options.requireManagedRuntime === false) return current;
+  if (!compatibleServiceVersions(health.version, options.serviceVersion)) {
+    throw updateRequired(`This app requires a compatible device service (${options.serviceVersion}). Existing environments and work records are retained.`);
   }
   let runtime = health.runtime;
   if (runtime === undefined) {
@@ -47,7 +69,7 @@ export async function probeDeviceConnection(connection: DeviceConnection, option
     }
   }
   assertRuntimeIdentity(runtime, options.stateDirectory);
-  return connection;
+  return current;
 }
 
 /** A slow existing HTTP service must recover or fail visibly, never invite a duplicate daemon. */

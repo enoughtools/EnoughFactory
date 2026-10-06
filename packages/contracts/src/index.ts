@@ -132,7 +132,12 @@ export interface FactoryState {
   projects: Project[]; sessions: Session[]; chats: Chat[]; approvals: Approval[];
   goals: Goal[]; tasks: FactoryTask[]; attempts: Attempt[]; diagnostics: Diagnostics; settings: Settings;
 }
-export interface RepositoryChanges { branch: string; head: string; status: string; diff: string; }
+export interface RepositoryChangeFile { path: string; originalPath?: string; indexStatus: string; workingTreeStatus: string; }
+export interface RepositoryChanges {
+  branch: string; head: string; status: string; diff: string;
+  /** Present on services that inspect both tracked and untracked live workspace files. */
+  files?: RepositoryChangeFile[]; path?: string; truncated?: boolean;
+}
 export interface ApiError { error: string; code?: string; details?: unknown; }
 export interface RpcRequest { v: 1; id: string; method: string; path: string; body?: unknown; }
 export interface RpcResponse { v: 1; id: string; status: number; body: unknown; }

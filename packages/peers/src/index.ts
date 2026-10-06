@@ -65,6 +65,9 @@ export class PeerManager extends EventEmitter {
   private streams = new Map<string,{peerId:string;stream:PeerStream}>();
   private streamReady = new Map<string,{resolve:()=>void;reject:(error:Error)=>void;timer:NodeJS.Timeout}>();
   private transfers = new Map<string,IncomingTransfer>();
+  private uploads = 0;
+  private transferProcessing = 0;
+  private serviceHandoff = false;
   private receipts = new Map<string,RpcResponse>();
   private processing = new Map<string,Promise<RpcResponse>>();
   private receiveSequences = new Map<string,number>();
@@ -88,6 +91,11 @@ export class PeerManager extends EventEmitter {
   }
   connectionInfo(peerId:string):{transport?:'webrtc'|'relay';localType?:string;remoteType?:string;rtt?:number}|undefined {const link=this.links.get(peerId);if(!link)return;return {transport:link.transport,...(link.transport==='webrtc'?link.native?.connectionInfo():{})};}
   devices(): Device[] { return [this.localDevice,...this.catalog.values()].map(device=>({...device})); }
+  serviceActivity(): {transfers:number;uploads:number;processing:number} {
+    return {transfers:[...this.transfers.values()].filter(transfer=>this.links.get(transfer.peerId)?.transport).length,
+      uploads:this.uploads,processing:this.transferProcessing};
+  }
+  beginServiceHandoff():void {this.serviceHandoff=true;}
   async start(): Promise<void> {
     if (!this.stopped) return; this.stopped=false;
     if (this.options.signalingUrl) this.connectSignaling();
@@ -421,7 +429,12 @@ export class PeerManager extends EventEmitter {
   private async handleRequest(peerId:string,request:RpcRequest):Promise<RpcResponse> {
     try {
       if(request.path==='/__peers/ping')return {v:1,id:request.id,status:200,body:{deviceId:this.identity.id,at:now()}};
-      if(request.path.startsWith('/__peers/transfers/'))return {v:1,id:request.id,status:200,body:await this.transferRequest(peerId,request)};
+      if(request.path.startsWith('/__peers/transfers/')) {
+        if(this.serviceHandoff)return {v:1,id:request.id,status:409,body:{error:'The device service is updating.',code:'SERVICE_UPDATING'}};
+        this.transferProcessing++;
+        try{return {v:1,id:request.id,status:200,body:await this.transferRequest(peerId,request)};}
+        finally{this.transferProcessing--;}
+      }
       if(!this.options.onRequest)return {v:1,id:request.id,status:404,body:{error:'Remote API unavailable'}};
       return {...await this.options.onRequest(peerId,request),v:1,id:request.id};
     }catch(error){return {v:1,id:request.id,status:500,body:{error:(error as Error).message}};}
@@ -430,6 +443,7 @@ export class PeerManager extends EventEmitter {
     const stream=new PeerStream(id,(frame,lane)=>this.send(peerId,frame,lane),()=>this.streams.delete(id));this.streams.set(id,{peerId,stream});return stream;
   }
   async openStream(peerId:string,options:StreamOptions):Promise<PeerStream> {
+    if(this.serviceHandoff)throw new Error('The device service is updating.');
     const id=randomUUID();const stream=this.makeStream(peerId,id);
     await new Promise<void>((resolve,reject)=> {
       const timer=setTimeout(()=>{this.streamReady.delete(id);stream.remoteClose('Stream open timed out');reject(new Error('Stream open timed out'));},15_000);timer.unref();
@@ -437,7 +451,9 @@ export class PeerManager extends EventEmitter {
     });return stream;
   }
   async uploadArtifact(peerId:string,path:string,manifest:ArtifactManifest):Promise<void> {
-    const file=await open(path,'r');try {
+    if(this.serviceHandoff)throw new Error('The device service is updating.');
+    this.uploads++;
+    try {const file=await open(path,'r');try {
       const size=(await file.stat()).size;if(size!==manifest.size)throw new Error('Artifact size does not match manifest');
       let response=await this.request(peerId,{method:'POST',path:'/__peers/transfers/start',body:manifest});if(response.status!==200)throw new Error(JSON.stringify(response.body));
       let offset=Number((response.body as any).offset??0);const chunk=Buffer.alloc(24*1024);
@@ -446,7 +462,8 @@ export class PeerManager extends EventEmitter {
         if(response.status!==200)throw new Error(JSON.stringify(response.body));offset=Number((response.body as any).offset);
       }
       response=await this.request(peerId,{method:'POST',path:'/__peers/transfers/finish',body:{id:manifest.id}});if(response.status!==200)throw new Error(JSON.stringify(response.body));
-    }finally{await file.close();}
+    }finally{await file.close();}}
+    finally{this.uploads--;}
   }
   private async transferRequest(peerId:string,request:RpcRequest):Promise<unknown> {
     const body=request.body as any;const root=join(this.options.dataDir,'peers','transfers');await mkdir(root,{recursive:true,mode:0o700});

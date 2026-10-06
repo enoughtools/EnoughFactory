@@ -172,6 +172,7 @@ export async function initializeNetwork(app: DeviceApp): Promise<{
   };
   const request=async(peerId:string,rpc:RpcRequest):Promise<RpcResponse>=>{
     try{
+      if(rpc.method!=='GET')app.assertServiceAvailable();
       const url=new URL(rpc.path,'http://enoughfactory.local');
       if(url.origin!=='http://enoughfactory.local'||!['GET','POST','PUT','PATCH','DELETE'].includes(rpc.method))throw new HttpError(400,'Invalid peer operation.');
       if(rpc.method==='GET'&&url.pathname==='/api/state')return {v:1,id:rpc.id,status:200,body:url.searchParams.get('local')==='1'?localState():app.state()};
@@ -204,6 +205,7 @@ export async function initializeNetwork(app: DeviceApp): Promise<{
       if(event.topic.startsWith('approval'))void refreshPeer(peerId);
     },
     async onStreamOpen(_peerId,options,stream){
+      app.assertServiceAvailable();
       const match=options.path.match(/^\/api\/sessions\/([^/]+)\/(preview-tcp|terminal)$/);
       if(!match)throw new HttpError(404,'Unknown remote stream');
       const sessionId=decodeURIComponent(match[1]);const deviceId=catalogOwner('sessions',sessionId);
@@ -221,6 +223,11 @@ export async function initializeNetwork(app: DeviceApp): Promise<{
     onArtifact(peerId,manifest,path){app.store.set('peer-artifacts',{id:manifest.id,peerId,manifest,path,receivedAt:now()});app.emit('peer-artifact',{id:manifest.id,peerId,manifest});},
     onError(error){if(!closed)app.emit('network-error',{error:error.message});}
   });
+  app.serviceActivityHooks.push(()=>{
+    const activity=peers.serviceActivity();
+    return activity.transfers||activity.uploads||activity.processing?['Peer artifact transfers are active.']:[];
+  });
+  app.serviceHandoffHooks.push(()=>peers.beginServiceHandoff());
   // Replace the provisional install ID before creating any environments and migrate
   // existing owner references once. The signing identity survives window/service restarts.
   const previousId=app.device.id;const device={...peers.localDevice,capacity:app.device.capacity??2,workerResources:app.device.workerResources};

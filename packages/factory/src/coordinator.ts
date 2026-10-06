@@ -99,6 +99,10 @@ export class FactoryCoordinator {
     this.timer = undefined;
   }
 
+  serviceActivity():{controllers:number;attempts:number;reconciliation:number;pending:number} {
+    return {controllers:this.busyGoals.size,attempts:this.busyAttempts.size,reconciliation:this.reconciling.size,pending:this.pending.size};
+  }
+
   async tick(): Promise<void> {
     if (this.ticking) return;
     this.ticking = true;

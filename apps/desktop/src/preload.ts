@@ -4,6 +4,11 @@ contextBridge.exposeInMainWorld('enoughFactory', Object.freeze({
   platform: process.platform,
   getConnection: () => ipcRenderer.invoke('factory:connection'),
   restartDeviceService: () => ipcRenderer.invoke('factory:service-restart'),
+  onConnectionChanged: (callback: (connection: unknown) => void) => {
+    const listener = (_event: unknown, connection: unknown) => callback(connection);
+    ipcRenderer.on('factory:connection-changed', listener);
+    return () => ipcRenderer.removeListener('factory:connection-changed', listener);
+  },
   pickDirectory: () => ipcRenderer.invoke('factory:directory'),
   openExternal: (url: string) => ipcRenderer.invoke('factory:external', url),
   openPreview: (options: unknown) => ipcRenderer.invoke('factory:preview-open', options),

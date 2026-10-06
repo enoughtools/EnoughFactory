@@ -9,6 +9,7 @@ import { ChatPane } from './ChatPane';
 import { RuntimePanel } from './RuntimePanel';
 import { RemoveEnvironmentAction } from './WorkspaceRemoval';
 import { Button, EmptyState, Input, Loading, PageHeader, Panel, Status } from './ui';
+import './repository-changes.css';
 
 type Run = (action: () => Promise<unknown>) => Promise<void>;
 type SessionTab = 'overview' | 'agent' | 'terminal' | 'preview' | 'changes';
@@ -23,10 +24,23 @@ function Output({ client, session, task }: { client: DeviceClient; session: Sess
 }
 
 function Changes({ client, session }: { client: DeviceClient; session: Session }) {
+  const [selectedPath, setSelectedPath] = useState<string | null>(null);
   const { data, error, loading } = useResource<RepositoryChanges>(client, `/api/sessions/${session.id}/changes`, session.status === 'ready' ? 5000 : 0);
+  const selected = useResource<RepositoryChanges>(client, selectedPath ? `/api/sessions/${session.id}/changes?path=${encodeURIComponent(selectedPath)}` : null, selectedPath && session.status === 'ready' ? 5000 : 0);
+  useEffect(() => setSelectedPath(null), [session.id]);
   if (loading) return <Loading>Reading repository changes…</Loading>;
   if (error) return <EmptyState icon={<GitBranch size={32} />} title="Changes are unavailable">{error}</EmptyState>;
-  return <div className="changes-pane"><div className="changes-header"><GitBranch size={16} /><strong>{data?.branch || session.branch || 'Working tree'}</strong>{data?.head && <span>{data.head.slice(0, 8)}</span>}</div>{data?.status && <pre className="code-output git-status">{data.status}</pre>}{data?.diff ? <pre className="code-output git-diff">{data.diff.split('\n').map((line, index) => <span className={line.startsWith('+') && !line.startsWith('+++') ? 'diff-added' : line.startsWith('-') && !line.startsWith('---') ? 'diff-removed' : line.startsWith('@@') ? 'diff-context' : ''} key={index}>{line}{'\n'}</span>)}</pre> : <EmptyState icon={<GitBranch size={32} />} title="No uncommitted diff">Repository changes appear here as you work.</EmptyState>}</div>;
+  const selectedMatches = selected.data?.path === selectedPath;
+  const view = selectedPath ? selectedMatches ? selected.data : null : data;
+  const hasChanges = Boolean(data?.files?.length || data?.status);
+  return <div className="changes-pane"><div className="changes-header"><GitBranch size={16} /><strong>{data?.branch || session.branch || 'Working tree'}</strong>{data?.head && <span>{data.head.slice(0, 8)}</span>}</div>
+    {data?.files?.length ? <div className="changed-files" aria-label="Changed files">
+      <button className={!selectedPath ? 'selected' : ''} aria-pressed={!selectedPath} onClick={() => setSelectedPath(null)}>Tracked changes<span>{data.files.length} changed {data.files.length === 1 ? 'file' : 'files'}</span></button>
+      {data.files.map(file => <button key={file.path} className={selectedPath === file.path ? 'selected' : ''} aria-pressed={selectedPath === file.path} onClick={() => setSelectedPath(file.path)}><code>{file.path}</code><span>{file.indexStatus === '?' && file.workingTreeStatus === '?' ? 'New file' : file.indexStatus === 'D' || file.workingTreeStatus === 'D' ? 'Deleted' : file.indexStatus === 'R' || file.workingTreeStatus === 'R' ? 'Renamed' : 'Modified'}</span></button>)}
+    </div> : data?.status && <pre className="code-output git-status">{data.status}</pre>}
+    {selectedPath && <div className="changes-file-heading"><code>{selectedPath}</code></div>}
+    {selectedPath && (selected.loading || (!selectedMatches && !selected.error)) ? <Loading>Reading file changes…</Loading> : selectedPath && selected.error ? <div className="error-banner">{selected.error}</div> : view?.diff ? <><pre className="code-output git-diff">{view.diff.split('\n').map((line, index) => <span className={line.startsWith('+') && !line.startsWith('+++') ? 'diff-added' : line.startsWith('-') && !line.startsWith('---') ? 'diff-removed' : line.startsWith('@@') ? 'diff-context' : ''} key={index}>{line}{'\n'}</span>)}</pre>{view.truncated && <p className="changes-file-heading">Diff limited to the first 2 MiB.</p>}</> : <EmptyState icon={<GitBranch size={32} />} title={selectedPath ? 'No text diff' : hasChanges ? 'Files have uncommitted changes' : 'No uncommitted changes'}>{selectedPath ? 'This changed file has no text patch to display.' : hasChanges ? 'Select a file to read its changes, including new files.' : 'Changes in this live workspace appear here as you work.'}</EmptyState>}
+  </div>;
 }
 
 function Preview({ client, session, hidden }: { client: DeviceClient; session: Session; hidden: boolean }) {

@@ -1,0 +1,21 @@
+.factory-sidebar-goals .factory-project-nav { min-width: 0; margin-bottom: 8px; }
+.factory-sidebar-goals .factory-project-nav-heading { display: flex; align-items: center; gap: 1px; min-width: 0; }
+.factory-sidebar-goals .factory-project-link { flex: 1; min-width: 0; min-height: 34px; gap: 8px; padding: 7px 5px 7px 9px; font-size: 12px; }
+.factory-sidebar-goals .factory-project-link > svg { flex: 0 0 16px; }
+.factory-sidebar-goals .factory-project-link > span { min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.factory-sidebar-goals .factory-project-action { display: grid; place-items: center; flex: 0 0 24px; width: 24px; height: 28px; padding: 0; color: var(--factory-muted); background: transparent; border: 0; }
+.factory-sidebar-goals .factory-project-action:hover { color: var(--factory-ink); background: var(--color-hover); }
+.factory-sidebar-goals .factory-project-collapse[aria-expanded="false"] > svg { transform: rotate(-90deg); }
+.factory-sidebar-goals .factory-project-goals { margin: 3px 0 6px 19px; border-left: 1px solid var(--factory-line); min-width: 0; }
+.factory-sidebar-goals .factory-goal-link { gap: 8px; min-height: 45px; padding: 7px 8px; font-size: 11px; align-items: flex-start; }
+.factory-sidebar-goals .factory-goal-link > .status-dot { flex: 0 0 6px; width: 6px; height: 6px; margin-top: 4px; }
+.factory-sidebar-goals .factory-goal-link-copy { display: flex; flex-direction: column; gap: 3px; min-width: 0; flex: 1; }
+.factory-sidebar-goals .factory-goal-title { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; line-height: 1.3; }
+.factory-sidebar-goals .factory-goal-status { color: var(--factory-muted); font-size: 9px; font-weight: 400; line-height: 1.2; }
+.factory-sidebar-goals .factory-goal-link.active .factory-goal-status { color: var(--factory-secondary); }
+.factory-sidebar-goals .status-dot.state-planning { background: var(--factory-accent); }
+.factory-sidebar-goals .status-dot.state-paused { background: var(--factory-warn); }
+.factory-sidebar-goals .factory-empty-goals { display: flex; align-items: center; gap: 6px; min-height: 30px; width: 100%; border: 0; background: transparent; padding: 6px 10px; text-align: left; color: var(--factory-muted); font-size: 10px; }
+.factory-sidebar-goals .factory-empty-goals:hover { color: var(--factory-ink); background: var(--color-hover); }
+.factory-sidebar-goals .device-status > div { min-width: 0; }
+.factory-sidebar-goals .device-status strong { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }

@@ -27,6 +27,8 @@ export class DeviceApp {
   readonly removals: CatalogRemoval;
   readonly runtime: ManagedRuntimeManager;
   readonly runtimeStopHooks: Array<()=>Promise<void>> = [];
+  readonly serviceActivityHooks: Array<()=>string[]> = [];
+  readonly serviceHandoffHooks: Array<()=>void> = [];
   readonly server: http.Server;
   readonly extensions: Extension[] = [];
   readonly listeners = new Set<(topic:string,data:unknown)=>void>();
@@ -40,6 +42,8 @@ export class DeviceApp {
   private sse = new Set<ServerResponse>();
   private changeTimer?: ReturnType<typeof setTimeout>;
   private closing = false;
+  private serviceUpdating = false;
+  private activeApiOperations = 0;
   private runtimeStarting?:Promise<DockerRuntimeEndpoint>;
   private runtimeStopping = false;
   private runtimeSuspended = false;
@@ -105,9 +109,25 @@ export class DeviceApp {
     this.sessions?.runtimeProgress(status);this.emit('runtime',status);this.changed();
   }
   async refreshRuntime():Promise<ContainerRuntimeStatus>{const actual=await this.runtime.status();const status=this.runtimeStopping&&actual.state==='ready'?{...actual,state:'stopping' as const,phase:'Stopping environments and preserving their work'}:actual;this.runtimeStatus(status);return status;}
-  assertRuntimeCanRun():void {if(this.runtimeStopping||this.runtimeSuspended)throw new HttpError(409,'Start EnoughFactory’s runtime to continue.','RUNTIME_PAUSED');}
-  allowRuntimeStart():void {if(this.runtimeStopping)throw new HttpError(409,'EnoughFactory is stopping its container runtime.');this.runtimeSuspended=false;this.store.set('private',{id:'runtime-control',suspended:false});this.syncRuntimeCapacity();}
+  assertServiceAvailable():void {if(this.serviceUpdating||this.closing)throw new HttpError(409,'The device service is updating. Reconnect to continue.','SERVICE_UPDATING');}
+  serviceUpdateStatus():{canUpdate:boolean;idleShutdown:true;busy:string[]} {
+    const busy:string[]=[];
+    if(this.serviceUpdating||this.closing)busy.push('The device service is already updating or closing.');
+    if(this.activeApiOperations)busy.push(`${this.activeApiOperations} API operation(s) are active.`);
+    if(this.runtimeStarting||this.runtimeStopping||this.runtimeOperations.size)busy.push('Container runtime operations are active.');
+    const sessions=this.sessions.serviceActivity();
+    if(sessions.starting)busy.push(`${sessions.starting} environment(s) are starting.`);
+    if(sessions.stopping)busy.push(`${sessions.stopping} environment(s) are stopping.`);
+    const chats=this.store.list<Chat>('chats').filter(chat=>['running','waiting'].includes(chat.status)).length;
+    if(chats)busy.push(`${chats} agent conversation(s) are active.`);
+    for(const hook of this.serviceActivityHooks)busy.push(...hook());
+    return {canUpdate:busy.length===0,idleShutdown:true,busy:[...new Set(busy)]};
+  }
+  scheduleServiceShutdown():void {setTimeout(()=>{void this.close().then(()=>process.exit(0));},200);}
+  assertRuntimeCanRun():void {this.assertServiceAvailable();if(this.runtimeStopping||this.runtimeSuspended)throw new HttpError(409,'Start EnoughFactory’s runtime to continue.','RUNTIME_PAUSED');}
+  allowRuntimeStart():void {this.assertServiceAvailable();if(this.runtimeStopping)throw new HttpError(409,'EnoughFactory is stopping its container runtime.');this.runtimeSuspended=false;this.store.set('private',{id:'runtime-control',suspended:false});this.syncRuntimeCapacity();}
   async ensureRuntimeReady():Promise<DockerRuntimeEndpoint>{
+    this.assertServiceAvailable();
     if(this.runtimeStopping||this.runtimeSuspended)throw new HttpError(409,'EnoughFactory’s container runtime is stopped. Start it to continue.','RUNTIME_PAUSED');
     if(!this.runtimeStarting){
       const operation=this.runtime.ensureReady().then(async endpoint=>{await this.refreshRuntime();if(this.runtimeStopping||this.runtimeSuspended)throw new HttpError(409,'The container runtime was stopped while preparing work.','RUNTIME_PAUSED');return endpoint;})
@@ -137,11 +157,28 @@ export class DeviceApp {
   }
   changed(): void {if(this.closing||this.changeTimer)return;this.changeTimer=setTimeout(()=>{this.changeTimer=undefined;if(!this.closing)this.emit('state',this.state());},50);}
   async dispatch(call: ApiCall): Promise<unknown> {
+    const updating=call.url.pathname==='/api/service/shutdown';
+    const mutation=call.method!=='GET'&&!updating;
+    if(mutation)this.assertServiceAvailable();
+    if(mutation)this.activeApiOperations++;
+    try{return await this.dispatchRequest(call);}
+    finally{if(mutation)this.activeApiOperations--;}
+  }
+  private async dispatchRequest(call: ApiCall): Promise<unknown> {
     const {method,url,body}=call;const route=url.pathname;
     if(this.routeRemote){const remote=await this.routeRemote(call);if(remote!==undefined)return remote;}
-    if(method==='GET' && route==='/api/health')return {ok:true,product:PRODUCT,version:'0.1.5',deviceId:this.device.id,runtime:{kind:process.platform==='darwin'?'lima':'rootless',stateDirectory:this.runtime.dataDirectory,socketPath:this.runtime.endpoint.host.slice(7)}};
+    if(method==='GET' && route==='/api/health')return {ok:true,product:PRODUCT,version:'0.1.5',deviceId:this.device.id,capabilities:{idleServiceUpdate:true},runtime:{kind:process.platform==='darwin'?'lima':'rootless',stateDirectory:this.runtime.dataDirectory,socketPath:this.runtime.endpoint.host.slice(7)}};
     if(method==='GET' && route==='/api/state')return this.state();
-    if(method==='POST' && route==='/api/service/shutdown'){setTimeout(()=>{void this.close().then(()=>process.exit(0));},200);return {ok:true};}
+    if(method==='GET'&&route==='/api/service/update-status')return this.serviceUpdateStatus();
+    if(method==='POST' && route==='/api/service/shutdown'){
+      if(body.onlyIfIdle===true){
+        if(body.expectedVersion!=='0.1.5')throw new HttpError(409,'The device service version changed. Check its update status again.','SERVICE_VERSION_CHANGED');
+        const status=this.serviceUpdateStatus();if(!status.canUpdate)throw new HttpError(409,status.busy.join(' '),'SERVICE_BUSY');
+        // No await separates the final idle check, the mutation gate and dispatch stop.
+        this.serviceUpdating=true;for(const hook of this.serviceHandoffHooks)hook();
+      }
+      this.scheduleServiceShutdown();return {ok:true};
+    }
     if(method==='GET'&&route==='/api/runtime')return this.refreshRuntime();
     if(method==='POST'&&route==='/api/runtime/start'){
       this.allowRuntimeStart();const status=await this.refreshRuntime();
@@ -213,7 +250,7 @@ export class DeviceApp {
       if(method==='POST')this.sessions.assertWorkAvailable(sid);
       if(method==='GET'&&!action)return this.sessions.record(sid);
       if(method==='GET'&&action==='state')return this.sessions.get(sid).state();
-      if(method==='GET'&&action==='changes')return this.sessions.changes(sid);
+      if(method==='GET'&&action==='changes')return this.sessions.changes(sid,url.searchParams.get('path')??undefined);
       if(method==='GET'&&action==='output'){const task=url.searchParams.get('task');return task?this.sessions.get(sid).logs(task):this.sessions.output(sid);}
       if(method==='POST'&&action==='stop'){void this.sessions.stop(sid).catch(error=>this.emit('error',{sessionId:sid,error:error.message}));return {ok:true};}
       if(method==='POST'&&action==='restart'){if(this.sessions.owns(sid))this.allowRuntimeStart();await this.sessions.restart(sid);return {ok:true};}

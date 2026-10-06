@@ -4,6 +4,7 @@ import type { DockerRuntimeEndpoint } from '@enoughfactory/runtime';
 import { Store } from './store.ts';
 import { HttpError, id, now } from './util.ts';
 import path from 'node:path';
+import { managedRepositoryReader, readRepositoryChanges } from './repository-changes.ts';
 
 interface WorkspaceBinding { bindSource:string; stateVolume:string; }
 interface PrivateSession { id: string; ready: EnvmuxReady; projectPath: string; pid?: number; workspace?:WorkspaceBinding; }
@@ -26,6 +27,7 @@ export class SessionController {
   setDeviceId(deviceId: string): void {this.deviceId=deviceId;}
   owns(sessionId:string):boolean {return (this.store.get<LaunchRecord>('session-launch',sessionId)?.dockerHost||this.store.get<PrivateSession>('session-private',sessionId)?.ready.dockerHost)===this.runtime.endpoint.host;}
   needsTermination(sessionId:string):boolean {return this.owns(sessionId)&&this.record(sessionId).status!=='stopped'&&(this.live.has(sessionId)||this.starts.has(sessionId)||Boolean(this.store.get<PrivateSession>('session-private',sessionId)));}
+  serviceActivity():{starting:number;stopping:number} {return {starting:new Set([...this.starts.keys(),...this.launchJobs.keys()]).size,stopping:new Set([...this.stopping,...this.stopJobs.keys()]).size};}
   assertCanArchive(sessionId:string):void {
     const record=this.record(sessionId);
     if(!['stopped','failed'].includes(record.status)||this.live.has(sessionId)||this.starts.has(sessionId)||this.launchJobs.has(sessionId)||this.stopJobs.has(sessionId)||this.stopping.has(sessionId)||this.needsTermination(sessionId))throw new HttpError(409,'Stop this environment and confirm its work has returned before removing it.','ENVIRONMENT_IN_USE');
@@ -147,9 +149,9 @@ export class SessionController {
     const project=this.store.get<Project>('projects',record.projectId);if(!project)throw new HttpError(404,'The source project is no longer available.');
     this.patch(sessionId,{status:'starting',phase:'Preparing EnoughFactory runtime',error:undefined,services:[]});this.launch(record,project,{workspace:launch?.workspace||saved?.workspace});
   }
-  async changes(sessionId: string): Promise<RepositoryChanges> {
-    const engine=this.get(sessionId); const [status,diff]=await Promise.all([engine.repositoryStatus(),engine.repositoryDiff()]);
-    return {branch:status.branch,head:status.head,status:status.entries.map(e=>`${e.indexStatus}${e.workingTreeStatus} ${e.path}`).join('\n'),diff:diff.diff};
+  async changes(sessionId: string, selectedPath?: string): Promise<RepositoryChanges> {
+    const engine=this.get(sessionId);
+    return readRepositoryChanges(managedRepositoryReader(this.runtime.endpoint,engine.ready),selectedPath);
   }
   output(sessionId: string): string {return this.store.events<{text:string}>('session-output',sessionId).map(e=>e.value.text).join('\n');}
   close(): void {for(const controller of this.streams.values())controller.abort();}

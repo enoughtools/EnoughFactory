@@ -2,10 +2,11 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import type { FactoryState } from '@enoughfactory/contracts';
 import { browserPeerClient, PeerSocket, peerChanges, type ClientSocket } from './browserPeers';
 
-export interface Connection { url: string; token: string; mode?: 'http' | 'peer'; deviceId?: string }
+export interface Connection { url: string; token: string; mode?: 'http' | 'peer'; deviceId?: string; version?: string; appVersion?: string }
 export interface DesktopBridge {
   getConnection(): Promise<Connection>;
   restartDeviceService?(): Promise<Connection>;
+  onConnectionChanged?(callback: (connection: Connection) => void): () => void;
   pickDirectory(): Promise<string | null>;
   openExternal(url: string): Promise<void>;
   openPreview?(options: { sessionId: string; url: string; bounds?: { x: number; y: number; width: number; height: number } }): Promise<void>;
@@ -97,30 +98,54 @@ export function useFactory() {
   const [bootstrapped, setBootstrapped] = useState(() => !window.enoughFactory);
   const bootstrappedRef = useRef(bootstrapped);
   const requestGeneration = useRef(0);
+  const desktopServiceUrl = useRef<string | null>(null);
+  const desktopReconnectNeeded = useRef(Boolean(window.enoughFactory));
   const client = useRef(new DeviceClient(connection));
   const refresh = useCallback(async () => {
     if (!bootstrappedRef.current) return;
     if (!canConnect(client.current.connection)) { setError(CONNECT_DEVICE_MESSAGE); setLoading(false); return; }
     const generation = requestGeneration.current;
     try {
-      const next = await client.current.get<FactoryState>('/api/state');
+      const next = await client.current.request<FactoryState>('/api/state', { signal: AbortSignal.timeout(8000) });
       if (generation !== requestGeneration.current) return;
-      setState(next); setError(null);
+      desktopReconnectNeeded.current = false; setState(next); setError(null);
     } catch (cause) {
-      if (generation === requestGeneration.current) setError(cause instanceof Error ? cause.message : 'The device is unavailable.');
+      if (generation === requestGeneration.current) {
+        desktopReconnectNeeded.current = Boolean(window.enoughFactory) && client.current.connection.mode !== 'peer' && client.current.connection.url === desktopServiceUrl.current;
+        setError(cause instanceof Error ? cause.message : 'The device is unavailable.');
+      }
     } finally { if (generation === requestGeneration.current) setLoading(false); }
   }, []);
   const setConnection = useCallback((next: Connection) => {
     bootstrappedRef.current = true; setBootstrapped(true);
+    const current = client.current.connection;
+    const sameService = current.url === next.url && current.token === next.token && current.mode === next.mode && current.deviceId === next.deviceId;
     storeConnection(next); requestGeneration.current++;
-    client.current = new DeviceClient(next); setConnectionState(next); setLoading(true); setState(null); setError(null);
+    client.current = new DeviceClient(next); setConnectionState(next); setLoading(true); setState(previous => sameService ? previous : null); setError(null);
   }, []);
   useEffect(() => {
-    let active = true;
-    void window.enoughFactory?.getConnection().then(next => { if (active) setConnection(next); }).catch(cause => {
-      if (active) { setError(cause instanceof Error ? cause.message : String(cause)); setLoading(false); }
-    });
-    return () => { active = false; };
+    const bridge = window.enoughFactory;
+    if (!bridge) return;
+    let active = true, pending = false;
+    const accept = (next: Connection) => {
+      if (!active) return;
+      const current = client.current.connection;
+      if (bootstrappedRef.current && desktopServiceUrl.current && (current.mode === 'peer' || current.url !== desktopServiceUrl.current)) return;
+      desktopServiceUrl.current = next.url;
+      desktopReconnectNeeded.current = false;
+      setConnection(next);
+    };
+    const reconnect = async () => {
+      if (!active || pending) return;
+      pending = true;
+      try { accept(await bridge.getConnection()); }
+      catch (cause) { if (active) { desktopReconnectNeeded.current = true; setError(cause instanceof Error ? cause.message : String(cause)); setLoading(false); } }
+      finally { pending = false; }
+    };
+    const unsubscribe = bridge.onConnectionChanged?.(accept);
+    void reconnect();
+    const retry = setInterval(() => { if (desktopReconnectNeeded.current) void reconnect(); }, 3000);
+    return () => { active = false; clearInterval(retry); unsubscribe?.(); };
   }, [setConnection]);
   useEffect(() => {
     if (!bootstrapped) return;

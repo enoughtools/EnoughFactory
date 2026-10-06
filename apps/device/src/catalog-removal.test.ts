@@ -33,7 +33,7 @@ async function fixture(t:TestContext) {
   async function reject(route:string,status=409) {
     const before=snapshot();assert.equal((await request('DELETE',route)).status,status);assert.deepEqual(snapshot(),before,'Rejected removal must preserve catalog, ownership and evidence');
   }
-  return {app,directory,request,project,session,reject};
+  return {app,directory,request,project,session,reject,snapshot};
 }
 
 test('environment removal rejects uncertain execution and preserves history through idempotent archive/restore',async t=>{
@@ -89,4 +89,30 @@ test('project removal protects goals and hidden workers, restores only its own g
   const remoteProject:Project={...project,id:'remote-project',deviceId:'remote-device',archivedAt:at};const remoteSession:Session={...session('remote-session'),projectId:remoteProject.id,deviceId:remoteProject.deviceId,archivedAt:at};
   app.catalog=()=>({projects:[project,remoteProject],sessions:[session('user'),remoteSession]});
   assert.equal((await request<Project[]>('GET','/api/projects')).body.some(item=>item.id===remoteProject.id),false);assert.equal((await request<Project[]>('GET','/api/projects?archived=1')).body[0]!.id,remoteProject.id,'Removed lists include paired metadata after aggregation');assert.equal((await request<Session[]>('GET','/api/sessions?archived=1')).body[0]!.id,remoteSession.id);
+});
+
+test('idle service handoff rechecks activity atomically and blocks new work while retaining unknown journals',async t=>{
+  const {app,request,session,snapshot}=await fixture(t);
+  let scheduled=0,claimed=0;
+  t.mock.method(app,'scheduleServiceShutdown',()=>{scheduled++;});
+  app.serviceHandoffHooks.push(()=>{claimed++;});
+  const status=()=>request<{canUpdate:boolean;idleShutdown:boolean;busy:string[]}>('GET','/api/service/update-status');
+  const shutdown=()=>request('POST','/api/service/shutdown',{onlyIfIdle:true,expectedVersion:'0.1.5'});
+  assert.equal((await request('GET','/api/service/update-status',undefined,false)).status,401);
+  assert.deepEqual((await status()).body,{canUpdate:true,idleShutdown:true,busy:[]});
+  const chat:Chat={id:'working-chat',sessionId:'environment',deviceId:app.device.id,title:'Working',runtime:'codex',approvalMode:'approve-all',status:'running',createdAt:at,updatedAt:at};
+  app.store.set('chats',chat);const busyBefore=snapshot();
+  assert.match((await status()).body.busy.join(' '),/conversation/);assert.equal((await shutdown()).status,409);assert.deepEqual(snapshot(),busyBefore);assert.equal(claimed,0);assert.equal(scheduled,0);
+  app.store.set('chats',{...chat,status:'interrupted'});app.store.set('sessions',session('environment','unknown'));app.store.set<Attempt>('attempts',{id:'unknown',taskId:'task',deviceId:app.device.id,status:'unknown',generation:1,startedAt:at});
+  let capture=false;app.serviceActivityHooks.push(()=>capture?['Factory candidate capture is active.']:[]);capture=true;assert.equal((await shutdown()).status,409);capture=false;
+  let finish!:()=>void,started!:()=>void;
+  const entered=new Promise<void>(resolve=>{started=resolve;}),operation=new Promise<void>(resolve=>{finish=resolve;});
+  app.extensions.push(async call=>{if(call.url.pathname==='/api/test-operation'){started();await operation;return {ok:true};}});
+  const pending=request('POST','/api/test-operation');await entered;
+  assert.match((await status()).body.busy.join(' '),/API operation/);assert.equal((await shutdown()).status,409);finish();assert.equal((await pending).status,200);
+  assert.equal((await status()).body.canUpdate,true,'Unknown durable work without active operations is left for the next service to reconcile');
+  assert.equal((await request('POST','/api/service/shutdown',{onlyIfIdle:true,expectedVersion:'0.1.4'})).status,409);assert.equal(claimed,0);
+  const retained=snapshot();assert.equal((await shutdown()).status,200);assert.equal(claimed,1);assert.equal(scheduled,1);assert.deepEqual(snapshot(),retained);
+  assert.equal((await request('POST','/api/projects/project/archive')).status,409);assert.deepEqual(snapshot(),retained,'A claimed handoff prevents later metadata or execution mutations');
+  assert.throws(()=>app.assertRuntimeCanRun(),/updating/);assert.equal((await status()).body.canUpdate,false);
 });

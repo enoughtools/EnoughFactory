@@ -1,0 +1,6 @@
+.changed-files { flex-shrink: 0; max-height: 220px; overflow: auto; border-bottom: 1px solid var(--factory-line); padding: 6px; }
+.changed-files button { display: flex; align-items: center; gap: 12px; width: 100%; padding: 7px 12px; border: 0; background: transparent; color: var(--factory-secondary); text-align: left; cursor: pointer; font-size: 12px; }
+.changed-files button:hover, .changed-files button.selected { background: var(--factory-accent-soft); color: var(--factory-ink); }
+.changed-files button code { overflow-wrap: anywhere; }
+.changed-files button span { flex-shrink: 0; margin-left: auto; color: var(--factory-muted); font-size: 11px; }
+.changes-file-heading { flex-shrink: 0; padding: 10px 20px; border-bottom: 1px solid var(--factory-line); font-size: 12px; overflow-wrap: anywhere; }

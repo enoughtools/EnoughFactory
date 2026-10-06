@@ -627,6 +627,15 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
       if(attempt&&attempt.status!=='retired')await coordinator.retireAttempt(record.id);else await cancelLocal(record.id);
     }
   });
+  app.serviceActivityHooks.push(()=>{
+    const active=coordinator.serviceActivity(),busy:string[]=[];
+    if(active.controllers||app.store.list<ControllerRun>('factory-controller-runs').some(run=>['starting','running'].includes(run.status)))busy.push('A factory controller is active.');
+    if(active.attempts||active.reconciliation||active.pending||jobs.size)busy.push('Factory execution or reconciliation is active.');
+    if(captureJobs.size)busy.push('Factory candidate capture is active.');
+    if(app.store.list<WorkerRecord>(journal).some(worker=>worker.status==='preparing'))busy.push('A factory worker is preparing.');
+    return busy;
+  });
+  app.serviceHandoffHooks.push(()=>coordinator.stop());
   app.closers.unshift(() => coordinator.stop());
   await coordinator.start();
   return { coordinator, workspaces, runtime, workspacePort };

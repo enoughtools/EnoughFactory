@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { connectExistingService, probeDeviceConnection } from './service-connection.ts';
+import { compatibleServiceVersions, connectExistingService, probeDeviceConnection, serviceUpgradeNeeded } from './service-connection.ts';
 
 const connection = { url: 'http://127.0.0.1:4317', token: 'inert-test-token' };
 const runtime = { kind: 'lima', stateDirectory: '/owned/factory', socketPath: '/owned/factory/container/lima/factory/sock/docker.sock' };
@@ -21,18 +21,18 @@ function requests(responses: Record<string, unknown>) {
 
 test('healthy service connects while its private VM is waking, without probing container commands', async () => {
   const calls = requests({ '/api/health': { ...health, runtime } });
-  assert.equal(await probeDeviceConnection(connection, { ...options, request: calls.request }), connection);
+  assert.deepEqual(await probeDeviceConnection(connection, { ...options, request: calls.request }), { ...connection, version: health.version });
   assert.deepEqual(calls.paths, ['/api/health']);
 });
 
 test('legacy service uses retained runtime identity instead of waiting on Docker status', async () => {
   const calls = requests({ '/api/health': health, '/api/state': { diagnostics: { containerRuntime: { ...runtime, state: 'failed', error: 'VM is resuming' } } } });
-  assert.equal(await probeDeviceConnection(connection, { ...options, request: calls.request }), connection);
+  assert.deepEqual(await probeDeviceConnection(connection, { ...options, request: calls.request }), { ...connection, version: health.version });
   assert.deepEqual(calls.paths, ['/api/health', '/api/state']);
 });
 
 test('incompatible service and an unowned runtime retain explicit update fences', async () => {
-  const old = requests({ '/api/health': { ...health, version: '0.1.3', runtime } });
+  const old = requests({ '/api/health': { ...health, version: '0.2.0', runtime } });
   await assert.rejects(probeDeviceConnection(connection, { ...options, request: old.request }), /\[DEVICE_SERVICE_UPDATE_REQUIRED\]/);
   assert.deepEqual(old.paths, ['/api/health']);
   for (const invalid of [{ ...runtime, socketPath: '/var/run/docker.sock' }, { ...runtime, stateDirectory: '/other/installation' }, { ...runtime, kind: 'external' }]) {
@@ -43,7 +43,7 @@ test('incompatible service and an unowned runtime retain explicit update fences'
 
 test('explicit service update can inspect healthy prior versions without VM ownership probes', async () => {
   const calls = requests({ '/api/health': { ...health, version: '0.1.3' } });
-  assert.equal(await probeDeviceConnection(connection, { ...options, requireManagedRuntime: false, request: calls.request }), connection);
+  assert.deepEqual(await probeDeviceConnection(connection, { ...options, requireManagedRuntime: false, request: calls.request }), { ...connection, version: '0.1.3' });
   assert.deepEqual(calls.paths, ['/api/health']);
 });
 
@@ -63,4 +63,18 @@ test('a reachable unresponsive service cannot authorize a duplicate daemon', asy
 
 test('a confirmed closed service port allows a replacement to start', async () => {
   assert.equal(await connectExistingService({ readConnection: () => connection, probe: async () => undefined, portOpen: async () => false }), undefined);
+});
+
+test('compatible patch releases connect immediately and report the running service version', async () => {
+  for (const version of ['0.1.3', '0.1.5', '0.1.6']) {
+    const calls = requests({ '/api/health': { ...health, version, runtime } });
+    assert.deepEqual(await probeDeviceConnection(connection, { ...options, request: calls.request }), { ...connection, version });
+    assert.deepEqual(calls.paths, ['/api/health']);
+  }
+  assert.ok(compatibleServiceVersions('0.1.3', '0.1.5'));
+  assert.equal(compatibleServiceVersions('0.2.0', '0.1.5'), false);
+  assert.equal(compatibleServiceVersions('unknown', '0.1.5'), false);
+  assert.ok(serviceUpgradeNeeded('0.1.3', '0.1.5'));
+  assert.equal(serviceUpgradeNeeded('0.1.5', '0.1.3'), false, 'an older app must never downgrade its newer service');
+  assert.equal(serviceUpgradeNeeded('0.1.5', '0.1.5'), false);
 });

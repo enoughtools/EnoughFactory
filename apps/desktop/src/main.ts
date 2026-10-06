@@ -8,6 +8,7 @@ import { createConnection } from 'node:net';
 import { delimiter, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { connectExistingService, probeDeviceConnection, type DeviceConnection } from './service-connection.ts';
+import { finishIdleServiceHandoff, prepareServiceUpdate, type ServiceUpdateStatus } from './service-update.ts';
 
 type Connection = DeviceConnection;
 interface PreviewOptions { sessionId: string; url: string; bounds?: Rectangle }
@@ -32,6 +33,10 @@ const executablePath = [...new Set([
 ].filter(Boolean))].join(delimiter);
 let mainWindow: BrowserWindow | undefined;
 let connectionPromise: Promise<Connection> | undefined;
+let updateJob: Promise<void> | undefined;
+let updateTimer: ReturnType<typeof setTimeout> | undefined;
+let handoffJob: Promise<Connection | undefined> | undefined;
+let stoppingDesktop = false;
 let preview: Preview | undefined;
 let previewGeneration = 0;
 let proxyConfiguration: Promise<unknown> = Promise.resolve();
@@ -83,10 +88,10 @@ async function serviceResources(): Promise<string> {
   return destination;
 }
 
-async function startOrConnectService(): Promise<Connection> {
+async function startOrConnectService(preparedResources?: string): Promise<Connection> {
   const running = await existingService();
   if (running) return running;
-  const durable = await serviceResources();
+  const durable = preparedResources ?? await serviceResources();
   // Another opener or a waking service may become ready while its resources copy.
   const recovered = await existingService();
   if (recovered) return recovered;
@@ -127,7 +132,8 @@ async function startOrConnectService(): Promise<Connection> {
 }
 
 function getConnection(): Promise<Connection> {
-  connectionPromise ??= startOrConnectService().finally(() => { connectionPromise = undefined; });
+  if (handoffJob) return handoffJob.then(connection => connection ?? startOrConnectService());
+  connectionPromise ??= startOrConnectService().then(connection => { scheduleServiceUpdate(connection); return connection; }).finally(() => { connectionPromise = undefined; });
   return connectionPromise;
 }
 
@@ -143,25 +149,76 @@ async function servicePortOpen(connection: Connection): Promise<boolean> {
   });
 }
 
-function restartDeviceService(): Promise<Connection> {
-  if (connectionPromise) return connectionPromise;
-  connectionPromise = (async () => {
-    await closePreview();
-    const existing = await availableConnection(false);
-    if (existing) {
-      const response = await fetch(`${existing.url}/api/service/shutdown`, {
-        method: 'POST', headers: { Authorization: `Bearer ${existing.token}` }, signal: AbortSignal.timeout(20_000),
-      });
-      if (!response.ok) throw new Error('The older device service could not stop. Stop it before updating EnoughFactory.');
-      const deadline = Date.now() + 20_000;
-      while (await servicePortOpen(existing)) {
-        if (Date.now() >= deadline) throw new Error('The prior device service is still stopping. Try the update again after it exits.');
-        await new Promise(resolveWait => setTimeout(resolveWait, 250));
-      }
-    }
-    return await startOrConnectService();
-  })().finally(() => { connectionPromise = undefined; });
-  return connectionPromise;
+async function idleUpdateStatus(connection: Connection): Promise<ServiceUpdateStatus | undefined> {
+  const response = await fetch(`${connection.url}/api/service/update-status`, {
+    headers: { Authorization: `Bearer ${connection.token}` }, signal: AbortSignal.timeout(2_000),
+  });
+  if (response.status === 404 || response.status === 405) return undefined;
+  if (!response.ok) throw new Error('The device service could not confirm whether its current work has finished.');
+  const status = await response.json() as ServiceUpdateStatus;
+  return status.idleShutdown === true && typeof status.canUpdate === 'boolean' ? status : undefined;
+}
+
+async function replaceIdleService(existing: Connection, durable: string): Promise<Connection | undefined> {
+  if (stoppingDesktop) return undefined;
+  handoffJob = finishIdleServiceHandoff({
+    async shutdown() {
+      let response: Response;
+      try {
+        response = await fetch(`${existing.url}/api/service/shutdown`, {
+          method: 'POST', headers: { Authorization: `Bearer ${existing.token}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ onlyIfIdle: true, expectedVersion: existing.version }), signal: AbortSignal.timeout(5_000),
+        });
+      } catch { return 'unknown'; }
+      if (response.status === 409) return 'busy';
+      if (!response.ok) throw new Error('The device service did not accept its safe automatic update. Current work was left connected.');
+      return 'accepted';
+    },
+    portOpen: () => servicePortOpen(existing), current: () => availableConnection(), closePreview,
+    start: () => startOrConnectService(durable),
+  });
+  try { return await handoffJob; } finally { handoffJob = undefined; }
+}
+
+function scheduleServiceUpdate(connection: Connection, delay = 0): void {
+  if (stoppingDesktop || updateJob || updateTimer) return;
+  updateTimer = setTimeout(() => {
+    updateTimer = undefined;
+    let preparedResources: string | undefined;
+    updateJob = prepareServiceUpdate(connection, {
+      targetVersion: expectedServiceVersion,
+      stage: async () => { preparedResources = await serviceResources(); return preparedResources; },
+      current: async () => {
+        const running = await existingService();
+        // An accepted shutdown can lose its HTTP response. Once its saved port
+        // is confirmed closed, recover by launching the staged independent daemon.
+        return running ?? (stoppingDesktop ? undefined : await startOrConnectService(preparedResources));
+      },
+      inspect: idleUpdateStatus, replace: replaceIdleService,
+    }).then(result => {
+      const changed = result.connection && (result.state === 'updated' || result.connection.version !== connection.version || result.connection.url !== connection.url || result.connection.token !== connection.token);
+      if (changed && result.connection && mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('factory:connection-changed', { ...result.connection, appVersion: app.getVersion() });
+      if (result.state === 'busy' || (result.state === 'deferred' && !result.connection)) scheduleServiceUpdateAfterJob(result.connection ?? connection);
+    }).catch(error => {
+      // Keep the workspace connected and retry later; update errors never stop workers.
+      if (process.env.ENOUGHFACTORY_DEBUG) console.error('Device service update deferred:', error instanceof Error ? error.message : String(error));
+      scheduleServiceUpdateAfterJob(connection);
+    }).finally(() => { updateJob = undefined; });
+  }, delay);
+  updateTimer.unref();
+}
+
+function scheduleServiceUpdateAfterJob(connection: Connection): void {
+  if (stoppingDesktop || updateTimer) return;
+  updateTimer = setTimeout(() => { updateTimer = undefined; scheduleServiceUpdate(connection); }, 15_000);
+  updateTimer.unref();
+}
+
+async function restartDeviceService(): Promise<Connection> {
+  // Opening/reloading the UI never authorizes terminating a live daemon.
+  const connection = await getConnection();
+  scheduleServiceUpdate(connection);
+  return connection;
 }
 
 function assertFactorySender(event: IpcMainInvokeEvent): void {
@@ -358,8 +415,8 @@ async function verifyNativeWindow(window: BrowserWindow): Promise<void> {
 }
 
 function installBridge(): void {
-  ipcMain.handle('factory:connection', async event => { assertFactorySender(event); const { url, token } = await getConnection(); return { url, token }; });
-  ipcMain.handle('factory:service-restart', async event => { assertFactorySender(event); const { url, token } = await restartDeviceService(); return { url, token }; });
+  ipcMain.handle('factory:connection', async event => { assertFactorySender(event); const { url, token, version } = await getConnection(); return { url, token, version, appVersion: app.getVersion() }; });
+  ipcMain.handle('factory:service-restart', async event => { assertFactorySender(event); const { url, token, version } = await restartDeviceService(); return { url, token, version, appVersion: app.getVersion() }; });
   ipcMain.handle('factory:directory', async event => {
     assertFactorySender(event);
     const result = await dialog.showOpenDialog(mainWindow!, { title: 'Choose a project repository', properties: ['openDirectory', 'createDirectory'] });
@@ -406,6 +463,10 @@ else {
     if (quitting) return;
     event.preventDefault();
     quitting = true;
-    void closePreview().finally(() => app.quit());
+    stoppingDesktop = true;
+    if (updateTimer) { clearTimeout(updateTimer); updateTimer = undefined; }
+    // Once an idle handoff is accepted, finish launching its independent daemon
+    // before this process exits. Staging or waiting never keeps the desktop open.
+    void (async () => { if (handoffJob) await handoffJob.catch(() => {}); await closePreview(); })().finally(() => app.quit());
   });
 }

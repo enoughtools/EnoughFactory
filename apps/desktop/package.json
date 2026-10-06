@@ -9,7 +9,7 @@
   "main": "dist/main.cjs",
   "scripts": {
     "build": "node build.mjs",
-    "test": "tsx --test src/service-connection.test.ts",
+    "test": "tsx --test src/service-connection.test.ts src/service-update.test.ts",
     "typecheck": "tsc --noEmit",
     "start": "node ensure-electron.mjs && node build.mjs && electron .",
     "dev": "node ensure-electron.mjs && node build.mjs && electron . --dev",
