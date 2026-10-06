@@ -1,0 +1,54 @@
+[data-slot="dialog-content"].goal-composer-dialog { width: calc(100vw - 48px); max-width: 1180px; height: min(900px, calc(100dvh - 48px)); max-height: calc(100dvh - 48px); display: flex; flex-direction: column; gap: 14px; }
+.goal-composer { display: flex; flex-direction: column; min-height: 0; flex: 1; gap: 14px; }
+.goal-composer > .form-field { max-width: 440px; }
+.goal-draft-layout { display: grid; grid-template-columns: minmax(0, 1fr) minmax(340px, 44%); gap: 22px; flex: 1; min-height: 0; }
+.goal-draft-editor { min-height: 0; gap: 0; }
+.goal-draft-fields { min-height: 0; overflow: auto; padding-right: 6px; display: flex; flex-direction: column; gap: 14px; }
+.goal-draft-fields .form-field textarea { min-height: 64px; }
+.specification-heading { display: flex; align-items: center; justify-content: space-between; font-size: 11px; font-weight: 500; }
+.specification-heading > span, .spec-import { display: flex; align-items: center; gap: 6px; }
+.spec-import { cursor: pointer; color: var(--factory-secondary); padding: 3px; }
+.spec-import:hover { color: var(--factory-accent); }
+.spec-import input { width: 1px; height: 1px; opacity: 0; position: absolute; }
+.goal-draft-fields .specification-editor { min-height: 260px; resize: vertical; font-family: ui-monospace, SFMono-Regular, monospace; font-size: 12px; line-height: 1.6; }
+.goal-execution-options { font-size: 11px; border-top: 1px solid var(--factory-line); padding-top: 12px; }
+.goal-execution-options summary { cursor: pointer; font-weight: 500; }
+.goal-execution-options .form-grid { margin-top: 14px; }
+.goal-draft-footer { border-top: 1px solid var(--factory-line); padding-top: 12px; margin-top: 14px; display: flex; align-items: center; gap: 10px; justify-content: space-between; }
+.goal-draft-footer > span { color: var(--factory-secondary); font-size: 10px; line-height: 1.5; }
+.goal-draft-footer > button { flex-shrink: 0; }
+.goal-draft-assistant { display: flex; flex-direction: column; border-left: 1px solid var(--factory-line); padding-left: 22px; min-width: 0; min-height: 0; gap: 12px; }
+.goal-draft-assistant > header { display: flex; justify-content: space-between; gap: 8px; align-items: center; min-height: 32px; font-size: 12px; }
+.goal-draft-assistant > header > strong { display: flex; gap: 7px; align-items: center; font-weight: 500; }
+.goal-draft-assistant .chat-pane { min-height: 0; flex: 1; display: flex; flex-direction: column; }
+.goal-draft-assistant .chat-tabs { flex-wrap: wrap; }
+.goal-draft-assistant .chat-new { margin-left: 0; }
+.goal-draft-assistant .conversation { min-height: 0; flex: 1; }
+.goal-draft-assistant .message-list { min-height: 80px; flex: 1; }
+.goal-draft-assistant .chat-composer { flex-shrink: 0; }
+.goal-draft-assistant .chat-composer { padding: 10px 12px; }
+.goal-draft-assistant .chat-textarea { min-height: 52px; height: 52px; }
+.goal-draft-assistant .composer-footer { padding-top: 6px; }
+.goal-draft-assistant .message-text { white-space: pre-wrap; overflow-wrap: anywhere; }
+.goal-draft-assistant .chat-message [data-slot="button"] { margin-top: 8px; }
+.goal-proposal { font-size: 12px; line-height: 1.6; }
+.goal-proposal > strong { font-weight: 600; }
+.goal-proposal > p { margin: 8px 0; }
+.goal-proposal details { margin-top: 10px; }
+.goal-proposal details summary { cursor: pointer; font-weight: 500; }
+.goal-proposal details > p { white-space: pre-wrap; margin-top: 8px; }
+.goal-proposal > ul { margin-top: 10px; padding-left: 18px; list-style: disc; }
+.goal-proposal-raw { color: var(--factory-secondary); font-size: 10px; }
+.goal-proposal-raw pre { max-height: 300px; overflow: auto; margin-top: 6px; }
+.draft-assistant-start { color: var(--factory-secondary); font-size: 12px; line-height: 1.6; padding-top: 10px; }
+.draft-assistant-start > p { margin-bottom: 12px; }
+.draft-assistant-start .field-hint { margin-top: 10px; }
+.goal-draft-assistant .error-banner { margin: 0; flex-shrink: 0; }
+@media (max-width: 800px) {
+  [data-slot="dialog-content"].goal-composer-dialog { width: calc(100vw - 24px); height: calc(100dvh - 24px); max-height: calc(100dvh - 24px); padding: 18px; overflow: auto; }
+  .goal-draft-layout { display: flex; flex-direction: column; flex: none; }
+  .goal-draft-fields { overflow: visible; padding: 0; }
+  .goal-draft-assistant { border-left: 0; border-top: 1px solid var(--factory-line); padding: 18px 0 0; min-height: 360px; }
+  .goal-draft-assistant .chat-pane { min-height: 500px; }
+  .goal-draft-assistant .message-list { max-height: 420px; }
+}

@@ -43,8 +43,9 @@
 .task-empty-filter { padding: .6rem; font-size: .75rem; color: var(--factory-secondary); }
 .board-mode.task-work-layout { grid-template-columns: minmax(0, 1fr); }
 .board-mode.task-work-layout.with-tools { grid-template-columns: minmax(300px, 42%) minmax(0, 1fr); }
-.board-mode .task-index { display: flex; grid-column: 1 / -1; gap: .65rem; max-height: 310px; overflow: auto; padding-bottom: .3rem; }
-.board-mode .task-state-group { flex: 1 0 205px; min-width: 205px; margin: 0; }
+.board-mode .task-index { display: flex; grid-column: 1 / -1; gap: .65rem; height: clamp(280px, 38dvh, 480px); max-height: none; min-height: 0; overflow-x: auto; overflow-y: hidden; align-items: stretch; padding-bottom: .3rem; }
+.board-mode .task-state-group { flex: 1 0 205px; min-width: 205px; min-height: 0; margin: 0; overflow-y: auto; padding-right: .2rem; }
+.board-mode .task-state-group h2 { position: sticky; top: 0; z-index: 1; background: var(--factory-paper); }
 .task-column-empty { border: 1px dashed var(--factory-line); min-height: 76px; padding: .75rem .6rem; color: var(--factory-secondary); font-size: .7rem; }
 .goal-plan-details { font-size: .75rem; margin-top: .8rem; padding: .6rem .7rem; border: 1px solid var(--factory-line); }
 .goal-plan-details summary { cursor: pointer; font-weight: 600; }
@@ -88,7 +89,9 @@
   .has-goal .goal-workspace { display: flex; flex-direction: column; flex: 1; min-height: 0; }
   .has-goal .goal-workspace > :not(.task-work-layout) { flex-shrink: 0; }
   .has-goal .task-work-layout { align-items: stretch; flex: 1; min-height: 0; grid-template-rows: minmax(0, 1fr); }
-  .has-goal .board-mode.task-work-layout { grid-template-rows: minmax(120px, 150px) minmax(0, 1fr); }
+  /* The board shares the available work area with evidence and live tools. */
+  .has-goal .board-mode.task-work-layout { grid-template-rows: minmax(0, .9fr) minmax(0, 1.1fr); }
+  .has-goal .board-mode .task-index { height: auto; }
   .has-goal .task-index { max-height: none; min-height: 0; }
   .has-goal .task-inspection-pane { min-height: 0; overflow: auto; }
   .has-goal .task-runtime-pane { display: flex; flex-direction: column; min-height: 0; overflow: hidden; }

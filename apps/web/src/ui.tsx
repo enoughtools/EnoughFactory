@@ -17,8 +17,8 @@ export function Status({ state, label }: { state: string; label?: string }) {
 export function Loading({ children = 'Connecting to your workspace…' }: { children?: ReactNode }) {
   return <div className="empty-state" role="status"><LoaderCircle className="loading-spinner" size={24} /><div className="empty-description">{children}</div></div>;
 }
-export function Modal({ open, onClose, title, description, children }: { open: boolean; onClose: () => void; title: string; description: string; children: ReactNode }) {
-  return <Dialog open={open} onOpenChange={(value: boolean) => !value && onClose()}><DialogContent><DialogHeader><DialogTitle>{title}</DialogTitle><DialogDescription>{description}</DialogDescription></DialogHeader>{children}</DialogContent></Dialog>;
+export function Modal({ open, onClose, title, description, children, className }: { open: boolean; onClose: () => void; title: string; description: string; children: ReactNode; className?: string }) {
+  return <Dialog open={open} onOpenChange={(value: boolean) => !value && onClose()}><DialogContent className={className}><DialogHeader><DialogTitle>{title}</DialogTitle><DialogDescription>{description}</DialogDescription></DialogHeader>{children}</DialogContent></Dialog>;
 }
 export function Field({ label, hint, children }: { label: string; hint?: string; children: ReactNode }) {
   return <label className="form-field"><span>{label}</span>{children}{hint && <span className="field-hint">{hint}</span>}</label>;
