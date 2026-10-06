@@ -1,0 +1,602 @@
+{
+  "formatVersion": 1,
+  "product": "EnoughFactory",
+  "version": "0.1.3",
+  "status": "passed",
+  "scope": "actual-published-site-routes-catalog-and-shared-app-bytes",
+  "verifiedAt": "2026-10-06T03:38:13.241Z",
+  "site": "https://factory.enoughtools.com",
+  "worker": {
+    "name": "enoughfactory",
+    "version": "837ad1fd-4cf1-460f-bff7-e5224a2f6b71"
+  },
+  "packageSourceCommit": "6015b2d0feeeff783c091babcf89f8481bf3ab11",
+  "routes": [
+    {
+      "path": "/",
+      "status": 200
+    },
+    {
+      "path": "/docs",
+      "status": 200
+    },
+    {
+      "path": "/downloads",
+      "status": 200
+    },
+    {
+      "path": "/downloads/manifest.json",
+      "status": 200
+    },
+    {
+      "path": "/app",
+      "status": 200
+    }
+  ],
+  "catalog": {
+    "sha256": "8fc286e11a5be0528f6f87727be4284b426513be779288ca2cd290c0dd2d2a8f",
+    "bytes": 10399,
+    "exactServedBytes": true,
+    "installerCount": 6,
+    "sourceCount": 13,
+    "ubuntuSourceIndexSha256": "70aae28ae71172ff64897506285cf2fd6963fe52bf648c430073ff7e7b63c81b"
+  },
+  "browserApplication": {
+    "entry": "/app/assets/index-KA62UQkW.js",
+    "sha256": "f6840046695b449568c2e8871a5d7cd950a6f970cf27e822dbdaa8eba3c06e34",
+    "bytes": 519561,
+    "exactStagedBytes": true
+  },
+  "catalogPreparation": {
+    "formatVersion": 1,
+    "product": "EnoughFactory",
+    "scope": "public-release-catalog-preparation",
+    "status": "passed",
+    "version": "0.1.3",
+    "sourceCommit": "6015b2d0feeeff783c091babcf89f8481bf3ab11",
+    "releaseId": 404264185,
+    "completedAt": "2026-10-06T03:35:00.665Z",
+    "deliveryWorkflowCommit": "05ddd5fbb01e366d89b81e5ffc934485bbc5b208",
+    "inputs": [
+      {
+        "filename": "darwin-arm64.component-qualification.verification.json",
+        "bytes": 209168,
+        "sha256": "e33f0ae6731047d88dae885a0743fe6a5f5e3e1643070a22cdf6090c130611c0",
+        "url": "https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.3/darwin-arm64.component-qualification.verification.json"
+      },
+      {
+        "filename": "darwin-arm64.gui.verification.json",
+        "bytes": 778,
+        "sha256": "d0d1d6b95b96db56806e00fd79475215c3bd9ea0bc4247aa4b0a102c0b71169b",
+        "url": "https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.3/darwin-arm64.gui.verification.json"
+      },
+      {
+        "filename": "darwin-arm64.gui.verification.json.png",
+        "bytes": 125858,
+        "sha256": "3df80c7eba3bf99d8f2056f1e302a76c2366f78bd228152fef5b015a4c9e77cc",
+        "url": "https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.3/darwin-arm64.gui.verification.json.png"
+      },
+      {
+        "filename": "darwin-arm64.installed.verification.json",
+        "bytes": 81737,
+        "sha256": "498dee0d65974e22d46c7a0dee55b6fde7ad2ec4c7c42134e3e442eb3e33279c",
+        "url": "https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.3/darwin-arm64.installed.verification.json"
+      },
+      {
+        "filename": "darwin-arm64.packaged-service-smoke.verification.json",
+        "bytes": 2337,
+        "sha256": "9cc6afd2ebaf81b69ddebaff1665566f5cd320299bd1888eff5b23b5d88a18b7",
+        "url": "https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.3/darwin-arm64.packaged-service-smoke.verification.json"
+      },
+      {
+        "filename": "darwin-arm64.service.verification.json",
+        "bytes": 4555,
+        "sha256": "fc01dc3d03aae4eb0f46cb862ab135c2e604d3bb2d73ed58f526d3fdc69cb216",
+        "url": "https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.3/darwin-arm64.service.verification.json"
+      },
+      {
+        "filename": "EnoughFactory-0.1.3-darwin-arm64-container-sources.tar.gz",
+        "bytes": 63940433,
+        "sha256": "18680ab52d8d1fcfe4eea6858c0f558433ad0a45e7a1b9b260fbb4bbfd932a46",
+        "url": "https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.3/EnoughFactory-0.1.3-darwin-arm64-container-sources.tar.gz"
+      },
+      {
+        "filename": "EnoughFactory-0.1.3-darwin-arm64-container-sources.tar.gz.json",
+        "bytes": 6869,
+        "sha256": "fddcaa175328c943a5209f7b090109229ad5fa291ea6602d869a9f8a476d8473",
+        "url": "https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.3/EnoughFactory-0.1.3-darwin-arm64-container-sources.tar.gz.json"
+      },
+      {
+        "filename": "EnoughFactory-0.1.3-linux-arm64-container-sources.tar.gz",
+        "bytes": 56036891,
+        "sha256": "7faa0b0711f97f8c6e837f9e7d3c94fc0e3820db8c3f9f1c0a9d5ff3cd3941c1",
+        "url": "https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.3/EnoughFactory-0.1.3-linux-arm64-container-sources.tar.gz"
+      },
+      {
+        "filename": "EnoughFactory-0.1.3-linux-arm64-container-sources.tar.gz.json",
+        "bytes": 6270,
+        "sha256": "34c5bc8455de1b8ebcd07679933e1bb7ceecff4fe04ea1f471d8d21e2018776e",
+        "url": "https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.3/EnoughFactory-0.1.3-linux-arm64-container-sources.tar.gz.json"
+      },
+      {
+        "filename": "EnoughFactory-0.1.3-linux-arm64.AppImage",
+        "bytes": 361699014,
+        "sha256": "8cec1ee87ed606aee84f05d33f06b83edea279cf8a1b499dfb77422938974097",
+        "url": "https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.3/EnoughFactory-0.1.3-linux-arm64.AppImage"
+      },
+      {
+        "filename": "EnoughFactory-0.1.3-linux-arm64.AppImage.verification.json",
+        "bytes": 152751,
+        "sha256": "b251813e2f17bdaf453cb110f5737463e3bec89f690a8308baaf589825064413",
+        "url": "https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.3/EnoughFactory-0.1.3-linux-arm64.AppImage.verification.json"
+      },
+      {
+        "filename": "EnoughFactory-0.1.3-linux-arm64.tar.gz",
+        "bytes": 349444365,
+        "sha256": "a8981d0cd81f22c6126134580fff3284122e01f7e7fc5095af9663ae19c1025c",
+        "url": "https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.3/EnoughFactory-0.1.3-linux-arm64.tar.gz"
+      },
+      {
+        "filename": "EnoughFactory-0.1.3-linux-arm64.tar.gz.verification.json",
+        "bytes": 152747,
+        "sha256": "3b99050668a7d87f401fb787f6d101754fdb121ef67f69a9ca91e70ded993d9f",
+        "url": "https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.3/EnoughFactory-0.1.3-linux-arm64.tar.gz.verification.json"
+      },
+      {
+        "filename": "EnoughFactory-0.1.3-linux-x64-container-sources.tar.gz",
+        "bytes": 55840197,
+        "sha256": "8a63fd73739c9f395488fe26e3b84e401862cef175091664d7fcbb1561ede864",
+        "url": "https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.3/EnoughFactory-0.1.3-linux-x64-container-sources.tar.gz"
+      },
+      {
+        "filename": "EnoughFactory-0.1.3-linux-x64-container-sources.tar.gz.json",
+        "bytes": 6262,
+        "sha256": "760dc95de3843de60660e175cd81c90cd950163f23dc6eb90ad1110d10d484eb",
+        "url": "https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.3/EnoughFactory-0.1.3-linux-x64-container-sources.tar.gz.json"
+      },
+      {
+        "filename": "EnoughFactory-0.1.3-linux-x64.AppImage",
+        "bytes": 371603138,
+        "sha256": "eb74585f6c02077969eb47d0fb2ab35ce1c29351dc90d57bf2b8023da5f2321d",
+        "url": "https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.3/EnoughFactory-0.1.3-linux-x64.AppImage"
+      },
+      {
+        "filename": "EnoughFactory-0.1.3-linux-x64.AppImage.verification.json",
+        "bytes": 152685,
+        "sha256": "1277c4266f65fa5fec3e1304d4fb9bbc1c1b097b11f6f5b3c2feabb2c80d39ab",
+        "url": "https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.3/EnoughFactory-0.1.3-linux-x64.AppImage.verification.json"
+      },
+      {
+        "filename": "EnoughFactory-0.1.3-linux-x64.tar.gz",
+        "bytes": 359707054,
+        "sha256": "47152079e3d7e082451ca0d4f31ccc89c81cb7f844ed21385c8b368ba8081603",
+        "url": "https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.3/EnoughFactory-0.1.3-linux-x64.tar.gz"
+      },
+      {
+        "filename": "EnoughFactory-0.1.3-linux-x64.tar.gz.verification.json",
+        "bytes": 152681,
+        "sha256": "543f2787d59168441537f36de151d0dba131324c43dc37490e5fd661f59a0664",
+        "url": "https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.3/EnoughFactory-0.1.3-linux-x64.tar.gz.verification.json"
+      },
+      {
+        "filename": "EnoughFactory-0.1.3-mac-arm64.dmg",
+        "bytes": 1028572035,
+        "sha256": "a9dfd9ae179a24ff2f74fc798cd9c88a2d95e041a42a84c2b4f2b223ed1c37c4",
+        "url": "https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.3/EnoughFactory-0.1.3-mac-arm64.dmg"
+      },
+      {
+        "filename": "EnoughFactory-0.1.3-mac-arm64.dmg.verification.json",
+        "bytes": 294547,
+        "sha256": "a1a9dfc362efe7e56c0a6c1472e211b6e87b11113cfec7b09ac85434fa0f5734",
+        "url": "https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.3/EnoughFactory-0.1.3-mac-arm64.dmg.verification.json"
+      },
+      {
+        "filename": "EnoughFactory-0.1.3-mac-arm64.zip",
+        "bytes": 1024657479,
+        "sha256": "574b92c35a76826aa8aba7486a06f35cad9f1a72068807c7876e80bec52b7b3f",
+        "url": "https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.3/EnoughFactory-0.1.3-mac-arm64.zip"
+      },
+      {
+        "filename": "EnoughFactory-0.1.3-mac-arm64.zip.verification.json",
+        "bytes": 294547,
+        "sha256": "c8c74f6a520926d49d09425495ada1403a919e04b0fbf80c267a061c57ddf9a6",
+        "url": "https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.3/EnoughFactory-0.1.3-mac-arm64.zip.verification.json"
+      },
+      {
+        "filename": "EnoughFactory-Ubuntu-24.04-20260926-sources-part01.tar.gz",
+        "bytes": 766180065,
+        "sha256": "de08b49f7ab2882b803f2b3bff3b44feaf193f4e7a75eb5ad8a0ff7f191d3704",
+        "url": "https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.3/EnoughFactory-Ubuntu-24.04-20260926-sources-part01.tar.gz"
+      },
+      {
+        "filename": "EnoughFactory-Ubuntu-24.04-20260926-sources-part02.tar.gz",
+        "bytes": 611450171,
+        "sha256": "6b27dc2436620fdc7e057facfc454d4b504b983e603c7fe5d079116ffcebaa86",
+        "url": "https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.3/EnoughFactory-Ubuntu-24.04-20260926-sources-part02.tar.gz"
+      },
+      {
+        "filename": "linux-arm64.gui.verification.json",
+        "bytes": 824,
+        "sha256": "b817c83ba8551ee8750d9fdf1864499e84ead42c3c2a51d45db0b1bbc5edcf7e",
+        "url": "https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.3/linux-arm64.gui.verification.json"
+      },
+      {
+        "filename": "linux-arm64.gui.verification.json.png",
+        "bytes": 47169,
+        "sha256": "aa38497c7083c8ca8c9c1f786f9dabed6bd6d5f3bfc2241c2f0a5006cbf28be8",
+        "url": "https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.3/linux-arm64.gui.verification.json.png"
+      },
+      {
+        "filename": "linux-arm64.installed.verification.json",
+        "bytes": 36360,
+        "sha256": "e96b4827e483ffa19b5ac0cc11c791c17ec1c251a5e21025eb9ca135b4685b86",
+        "url": "https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.3/linux-arm64.installed.verification.json"
+      },
+      {
+        "filename": "linux-arm64.packaged-service-smoke.verification.json",
+        "bytes": 2339,
+        "sha256": "552d81ab48c2becdeb7d822168c5bcf10b45047da7d5cf041c3dfb1f016f9a22",
+        "url": "https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.3/linux-arm64.packaged-service-smoke.verification.json"
+      },
+      {
+        "filename": "linux-arm64.service.verification.json",
+        "bytes": 4559,
+        "sha256": "834e716fa5537891169cdb2b957ff05761de2d157a360dd84fa9bc88a59beb1f",
+        "url": "https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.3/linux-arm64.service.verification.json"
+      },
+      {
+        "filename": "linux-x64.gui.verification.json",
+        "bytes": 822,
+        "sha256": "c539cffbb96fe74bdfcf45184f9abd245c7f5b9716f58177e8ffe9a161b37a50",
+        "url": "https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.3/linux-x64.gui.verification.json"
+      },
+      {
+        "filename": "linux-x64.gui.verification.json.png",
+        "bytes": 47181,
+        "sha256": "54044cf7e2401db4bd359b532e9416d137dee0ec00091a9bafda5a32dd9fc2e4",
+        "url": "https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.3/linux-x64.gui.verification.json.png"
+      },
+      {
+        "filename": "linux-x64.installed.verification.json",
+        "bytes": 36338,
+        "sha256": "2a042ec41fe8d32de63d150ebdd1576cb8c2b0c943b64041563ed5e00f80116a",
+        "url": "https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.3/linux-x64.installed.verification.json"
+      },
+      {
+        "filename": "linux-x64.packaged-service-smoke.verification.json",
+        "bytes": 2335,
+        "sha256": "f6a5d9abb0c42155b80b2c362fd578ac110076f0665a4fa145525b6672c3cc56",
+        "url": "https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.3/linux-x64.packaged-service-smoke.verification.json"
+      },
+      {
+        "filename": "linux-x64.service.verification.json",
+        "bytes": 4557,
+        "sha256": "c72a04c3e2270c4ad35f669a8ae081b7755a48c5813119d49d30b46194c89ad4",
+        "url": "https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.3/linux-x64.service.verification.json"
+      },
+      {
+        "filename": "provenance.json",
+        "bytes": 9385,
+        "sha256": "8d0e85b7785cfd25161d432cd4ff58b319db388c180ddb17907417d59432373b",
+        "url": "https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.3/provenance.json"
+      },
+      {
+        "filename": "SHA256SUMS",
+        "bytes": 4628,
+        "sha256": "2471f0400f06259fdc45d1fdf8f516056468f442079581475d7612d245dc8ddf",
+        "url": "https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.3/SHA256SUMS"
+      },
+      {
+        "filename": "Ubuntu-archive-evidence.tar.gz",
+        "bytes": 99066216,
+        "sha256": "fc6d93e8ebd64963b2993f96e7ba6ef8f51a0c4e7d975128d2c36fbb25040643",
+        "url": "https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.3/Ubuntu-archive-evidence.tar.gz"
+      },
+      {
+        "filename": "Ubuntu-source-companion-README.md",
+        "bytes": 6192,
+        "sha256": "28bb9839cad63a8883ed4bc256b254c36e87e33687e6caab57172519883d335e",
+        "url": "https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.3/Ubuntu-source-companion-README.md"
+      },
+      {
+        "filename": "Ubuntu-source-companion-SHA256SUMS",
+        "bytes": 436,
+        "sha256": "a976eaa483453e488bb724b64a01fe9a05cecea71298c05a738a9a9c3b542248",
+        "url": "https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.3/Ubuntu-source-companion-SHA256SUMS"
+      },
+      {
+        "filename": "Ubuntu-source-companion.json",
+        "bytes": 41707,
+        "sha256": "70aae28ae71172ff64897506285cf2fd6963fe52bf648c430073ff7e7b63c81b",
+        "url": "https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.3/Ubuntu-source-companion.json"
+      },
+      {
+        "filename": "Ubuntu-sources.lock.json",
+        "bytes": 1444926,
+        "sha256": "69970920a7e8b558c7b9f762090b8c737106e9d8c2146d36381e707429046522",
+        "url": "https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.3/Ubuntu-sources.lock.json"
+      }
+    ],
+    "publicByteChecks": {
+      "implementation": "release/marketing/prepare-release.mjs",
+      "installerCount": 6,
+      "sourceCount": 13,
+      "freshQualifiedProofsChecked": true
+    },
+    "catalog": {
+      "path": "apps/marketing/public/downloads/manifest.json",
+      "sha256": "8fc286e11a5be0528f6f87727be4284b426513be779288ca2cd290c0dd2d2a8f",
+      "bytes": 10399
+    },
+    "generatedFiles": [
+      {
+        "path": "apps/marketing/public/downloads/0.1.3/EnoughFactory-0.1.3-linux-arm64.AppImage.verification.json",
+        "sha256": "b251813e2f17bdaf453cb110f5737463e3bec89f690a8308baaf589825064413",
+        "bytes": 152751
+      },
+      {
+        "path": "apps/marketing/public/downloads/0.1.3/EnoughFactory-0.1.3-linux-arm64.tar.gz.verification.json",
+        "sha256": "3b99050668a7d87f401fb787f6d101754fdb121ef67f69a9ca91e70ded993d9f",
+        "bytes": 152747
+      },
+      {
+        "path": "apps/marketing/public/downloads/0.1.3/EnoughFactory-0.1.3-linux-x64.AppImage.verification.json",
+        "sha256": "1277c4266f65fa5fec3e1304d4fb9bbc1c1b097b11f6f5b3c2feabb2c80d39ab",
+        "bytes": 152685
+      },
+      {
+        "path": "apps/marketing/public/downloads/0.1.3/EnoughFactory-0.1.3-linux-x64.tar.gz.verification.json",
+        "sha256": "543f2787d59168441537f36de151d0dba131324c43dc37490e5fd661f59a0664",
+        "bytes": 152681
+      },
+      {
+        "path": "apps/marketing/public/downloads/0.1.3/EnoughFactory-0.1.3-mac-arm64.dmg.verification.json",
+        "sha256": "a1a9dfc362efe7e56c0a6c1472e211b6e87b11113cfec7b09ac85434fa0f5734",
+        "bytes": 294547
+      },
+      {
+        "path": "apps/marketing/public/downloads/0.1.3/EnoughFactory-0.1.3-mac-arm64.zip.verification.json",
+        "sha256": "c8c74f6a520926d49d09425495ada1403a919e04b0fbf80c267a061c57ddf9a6",
+        "bytes": 294547
+      },
+      {
+        "path": "apps/marketing/public/downloads/0.1.3/Ubuntu-source-companion.json",
+        "sha256": "70aae28ae71172ff64897506285cf2fd6963fe52bf648c430073ff7e7b63c81b",
+        "bytes": 41707
+      },
+      {
+        "path": "apps/marketing/public/downloads/0.1.3/darwin-arm64.gui.verification.json",
+        "sha256": "d0d1d6b95b96db56806e00fd79475215c3bd9ea0bc4247aa4b0a102c0b71169b",
+        "bytes": 778
+      },
+      {
+        "path": "apps/marketing/public/downloads/0.1.3/darwin-arm64.gui.verification.json.png",
+        "sha256": "3df80c7eba3bf99d8f2056f1e302a76c2366f78bd228152fef5b015a4c9e77cc",
+        "bytes": 125858
+      },
+      {
+        "path": "apps/marketing/public/downloads/0.1.3/darwin-arm64.packaged-service-smoke.verification.json",
+        "sha256": "9cc6afd2ebaf81b69ddebaff1665566f5cd320299bd1888eff5b23b5d88a18b7",
+        "bytes": 2337
+      },
+      {
+        "path": "apps/marketing/public/downloads/0.1.3/darwin-arm64.service.verification.json",
+        "sha256": "fc01dc3d03aae4eb0f46cb862ab135c2e604d3bb2d73ed58f526d3fdc69cb216",
+        "bytes": 4555
+      },
+      {
+        "path": "apps/marketing/public/downloads/0.1.3/linux-arm64.gui.verification.json",
+        "sha256": "b817c83ba8551ee8750d9fdf1864499e84ead42c3c2a51d45db0b1bbc5edcf7e",
+        "bytes": 824
+      },
+      {
+        "path": "apps/marketing/public/downloads/0.1.3/linux-arm64.gui.verification.json.png",
+        "sha256": "aa38497c7083c8ca8c9c1f786f9dabed6bd6d5f3bfc2241c2f0a5006cbf28be8",
+        "bytes": 47169
+      },
+      {
+        "path": "apps/marketing/public/downloads/0.1.3/linux-arm64.packaged-service-smoke.verification.json",
+        "sha256": "552d81ab48c2becdeb7d822168c5bcf10b45047da7d5cf041c3dfb1f016f9a22",
+        "bytes": 2339
+      },
+      {
+        "path": "apps/marketing/public/downloads/0.1.3/linux-arm64.service.verification.json",
+        "sha256": "834e716fa5537891169cdb2b957ff05761de2d157a360dd84fa9bc88a59beb1f",
+        "bytes": 4559
+      },
+      {
+        "path": "apps/marketing/public/downloads/0.1.3/linux-x64.gui.verification.json",
+        "sha256": "c539cffbb96fe74bdfcf45184f9abd245c7f5b9716f58177e8ffe9a161b37a50",
+        "bytes": 822
+      },
+      {
+        "path": "apps/marketing/public/downloads/0.1.3/linux-x64.gui.verification.json.png",
+        "sha256": "54044cf7e2401db4bd359b532e9416d137dee0ec00091a9bafda5a32dd9fc2e4",
+        "bytes": 47181
+      },
+      {
+        "path": "apps/marketing/public/downloads/0.1.3/linux-x64.packaged-service-smoke.verification.json",
+        "sha256": "f6a5d9abb0c42155b80b2c362fd578ac110076f0665a4fa145525b6672c3cc56",
+        "bytes": 2335
+      },
+      {
+        "path": "apps/marketing/public/downloads/0.1.3/linux-x64.service.verification.json",
+        "sha256": "c72a04c3e2270c4ad35f669a8ae081b7755a48c5813119d49d30b46194c89ad4",
+        "bytes": 4557
+      },
+      {
+        "path": "apps/marketing/public/downloads/SHA256SUMS.txt",
+        "sha256": "162f40a6601f9ce2792c0a29f114f0bc9baa7461c9cd4d6487edf5b713b9c72b",
+        "bytes": 2103
+      },
+      {
+        "path": "apps/marketing/public/downloads/manifest.json",
+        "sha256": "8fc286e11a5be0528f6f87727be4284b426513be779288ca2cd290c0dd2d2a8f",
+        "bytes": 10399
+      }
+    ]
+  },
+  "catalogInstallation": {
+    "formatVersion": 1,
+    "product": "EnoughFactory",
+    "scope": "verified-cloud-catalog-installation",
+    "status": "passed",
+    "version": "0.1.3",
+    "sourceCommit": "6015b2d0feeeff783c091babcf89f8481bf3ab11",
+    "releaseId": 404264185,
+    "runId": 37409382157,
+    "prepareJobId": 112094141931,
+    "deliveryWorkflowCommit": "05ddd5fbb01e366d89b81e5ffc934485bbc5b208",
+    "artifactId": 11388208523,
+    "artifactName": "EnoughFactory-0.1.3-public-catalog",
+    "artifactBytes": 581444,
+    "artifactDigest": "sha256:b90a2d0b64bd7de5162f3b00d21ff81567cc97823f8e01eef389d8b817404533",
+    "completedAt": "2026-10-06T03:37:03.432Z",
+    "publicInputCount": 43,
+    "generatedFileCount": 21,
+    "catalog": {
+      "path": "apps/marketing/public/downloads/manifest.json",
+      "sha256": "8fc286e11a5be0528f6f87727be4284b426513be779288ca2cd290c0dd2d2a8f",
+      "bytes": 10399
+    },
+    "oldVersionDirectoriesPreserved": [
+      "0.1.1",
+      "0.1.2"
+    ],
+    "oldVersionFilesPreserved": 14,
+    "preparedReceipt": ".cache/release-0.1.3-cloudprepare/.cache/release-0.1.3-public/prepared.verification.json",
+    "inputsReceipt": ".cache/release-0.1.3-cloudprepare/.cache/release-0.1.3-public/inputs.verification.json",
+    "generatedFiles": [
+      {
+        "path": "apps/marketing/public/downloads/0.1.3/EnoughFactory-0.1.3-linux-arm64.AppImage.verification.json",
+        "sha256": "b251813e2f17bdaf453cb110f5737463e3bec89f690a8308baaf589825064413",
+        "bytes": 152751
+      },
+      {
+        "path": "apps/marketing/public/downloads/0.1.3/EnoughFactory-0.1.3-linux-arm64.tar.gz.verification.json",
+        "sha256": "3b99050668a7d87f401fb787f6d101754fdb121ef67f69a9ca91e70ded993d9f",
+        "bytes": 152747
+      },
+      {
+        "path": "apps/marketing/public/downloads/0.1.3/EnoughFactory-0.1.3-linux-x64.AppImage.verification.json",
+        "sha256": "1277c4266f65fa5fec3e1304d4fb9bbc1c1b097b11f6f5b3c2feabb2c80d39ab",
+        "bytes": 152685
+      },
+      {
+        "path": "apps/marketing/public/downloads/0.1.3/EnoughFactory-0.1.3-linux-x64.tar.gz.verification.json",
+        "sha256": "543f2787d59168441537f36de151d0dba131324c43dc37490e5fd661f59a0664",
+        "bytes": 152681
+      },
+      {
+        "path": "apps/marketing/public/downloads/0.1.3/EnoughFactory-0.1.3-mac-arm64.dmg.verification.json",
+        "sha256": "a1a9dfc362efe7e56c0a6c1472e211b6e87b11113cfec7b09ac85434fa0f5734",
+        "bytes": 294547
+      },
+      {
+        "path": "apps/marketing/public/downloads/0.1.3/EnoughFactory-0.1.3-mac-arm64.zip.verification.json",
+        "sha256": "c8c74f6a520926d49d09425495ada1403a919e04b0fbf80c267a061c57ddf9a6",
+        "bytes": 294547
+      },
+      {
+        "path": "apps/marketing/public/downloads/0.1.3/Ubuntu-source-companion.json",
+        "sha256": "70aae28ae71172ff64897506285cf2fd6963fe52bf648c430073ff7e7b63c81b",
+        "bytes": 41707
+      },
+      {
+        "path": "apps/marketing/public/downloads/0.1.3/darwin-arm64.gui.verification.json",
+        "sha256": "d0d1d6b95b96db56806e00fd79475215c3bd9ea0bc4247aa4b0a102c0b71169b",
+        "bytes": 778
+      },
+      {
+        "path": "apps/marketing/public/downloads/0.1.3/darwin-arm64.gui.verification.json.png",
+        "sha256": "3df80c7eba3bf99d8f2056f1e302a76c2366f78bd228152fef5b015a4c9e77cc",
+        "bytes": 125858
+      },
+      {
+        "path": "apps/marketing/public/downloads/0.1.3/darwin-arm64.packaged-service-smoke.verification.json",
+        "sha256": "9cc6afd2ebaf81b69ddebaff1665566f5cd320299bd1888eff5b23b5d88a18b7",
+        "bytes": 2337
+      },
+      {
+        "path": "apps/marketing/public/downloads/0.1.3/darwin-arm64.service.verification.json",
+        "sha256": "fc01dc3d03aae4eb0f46cb862ab135c2e604d3bb2d73ed58f526d3fdc69cb216",
+        "bytes": 4555
+      },
+      {
+        "path": "apps/marketing/public/downloads/0.1.3/linux-arm64.gui.verification.json",
+        "sha256": "b817c83ba8551ee8750d9fdf1864499e84ead42c3c2a51d45db0b1bbc5edcf7e",
+        "bytes": 824
+      },
+      {
+        "path": "apps/marketing/public/downloads/0.1.3/linux-arm64.gui.verification.json.png",
+        "sha256": "aa38497c7083c8ca8c9c1f786f9dabed6bd6d5f3bfc2241c2f0a5006cbf28be8",
+        "bytes": 47169
+      },
+      {
+        "path": "apps/marketing/public/downloads/0.1.3/linux-arm64.packaged-service-smoke.verification.json",
+        "sha256": "552d81ab48c2becdeb7d822168c5bcf10b45047da7d5cf041c3dfb1f016f9a22",
+        "bytes": 2339
+      },
+      {
+        "path": "apps/marketing/public/downloads/0.1.3/linux-arm64.service.verification.json",
+        "sha256": "834e716fa5537891169cdb2b957ff05761de2d157a360dd84fa9bc88a59beb1f",
+        "bytes": 4559
+      },
+      {
+        "path": "apps/marketing/public/downloads/0.1.3/linux-x64.gui.verification.json",
+        "sha256": "c539cffbb96fe74bdfcf45184f9abd245c7f5b9716f58177e8ffe9a161b37a50",
+        "bytes": 822
+      },
+      {
+        "path": "apps/marketing/public/downloads/0.1.3/linux-x64.gui.verification.json.png",
+        "sha256": "54044cf7e2401db4bd359b532e9416d137dee0ec00091a9bafda5a32dd9fc2e4",
+        "bytes": 47181
+      },
+      {
+        "path": "apps/marketing/public/downloads/0.1.3/linux-x64.packaged-service-smoke.verification.json",
+        "sha256": "f6a5d9abb0c42155b80b2c362fd578ac110076f0665a4fa145525b6672c3cc56",
+        "bytes": 2335
+      },
+      {
+        "path": "apps/marketing/public/downloads/0.1.3/linux-x64.service.verification.json",
+        "sha256": "c72a04c3e2270c4ad35f669a8ae081b7755a48c5813119d49d30b46194c89ad4",
+        "bytes": 4557
+      },
+      {
+        "path": "apps/marketing/public/downloads/SHA256SUMS.txt",
+        "sha256": "162f40a6601f9ce2792c0a29f114f0bc9baa7461c9cd4d6487edf5b713b9c72b",
+        "bytes": 2103
+      },
+      {
+        "path": "apps/marketing/public/downloads/manifest.json",
+        "sha256": "8fc286e11a5be0528f6f87727be4284b426513be779288ca2cd290c0dd2d2a8f",
+        "bytes": 10399
+      }
+    ]
+  },
+  "visualEvidence": [
+    {
+      "scope": "Actual live production downloads page inspected in Chrome after deployment",
+      "screenshot": "docs/verification/public-downloads-0.1.3.jpg",
+      "observed": [
+        "Version0.1.3",
+        "six exact public installer links",
+        "13 source links",
+        "frozen source6015",
+        "unsigned package labels"
+      ],
+      "tabKeptAsDeliverable": true
+    },
+    {
+      "scope": "Same production application bytes, populated deterministic UI fixture; no agent execution",
+      "screenshot": "docs/verification/public-task-workspace-ui-fixture.jpg",
+      "applicationSha256": "f6840046695b449568c2e8871a5d7cd950a6f970cf27e822dbdaa8eba3c06e34",
+      "originalReceipt": "docs/verification/public-power-workspace.json"
+    },
+    {
+      "scope": "Actual production application connected to the newly packaged0.1.3 service before final catalog deployment; identical app bytes",
+      "receipt": "docs/verification/public-workspace-connected-0.1.3.json",
+      "applicationSha256": "f6840046695b449568c2e8871a5d7cd950a6f970cf27e822dbdaa8eba3c06e34"
+    }
+  ]
+}

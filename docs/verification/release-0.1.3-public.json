@@ -1,0 +1,769 @@
+{
+  "formatVersion": 1,
+  "product": "EnoughFactory",
+  "version": "0.1.3",
+  "status": "passed",
+  "verificationScope": "public-release-asset-metadata-and-exact-local-input-gates",
+  "publicRelease": {
+    "formatVersion": 1,
+    "product": "EnoughFactory",
+    "version": "0.1.3",
+    "scope": "public-release-asset-metadata-and-prior-exact-local-input-gate",
+    "status": "passed",
+    "sourceCommit": "6015b2d0feeeff783c091babcf89f8481bf3ab11",
+    "releaseId": 404264185,
+    "htmlUrl": "https://github.com/enoughtools/EnoughFactory/releases/tag/v0.1.3",
+    "public": true,
+    "verifiedAt": "2026-10-06T03:31:24.055Z",
+    "method": "All 43 server asset states, sizes and SHA-256 digests compared to the exact local 41-input gate and two metadata files; full public installer/source byte checks are separate catalog preparation evidence.",
+    "artifacts": [
+      {
+        "name": "darwin-arm64.component-qualification.verification.json",
+        "sha256": "e33f0ae6731047d88dae885a0743fe6a5f5e3e1643070a22cdf6090c130611c0",
+        "size": 209168
+      },
+      {
+        "name": "darwin-arm64.gui.verification.json",
+        "sha256": "d0d1d6b95b96db56806e00fd79475215c3bd9ea0bc4247aa4b0a102c0b71169b",
+        "size": 778
+      },
+      {
+        "name": "darwin-arm64.gui.verification.json.png",
+        "sha256": "3df80c7eba3bf99d8f2056f1e302a76c2366f78bd228152fef5b015a4c9e77cc",
+        "size": 125858
+      },
+      {
+        "name": "darwin-arm64.installed.verification.json",
+        "sha256": "498dee0d65974e22d46c7a0dee55b6fde7ad2ec4c7c42134e3e442eb3e33279c",
+        "size": 81737
+      },
+      {
+        "name": "darwin-arm64.packaged-service-smoke.verification.json",
+        "sha256": "9cc6afd2ebaf81b69ddebaff1665566f5cd320299bd1888eff5b23b5d88a18b7",
+        "size": 2337
+      },
+      {
+        "name": "darwin-arm64.service.verification.json",
+        "sha256": "fc01dc3d03aae4eb0f46cb862ab135c2e604d3bb2d73ed58f526d3fdc69cb216",
+        "size": 4555
+      },
+      {
+        "name": "EnoughFactory-0.1.3-darwin-arm64-container-sources.tar.gz",
+        "sha256": "18680ab52d8d1fcfe4eea6858c0f558433ad0a45e7a1b9b260fbb4bbfd932a46",
+        "size": 63940433
+      },
+      {
+        "name": "EnoughFactory-0.1.3-darwin-arm64-container-sources.tar.gz.json",
+        "sha256": "fddcaa175328c943a5209f7b090109229ad5fa291ea6602d869a9f8a476d8473",
+        "size": 6869
+      },
+      {
+        "name": "EnoughFactory-0.1.3-linux-arm64-container-sources.tar.gz",
+        "sha256": "7faa0b0711f97f8c6e837f9e7d3c94fc0e3820db8c3f9f1c0a9d5ff3cd3941c1",
+        "size": 56036891
+      },
+      {
+        "name": "EnoughFactory-0.1.3-linux-arm64-container-sources.tar.gz.json",
+        "sha256": "34c5bc8455de1b8ebcd07679933e1bb7ceecff4fe04ea1f471d8d21e2018776e",
+        "size": 6270
+      },
+      {
+        "name": "EnoughFactory-0.1.3-linux-arm64.AppImage",
+        "sha256": "8cec1ee87ed606aee84f05d33f06b83edea279cf8a1b499dfb77422938974097",
+        "size": 361699014
+      },
+      {
+        "name": "EnoughFactory-0.1.3-linux-arm64.AppImage.verification.json",
+        "sha256": "b251813e2f17bdaf453cb110f5737463e3bec89f690a8308baaf589825064413",
+        "size": 152751
+      },
+      {
+        "name": "EnoughFactory-0.1.3-linux-arm64.tar.gz",
+        "sha256": "a8981d0cd81f22c6126134580fff3284122e01f7e7fc5095af9663ae19c1025c",
+        "size": 349444365
+      },
+      {
+        "name": "EnoughFactory-0.1.3-linux-arm64.tar.gz.verification.json",
+        "sha256": "3b99050668a7d87f401fb787f6d101754fdb121ef67f69a9ca91e70ded993d9f",
+        "size": 152747
+      },
+      {
+        "name": "EnoughFactory-0.1.3-linux-x64-container-sources.tar.gz",
+        "sha256": "8a63fd73739c9f395488fe26e3b84e401862cef175091664d7fcbb1561ede864",
+        "size": 55840197
+      },
+      {
+        "name": "EnoughFactory-0.1.3-linux-x64-container-sources.tar.gz.json",
+        "sha256": "760dc95de3843de60660e175cd81c90cd950163f23dc6eb90ad1110d10d484eb",
+        "size": 6262
+      },
+      {
+        "name": "EnoughFactory-0.1.3-linux-x64.AppImage",
+        "sha256": "eb74585f6c02077969eb47d0fb2ab35ce1c29351dc90d57bf2b8023da5f2321d",
+        "size": 371603138
+      },
+      {
+        "name": "EnoughFactory-0.1.3-linux-x64.AppImage.verification.json",
+        "sha256": "1277c4266f65fa5fec3e1304d4fb9bbc1c1b097b11f6f5b3c2feabb2c80d39ab",
+        "size": 152685
+      },
+      {
+        "name": "EnoughFactory-0.1.3-linux-x64.tar.gz",
+        "sha256": "47152079e3d7e082451ca0d4f31ccc89c81cb7f844ed21385c8b368ba8081603",
+        "size": 359707054
+      },
+      {
+        "name": "EnoughFactory-0.1.3-linux-x64.tar.gz.verification.json",
+        "sha256": "543f2787d59168441537f36de151d0dba131324c43dc37490e5fd661f59a0664",
+        "size": 152681
+      },
+      {
+        "name": "EnoughFactory-0.1.3-mac-arm64.dmg",
+        "sha256": "a9dfd9ae179a24ff2f74fc798cd9c88a2d95e041a42a84c2b4f2b223ed1c37c4",
+        "size": 1028572035
+      },
+      {
+        "name": "EnoughFactory-0.1.3-mac-arm64.dmg.verification.json",
+        "sha256": "a1a9dfc362efe7e56c0a6c1472e211b6e87b11113cfec7b09ac85434fa0f5734",
+        "size": 294547
+      },
+      {
+        "name": "EnoughFactory-0.1.3-mac-arm64.zip",
+        "sha256": "574b92c35a76826aa8aba7486a06f35cad9f1a72068807c7876e80bec52b7b3f",
+        "size": 1024657479
+      },
+      {
+        "name": "EnoughFactory-0.1.3-mac-arm64.zip.verification.json",
+        "sha256": "c8c74f6a520926d49d09425495ada1403a919e04b0fbf80c267a061c57ddf9a6",
+        "size": 294547
+      },
+      {
+        "name": "EnoughFactory-Ubuntu-24.04-20260926-sources-part01.tar.gz",
+        "sha256": "de08b49f7ab2882b803f2b3bff3b44feaf193f4e7a75eb5ad8a0ff7f191d3704",
+        "size": 766180065
+      },
+      {
+        "name": "EnoughFactory-Ubuntu-24.04-20260926-sources-part02.tar.gz",
+        "sha256": "6b27dc2436620fdc7e057facfc454d4b504b983e603c7fe5d079116ffcebaa86",
+        "size": 611450171
+      },
+      {
+        "name": "linux-arm64.gui.verification.json",
+        "sha256": "b817c83ba8551ee8750d9fdf1864499e84ead42c3c2a51d45db0b1bbc5edcf7e",
+        "size": 824
+      },
+      {
+        "name": "linux-arm64.gui.verification.json.png",
+        "sha256": "aa38497c7083c8ca8c9c1f786f9dabed6bd6d5f3bfc2241c2f0a5006cbf28be8",
+        "size": 47169
+      },
+      {
+        "name": "linux-arm64.installed.verification.json",
+        "sha256": "e96b4827e483ffa19b5ac0cc11c791c17ec1c251a5e21025eb9ca135b4685b86",
+        "size": 36360
+      },
+      {
+        "name": "linux-arm64.packaged-service-smoke.verification.json",
+        "sha256": "552d81ab48c2becdeb7d822168c5bcf10b45047da7d5cf041c3dfb1f016f9a22",
+        "size": 2339
+      },
+      {
+        "name": "linux-arm64.service.verification.json",
+        "sha256": "834e716fa5537891169cdb2b957ff05761de2d157a360dd84fa9bc88a59beb1f",
+        "size": 4559
+      },
+      {
+        "name": "linux-x64.gui.verification.json",
+        "sha256": "c539cffbb96fe74bdfcf45184f9abd245c7f5b9716f58177e8ffe9a161b37a50",
+        "size": 822
+      },
+      {
+        "name": "linux-x64.gui.verification.json.png",
+        "sha256": "54044cf7e2401db4bd359b532e9416d137dee0ec00091a9bafda5a32dd9fc2e4",
+        "size": 47181
+      },
+      {
+        "name": "linux-x64.installed.verification.json",
+        "sha256": "2a042ec41fe8d32de63d150ebdd1576cb8c2b0c943b64041563ed5e00f80116a",
+        "size": 36338
+      },
+      {
+        "name": "linux-x64.packaged-service-smoke.verification.json",
+        "sha256": "f6a5d9abb0c42155b80b2c362fd578ac110076f0665a4fa145525b6672c3cc56",
+        "size": 2335
+      },
+      {
+        "name": "linux-x64.service.verification.json",
+        "sha256": "c72a04c3e2270c4ad35f669a8ae081b7755a48c5813119d49d30b46194c89ad4",
+        "size": 4557
+      },
+      {
+        "name": "Ubuntu-archive-evidence.tar.gz",
+        "sha256": "fc6d93e8ebd64963b2993f96e7ba6ef8f51a0c4e7d975128d2c36fbb25040643",
+        "size": 99066216
+      },
+      {
+        "name": "Ubuntu-source-companion-README.md",
+        "sha256": "28bb9839cad63a8883ed4bc256b254c36e87e33687e6caab57172519883d335e",
+        "size": 6192
+      },
+      {
+        "name": "Ubuntu-source-companion-SHA256SUMS",
+        "sha256": "a976eaa483453e488bb724b64a01fe9a05cecea71298c05a738a9a9c3b542248",
+        "size": 436
+      },
+      {
+        "name": "Ubuntu-source-companion.json",
+        "sha256": "70aae28ae71172ff64897506285cf2fd6963fe52bf648c430073ff7e7b63c81b",
+        "size": 41707
+      },
+      {
+        "name": "Ubuntu-sources.lock.json",
+        "sha256": "69970920a7e8b558c7b9f762090b8c737106e9d8c2146d36381e707429046522",
+        "size": 1444926
+      },
+      {
+        "name": "provenance.json",
+        "sha256": "8d0e85b7785cfd25161d432cd4ff58b319db388c180ddb17907417d59432373b",
+        "size": 9385
+      },
+      {
+        "name": "SHA256SUMS",
+        "sha256": "2471f0400f06259fdc45d1fdf8f516056468f442079581475d7612d245dc8ddf",
+        "size": 4628
+      }
+    ],
+    "previousReleaseTagPreserved": true
+  },
+  "localAssembly": {
+    "formatVersion": 1,
+    "product": "EnoughFactory",
+    "scope": "exact-local-release-assembly",
+    "status": "passed",
+    "version": "0.1.3",
+    "sourceCommit": "6015b2d0feeeff783c091babcf89f8481bf3ab11",
+    "releaseId": 404264185,
+    "completedAt": "2026-10-06T03:18:44.962Z",
+    "inputs": [
+      {
+        "filename": "darwin-arm64.component-qualification.verification.json",
+        "sha256": "e33f0ae6731047d88dae885a0743fe6a5f5e3e1643070a22cdf6090c130611c0",
+        "bytes": 209168,
+        "kind": "verification"
+      },
+      {
+        "filename": "darwin-arm64.gui.verification.json",
+        "sha256": "d0d1d6b95b96db56806e00fd79475215c3bd9ea0bc4247aa4b0a102c0b71169b",
+        "bytes": 778,
+        "kind": "verification"
+      },
+      {
+        "filename": "darwin-arm64.gui.verification.json.png",
+        "sha256": "3df80c7eba3bf99d8f2056f1e302a76c2366f78bd228152fef5b015a4c9e77cc",
+        "bytes": 125858,
+        "kind": "screenshot"
+      },
+      {
+        "filename": "darwin-arm64.installed.verification.json",
+        "sha256": "498dee0d65974e22d46c7a0dee55b6fde7ad2ec4c7c42134e3e442eb3e33279c",
+        "bytes": 81737,
+        "kind": "verification"
+      },
+      {
+        "filename": "darwin-arm64.packaged-service-smoke.verification.json",
+        "sha256": "9cc6afd2ebaf81b69ddebaff1665566f5cd320299bd1888eff5b23b5d88a18b7",
+        "bytes": 2337,
+        "kind": "verification"
+      },
+      {
+        "filename": "darwin-arm64.service.verification.json",
+        "sha256": "fc01dc3d03aae4eb0f46cb862ab135c2e604d3bb2d73ed58f526d3fdc69cb216",
+        "bytes": 4555,
+        "kind": "verification"
+      },
+      {
+        "filename": "EnoughFactory-0.1.3-darwin-arm64-container-sources.tar.gz",
+        "sha256": "18680ab52d8d1fcfe4eea6858c0f558433ad0a45e7a1b9b260fbb4bbfd932a46",
+        "bytes": 63940433,
+        "kind": "container-sources"
+      },
+      {
+        "filename": "EnoughFactory-0.1.3-darwin-arm64-container-sources.tar.gz.json",
+        "sha256": "fddcaa175328c943a5209f7b090109229ad5fa291ea6602d869a9f8a476d8473",
+        "bytes": 6869,
+        "kind": "container-sources"
+      },
+      {
+        "filename": "EnoughFactory-0.1.3-linux-arm64-container-sources.tar.gz",
+        "sha256": "7faa0b0711f97f8c6e837f9e7d3c94fc0e3820db8c3f9f1c0a9d5ff3cd3941c1",
+        "bytes": 56036891,
+        "kind": "container-sources"
+      },
+      {
+        "filename": "EnoughFactory-0.1.3-linux-arm64-container-sources.tar.gz.json",
+        "sha256": "34c5bc8455de1b8ebcd07679933e1bb7ceecff4fe04ea1f471d8d21e2018776e",
+        "bytes": 6270,
+        "kind": "container-sources"
+      },
+      {
+        "filename": "EnoughFactory-0.1.3-linux-arm64.AppImage",
+        "sha256": "8cec1ee87ed606aee84f05d33f06b83edea279cf8a1b499dfb77422938974097",
+        "bytes": 361699014,
+        "kind": "desktop"
+      },
+      {
+        "filename": "EnoughFactory-0.1.3-linux-arm64.AppImage.verification.json",
+        "sha256": "b251813e2f17bdaf453cb110f5737463e3bec89f690a8308baaf589825064413",
+        "bytes": 152751,
+        "kind": "verification"
+      },
+      {
+        "filename": "EnoughFactory-0.1.3-linux-arm64.tar.gz",
+        "sha256": "a8981d0cd81f22c6126134580fff3284122e01f7e7fc5095af9663ae19c1025c",
+        "bytes": 349444365,
+        "kind": "desktop"
+      },
+      {
+        "filename": "EnoughFactory-0.1.3-linux-arm64.tar.gz.verification.json",
+        "sha256": "3b99050668a7d87f401fb787f6d101754fdb121ef67f69a9ca91e70ded993d9f",
+        "bytes": 152747,
+        "kind": "verification"
+      },
+      {
+        "filename": "EnoughFactory-0.1.3-linux-x64-container-sources.tar.gz",
+        "sha256": "8a63fd73739c9f395488fe26e3b84e401862cef175091664d7fcbb1561ede864",
+        "bytes": 55840197,
+        "kind": "container-sources"
+      },
+      {
+        "filename": "EnoughFactory-0.1.3-linux-x64-container-sources.tar.gz.json",
+        "sha256": "760dc95de3843de60660e175cd81c90cd950163f23dc6eb90ad1110d10d484eb",
+        "bytes": 6262,
+        "kind": "container-sources"
+      },
+      {
+        "filename": "EnoughFactory-0.1.3-linux-x64.AppImage",
+        "sha256": "eb74585f6c02077969eb47d0fb2ab35ce1c29351dc90d57bf2b8023da5f2321d",
+        "bytes": 371603138,
+        "kind": "desktop"
+      },
+      {
+        "filename": "EnoughFactory-0.1.3-linux-x64.AppImage.verification.json",
+        "sha256": "1277c4266f65fa5fec3e1304d4fb9bbc1c1b097b11f6f5b3c2feabb2c80d39ab",
+        "bytes": 152685,
+        "kind": "verification"
+      },
+      {
+        "filename": "EnoughFactory-0.1.3-linux-x64.tar.gz",
+        "sha256": "47152079e3d7e082451ca0d4f31ccc89c81cb7f844ed21385c8b368ba8081603",
+        "bytes": 359707054,
+        "kind": "desktop"
+      },
+      {
+        "filename": "EnoughFactory-0.1.3-linux-x64.tar.gz.verification.json",
+        "sha256": "543f2787d59168441537f36de151d0dba131324c43dc37490e5fd661f59a0664",
+        "bytes": 152681,
+        "kind": "verification"
+      },
+      {
+        "filename": "EnoughFactory-0.1.3-mac-arm64.dmg",
+        "sha256": "a9dfd9ae179a24ff2f74fc798cd9c88a2d95e041a42a84c2b4f2b223ed1c37c4",
+        "bytes": 1028572035,
+        "kind": "desktop"
+      },
+      {
+        "filename": "EnoughFactory-0.1.3-mac-arm64.dmg.verification.json",
+        "sha256": "a1a9dfc362efe7e56c0a6c1472e211b6e87b11113cfec7b09ac85434fa0f5734",
+        "bytes": 294547,
+        "kind": "verification"
+      },
+      {
+        "filename": "EnoughFactory-0.1.3-mac-arm64.zip",
+        "sha256": "574b92c35a76826aa8aba7486a06f35cad9f1a72068807c7876e80bec52b7b3f",
+        "bytes": 1024657479,
+        "kind": "desktop"
+      },
+      {
+        "filename": "EnoughFactory-0.1.3-mac-arm64.zip.verification.json",
+        "sha256": "c8c74f6a520926d49d09425495ada1403a919e04b0fbf80c267a061c57ddf9a6",
+        "bytes": 294547,
+        "kind": "verification"
+      },
+      {
+        "filename": "EnoughFactory-Ubuntu-24.04-20260926-sources-part01.tar.gz",
+        "sha256": "de08b49f7ab2882b803f2b3bff3b44feaf193f4e7a75eb5ad8a0ff7f191d3704",
+        "bytes": 766180065,
+        "kind": "os-sources"
+      },
+      {
+        "filename": "EnoughFactory-Ubuntu-24.04-20260926-sources-part02.tar.gz",
+        "sha256": "6b27dc2436620fdc7e057facfc454d4b504b983e603c7fe5d079116ffcebaa86",
+        "bytes": 611450171,
+        "kind": "os-sources"
+      },
+      {
+        "filename": "linux-arm64.gui.verification.json",
+        "sha256": "b817c83ba8551ee8750d9fdf1864499e84ead42c3c2a51d45db0b1bbc5edcf7e",
+        "bytes": 824,
+        "kind": "verification"
+      },
+      {
+        "filename": "linux-arm64.gui.verification.json.png",
+        "sha256": "aa38497c7083c8ca8c9c1f786f9dabed6bd6d5f3bfc2241c2f0a5006cbf28be8",
+        "bytes": 47169,
+        "kind": "screenshot"
+      },
+      {
+        "filename": "linux-arm64.installed.verification.json",
+        "sha256": "e96b4827e483ffa19b5ac0cc11c791c17ec1c251a5e21025eb9ca135b4685b86",
+        "bytes": 36360,
+        "kind": "verification"
+      },
+      {
+        "filename": "linux-arm64.packaged-service-smoke.verification.json",
+        "sha256": "552d81ab48c2becdeb7d822168c5bcf10b45047da7d5cf041c3dfb1f016f9a22",
+        "bytes": 2339,
+        "kind": "verification"
+      },
+      {
+        "filename": "linux-arm64.service.verification.json",
+        "sha256": "834e716fa5537891169cdb2b957ff05761de2d157a360dd84fa9bc88a59beb1f",
+        "bytes": 4559,
+        "kind": "verification"
+      },
+      {
+        "filename": "linux-x64.gui.verification.json",
+        "sha256": "c539cffbb96fe74bdfcf45184f9abd245c7f5b9716f58177e8ffe9a161b37a50",
+        "bytes": 822,
+        "kind": "verification"
+      },
+      {
+        "filename": "linux-x64.gui.verification.json.png",
+        "sha256": "54044cf7e2401db4bd359b532e9416d137dee0ec00091a9bafda5a32dd9fc2e4",
+        "bytes": 47181,
+        "kind": "screenshot"
+      },
+      {
+        "filename": "linux-x64.installed.verification.json",
+        "sha256": "2a042ec41fe8d32de63d150ebdd1576cb8c2b0c943b64041563ed5e00f80116a",
+        "bytes": 36338,
+        "kind": "verification"
+      },
+      {
+        "filename": "linux-x64.packaged-service-smoke.verification.json",
+        "sha256": "f6a5d9abb0c42155b80b2c362fd578ac110076f0665a4fa145525b6672c3cc56",
+        "bytes": 2335,
+        "kind": "verification"
+      },
+      {
+        "filename": "linux-x64.service.verification.json",
+        "sha256": "c72a04c3e2270c4ad35f669a8ae081b7755a48c5813119d49d30b46194c89ad4",
+        "bytes": 4557,
+        "kind": "verification"
+      },
+      {
+        "filename": "Ubuntu-archive-evidence.tar.gz",
+        "sha256": "fc6d93e8ebd64963b2993f96e7ba6ef8f51a0c4e7d975128d2c36fbb25040643",
+        "bytes": 99066216,
+        "kind": "os-sources"
+      },
+      {
+        "filename": "Ubuntu-source-companion-README.md",
+        "sha256": "28bb9839cad63a8883ed4bc256b254c36e87e33687e6caab57172519883d335e",
+        "bytes": 6192,
+        "kind": "os-sources"
+      },
+      {
+        "filename": "Ubuntu-source-companion-SHA256SUMS",
+        "sha256": "a976eaa483453e488bb724b64a01fe9a05cecea71298c05a738a9a9c3b542248",
+        "bytes": 436,
+        "kind": "os-sources"
+      },
+      {
+        "filename": "Ubuntu-source-companion.json",
+        "sha256": "70aae28ae71172ff64897506285cf2fd6963fe52bf648c430073ff7e7b63c81b",
+        "bytes": 41707,
+        "kind": "os-sources"
+      },
+      {
+        "filename": "Ubuntu-sources.lock.json",
+        "sha256": "69970920a7e8b558c7b9f762090b8c737106e9d8c2146d36381e707429046522",
+        "bytes": 1444926,
+        "kind": "os-sources"
+      }
+    ],
+    "metadata": [
+      {
+        "filename": "provenance.json",
+        "sha256": "8d0e85b7785cfd25161d432cd4ff58b319db388c180ddb17907417d59432373b",
+        "bytes": 9385
+      },
+      {
+        "filename": "SHA256SUMS",
+        "sha256": "2471f0400f06259fdc45d1fdf8f516056468f442079581475d7612d245dc8ddf",
+        "bytes": 4628
+      }
+    ],
+    "specification": ".cache/release-0.1.3-spec.json"
+  },
+  "cloudStage": {
+    "formatVersion": 1,
+    "product": "EnoughFactory",
+    "verificationScope": "verified-draft-staging",
+    "status": "passed",
+    "version": "0.1.3",
+    "sourceCommit": "6015b2d0feeeff783c091babcf89f8481bf3ab11",
+    "releaseId": 404264185,
+    "releaseRemainsDraft": true,
+    "deliveryWorkflowCommit": "05ddd5fbb01e366d89b81e5ffc934485bbc5b208",
+    "startedAt": "2026-10-06T03:17:00.427Z",
+    "completedAt": "2026-10-06T03:19:18.964Z",
+    "nativeRun": {
+      "runId": 37406143171,
+      "sourceCommit": "6015b2d0feeeff783c091babcf89f8481bf3ab11",
+      "jobs": [
+        {
+          "id": 112084046164,
+          "name": "linux x64",
+          "conclusion": "success",
+          "stepDetailsAvailable": true
+        },
+        {
+          "id": 112084046258,
+          "name": "linux arm64",
+          "conclusion": "success",
+          "stepDetailsAvailable": true
+        }
+      ],
+      "artifacts": [
+        {
+          "id": 11387324042,
+          "name": "EnoughFactory-linux-x64"
+        },
+        {
+          "id": 11387092966,
+          "name": "EnoughFactory-linux-arm64"
+        }
+      ]
+    },
+    "runtimeCoverage": "qualified-unchanged-0.1.2-components-with-fresh-package-proofs",
+    "ubuntuBaseline": {
+      "releaseId": 404131266,
+      "sourceClosureSha256": "c984eb3ed970146231450be1f9e6b56e80dd462cf47c10a9b16c2d1cd1686ce4",
+      "indexSha256": "70aae28ae71172ff64897506285cf2fd6963fe52bf648c430073ff7e7b63c81b"
+    },
+    "assets": [
+      {
+        "filename": "EnoughFactory-0.1.3-linux-arm64.AppImage",
+        "sha256": "8cec1ee87ed606aee84f05d33f06b83edea279cf8a1b499dfb77422938974097",
+        "bytes": 361699014,
+        "result": "uploaded"
+      },
+      {
+        "filename": "EnoughFactory-0.1.3-linux-arm64.AppImage.verification.json",
+        "sha256": "b251813e2f17bdaf453cb110f5737463e3bec89f690a8308baaf589825064413",
+        "bytes": 152751,
+        "result": "uploaded"
+      },
+      {
+        "filename": "EnoughFactory-0.1.3-linux-arm64.tar.gz",
+        "sha256": "a8981d0cd81f22c6126134580fff3284122e01f7e7fc5095af9663ae19c1025c",
+        "bytes": 349444365,
+        "result": "uploaded"
+      },
+      {
+        "filename": "EnoughFactory-0.1.3-linux-arm64.tar.gz.verification.json",
+        "sha256": "3b99050668a7d87f401fb787f6d101754fdb121ef67f69a9ca91e70ded993d9f",
+        "bytes": 152747,
+        "result": "uploaded"
+      },
+      {
+        "filename": "EnoughFactory-0.1.3-linux-arm64-container-sources.tar.gz",
+        "sha256": "7faa0b0711f97f8c6e837f9e7d3c94fc0e3820db8c3f9f1c0a9d5ff3cd3941c1",
+        "bytes": 56036891,
+        "result": "uploaded"
+      },
+      {
+        "filename": "EnoughFactory-0.1.3-linux-arm64-container-sources.tar.gz.json",
+        "sha256": "34c5bc8455de1b8ebcd07679933e1bb7ceecff4fe04ea1f471d8d21e2018776e",
+        "bytes": 6270,
+        "result": "uploaded"
+      },
+      {
+        "filename": "linux-arm64.installed.verification.json",
+        "sha256": "e96b4827e483ffa19b5ac0cc11c791c17ec1c251a5e21025eb9ca135b4685b86",
+        "bytes": 36360,
+        "result": "uploaded"
+      },
+      {
+        "filename": "linux-arm64.packaged-service-smoke.verification.json",
+        "sha256": "552d81ab48c2becdeb7d822168c5bcf10b45047da7d5cf041c3dfb1f016f9a22",
+        "bytes": 2339,
+        "result": "uploaded"
+      },
+      {
+        "filename": "linux-arm64.service.verification.json",
+        "sha256": "834e716fa5537891169cdb2b957ff05761de2d157a360dd84fa9bc88a59beb1f",
+        "bytes": 4559,
+        "result": "uploaded"
+      },
+      {
+        "filename": "linux-arm64.gui.verification.json",
+        "sha256": "b817c83ba8551ee8750d9fdf1864499e84ead42c3c2a51d45db0b1bbc5edcf7e",
+        "bytes": 824,
+        "result": "uploaded"
+      },
+      {
+        "filename": "linux-arm64.gui.verification.json.png",
+        "sha256": "aa38497c7083c8ca8c9c1f786f9dabed6bd6d5f3bfc2241c2f0a5006cbf28be8",
+        "bytes": 47169,
+        "result": "uploaded"
+      },
+      {
+        "filename": "EnoughFactory-0.1.3-linux-x64.AppImage",
+        "sha256": "eb74585f6c02077969eb47d0fb2ab35ce1c29351dc90d57bf2b8023da5f2321d",
+        "bytes": 371603138,
+        "result": "uploaded"
+      },
+      {
+        "filename": "EnoughFactory-0.1.3-linux-x64.AppImage.verification.json",
+        "sha256": "1277c4266f65fa5fec3e1304d4fb9bbc1c1b097b11f6f5b3c2feabb2c80d39ab",
+        "bytes": 152685,
+        "result": "uploaded"
+      },
+      {
+        "filename": "EnoughFactory-0.1.3-linux-x64.tar.gz",
+        "sha256": "47152079e3d7e082451ca0d4f31ccc89c81cb7f844ed21385c8b368ba8081603",
+        "bytes": 359707054,
+        "result": "uploaded"
+      },
+      {
+        "filename": "EnoughFactory-0.1.3-linux-x64.tar.gz.verification.json",
+        "sha256": "543f2787d59168441537f36de151d0dba131324c43dc37490e5fd661f59a0664",
+        "bytes": 152681,
+        "result": "uploaded"
+      },
+      {
+        "filename": "EnoughFactory-0.1.3-linux-x64-container-sources.tar.gz",
+        "sha256": "8a63fd73739c9f395488fe26e3b84e401862cef175091664d7fcbb1561ede864",
+        "bytes": 55840197,
+        "result": "uploaded"
+      },
+      {
+        "filename": "EnoughFactory-0.1.3-linux-x64-container-sources.tar.gz.json",
+        "sha256": "760dc95de3843de60660e175cd81c90cd950163f23dc6eb90ad1110d10d484eb",
+        "bytes": 6262,
+        "result": "uploaded"
+      },
+      {
+        "filename": "linux-x64.installed.verification.json",
+        "sha256": "2a042ec41fe8d32de63d150ebdd1576cb8c2b0c943b64041563ed5e00f80116a",
+        "bytes": 36338,
+        "result": "uploaded"
+      },
+      {
+        "filename": "linux-x64.packaged-service-smoke.verification.json",
+        "sha256": "f6a5d9abb0c42155b80b2c362fd578ac110076f0665a4fa145525b6672c3cc56",
+        "bytes": 2335,
+        "result": "uploaded"
+      },
+      {
+        "filename": "linux-x64.service.verification.json",
+        "sha256": "c72a04c3e2270c4ad35f669a8ae081b7755a48c5813119d49d30b46194c89ad4",
+        "bytes": 4557,
+        "result": "uploaded"
+      },
+      {
+        "filename": "linux-x64.gui.verification.json",
+        "sha256": "c539cffbb96fe74bdfcf45184f9abd245c7f5b9716f58177e8ffe9a161b37a50",
+        "bytes": 822,
+        "result": "uploaded"
+      },
+      {
+        "filename": "linux-x64.gui.verification.json.png",
+        "sha256": "54044cf7e2401db4bd359b532e9416d137dee0ec00091a9bafda5a32dd9fc2e4",
+        "bytes": 47181,
+        "result": "uploaded"
+      },
+      {
+        "filename": "Ubuntu-source-companion.json",
+        "sha256": "70aae28ae71172ff64897506285cf2fd6963fe52bf648c430073ff7e7b63c81b",
+        "bytes": 41707,
+        "result": "uploaded"
+      },
+      {
+        "filename": "EnoughFactory-Ubuntu-24.04-20260926-sources-part01.tar.gz",
+        "sha256": "de08b49f7ab2882b803f2b3bff3b44feaf193f4e7a75eb5ad8a0ff7f191d3704",
+        "bytes": 766180065,
+        "result": "uploaded"
+      },
+      {
+        "filename": "EnoughFactory-Ubuntu-24.04-20260926-sources-part02.tar.gz",
+        "sha256": "6b27dc2436620fdc7e057facfc454d4b504b983e603c7fe5d079116ffcebaa86",
+        "bytes": 611450171,
+        "result": "uploaded"
+      },
+      {
+        "filename": "Ubuntu-archive-evidence.tar.gz",
+        "sha256": "fc6d93e8ebd64963b2993f96e7ba6ef8f51a0c4e7d975128d2c36fbb25040643",
+        "bytes": 99066216,
+        "result": "uploaded"
+      },
+      {
+        "filename": "Ubuntu-sources.lock.json",
+        "sha256": "69970920a7e8b558c7b9f762090b8c737106e9d8c2146d36381e707429046522",
+        "bytes": 1444926,
+        "result": "uploaded"
+      },
+      {
+        "filename": "Ubuntu-source-companion-SHA256SUMS",
+        "sha256": "a976eaa483453e488bb724b64a01fe9a05cecea71298c05a738a9a9c3b542248",
+        "bytes": 436,
+        "result": "uploaded"
+      },
+      {
+        "filename": "Ubuntu-source-companion-README.md",
+        "sha256": "28bb9839cad63a8883ed4bc256b254c36e87e33687e6caab57172519883d335e",
+        "bytes": 6192,
+        "result": "uploaded"
+      }
+    ],
+    "workflowRun": "https://github.com/enoughtools/EnoughFactory/actions/runs/37408181871"
+  },
+  "macInstallerUpload": {
+    "formatVersion": 1,
+    "product": "EnoughFactory",
+    "version": "0.1.3",
+    "sourceCommit": "6015b2d0feeeff783c091babcf89f8481bf3ab11",
+    "releaseId": 404264185,
+    "draft": true,
+    "status": "passed",
+    "verifiedAt": "2026-10-06T03:30:37.289Z",
+    "assets": [
+      {
+        "id": 614296728,
+        "filename": "EnoughFactory-0.1.3-mac-arm64.dmg",
+        "bytes": 1028572035,
+        "sha256": "a9dfd9ae179a24ff2f74fc798cd9c88a2d95e041a42a84c2b4f2b223ed1c37c4",
+        "serverDigest": "sha256:a9dfd9ae179a24ff2f74fc798cd9c88a2d95e041a42a84c2b4f2b223ed1c37c4",
+        "state": "uploaded"
+      },
+      {
+        "id": 614296737,
+        "filename": "EnoughFactory-0.1.3-mac-arm64.zip",
+        "bytes": 1024657479,
+        "sha256": "574b92c35a76826aa8aba7486a06f35cad9f1a72068807c7876e80bec52b7b3f",
+        "serverDigest": "sha256:574b92c35a76826aa8aba7486a06f35cad9f1a72068807c7876e80bec52b7b3f",
+        "state": "uploaded"
+      }
+    ]
+  },
+  "automaticTagBuild": {
+    "run": "https://github.com/enoughtools/EnoughFactory/actions/runs/37409367842",
+    "cancellationRequested": true,
+    "reason": "The frozen native packages and required checks already passed; stop the redundant tag build before publication.",
+    "conclusion": "cancelled",
+    "verifiedAt": "2026-10-06T03:33:10.901Z",
+    "assetReplacement": false
+  }
+}

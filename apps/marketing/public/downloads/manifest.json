@@ -1,80 +1,110 @@
 {
   "schemaVersion": 1,
   "product": "EnoughFactory",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "status": "published",
-  "publishedAt": "2026-10-06T01:35:08.421Z",
+  "publishedAt": "2026-10-06T03:35:00.231Z",
   "sourceUrl": "https://github.com/enoughtools/EnoughFactory",
-  "sourceCommit": "c71a3a91861c3dd3bd11ab90b9edbc740aa0f12e",
+  "sourceCommit": "6015b2d0feeeff783c091babcf89f8481bf3ab11",
   "artifacts": [
     {
       "platform": "linux",
       "arch": "arm64",
       "format": "AppImage",
-      "filename": "EnoughFactory-0.1.2-linux-arm64.AppImage",
-      "url": "https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.2/EnoughFactory-0.1.2-linux-arm64.AppImage",
-      "sha256": "6747032f84e9184014ceebdc58ed466a3b17fb0abaf753e894dc07305ccda30a",
-      "bytes": 361674452,
+      "filename": "EnoughFactory-0.1.3-linux-arm64.AppImage",
+      "url": "https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.3/EnoughFactory-0.1.3-linux-arm64.AppImage",
+      "sha256": "8cec1ee87ed606aee84f05d33f06b83edea279cf8a1b499dfb77422938974097",
+      "bytes": 361699014,
       "signing": "unsigned",
-      "verificationUrl": "/downloads/0.1.2/EnoughFactory-0.1.2-linux-arm64.AppImage.verification.json"
+      "verificationUrl": "/downloads/0.1.3/EnoughFactory-0.1.3-linux-arm64.AppImage.verification.json",
+      "verificationReceiptUrls": {
+        "service": "/downloads/0.1.3/linux-arm64.service.verification.json",
+        "gui": "/downloads/0.1.3/linux-arm64.gui.verification.json",
+        "smoke": "/downloads/0.1.3/linux-arm64.packaged-service-smoke.verification.json"
+      }
     },
     {
       "platform": "linux",
       "arch": "arm64",
       "format": "tar.gz",
-      "filename": "EnoughFactory-0.1.2-linux-arm64.tar.gz",
-      "url": "https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.2/EnoughFactory-0.1.2-linux-arm64.tar.gz",
-      "sha256": "43b9d6fca70f46c8d26ca01b673165f23192dffebc5e34017973764d2ab5f47e",
-      "bytes": 349310172,
+      "filename": "EnoughFactory-0.1.3-linux-arm64.tar.gz",
+      "url": "https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.3/EnoughFactory-0.1.3-linux-arm64.tar.gz",
+      "sha256": "a8981d0cd81f22c6126134580fff3284122e01f7e7fc5095af9663ae19c1025c",
+      "bytes": 349444365,
       "signing": "unsigned",
-      "verificationUrl": "/downloads/0.1.2/EnoughFactory-0.1.2-linux-arm64.tar.gz.verification.json"
+      "verificationUrl": "/downloads/0.1.3/EnoughFactory-0.1.3-linux-arm64.tar.gz.verification.json",
+      "verificationReceiptUrls": {
+        "service": "/downloads/0.1.3/linux-arm64.service.verification.json",
+        "gui": "/downloads/0.1.3/linux-arm64.gui.verification.json",
+        "smoke": "/downloads/0.1.3/linux-arm64.packaged-service-smoke.verification.json"
+      }
     },
     {
       "platform": "linux",
       "arch": "x64",
       "format": "AppImage",
-      "filename": "EnoughFactory-0.1.2-linux-x64.AppImage",
-      "url": "https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.2/EnoughFactory-0.1.2-linux-x64.AppImage",
-      "sha256": "e47c3b62a23f949fb04a777eb2e5299e317d45aa949078953f5e459a08c7f25c",
-      "bytes": 371578632,
+      "filename": "EnoughFactory-0.1.3-linux-x64.AppImage",
+      "url": "https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.3/EnoughFactory-0.1.3-linux-x64.AppImage",
+      "sha256": "eb74585f6c02077969eb47d0fb2ab35ce1c29351dc90d57bf2b8023da5f2321d",
+      "bytes": 371603138,
       "signing": "unsigned",
-      "verificationUrl": "/downloads/0.1.2/EnoughFactory-0.1.2-linux-x64.AppImage.verification.json"
+      "verificationUrl": "/downloads/0.1.3/EnoughFactory-0.1.3-linux-x64.AppImage.verification.json",
+      "verificationReceiptUrls": {
+        "service": "/downloads/0.1.3/linux-x64.service.verification.json",
+        "gui": "/downloads/0.1.3/linux-x64.gui.verification.json",
+        "smoke": "/downloads/0.1.3/linux-x64.packaged-service-smoke.verification.json"
+      }
     },
     {
       "platform": "linux",
       "arch": "x64",
       "format": "tar.gz",
-      "filename": "EnoughFactory-0.1.2-linux-x64.tar.gz",
-      "url": "https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.2/EnoughFactory-0.1.2-linux-x64.tar.gz",
-      "sha256": "861a18c0774380c98b2c8a06954d7d7ce3c3e0452baa7256ce344deca7afc5a4",
-      "bytes": 359575568,
+      "filename": "EnoughFactory-0.1.3-linux-x64.tar.gz",
+      "url": "https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.3/EnoughFactory-0.1.3-linux-x64.tar.gz",
+      "sha256": "47152079e3d7e082451ca0d4f31ccc89c81cb7f844ed21385c8b368ba8081603",
+      "bytes": 359707054,
       "signing": "unsigned",
-      "verificationUrl": "/downloads/0.1.2/EnoughFactory-0.1.2-linux-x64.tar.gz.verification.json"
+      "verificationUrl": "/downloads/0.1.3/EnoughFactory-0.1.3-linux-x64.tar.gz.verification.json",
+      "verificationReceiptUrls": {
+        "service": "/downloads/0.1.3/linux-x64.service.verification.json",
+        "gui": "/downloads/0.1.3/linux-x64.gui.verification.json",
+        "smoke": "/downloads/0.1.3/linux-x64.packaged-service-smoke.verification.json"
+      }
     },
     {
       "platform": "darwin",
       "arch": "arm64",
       "format": "dmg",
-      "filename": "EnoughFactory-0.1.2-mac-arm64.dmg",
-      "url": "https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.2/EnoughFactory-0.1.2-mac-arm64.dmg",
-      "sha256": "cf59cc6c2ea78a8062642621b59d2d8aca47e4887bd0a5e527addd59c5c35b41",
-      "bytes": 1028323204,
+      "filename": "EnoughFactory-0.1.3-mac-arm64.dmg",
+      "url": "https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.3/EnoughFactory-0.1.3-mac-arm64.dmg",
+      "sha256": "a9dfd9ae179a24ff2f74fc798cd9c88a2d95e041a42a84c2b4f2b223ed1c37c4",
+      "bytes": 1028572035,
       "signing": "unsigned",
-      "verificationUrl": "/downloads/0.1.2/EnoughFactory-0.1.2-mac-arm64.dmg.verification.json"
+      "verificationUrl": "/downloads/0.1.3/EnoughFactory-0.1.3-mac-arm64.dmg.verification.json",
+      "verificationReceiptUrls": {
+        "service": "/downloads/0.1.3/darwin-arm64.service.verification.json",
+        "gui": "/downloads/0.1.3/darwin-arm64.gui.verification.json",
+        "smoke": "/downloads/0.1.3/darwin-arm64.packaged-service-smoke.verification.json"
+      }
     },
     {
       "platform": "darwin",
       "arch": "arm64",
       "format": "zip",
-      "filename": "EnoughFactory-0.1.2-mac-arm64.zip",
-      "url": "https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.2/EnoughFactory-0.1.2-mac-arm64.zip",
-      "sha256": "ab62304268dbb9eed0814bae53fe874036650a496152ec2c028a508b91f2fc02",
-      "bytes": 1024522382,
+      "filename": "EnoughFactory-0.1.3-mac-arm64.zip",
+      "url": "https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.3/EnoughFactory-0.1.3-mac-arm64.zip",
+      "sha256": "574b92c35a76826aa8aba7486a06f35cad9f1a72068807c7876e80bec52b7b3f",
+      "bytes": 1024657479,
       "signing": "unsigned",
-      "verificationUrl": "/downloads/0.1.2/EnoughFactory-0.1.2-mac-arm64.zip.verification.json"
+      "verificationUrl": "/downloads/0.1.3/EnoughFactory-0.1.3-mac-arm64.zip.verification.json",
+      "verificationReceiptUrls": {
+        "service": "/downloads/0.1.3/darwin-arm64.service.verification.json",
+        "gui": "/downloads/0.1.3/darwin-arm64.gui.verification.json",
+        "smoke": "/downloads/0.1.3/darwin-arm64.packaged-service-smoke.verification.json"
+      }
     }
   ],
-  "releaseBaseUrl": "https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.2",
+  "releaseBaseUrl": "https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.3",
   "ubuntuSourceIndexSha256": "70aae28ae71172ff64897506285cf2fd6963fe52bf648c430073ff7e7b63c81b",
   "sources": [
     {
@@ -82,60 +112,60 @@
       "role": "archive",
       "platform": "linux",
       "arch": "arm64",
-      "filename": "EnoughFactory-0.1.2-linux-arm64-container-sources.tar.gz",
+      "filename": "EnoughFactory-0.1.3-linux-arm64-container-sources.tar.gz",
       "sha256": "7faa0b0711f97f8c6e837f9e7d3c94fc0e3820db8c3f9f1c0a9d5ff3cd3941c1",
       "bytes": 56036891,
-      "url": "https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.2/EnoughFactory-0.1.2-linux-arm64-container-sources.tar.gz"
+      "url": "https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.3/EnoughFactory-0.1.3-linux-arm64-container-sources.tar.gz"
     },
     {
       "kind": "container-engine",
       "role": "receipt",
       "platform": "linux",
       "arch": "arm64",
-      "filename": "EnoughFactory-0.1.2-linux-arm64-container-sources.tar.gz.json",
+      "filename": "EnoughFactory-0.1.3-linux-arm64-container-sources.tar.gz.json",
       "sha256": "34c5bc8455de1b8ebcd07679933e1bb7ceecff4fe04ea1f471d8d21e2018776e",
       "bytes": 6270,
-      "url": "https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.2/EnoughFactory-0.1.2-linux-arm64-container-sources.tar.gz.json"
+      "url": "https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.3/EnoughFactory-0.1.3-linux-arm64-container-sources.tar.gz.json"
     },
     {
       "kind": "container-engine",
       "role": "archive",
       "platform": "linux",
       "arch": "x64",
-      "filename": "EnoughFactory-0.1.2-linux-x64-container-sources.tar.gz",
+      "filename": "EnoughFactory-0.1.3-linux-x64-container-sources.tar.gz",
       "sha256": "8a63fd73739c9f395488fe26e3b84e401862cef175091664d7fcbb1561ede864",
       "bytes": 55840197,
-      "url": "https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.2/EnoughFactory-0.1.2-linux-x64-container-sources.tar.gz"
+      "url": "https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.3/EnoughFactory-0.1.3-linux-x64-container-sources.tar.gz"
     },
     {
       "kind": "container-engine",
       "role": "receipt",
       "platform": "linux",
       "arch": "x64",
-      "filename": "EnoughFactory-0.1.2-linux-x64-container-sources.tar.gz.json",
+      "filename": "EnoughFactory-0.1.3-linux-x64-container-sources.tar.gz.json",
       "sha256": "760dc95de3843de60660e175cd81c90cd950163f23dc6eb90ad1110d10d484eb",
       "bytes": 6262,
-      "url": "https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.2/EnoughFactory-0.1.2-linux-x64-container-sources.tar.gz.json"
+      "url": "https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.3/EnoughFactory-0.1.3-linux-x64-container-sources.tar.gz.json"
     },
     {
       "kind": "container-engine",
       "role": "archive",
       "platform": "darwin",
       "arch": "arm64",
-      "filename": "EnoughFactory-0.1.2-darwin-arm64-container-sources.tar.gz",
+      "filename": "EnoughFactory-0.1.3-darwin-arm64-container-sources.tar.gz",
       "sha256": "18680ab52d8d1fcfe4eea6858c0f558433ad0a45e7a1b9b260fbb4bbfd932a46",
       "bytes": 63940433,
-      "url": "https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.2/EnoughFactory-0.1.2-darwin-arm64-container-sources.tar.gz"
+      "url": "https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.3/EnoughFactory-0.1.3-darwin-arm64-container-sources.tar.gz"
     },
     {
       "kind": "container-engine",
       "role": "receipt",
       "platform": "darwin",
       "arch": "arm64",
-      "filename": "EnoughFactory-0.1.2-darwin-arm64-container-sources.tar.gz.json",
+      "filename": "EnoughFactory-0.1.3-darwin-arm64-container-sources.tar.gz.json",
       "sha256": "fddcaa175328c943a5209f7b090109229ad5fa291ea6602d869a9f8a476d8473",
       "bytes": 6869,
-      "url": "https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.2/EnoughFactory-0.1.2-darwin-arm64-container-sources.tar.gz.json"
+      "url": "https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.3/EnoughFactory-0.1.3-darwin-arm64-container-sources.tar.gz.json"
     },
     {
       "kind": "ubuntu",
@@ -143,7 +173,7 @@
       "filename": "EnoughFactory-Ubuntu-24.04-20260926-sources-part01.tar.gz",
       "sha256": "de08b49f7ab2882b803f2b3bff3b44feaf193f4e7a75eb5ad8a0ff7f191d3704",
       "bytes": 766180065,
-      "url": "https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.2/EnoughFactory-Ubuntu-24.04-20260926-sources-part01.tar.gz"
+      "url": "https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.3/EnoughFactory-Ubuntu-24.04-20260926-sources-part01.tar.gz"
     },
     {
       "kind": "ubuntu",
@@ -151,7 +181,7 @@
       "filename": "EnoughFactory-Ubuntu-24.04-20260926-sources-part02.tar.gz",
       "sha256": "6b27dc2436620fdc7e057facfc454d4b504b983e603c7fe5d079116ffcebaa86",
       "bytes": 611450171,
-      "url": "https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.2/EnoughFactory-Ubuntu-24.04-20260926-sources-part02.tar.gz"
+      "url": "https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.3/EnoughFactory-Ubuntu-24.04-20260926-sources-part02.tar.gz"
     },
     {
       "kind": "ubuntu",
@@ -159,7 +189,7 @@
       "filename": "Ubuntu-archive-evidence.tar.gz",
       "sha256": "fc6d93e8ebd64963b2993f96e7ba6ef8f51a0c4e7d975128d2c36fbb25040643",
       "bytes": 99066216,
-      "url": "https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.2/Ubuntu-archive-evidence.tar.gz"
+      "url": "https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.3/Ubuntu-archive-evidence.tar.gz"
     },
     {
       "kind": "ubuntu",
@@ -167,7 +197,7 @@
       "filename": "Ubuntu-sources.lock.json",
       "sha256": "69970920a7e8b558c7b9f762090b8c737106e9d8c2146d36381e707429046522",
       "bytes": 1444926,
-      "url": "https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.2/Ubuntu-sources.lock.json"
+      "url": "https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.3/Ubuntu-sources.lock.json"
     },
     {
       "kind": "ubuntu",
@@ -175,7 +205,7 @@
       "filename": "Ubuntu-source-companion.json",
       "sha256": "70aae28ae71172ff64897506285cf2fd6963fe52bf648c430073ff7e7b63c81b",
       "bytes": 41707,
-      "url": "https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.2/Ubuntu-source-companion.json"
+      "url": "https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.3/Ubuntu-source-companion.json"
     },
     {
       "kind": "ubuntu",
@@ -183,7 +213,7 @@
       "filename": "Ubuntu-source-companion-SHA256SUMS",
       "sha256": "a976eaa483453e488bb724b64a01fe9a05cecea71298c05a738a9a9c3b542248",
       "bytes": 436,
-      "url": "https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.2/Ubuntu-source-companion-SHA256SUMS"
+      "url": "https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.3/Ubuntu-source-companion-SHA256SUMS"
     },
     {
       "kind": "ubuntu",
@@ -191,7 +221,7 @@
       "filename": "Ubuntu-source-companion-README.md",
       "sha256": "28bb9839cad63a8883ed4bc256b254c36e87e33687e6caab57172519883d335e",
       "bytes": 6192,
-      "url": "https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.2/Ubuntu-source-companion-README.md"
+      "url": "https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.3/Ubuntu-source-companion-README.md"
     }
   ]
 }

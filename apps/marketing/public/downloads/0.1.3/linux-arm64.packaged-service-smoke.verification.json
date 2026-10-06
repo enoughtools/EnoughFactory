@@ -1,0 +1,68 @@
+{
+  "formatVersion": 1,
+  "product": "EnoughFactory",
+  "suite": "packaged-service-smoke",
+  "status": "passed",
+  "version": "0.1.3",
+  "platform": "linux",
+  "arch": "arm64",
+  "sourceCommit": "6015b2d0feeeff783c091babcf89f8481bf3ab11",
+  "startedAt": "2026-10-06T02:58:52.620Z",
+  "completedAt": "2026-10-06T02:58:53.283Z",
+  "bundle": {
+    "manifestSha256": "7a7556cae61700ff9ba547240921f9f802aed0a196ebb57842725a75530f49a9",
+    "sourceCommit": "6015b2d0feeeff783c091babcf89f8481bf3ab11",
+    "version": "0.1.3",
+    "platform": "linux",
+    "arch": "arm64"
+  },
+  "serviceSha256": "e9aae6d860e924357c6418bc122b809561d4e170eb043c691d0882d61c04fb0b",
+  "nodeSha256": "8eeefcacdf48f58541a651016e604055d14a992e39df98636b76495bc7244395",
+  "checks": [
+    "current bundled Node and service match the installed manifest",
+    "authenticated local health reports the current release",
+    "inspection endpoints reject unauthenticated requests",
+    "paused goal projects typed tasks and recovered controllers",
+    "task inspection preserves kind, criteria and expected outputs",
+    "attempt inspection exposes retained candidate and check receipts",
+    "legacy task inspection preserves absent optional fields",
+    "inspection hides private paths and leaves records unchanged",
+    "artifact content matches its immutable manifest",
+    "owned private runtime remains stopped",
+    "authenticated shutdown exits and closes the service"
+  ],
+  "scope": {
+    "transport": "authenticated-local-http",
+    "pairedTransportTested": false,
+    "containerEngineStarted": false,
+    "agentOrModelStarted": false
+  },
+  "inspection": {
+    "typedTaskKind": "feature",
+    "criteriaAndOutputsPreserved": true,
+    "retainedAttemptReceipts": true,
+    "controllerRecovery": "interrupted",
+    "legacyOptionalFieldsPreserved": true,
+    "privatePathsRedacted": true,
+    "readOnlyRecordsPreserved": true
+  },
+  "authentication": {
+    "unauthenticatedStatus": 401
+  },
+  "runtime": {
+    "kind": "rootless",
+    "state": "stopped",
+    "ownedStateDirectory": true,
+    "ownedSocket": true
+  },
+  "shutdown": {
+    "authenticated": true,
+    "exitedCleanly": true,
+    "connectionClosed": true
+  },
+  "artifact": {
+    "sha256": "bec1f1272275fe6ab67a2d69a50caa4cd5944e77fe4ea13e91ab965afdbbb55d",
+    "size": 47,
+    "contentVerified": true
+  }
+}

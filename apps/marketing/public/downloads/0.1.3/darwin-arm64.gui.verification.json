@@ -1,0 +1,21 @@
+{
+  "formatVersion": 1,
+  "product": "EnoughFactory",
+  "suite": "desktop-gui",
+  "status": "passed",
+  "platform": "darwin",
+  "arch": "arm64",
+  "sourceCommit": "6015b2d0feeeff783c091babcf89f8481bf3ab11",
+  "bundleProvenanceSha256": "d3154adf04e03b077226943e0e748ef957c2b7da13e9f992ef2e680c98008bbd",
+  "rendererSandbox": {
+    "enabled": true
+  },
+  "screenshotSha256": "3df80c7eba3bf99d8f2056f1e302a76c2366f78bd228152fef5b015a4c9e77cc",
+  "checks": [
+    "packaged Electron starts with Chromium sandbox enabled",
+    "shared workbench mounts in the isolated native renderer",
+    "isolated native workbench renders a visible frame",
+    "bundled independent device service answers authenticated health",
+    "device service remains healthy after native desktop exits"
+  ]
+}
