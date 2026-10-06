@@ -2,11 +2,11 @@ import { randomUUID, createHash } from 'node:crypto';
 import { createReadStream } from 'node:fs';
 import { mkdir, readFile, writeFile, lstat, readlink, open } from 'node:fs/promises';
 import path from 'node:path';
-import type { Attempt, FactoryTask, Goal, Project, Decision } from '@enoughfactory/contracts';
+import type { Attempt, FactoryTask, Goal, Project, Decision, ControllerRun } from '@enoughfactory/contracts';
 import {
   FactoryCoordinator, FactoryOperationError, type FactoryWorkspacePort, type FactoryRuntimePort, type WorkspaceRef,
   type CandidateRef, type ExecutionResult, type CheckResult, type CreateGoalInput,
-  type RepositoryEvidence, type EvaluationRecord,
+  type RepositoryEvidence, type EvaluationRecord, type ControlRecord,
 } from '@enoughfactory/factory';
 import { WorkspaceManager, ArtifactFsWorkspaceProvider, dockerCheckExecutor, type ArtifactManifest, type Candidate, type CheckReport, type WorkspaceRecord } from '@enoughfactory/workspaces';
 import type { PeerManager } from '@enoughfactory/peers';
@@ -15,6 +15,7 @@ import { dockerInvocation } from '@enoughfactory/runtime';
 import type { DeviceApp, ApiCall } from './app.ts';
 import type { ChatController } from './chats.ts';
 import { exec, HttpError, now } from './util.ts';
+import { inspectAttempt, inspectGoal, inspectTask } from './task-inspection.ts';
 
 interface WorkerRecord {
   id: string; coordinatorId: string; goal: Goal; task: FactoryTask; attempt: Attempt; project: Project;
@@ -29,6 +30,9 @@ const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, m
 
 /** The service owns execution and the supervisor; no open window is required. */
 export async function initializeFactory(app: DeviceApp, chats: ChatController, network?: { peers: PeerManager }) {
+  for (const run of app.store.list<ControllerRun>('factory-controller-runs')) {
+    if (run.status === 'starting' || run.status === 'running') app.store.set('factory-controller-runs', { ...run, status: 'interrupted', error: 'The device service restarted before this decision completed. Its conversation and environment remain inspectable.', updatedAt: now() });
+  }
   const checkExecutor=dockerCheckExecutor({ image:process.env.ENOUGHFACTORY_CHECK_IMAGE,dockerRuntime:app.runtime.endpoint });
   const workspaces = new WorkspaceManager({
     dataDir: path.join(app.dataDir, 'workspace-data'), deviceId: app.device.id,
@@ -339,7 +343,7 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
       await configureHandoff(workspace);
       const owned = internalProject(project, workspace, `${goal.title} · ${role}`);
       const session = await app.sessions.create(owned, sessionName(operation));
-      const record = { id: operation, goalId: goal.id, role, sessionId: session.id, status: 'starting', updatedAt: now() };
+      const record: ControllerRun = { id: operation, goalId: goal.id, role, sessionId: session.id, status: 'starting', updatedAt: now() };
       app.store.set('factory-controller-runs', record);
       let chatId: string | undefined;
       const cancel = () => {
@@ -358,6 +362,9 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
           systemInstructions: `You are the EnoughFactory ${role}. This container contains an isolated snapshot of the current project repository. Inspect the actual source and relevant runtime evidence to make your decision. You have full container permissions under ${goal.approvalMode} policy. Your role is to decide the next factory action; implementation belongs to assigned worker tasks. Do not modify product source as part of this decision. Return the structured JSON requested in the prompt. Goal: ${goal.objective}` });
         app.store.set('factory-controller-runs', { ...record, chatId: chat.id, status: 'completed', updatedAt: now(), result: result.text });
         return { text: result.text, chatId: chat.id, spend: spend(result) };
+      } catch (error) {
+        app.store.set('factory-controller-runs', { ...record, chatId, status: signal?.aborted ? 'interrupted' : 'failed', error: (error as Error).message, updatedAt: now() });
+        throw error;
       } finally {
         signal?.removeEventListener('abort', cancel);
         const current = app.sessions.record(session.id);
@@ -421,6 +428,7 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
     if (goalRoute) {
       const goal = app.store.get<Goal>('goals', goalRoute[1]); if (!goal) throw new HttpError(404, 'Goal not found.');
       const action = goalRoute[2];
+      if (method === 'GET' && action === 'inspection') return inspectGoal(app.store, app.devices, goal);
       if (method === 'GET' && !action) return { goal, tasks: app.store.list<FactoryTask>('tasks').filter(t => t.goalId === goal.id),
         attempts: app.store.list<Attempt>('attempts').filter(a => app.store.list<FactoryTask>('tasks').some(t => t.id === a.taskId && t.goalId === goal.id)),
         decisions: app.store.list<Decision>('decisions').filter(d => d.goalId === goal.id),
@@ -453,14 +461,48 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
       if (method === 'POST' && action === 'tasks') { coordinator.selectTasks(goal.id, stringArray(body.taskIds)); return { ok: true }; }
       if (method === 'POST' && action === 'wake') { coordinator.notifyCondition(String(body.condition || 'external-condition'), goal.id); return { ok: true }; }
     }
+    const taskInspectionRoute = route.match(/^\/api\/tasks\/([^/]+)$/);
+    if (method === 'GET' && taskInspectionRoute) {
+      const task = app.store.get<FactoryTask>('tasks', taskInspectionRoute[1]); if (!task) throw new HttpError(404, 'Task not found.');
+      return inspectTask(app.store, app.devices, task);
+    }
+    const attemptInspectionRoute = route.match(/^\/api\/attempts\/([^/]+)$/);
+    if (method === 'GET' && attemptInspectionRoute) {
+      const attempt = app.store.get<Attempt>('attempts', attemptInspectionRoute[1]); if (!attempt) throw new HttpError(404, 'Attempt not found.');
+      return inspectAttempt(app.store, attempt);
+    }
     const taskRoute = route.match(/^\/api\/tasks\/([^/]+)\/(run|retry)$/);
     if (method === 'POST' && taskRoute) {
-      const task = app.store.get<FactoryTask>('tasks', taskRoute[1]); if (!task) throw new HttpError(404, 'Task not found.');
-      if (taskRoute[2] === 'retry' && task.currentAttemptId) await coordinator.retireAttempt(task.currentAttemptId);
+      if (body.expectedGoalRevision !== undefined && (!Number.isInteger(body.expectedGoalRevision) || Number(body.expectedGoalRevision) < 1)) throw new HttpError(400, 'Expected goal revision must be a positive integer.');
+      if (body.expectedAttemptId !== undefined && body.expectedAttemptId !== null && typeof body.expectedAttemptId !== 'string') throw new HttpError(400, 'Expected attempt identity must be text or null.');
+      const currentState = (expectedRevision: unknown) => {
+        const task = app.store.get<FactoryTask>('tasks', taskRoute[1]); if (!task) throw new HttpError(404, 'Task not found.');
+        const goal = app.store.get<Goal>('goals', task.goalId); if (!goal) throw new HttpError(404, 'Goal not found.');
+        const control = app.store.get<ControlRecord>('factory-control', goal.id);
+        if ((expectedRevision !== undefined && goal.revision !== expectedRevision) || !['draft', 'running', 'waiting'].includes(goal.status) || control?.stage !== 'dispatch') throw new HttpError(409, 'The goal changed or is coordinating another action. Refresh its task before running or retrying.');
+        return { task, goal };
+      };
+      const { task, goal } = currentState(body.expectedGoalRevision);
+      if (taskRoute[2] === 'run') {
+        if (!['queued', 'ready'].includes(task.status) || !task.dependsOn.every(id => app.store.get<FactoryTask>('tasks', id)?.status === 'completed')) throw new HttpError(409, 'This task is no longer eligible to run. Refresh its current state.');
+      } else {
+        const attempt = task.currentAttemptId ? app.store.get<Attempt>('attempts', task.currentAttemptId) : undefined;
+        if (task.status !== 'failed' || (task.currentAttemptId && attempt?.status !== 'failed') || (body.expectedAttemptId !== undefined && body.expectedAttemptId !== (task.currentAttemptId ?? null))) throw new HttpError(409, 'This failed attempt has changed. Refresh its current state before retrying.');
+        if (task.currentAttemptId) {
+          try { await coordinator.retireAttempt(task.currentAttemptId); }
+          catch (error) { if (error instanceof FactoryOperationError && error.kind === 'stale') throw new HttpError(409, error.message); throw error; }
+          const after = currentState(goal.revision).task;
+          if (after.status !== 'queued' || after.currentAttemptId) throw new HttpError(409, 'Coordination advanced while cancellation was acknowledged. Refresh the current attempt.');
+        }
+      }
       coordinator.selectTasks(task.goalId, [task.id]); return { ok: true };
     }
     const attemptRoute = route.match(/^\/api\/attempts\/([^/]+)\/retire$/);
-    if (method === 'POST' && attemptRoute) { await coordinator.retireAttempt(attemptRoute[1]); return { ok: true }; }
+    if (method === 'POST' && attemptRoute) {
+      try { await coordinator.retireAttempt(attemptRoute[1]); }
+      catch (error) { if (error instanceof FactoryOperationError && error.kind === 'stale') throw new HttpError(409, error.message); throw error; }
+      return { ok: true };
+    }
     const artifactRoute = route.match(/^\/api\/artifacts\/([^/]+)(?:\/(content|chunk))?$/);
     if (method === 'GET' && artifactRoute) {
       const manifest = await workspaces.artifacts.get(artifactRoute[1]);

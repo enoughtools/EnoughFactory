@@ -106,14 +106,16 @@ jobs:
       - name: Install locked dependencies
         run: pnpm install --frozen-lockfile
       - name: Check types and tagged version
+        id: release_identity
         env:
           RELEASE_REF: ${{ github.ref }}
         run: |
           pnpm typecheck
           node --input-type=module <<'NODE'
-          import { readFile } from 'node:fs/promises';
+          import { appendFile, readFile } from 'node:fs/promises';
           const version = JSON.parse(await readFile('package.json', 'utf8')).version;
           if (process.env.RELEASE_REF.startsWith('refs/tags/') && process.env.RELEASE_REF !== `refs/tags/v${version}`) throw new Error('Release tag must match the package version.');
+          await appendFile(process.env.GITHUB_OUTPUT, `version=${version}\n`);
           NODE
       - name: Compare native Linux build inputs with the verified baseline
         if: matrix.platform == 'linux'
@@ -163,6 +165,16 @@ jobs:
           CSC_IDENTITY_AUTO_DISCOVERY: 'false'
       - name: Verify installed runtime on its native architecture
         run: node scripts/check-desktop-bundle.mjs --resources "${{ matrix.installedResources }}" --receipt "releases/${{ matrix.platform }}-${{ matrix.arch }}.installed.verification.json" --source-commit "$GITHUB_SHA"
+      - name: Download original published component evidence
+        if: matrix.platform == 'linux' && steps.release_identity.outputs.version == '0.1.3'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/download-component-baseline.mjs --platform linux --arch "${{ matrix.arch }}" --output ".cache/component-baseline/linux-${{ matrix.arch }}"
+      - name: Qualify unchanged runtime components against published evidence
+        if: matrix.platform == 'linux' && steps.release_identity.outputs.version == '0.1.3'
+        run: node scripts/qualify-desktop-components.mjs --resources "${{ matrix.installedResources }}" --baseline-directory ".cache/component-baseline/linux-${{ matrix.arch }}" --receipt "releases/linux-${{ matrix.arch }}.component-qualification.verification.json" --source-commit "$GITHUB_SHA"
+      - name: Verify packaged service inspection without starting containers
+        run: node scripts/check-packaged-service-smoke.mjs --resources "${{ matrix.installedResources }}" --receipt "releases/${{ matrix.platform }}-${{ matrix.arch }}.packaged-service-smoke.verification.json" --source-commit "$GITHUB_SHA"
       - name: Prepare Linux user namespaces in this disposable runner
         if: matrix.platform == 'linux'
         env:
@@ -207,22 +219,27 @@ jobs:
           export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
           node scripts/check-installed-service.mjs --resources "${{ matrix.installedResources }}" --receipt "releases/${{ matrix.platform }}-${{ matrix.arch }}.service.verification.json" --source-commit "$GITHUB_SHA"
       - name: Verify the bundled private Linux engine and source retention
-        if: matrix.platform == 'linux'
+        if: matrix.platform == 'linux' && steps.release_identity.outputs.version != '0.1.3'
         run: |
           pnpm exec esbuild scripts/check-linux-runtime.ts --bundle --platform=node --format=esm --outfile=.cache/check-linux-runtime.mjs
           "${{ matrix.installedResources }}/runtime/node" .cache/check-linux-runtime.mjs --assets "${{ matrix.installedResources }}/runtime/container" --envmux "${{ matrix.installedResources }}/envmux/envmux" --bundle-provenance "${{ matrix.installedResources }}/bundle-provenance.json" --receipt "releases/${{ matrix.platform }}-${{ matrix.arch }}.runtime.verification.json"
       - name: Verify the exact downloadable archives
         env:
           RUNTIME_RECEIPT: releases/${{ matrix.platform }}-${{ matrix.arch }}.runtime.verification.json
+          COMPONENT_QUALIFICATION: releases/${{ matrix.platform }}-${{ matrix.arch }}.component-qualification.verification.json
         run: |
           node --input-type=module <<'NODE'
           import { readdir, access } from 'node:fs/promises';
           import { execFileSync } from 'node:child_process';
           let runtimeReceipt;
           try { await access(process.env.RUNTIME_RECEIPT); runtimeReceipt = process.env.RUNTIME_RECEIPT; } catch {}
+          let componentQualification;
+          try { await access(process.env.COMPONENT_QUALIFICATION); componentQualification = process.env.COMPONENT_QUALIFICATION; } catch {}
+          if (runtimeReceipt && componentQualification) throw new Error('Archive coverage must select either a fresh runtime journey or unchanged-component qualification.');
           for (const name of (await readdir('releases')).filter(name => /^EnoughFactory-.+-(mac|linux)-(arm64|x64|x86_64)\.(dmg|zip|AppImage|tar\.gz)$/.test(name)).sort()) {
             const args = ['scripts/check-desktop-archive.mjs', '--artifact', `releases/${name}`, '--receipt', `releases/${name}.verification.json`, '--source-commit', process.env.GITHUB_SHA];
             if (runtimeReceipt) args.push('--runtime-receipt', runtimeReceipt);
+            if (componentQualification) args.push('--component-qualification', componentQualification);
             execFileSync(process.execPath, args, { stdio: 'inherit' });
           }
           NODE

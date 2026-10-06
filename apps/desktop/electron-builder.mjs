@@ -16,7 +16,7 @@ export default {
     notarize: Boolean(process.env.APPLE_ID && process.env.APPLE_APP_SPECIFIC_PASSWORD && process.env.APPLE_TEAM_ID),
     artifactName: 'EnoughFactory-${version}-mac-${arch}.${ext}',
   },
-  dmg: { title: 'EnoughFactory ${version}', backgroundColor: '#f7f5f0', iconSize: 96, window: { width: 540, height: 360 } },
+  dmg: { title: 'EnoughFactory ${version}', backgroundColor: '#f4f5f8', iconSize: 96, window: { width: 540, height: 360 } },
   linux: {
     executableName: 'enoughfactory',
     icon: 'assets/icon.png',

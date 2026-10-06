@@ -217,10 +217,23 @@
     }
   },
   "browserToDevice": {
-    "status": "awaiting-user-permission",
+    "status": "passed",
+    "verifiedAt": "2026-10-06T02:06:00.302Z",
     "permission": "Chrome local-device access for factory.enoughtools.com",
-    "scope": "Empty isolated service from final released Mac resources; no container engine started",
-    "reason": "Browser-control policy requires confirmation before accepting an unexpected site permission",
-    "permissionAccepted": false
+    "permissionAccepted": true,
+    "userAuthorization": "User explicitly replied Allow to the pending site-permission request",
+    "scope": "Hosted interface connected to empty isolated service from final released Mac resources; no container engine started",
+    "serviceVersion": "0.1.2",
+    "sourceCommit": "c71a3a91861c3dd3bd11ab90b9edbc740aa0f12e",
+    "observations": [
+      "Device service connected displayed for Release verification Mac",
+      "Workspace state loaded after permission and refresh",
+      "Add project is available; zero live environments",
+      "Private runtime remains stopped"
+    ],
+    "screenshot": {
+      "path": "docs/verification/public-workspace-connected-0.1.2.jpg",
+      "sha256": "ed51116760b2007a2f2a4132240fb8a144d11a11ed696c9dc3bb4b4e1c18addb"
+    }
   }
 }

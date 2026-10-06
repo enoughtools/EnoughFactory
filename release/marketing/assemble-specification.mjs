@@ -51,8 +51,10 @@ for (const filename of (await readdir(releaseDirectory)).filter(name => pattern.
     const filename = relative(releaseDirectory, verificationPath);
     verificationFiles.set(filename, { path: relative(outputDirectory, verificationPath), url: `${releaseBaseUrl}/${filename}`, sha256: hashBytes(bytes), bytes: bytes.length });
   }
-  if (platform === 'darwin') {
-    const apiPath = resolve(releaseDirectory, `${platform}-${arch}.packaged-service-runtime.verification.json`);
+  let smokePath;
+  if (receipt.componentQualification || platform === 'darwin') {
+    const apiPath = resolve(releaseDirectory, `${platform}-${arch}.${receipt.componentQualification ? 'packaged-service-smoke' : 'packaged-service-runtime'}.verification.json`);
+    if (receipt.componentQualification) smokePath = apiPath;
     const apiBytes = await readFile(apiPath);
     verifyPackagedServiceProof(receipt, JSON.parse(apiBytes));
     inputPaths.add(apiPath);
@@ -60,7 +62,7 @@ for (const filename of (await readdir(releaseDirectory)).filter(name => pattern.
     verificationFiles.set(apiFilename, { path: relative(outputDirectory, apiPath), url: `${releaseBaseUrl}/${apiFilename}`, sha256: hashBytes(apiBytes), bytes: apiBytes.length });
   }
   receipts.push(receipt);
-  artifacts.push({ path: relative(outputDirectory, path), platform, arch, format, signing: 'unsigned', verificationPath: relative(outputDirectory, verificationPath), verificationReceiptPaths: { service: relative(outputDirectory, servicePath), gui: relative(outputDirectory, guiPath) }, url: `${releaseBaseUrl}/${filename}` });
+  artifacts.push({ path: relative(outputDirectory, path), platform, arch, format, signing: 'unsigned', verificationPath: relative(outputDirectory, verificationPath), verificationReceiptPaths: { service: relative(outputDirectory, servicePath), gui: relative(outputDirectory, guiPath), ...(smokePath ? { smoke: relative(outputDirectory, smokePath) } : {}) }, url: `${releaseBaseUrl}/${filename}` });
   inputPaths.add(verificationPath);
   for (const source of engineSourceRequirements(receipt)) {
     const sourcePath = resolve(releaseDirectory, source.filename);

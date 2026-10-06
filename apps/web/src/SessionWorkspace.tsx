@@ -4,7 +4,7 @@ import type { FactoryState, RepositoryChanges, Session } from '@enoughfactory/co
 import { ResizableHandle, ResizablePanel, ResizablePanelGroup } from '@enoughtools/ui-react';
 import { Activity, ArrowLeft, ArrowRight, ArrowUpRight, Box, GitBranch, Globe, MessageSquare, Play, RotateCcw, Square, TerminalSquare } from 'lucide-react';
 import type { DeviceClient } from './api';
-import { useResource, relativeTime } from './hooks';
+import { useResource } from './hooks';
 import { ChatPane } from './ChatPane';
 import { RuntimePanel } from './RuntimePanel';
 import { Button, EmptyState, Input, Loading, PageHeader, Panel, Status } from './ui';
@@ -18,14 +18,14 @@ function Output({ client, session, task }: { client: DeviceClient; session: Sess
   const output = useRef<HTMLPreElement>(null);
   const [following, setFollowing] = useState(true);
   useEffect(() => { if (following && output.current) output.current.scrollTop = output.current.scrollHeight; }, [data, following]);
-  return <div className="output-pane"><div className="output-toolbar"><span><Activity size={14} />{task === 'stdout' ? 'Environment output' : task}</span><label><input type="checkbox" checked={following} onChange={(event: ChangeEvent<HTMLInputElement>) => setFollowing(event.target.checked)} />Follow output</label></div>{loading ? <Loading>Opening output…</Loading> : error ? <div className="error-banner">{error}</div> : <pre ref={output} className="code-output live-output">{data || 'Output will appear here as the environment works.'}</pre>}</div>;
+  return <div className="output-pane"><div className="output-toolbar"><span><Activity size={14} />{task === 'stdout' ? 'Environment output' : task}</span><label><input type="checkbox" checked={following} onChange={(event: ChangeEvent<HTMLInputElement>) => setFollowing(event.target.checked)} />Follow output</label></div>{loading ? <Loading>Loading output…</Loading> : error ? <div className="error-banner">{error}</div> : <pre ref={output} className="code-output live-output">{data || 'No output yet.'}</pre>}</div>;
 }
 
 function Changes({ client, session }: { client: DeviceClient; session: Session }) {
   const { data, error, loading } = useResource<RepositoryChanges>(client, `/api/sessions/${session.id}/changes`, session.status === 'ready' ? 5000 : 0);
   if (loading) return <Loading>Reading repository changes…</Loading>;
   if (error) return <EmptyState icon={<GitBranch size={32} />} title="Changes are unavailable">{error}</EmptyState>;
-  return <div className="changes-pane"><div className="changes-header"><GitBranch size={16} /><strong>{data?.branch || session.branch || 'Working tree'}</strong>{data?.head && <span>{data.head.slice(0, 8)}</span>}</div>{data?.status && <pre className="code-output git-status">{data.status}</pre>}{data?.diff ? <pre className="code-output git-diff">{data.diff.split('\n').map((line, index) => <span className={line.startsWith('+') && !line.startsWith('+++') ? 'diff-added' : line.startsWith('-') && !line.startsWith('---') ? 'diff-removed' : line.startsWith('@@') ? 'diff-context' : ''} key={index}>{line}{'\n'}</span>)}</pre> : <EmptyState icon={<GitBranch size={32} />} title="A clean working tree">Your agent’s changes appear here. Stopping a session preserves work through Git recovery.</EmptyState>}</div>;
+  return <div className="changes-pane"><div className="changes-header"><GitBranch size={16} /><strong>{data?.branch || session.branch || 'Working tree'}</strong>{data?.head && <span>{data.head.slice(0, 8)}</span>}</div>{data?.status && <pre className="code-output git-status">{data.status}</pre>}{data?.diff ? <pre className="code-output git-diff">{data.diff.split('\n').map((line, index) => <span className={line.startsWith('+') && !line.startsWith('+++') ? 'diff-added' : line.startsWith('-') && !line.startsWith('---') ? 'diff-removed' : line.startsWith('@@') ? 'diff-context' : ''} key={index}>{line}{'\n'}</span>)}</pre> : <EmptyState icon={<GitBranch size={32} />} title="No uncommitted diff">Repository changes appear here as you work.</EmptyState>}</div>;
 }
 
 function Preview({ client, session, hidden }: { client: DeviceClient; session: Session; hidden: boolean }) {
@@ -57,20 +57,78 @@ function Preview({ client, session, hidden }: { client: DeviceClient; session: S
   }, [desktop, hidden]);
   useEffect(() => { if (hidden) void window.enoughFactory?.closePreview?.(); else if (desktop && lastTarget.current) void window.enoughFactory?.openPreview?.({ sessionId: session.id, url: lastTarget.current, bounds: bounds() }); }, [hidden, desktop, session.id]);
   useEffect(() => window.enoughFactory?.onPreviewStatus?.(status => { if (status.sessionId && status.sessionId !== session.id) return; if (status.status === 'failed') setError(status.error || 'The application could not be opened.'); else { setError(null); setAddress(status.url); lastTarget.current = status.url; } }), [session.id]);
-  return <div className="preview-pane"><form className="preview-toolbar" onSubmit={event => { event.preventDefault(); void navigate(); }}><Globe size={16} />{desktop && target && <><Button type="button" variant="ghost" size="icon" aria-label="Previous preview page" onClick={() => void window.enoughFactory?.previewNavigation?.('back')}><ArrowLeft size={14} /></Button><Button type="button" variant="ghost" size="icon" aria-label="Next preview page" onClick={() => void window.enoughFactory?.previewNavigation?.('forward')}><ArrowRight size={14} /></Button></>}<Input aria-label="Preview address" value={address} onChange={(event: ChangeEvent<HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement>) => setAddress(event.target.value)} placeholder="http://localhost:3000" /><Button variant="outline" size="sm" disabled={loading || session.status !== 'ready'} type="submit">{loading ? 'Opening…' : 'Open'}</Button>{target && <Button type="button" variant="ghost" size="icon" aria-label="Open preview in a separate window" onClick={() => { if (desktop) void window.enoughFactory?.openPreview?.({ sessionId: session.id, url: address }); else window.open(target, '_blank', 'noopener,noreferrer'); }}><ArrowUpRight size={16} /></Button>}</form>{error && <div className="error-banner">{error}</div>}<div className="preview-viewport" ref={viewport}>{target ? !desktop && <iframe title={`${session.name} preview`} src={target} className="preview-frame" referrerPolicy="no-referrer" /> : <EmptyState icon={<Globe size={32} />} title="See what you’re building">Open an application running inside this environment. Its browser is isolated from the factory’s controls.</EmptyState>}</div><p className="preview-hint">If an application prevents embedding, open its preview in a separate browser window.</p></div>;
+  return <div className="preview-pane"><form className="preview-toolbar" onSubmit={event => { event.preventDefault(); void navigate(); }}><Globe size={16} />{desktop && target && <><Button type="button" variant="ghost" size="icon" aria-label="Previous preview page" onClick={() => void window.enoughFactory?.previewNavigation?.('back')}><ArrowLeft size={14} /></Button><Button type="button" variant="ghost" size="icon" aria-label="Next preview page" onClick={() => void window.enoughFactory?.previewNavigation?.('forward')}><ArrowRight size={14} /></Button></>}<Input aria-label="Preview address" value={address} onChange={(event: ChangeEvent<HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement>) => setAddress(event.target.value)} placeholder="http://localhost:3000" /><Button variant="outline" size="sm" disabled={loading || session.status !== 'ready'} type="submit">{loading ? 'Opening…' : 'Open'}</Button>{target && <Button type="button" variant="ghost" size="icon" aria-label="Open preview in a separate window" onClick={() => { if (desktop) void window.enoughFactory?.openPreview?.({ sessionId: session.id, url: address }); else window.open(target, '_blank', 'noopener,noreferrer'); }}><ArrowUpRight size={16} /></Button>}</form>{error && <div className="error-banner">{error}</div>}<div className="preview-viewport" ref={viewport}>{target ? !desktop && <iframe title={`${session.name} preview`} src={target} className="preview-frame" referrerPolicy="no-referrer" /> : <EmptyState icon={<Globe size={32} />} title="Open a preview">Enter the URL of a service running in this environment.</EmptyState>}</div><p className="preview-hint">If this site blocks embedding, open it in a separate window.</p></div>;
 }
 
-export function SessionWorkspace({ client, session, state, run, modalOpen }: { client: DeviceClient; session: Session; state: FactoryState; run: Run; modalOpen: boolean }) {
-  const [tab, setTab] = useState<SessionTab>('overview');
+export function SessionWorkspace({ client, session, state, run, modalOpen, initialChatId, compact, initialTab }: { client: DeviceClient; session: Session; state: FactoryState; run: Run; modalOpen: boolean; initialChatId?: string; compact?: boolean; initialTab?: SessionTab }) {
+  const [tab, setTab] = useState<SessionTab>(initialChatId ? 'agent' : initialTab ?? 'overview');
   const [outputTask, setOutputTask] = useState('stdout');
+  const [panelOrientation, setPanelOrientation] = useState<'horizontal' | 'vertical'>(() => window.matchMedia('(max-width: 900px)').matches ? 'vertical' : 'horizontal');
+  useEffect(() => {
+    const query = window.matchMedia('(max-width: 900px)');
+    const update = () => setPanelOrientation(query.matches ? 'vertical' : 'horizontal');
+    update();
+    query.addEventListener('change', update);
+    return () => query.removeEventListener('change', update);
+  }, []);
   const project = state.projects.find(item => item.id === session.projectId);
   const device = state.devices.find(item => item.id === session.deviceId);
   const tabs: { id: SessionTab; label: string; icon: typeof Box }[] = [{ id: 'overview', label: 'Environment', icon: Box }, { id: 'agent', label: 'Agent', icon: MessageSquare }, { id: 'terminal', label: 'Terminal', icon: TerminalSquare }, { id: 'preview', label: 'Preview', icon: Globe }, { id: 'changes', label: 'Changes', icon: GitBranch }];
-  return <div className="session-workspace"><PageHeader eyebrow={project?.name ?? 'Environment'} title={session.name} description={`${device?.name ?? 'Device'} · created ${relativeTime(session.createdAt)}${session.branch ? ` · ${session.branch}` : ''}`} actions={<><Status state={device?.online === false ? 'unknown' : session.status} label={device?.online === false ? 'Device offline' : undefined} />{session.status === 'stopped' || session.status === 'failed' ? <Button onClick={() => void run(() => client.post(`/api/sessions/${session.id}/restart`))}><Play size={15} />Start session</Button> : <Button variant="outline" disabled={session.status === 'stopping' || device?.online === false} onClick={() => void run(() => client.post(`/api/sessions/${session.id}/stop`))}><Square size={13} />Stop</Button>}</>} />{session.deviceId === state.device.id && state.diagnostics.containerRuntime && state.diagnostics.containerRuntime.state !== 'ready' && <RuntimePanel state={state} client={client} run={run} compact />}{session.error && <div className="error-banner">{session.error}</div>}{session.status === 'starting' && <div className="notice"><span className="loading-spinner" /><strong>Preparing your environment</strong><span>{session.phase || 'Building its image and starting services…'}</span></div>}{device?.online === false && <div className="connection-banner">This session belongs to {device.name}. Its last known state is shown until that device reconnects.</div>}<div className="session-tabs" role="tablist" aria-label="Session workspace">{tabs.map(item => <button key={item.id} role="tab" id={`tab-${item.id}`} aria-selected={tab === item.id} aria-controls={`panel-${item.id}`} tabIndex={tab === item.id ? 0 : -1} className={`session-tab ${tab === item.id ? 'active' : ''}`} onClick={() => setTab(item.id)} onKeyDown={event => { if (event.key === 'ArrowRight' || event.key === 'ArrowLeft') { event.preventDefault(); const next = tabs[(tabs.findIndex(value => value.id === tab) + (event.key === 'ArrowRight' ? 1 : tabs.length - 1)) % tabs.length]!; setTab(next.id); document.getElementById(`tab-${next.id}`)?.focus(); } }}><item.icon size={15} />{item.label}</button>)}</div><div className="session-content" role="tabpanel" id={`panel-${tab}`} aria-labelledby={`tab-${tab}`}>
-    {tab === 'overview' && <ResizablePanelGroup orientation="horizontal" className="split-workspace"><ResizablePanel defaultSize="35%" minSize="220px"><Panel title="Services" actions={<Status state={session.status} />}>{session.services.length ? <div className="service-list">{session.services.map(service => <div className="service-row" key={service.name}><div className="service-info"><button className="service-title" onClick={() => setOutputTask(service.name)}><span className={`status-dot state-${service.status}`} /><strong>{service.name}</strong></button><span>{service.command || service.status}{service.port ? ` · :${service.port}` : ''}</span></div><div className="service-actions"><Button variant="ghost" size="icon" aria-label={`Restart ${service.name}`} disabled={session.status !== 'ready'} onClick={() => void run(() => client.post(`/api/sessions/${session.id}/services/${encodeURIComponent(service.name)}/restart`))}><RotateCcw size={14} /></Button><Button variant="ghost" size="icon" aria-label={service.status === 'running' ? `Stop ${service.name}` : `Start ${service.name}`} disabled={session.status !== 'ready'} onClick={() => void run(() => client.post(`/api/sessions/${session.id}/services/${encodeURIComponent(service.name)}/${service.status === 'running' ? 'stop' : 'start'}`))}>{service.status === 'running' ? <Square size={12} /> : <Play size={14} />}</Button></div></div>)}</div> : <EmptyState icon={<Box size={26} />} title="Your environment is taking shape">Services appear when EnoughFactory has prepared this environment.</EmptyState>}<div className="session-details"><div><span>Runtime</span><strong>Bundled with EnoughFactory</strong></div><div><span>Workspace</span><strong>Isolated container</strong></div><div><span>Agent access</span><strong>Full permissions</strong></div>{session.branch && <div><span>Recovery branch</span><strong>{session.branch}</strong></div>}</div></Panel></ResizablePanel><ResizableHandle /><ResizablePanel defaultSize="65%" minSize="280px"><Output client={client} session={session} task={outputTask} /></ResizablePanel></ResizablePanelGroup>}
-    {tab === 'agent' && <ChatPane client={client} session={session} state={state} run={run} />}
-    {tab === 'terminal' && <Suspense fallback={<Loading>Opening terminal…</Loading>}><TerminalPane client={client} session={session} /></Suspense>}
-    {tab === 'preview' && <Preview client={client} session={session} hidden={modalOpen} />}
-    {tab === 'changes' && <Changes client={client} session={session} />}
-  </div></div>;
+  const metadata = [project?.name, device?.name ?? 'Unknown device', session.branch].filter(Boolean).join(' · ');
+  return <div className={`session-workspace${compact ? ' is-compact' : ''}`}>
+    <PageHeader title={session.name} description={compact ? undefined : metadata} actions={<>
+      <Status state={device?.online === false ? 'unknown' : session.status} label={device?.online === false ? 'Device offline' : undefined} />
+      {session.status === 'stopped' || session.status === 'failed'
+        ? <Button disabled={device?.online === false} onClick={() => void run(() => client.post(`/api/sessions/${session.id}/restart`))}><Play size={15} />Start environment</Button>
+        : <Button variant="outline" disabled={session.status === 'stopping' || device?.online === false} onClick={() => void run(() => client.post(`/api/sessions/${session.id}/stop`))}><Square size={13} />Stop</Button>}
+    </>} />
+    {session.deviceId === state.device.id && state.diagnostics.containerRuntime && state.diagnostics.containerRuntime.state !== 'ready' && <RuntimePanel state={state} client={client} run={run} compact />}
+    {session.error && <div className="error-banner">{session.error}</div>}
+    {session.status === 'starting' && <div className="notice"><span className="loading-spinner" /><strong>Starting environment</strong><span>{session.phase || 'Preparing image and starting services…'}</span></div>}
+    {device?.online === false && <div className="connection-banner">{device.name} is offline. Showing its last reported environment state.</div>}
+    <div className="session-tabs" role="tablist" aria-label="Session workspace">{tabs.map(item => <button
+      key={item.id}
+      role="tab"
+      id={`tab-${item.id}`}
+      aria-selected={tab === item.id}
+      aria-controls={`panel-${item.id}`}
+      tabIndex={tab === item.id ? 0 : -1}
+      className={`session-tab ${tab === item.id ? 'active' : ''}`}
+      onClick={() => setTab(item.id)}
+      onKeyDown={event => {
+        if (event.key === 'ArrowRight' || event.key === 'ArrowLeft') {
+          event.preventDefault();
+          const next = tabs[(tabs.findIndex(value => value.id === tab) + (event.key === 'ArrowRight' ? 1 : tabs.length - 1)) % tabs.length]!;
+          setTab(next.id);
+          document.getElementById(`tab-${next.id}`)?.focus();
+        }
+      }}
+    ><item.icon size={15} />{item.label}</button>)}</div>
+    <div className="session-content" role="tabpanel" id={`panel-${tab}`} aria-labelledby={`tab-${tab}`}>
+      {tab === 'overview' && <ResizablePanelGroup orientation={panelOrientation} className="split-workspace session-split-workspace">
+        <ResizablePanel className="session-services-panel" defaultSize="35%" minSize={panelOrientation === 'vertical' ? '160px' : '220px'}>
+          <Panel title="Services">
+            {session.services.length ? <div className="service-list">{session.services.map(service => <div className="service-row" key={service.name}>
+              <div className="service-info">
+                <button className="service-title" aria-pressed={outputTask === service.name} onClick={() => setOutputTask(outputTask === service.name ? 'stdout' : service.name)}><span className={`status-dot state-${service.status}`} /><strong>{service.name}</strong></button>
+                <span>{service.command || service.status}{service.port ? ` · :${service.port}` : ''}</span>
+              </div>
+              <div className="service-actions">
+                <Button variant="ghost" size="icon" aria-label={`Restart ${service.name}`} disabled={session.status !== 'ready' || device?.online === false} onClick={() => void run(() => client.post(`/api/sessions/${session.id}/services/${encodeURIComponent(service.name)}/restart`))}><RotateCcw size={14} /></Button>
+                <Button variant="ghost" size="icon" aria-label={service.status === 'running' ? `Stop ${service.name}` : `Start ${service.name}`} disabled={session.status !== 'ready' || device?.online === false} onClick={() => void run(() => client.post(`/api/sessions/${session.id}/services/${encodeURIComponent(service.name)}/${service.status === 'running' ? 'stop' : 'start'}`))}>{service.status === 'running' ? <Square size={12} /> : <Play size={14} />}</Button>
+              </div>
+            </div>)}</div> : <EmptyState icon={<Box size={26} />} title="No services">{session.status === 'starting' ? 'Waiting for service startup.' : 'This environment has no configured services.'}</EmptyState>}
+          </Panel>
+        </ResizablePanel>
+        <ResizableHandle />
+        <ResizablePanel className="session-output-panel" defaultSize="65%" minSize={panelOrientation === 'vertical' ? '220px' : '280px'}>
+          <Output client={client} session={session} task={outputTask} />
+        </ResizablePanel>
+      </ResizablePanelGroup>}
+      {tab === 'agent' && <ChatPane client={client} session={session} state={state} run={run} initialChatId={initialChatId} />}
+      {tab === 'terminal' && <Suspense fallback={<Loading>Opening terminal…</Loading>}><TerminalPane client={client} session={session} /></Suspense>}
+      {tab === 'preview' && <Preview client={client} session={session} hidden={modalOpen} />}
+      {tab === 'changes' && <Changes client={client} session={session} />}
+    </div>
+  </div>;
 }

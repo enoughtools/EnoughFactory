@@ -9,6 +9,7 @@ import { identityId, loadIdentity, saveJson, signValue, verifyValue, encrypt, de
 import { canonical, signedPart, type SignedEnvelope, type IceServer, type Frame, type Lane, type StreamOptions, type ArtifactManifest } from './protocol.js';
 import { NativeConnection } from './native.js';
 import { PeerStream } from './stream.js';
+import { iceCredentialsNeedRefresh, liveRtcIceServers, negotiatedRelayLimits, type RelayLimits } from './types.js';
 export { PeerStream, bridgePeerStreams } from './stream.js';
 export { streamToDuplex } from './duplex.js';
 export type { IceServer, StreamOptions, ArtifactManifest } from './protocol.js';
@@ -47,6 +48,10 @@ export class PeerManager extends EventEmitter {
   private links = new Map<string,Link>();
   private socket?: WebSocket;
   private signalReady = false;
+  private deliveryAcknowledgments = false;
+  private signalingPongAt = 0;
+  private relayLimits?: RelayLimits;
+  private nextRelaySendAt = 0;
   private stopped = true;
   private reconnect?: NodeJS.Timeout;
   private heartbeat?: NodeJS.Timeout;
@@ -87,16 +92,25 @@ export class PeerManager extends EventEmitter {
     if (!this.stopped) return; this.stopped=false;
     if (this.options.signalingUrl) this.connectSignaling();
     this.heartbeat=setInterval(()=> {
-      const turnExpiry=this.iceServers.map(server=>Number(server.username?.split(':')[0])).filter(value=>Number.isFinite(value)&&value>1_000_000_000);
-      if(this.signalReady && turnExpiry.some(expiry=>expiry*1000<Date.now()+60_000))this.socket?.send(JSON.stringify({v:1,type:'ice-request'}));
+      if(this.signalReady && this.socket?.readyState===WebSocket.OPEN){
+        if(this.deliveryAcknowledgments && Date.now()-this.signalingPongAt>=30_000)this.socket.terminate();
+        else {
+          if(this.deliveryAcknowledgments)this.socket.send('ping');
+          if(iceCredentialsNeedRefresh(this.iceServers))this.socket.send(JSON.stringify({v:1,type:'ice-request'}));
+        }
+      }
       for (const link of this.links.values()) {
         if (!link.transport && !link.connecting && this.signalReady) this.initiate(link.id);
-        if (link.transport) void this.request(link.id,{method:'GET',path:'/__peers/ping'},5000).catch(()=>this.disconnect(link.id,'Connection heartbeat missed'));
+        // Hosted relay reachability comes from room presence and its automatic
+        // socket pong. Idle RPCs would wake a hibernating Worker every15 seconds.
+        if (link.transport && !(link.transport==='relay' && this.deliveryAcknowledgments))
+          void this.request(link.id,{method:'GET',path:'/__peers/ping'},5000).catch(()=>{if(this.links.get(link.id)===link)this.disconnect(link.id,'Connection heartbeat missed');});
       }
     },15000); this.heartbeat.unref();
   }
   async stop(): Promise<void> {
-    this.stopped=true; this.signalReady=false;
+    this.stopped=true; this.signalReady=false;this.deliveryAcknowledgments=false;this.signalingPongAt=0;
+    this.relayLimits=undefined;this.nextRelaySendAt=0;
     if (this.reconnect) clearTimeout(this.reconnect); if (this.heartbeat) clearInterval(this.heartbeat);
     this.socket?.close(); this.socket=undefined;
     for (const id of [...this.links.keys()]) this.disconnect(id,'Device service stopped');
@@ -132,7 +146,11 @@ export class PeerManager extends EventEmitter {
         box:encrypt(secretKey(invitation.secret),{device:this.localDevice},requestId)});
     });
   }
-  async forget(peerId:string):Promise<void> {this.disconnect(peerId,'Device unpaired');this.catalog.delete(peerId);await this.persist();this.notify();}
+  async forget(peerId:string):Promise<void> {this.disconnect(peerId,'Device unpaired');this.catalog.delete(peerId);await this.persist();this.discoverPeers();this.notify();}
+  private discoverPeers():void {
+    if(this.deliveryAcknowledgments && this.socket?.readyState===WebSocket.OPEN)
+      this.socket.send(JSON.stringify({v:1,type:'discover',devices:[...this.catalog.keys()]}));
+  }
   private validateSignalingUrl(url:string):void {
     const parsed=new URL(url); if(parsed.protocol!=='wss:' && !(parsed.protocol==='ws:' && ['localhost','127.0.0.1','[::1]'].includes(parsed.hostname)))
       throw new Error('Signaling must use WSS, or WS on localhost for development');
@@ -141,10 +159,19 @@ export class PeerManager extends EventEmitter {
     if(this.stopped || !this.options.signalingUrl)return;
     try {
       this.validateSignalingUrl(this.options.signalingUrl); const socket=new WebSocket(this.options.signalingUrl,{maxPayload:2*1024*1024}); this.socket=socket;
-      socket.on('message',data=> {try{void this.handleSignal(JSON.parse(data.toString())).catch(error=>this.error(error));}catch(error){this.error(error);}});
+      socket.on('message',data=> {try{
+        if(this.socket!==socket)return;
+        const wire=data.toString();if(wire==='pong'){this.signalingPongAt=Date.now();return;}
+        const message=JSON.parse(wire);
+        void this.handleSignal(message).then(()=>{
+          if(this.socket===socket && this.deliveryAcknowledgments && socket.readyState===WebSocket.OPEN && typeof message.deliveryId==='string' && message.deliveryId.length<=128)
+            socket.send(JSON.stringify({v:1,type:'delivery-ack',id:message.deliveryId}));
+        }).catch(error=>this.error(error));
+      }catch(error){this.error(error);}});
       socket.on('error',error=>this.error(error));
       socket.on('close',()=> {
-        if(this.socket!==socket)return; this.signalReady=false;this.socket=undefined;
+        if(this.socket!==socket)return; this.signalReady=false;this.deliveryAcknowledgments=false;this.signalingPongAt=0;this.socket=undefined;
+        this.relayLimits=undefined;this.nextRelaySendAt=0;
         for(const link of this.links.values())if(link.transport==='relay')this.disconnect(link.id,'Signaling relay disconnected');
         if(!this.stopped){this.reconnect=setTimeout(()=>this.connectSignaling(),this.reconnectDelay);this.reconnectDelay=Math.min(15_000,this.reconnectDelay*2);this.reconnect.unref();}
       });
@@ -153,10 +180,10 @@ export class PeerManager extends EventEmitter {
   private async handleSignal(message:any):Promise<void> {
     if(message.type==='challenge') {
       const auth={v:1,type:'auth',deviceId:this.identity.id,publicKey:this.identity.publicKey,name:this.localDevice.name,platform:this.localDevice.platform,arch:this.localDevice.arch,nonce:message.nonce};
-      this.socket?.send(JSON.stringify({...auth,signature:signValue(this.identity.privateKey,auth)}));return;
+      this.socket?.send(JSON.stringify({...auth,signature:signValue(this.identity.privateKey,auth),deliveryAcknowledgments:true,discoverPeers:[...this.catalog.keys()]}));return;
     }
-    if(message.type==='auth-ok') {this.signalReady=true;if(message.relay===false)this.options.relayFallback=false;this.reconnectDelay=500;this.iceServers=[...this.options.iceServers??[],...message.iceServers??[]];this.emit('signaling',true);return;}
-    if(message.type==='ice'){this.iceServers=[...this.options.iceServers??[],...message.iceServers??[]];return;}
+    if(message.type==='auth-ok') {this.signalReady=true;this.deliveryAcknowledgments=message.deliveryAcknowledgments===true;this.signalingPongAt=Date.now();this.relayLimits=negotiatedRelayLimits(message.relayLimits);this.nextRelaySendAt=0;if(message.relay===false)this.options.relayFallback=false;this.reconnectDelay=500;this.updateIceServers(message.iceServers??[]);this.emit('signaling',true);return;}
+    if(message.type==='ice'){this.updateIceServers(message.iceServers??[]);return;}
     if(message.type==='presence') {
       const present=new Set((message.devices??[]).filter((entry:any)=>entry.online).map((entry:any)=>entry.deviceId));
       for(const link of this.links.values())if(link.transport==='relay' && !present.has(link.id))this.disconnect(link.id,'Peer offline');
@@ -195,7 +222,7 @@ export class PeerManager extends EventEmitter {
     const decoded=decrypt<{device:PairedDevice}>(secretKey(invitation.secret),payload.box,payload.requestId);
     if(decoded.device.id!==envelope.from || decoded.device.publicKey!==payload.publicKey)return;
     this.invitations.delete(invitation.secret);
-    this.catalog.set(envelope.from,{...decoded.device,online:false,local:false});await this.persist();this.notify();
+    this.catalog.set(envelope.from,{...decoded.device,online:false,local:false});await this.persist();this.discoverPeers();this.notify();
     this.signal(envelope.from,envelope.session,{kind:'pair-accepted',requestId:payload.requestId,
       box:encrypt(secretKey(invitation.secret),{device:this.localDevice},payload.requestId)});
     if(this.identity.id<envelope.from)this.initiate(envelope.from);
@@ -204,7 +231,7 @@ export class PeerManager extends EventEmitter {
     const pending=this.pendingPairs.get(payload.requestId);if(!pending)return;
     const decoded=decrypt<{device:PairedDevice}>(secretKey(pending.invitation.secret),payload.box,payload.requestId);
     if(decoded.device.id!==envelope.from || decoded.device.publicKey!==pending.invitation.publicKey)return;
-    clearTimeout(pending.timer);this.pendingPairs.delete(payload.requestId);this.catalog.set(envelope.from,{...decoded.device,online:false,local:false});await this.persist();this.notify();
+    clearTimeout(pending.timer);this.pendingPairs.delete(payload.requestId);this.catalog.set(envelope.from,{...decoded.device,online:false,local:false});await this.persist();this.discoverPeers();this.notify();
     pending.resolve({...decoded.device,online:false,local:false});if(this.identity.id<envelope.from)this.initiate(envelope.from);
   }
   private signal(to:string,session:string,payload:unknown):void {
@@ -223,11 +250,13 @@ export class PeerManager extends EventEmitter {
     if(prior)this.disconnect(id,'Negotiation restarted');
     const link=this.newLink(id,randomUUID(),true);this.sendHello(link);
     if(this.options.transport!=='relay')void this.native(link,true).catch(error=>this.error(error));
+    // A relay hello activates immediately; its failure deadline must still allow a WAN round trip.
     link.connecting=setTimeout(()=> {
+      if(this.links.get(id)!==link)return;
       link.connecting=undefined;if(link.transport)return;
       if(this.options.transport!=='webrtc' && this.options.relayFallback!==false && link.relayKey) {this.signal(id,link.session,{kind:'use-relay'});this.online(link,'relay');}
-      else {this.disconnect(id,'No direct or relay connection');if(!this.stopped)setTimeout(()=>this.initiate(id),3000).unref();}
-    },this.options.transport==='relay'?50:5000);link.connecting.unref();
+      else this.disconnect(id,'No direct or relay connection');
+    },5000);link.connecting.unref();
   }
   private sendHello(link:Link):void {this.signal(link.id,link.session,{kind:'hello',publicKey:link.ephemeral.publicKey.export({format:'pem',type:'spki'}).toString()});}
   private async negotiate(id:string,session:string,payload:any):Promise<void> {
@@ -251,9 +280,21 @@ export class PeerManager extends EventEmitter {
     }
     if(payload.kind==='candidate') {if(link.native && link.described)link.native.candidate(payload.candidate,payload.mid);else link.candidates.push(payload);}
   }
+  private updateIceServers(servers:IceServer[]):void {
+    const next=[...this.options.iceServers??[],...servers];
+    const credentials=(values:IceServer[])=>JSON.stringify(values.map(({expiresAt:_expiry,...server})=>server));
+    const changed=credentials(this.iceServers)!==credentials(next);this.iceServers=next;
+    if(!changed)return;
+    // Pinned libdatachannel has no live TURN credential setter. Recreate only
+    // observable local TURN allocations; established direct paths stay live.
+    for(const link of [...this.links.values()])if(link.transport==='webrtc' && link.native){
+      let localType:string|undefined;try{localType=link.native.connectionInfo().localType;}catch{continue;}
+      if(localType==='relay')this.disconnect(link.id,'Temporary TURN credentials renewed; reconnecting relay');
+    }
+  }
   private native(link:Link,initiator:boolean):Promise<NativeConnection> {
     if(link.native)return Promise.resolve(link.native);if(link.creating)return link.creating;
-    link.creating=NativeConnection.create(link.id,this.iceServers,{
+    link.creating=NativeConnection.create(link.id,liveRtcIceServers(this.iceServers),{
       onDescription:(sdp,type)=>{if(this.links.get(link.id)===link)this.signal(link.id,link.session,{kind:'description',sdp,type});},
       onCandidate:(candidate,mid)=>{if(this.links.get(link.id)===link)this.signal(link.id,link.session,{kind:'candidate',candidate,mid});},
       onOpen:lane=>{if(lane==='control' && this.links.get(link.id)===link)this.online(link,'webrtc');},
@@ -263,6 +304,7 @@ export class PeerManager extends EventEmitter {
     },initiator,this.options.relayOnlyIce).then(native=> {if(this.links.get(link.id)!==link || this.stopped){native.close();throw new Error('Peer negotiation superseded');}link.native=native;return native;});return link.creating;
   }
   private online(link:Link,transport:'webrtc'|'relay'):void {
+    if(this.links.get(link.id)!==link || !this.catalog.has(link.id))return;
     if(link.connecting)clearTimeout(link.connecting);link.connecting=undefined;link.transport=transport;
     const peer=this.catalog.get(link.id);if(peer){peer.online=true;peer.transport=transport;peer.lastSeen=now();this.notify();void this.persist();}
     void this.drain(link);this.emit('online',link.id,transport);
@@ -275,7 +317,7 @@ export class PeerManager extends EventEmitter {
     for(const {peerId,stream}of this.streams.values())if(peerId===id)stream.remoteClose(reason);
     for(const key of this.fragments.keys())if(key.startsWith(id+':'))this.fragments.delete(key);
     this.emit('offline',id,reason);
-    if(!this.stopped && this.signalReady && this.identity.id<id && this.catalog.has(id))setTimeout(()=>this.initiate(id),1000).unref();
+    if(!this.stopped && this.signalReady && this.identity.id<id && this.catalog.has(id))setTimeout(()=>{if(!this.links.has(id))this.initiate(id);},1000).unref();
   }
   private async waitSignaling():Promise<void> {
     if(this.stopped)await this.start();const until=Date.now()+10_000;
@@ -311,10 +353,13 @@ export class PeerManager extends EventEmitter {
             if(!link.native?.open(lane) || link.native.buffered(lane)>256*1024)continue;
             if(!link.native.send(lane,item.wire))continue;
           } else {
-            if(!link.relayKey || !this.signalReady || !this.socket || this.socket.bufferedAmount>256*1024)continue;
+            if(!link.relayKey || !this.signalReady || this.socket?.readyState!==WebSocket.OPEN || this.socket.bufferedAmount>256*1024)continue;
+            if(this.relayLimits && Date.now()<this.nextRelaySendAt)continue;
             const seq=++link.seq;const payload={box:encrypt(link.relayKey,JSON.parse(item.wire),link.session+':'+this.identity.id+':'+seq)};
             const envelope:Omit<SignedEnvelope,'signature'>={v:1,type:'relay',from:this.identity.id,to:link.id,session:link.session,seq,at:Date.now(),payload};
-            this.socket.send(JSON.stringify({...envelope,signature:signValue(this.identity.privateKey,envelope)}));
+            const relayWire=JSON.stringify({...envelope,signature:signValue(this.identity.privateKey,envelope)});
+            this.socket.send(relayWire);
+            if(this.relayLimits)this.nextRelaySendAt=Date.now()+Math.max(Buffer.byteLength(relayWire)/this.relayLimits.bytesPerSecond*1000,1000/this.relayLimits.messagesPerSecond);
           }
           progress=true;link.queue[lane].shift();link.queueBytes[lane]-=Buffer.byteLength(item.wire);item.resolve();
         }

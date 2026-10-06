@@ -258,6 +258,7 @@ export class FactoryCoordinator {
   async retireAttempt(attemptId: string): Promise<void> {
     const attempt = this.attempt(attemptId), task = this.task(attempt.taskId), goal = this.goal(task.goalId);
     if (terminalGoals.has(goal.status) || task.status === "completed") throw new Error("Integrated or terminal work cannot be retired as a live attempt.");
+    if (!this.isCurrent(attempt)) throw new FactoryOperationError("stale", "This attempt no longer owns its task's execution authority.");
     this.options.store.transaction(() => {
       this.revoke(attempt); this.writeTask(task.id, { status: "queued", currentAttemptId: undefined });
       this.decision(goal.id, "attempt-retired", "Attempt authority was retired explicitly. A new isolated attempt may now be placed; external effects still require reconciliation.", { attemptId });
@@ -280,7 +281,8 @@ export class FactoryCoordinator {
     const completed = this.tasks(goal.id).filter(task => task.status === "completed");
     const prompt = [
       "You are the EnoughFactory planner. Build the entire objective, preserving all explicit requirements. Make routine implementation decisions yourself.",
-      "Return one JSON object: {summary,criteria:string[],checks:string[],tasks:[{key,title,description,dependsOn:string[],checks:string[],deviceId?:string}]}. Stable task keys must be unique, dependencies acyclic, checks focused and executable inside the isolated runtime.",
+      "Return one JSON object: {summary,criteria:string[],checks:string[],tasks:[{key,title,description,kind:'feature'|'unit'|'architecture'|'test',acceptanceCriteria:string[],expectedOutputs:string[],dependsOn:string[],checks:string[],deviceId?:string}]}. Stable task keys must be unique, dependencies acyclic, checks focused and executable inside the isolated runtime.",
+      "Choose task kinds by outcome: feature delivers observable product behavior; unit implements a bounded component or change; architecture resolves a structural decision and preserves its rationale and handoff; test supplies focused verification for an identified uncertainty. Give each task concrete acceptance criteria and expected deliverables. Do not invent extra architecture/test tasks or mandatory reviews when the work does not need them.",
       "Use independent parallel tasks where useful. Keep verification proportionate; do not require human approval or ceremonies unless the goal's actual policy requires them.",
       "Do not claim implementation or completion. A task may include configured release/deployment actions. Derive explicit observable criteria when the user omitted them.",
       this.context(goal),
@@ -350,7 +352,8 @@ export class FactoryCoordinator {
       const attempt: Attempt = { id: randomUUID(), taskId: task.id, generation: Math.max(0, ...attempts.map(item => item.generation)) + 1, deviceId: device.id, status: "created", startedAt: this.now() };
       this.options.store.transaction(() => {
         this.options.store.set(TABLE.attempts, attempt);
-        this.options.store.set<AttemptDetail>(TABLE.attemptDetails, { id: attempt.id, goalId: goal.id, goalRevision: goal.revision, cancellation: "none", phase: "preparing" });
+        this.options.store.set<AttemptDetail>(TABLE.attemptDetails, { id: attempt.id, goalId: goal.id, goalRevision: goal.revision, cancellation: "none", phase: "preparing",
+          contract: { title: task.title, description: task.description, kind: task.kind, acceptanceCriteria: task.acceptanceCriteria, expectedOutputs: task.expectedOutputs, dependsOn: [...task.dependsOn], checks: [...new Set([...(this.planRecord(goal.id)?.checks ?? []), ...detail.checks])], planRevision: detail.planRevision } });
         this.writeTask(task.id, { status: "running", currentAttemptId: attempt.id, deviceId: device.id });
         this.decision(goal.id, "dispatch", `Dispatched ${task.title} to ${device.name}.`, { taskId: task.id, attemptId: attempt.id, generation: attempt.generation, deviceId: device.id });
       });
@@ -579,8 +582,9 @@ export class FactoryCoordinator {
       const evidence = this.tasks(goal.id).filter(task => task.status === "completed").map(task => ({ task, attempt: task.currentAttemptId ? this.attemptDetail(task.currentAttemptId) : undefined }));
       const prompt = [
         "You are the EnoughFactory completion evaluator. Audit the entire original objective against the actual repository and retained execution evidence. A worker's final response, green unrelated tests or partial implementation do not prove completion.",
-        "Inspect/run only meaningful checks needed for uncertain criteria. Return JSON {complete:boolean,summary:string,criteria:[{criterion:string,satisfied:boolean,evidence:string[]}],additionalTasks?:[{key,title,description,dependsOn:string[],checks:string[]}],waitReason?:string,wakeCondition?:string}.",
+        "Inspect/run only meaningful checks needed for uncertain criteria. Return JSON {complete:boolean,summary:string,criteria:[{criterion:string,satisfied:boolean,evidence:string[]}],additionalTasks?:[{key,title,description,kind:'feature'|'unit'|'architecture'|'test',acceptanceCriteria:string[],expectedOutputs:string[],dependsOn:string[],checks:string[]}],waitReason?:string,wakeCondition?:string}. Use task kinds for concrete delivery outcomes, not mandatory role ceremonies.",
         "Use each criterion's exact original text. Every satisfied criterion requires concrete current-state evidence such as files, runtime outcomes, exact commit check records or published URLs. If something remains, add actionable tasks. Never weaken the objective to declare completion. No mandatory human gate applies to autonomous plus approve-all.",
+        "Also inspect the accepted tasks' acceptance criteria and expected deliverables. Integration records prove accepted source, not that every requested behavior or deliverable exists. Add concrete follow-up work for any unmet contract that matters to the original objective.",
         this.context(goal), `Repository snapshot: ${JSON.stringify(repository)}`, `Integrated work and check records: ${JSON.stringify(evidence)}`,
       ].join("\n\n");
       const response = await this.options.runtime.complete({ goal, role: "evaluator", prompt, project, signal: this.operationControllers.get(goal.id)?.signal });
@@ -640,7 +644,10 @@ export class FactoryCoordinator {
     for (const task of tasks) taskKeys[task.key] = retained.get(task.key)?.id ?? randomUUID();
     for (const task of tasks) {
       const id = taskKeys[task.key]!, previous = retained.get(task.key), previousDetail = previous ? this.taskDetail(previous.id) : undefined;
-      this.options.store.set<FactoryTask>(TABLE.tasks, { id, goalId, title: task.title, description: task.description, dependsOn: task.dependsOn.map(key => taskKeys[key]!), status: "queued", createdAt: previous?.createdAt ?? at, updatedAt: at, ...(task.deviceId ? { deviceId: task.deviceId } : {}) });
+      this.options.store.set<FactoryTask>(TABLE.tasks, { id, goalId, title: task.title, description: task.description, dependsOn: task.dependsOn.map(key => taskKeys[key]!), status: "queued", createdAt: previous?.createdAt ?? at, updatedAt: at, ...(task.deviceId ? { deviceId: task.deviceId } : {}),
+        ...(task.kind ?? previous?.kind ? { kind: task.kind ?? previous?.kind } : {}),
+        ...(task.acceptanceCriteria ?? previous?.acceptanceCriteria ? { acceptanceCriteria: task.acceptanceCriteria ?? previous?.acceptanceCriteria } : {}),
+        ...(task.expectedOutputs ?? previous?.expectedOutputs ? { expectedOutputs: task.expectedOutputs ?? previous?.expectedOutputs } : {}) });
       this.options.store.set<TaskDetail>(TABLE.taskDetails, { ...previousDetail, id, key: task.key, checks: task.checks, planRevision: goal.revision, selected: goal.autonomy === "autonomous", failureSignatures: previousDetail?.failureSignatures ?? [] });
     }
     this.options.store.set<PlanRecord>(TABLE.plans, { id: goalId, goalId, revision: goal.revision, summary, checks, taskKeys, createdAt: at });
@@ -775,7 +782,16 @@ export class FactoryCoordinator {
     return `Original objective:\n${goal.objective}\n\nRequired completion criteria:\n${goal.criteria.map(value => `- ${value}`).join("\n")}\n\nAutonomy: ${goal.autonomy}; approvals: ${goal.approvalMode}.\n\nSteering context:\n${control.steering.join("\n")}\n\nReplanning reason:\n${control.replanReason ?? "Initial plan"}`;
   }
   private executionPrompt(goal: Goal, task: FactoryTask): string {
-    return ["You are executing an EnoughFactory task inside its isolated full-permission container. Make routine decisions and implement the requested behavior. Run focused relevant checks, preserve useful work, and finish with evidence of what actually changed. Do not stop at a proposal.", this.context(goal), `Task: ${task.title}\n${task.description}`, `Repair instructions: ${this.taskDetail(task.id).repairInstructions ?? "None"}`, `Configured checks: ${JSON.stringify(this.taskDetail(task.id).checks)}`, "The factory will capture and integrate the exact candidate. Do not merge into another attempt's workspace. Project-configured deployment capabilities are authorized according to the goal policy; report any uncertain external effects explicitly."].join("\n\n");
+    const guidance = {
+      feature: "Feature contract: deliver the observable product behavior across the necessary layers. Account for the acceptance scenarios, including relevant failure or loading behavior. Report concrete behavior and evidence rather than only implementation details.",
+      unit: "Unit contract: complete the bounded component or change described by this task. Preserve surrounding interfaces and integrate with its callers. Verify the relevant behavior without expanding into unrelated work.",
+      architecture: "Architecture contract: resolve the structural decision against the actual source and requirements. Preserve the chosen design, rationale, tradeoffs and actionable handoff in repository deliverables. Implement a technical foundation only when the task asks for it; a conversational proposal alone is not a deliverable.",
+      test: "Test contract: address the identified verification uncertainty with meaningful checks or product scenarios. Record actual results and limitations, and preserve reusable verification where requested. Do not add tests that merely mirror implementation or claim evidence from checks you did not run.",
+    };
+    return ["You are executing an EnoughFactory task inside its isolated full-permission container. Make routine decisions and deliver the requested outcome. Run focused relevant checks, preserve useful work, and finish with evidence of what actually changed. Do not stop at a proposal.", this.context(goal), `Task: ${task.title}\n${task.description}`, task.kind ? guidance[task.kind] : "Generic task contract: complete the described work and provide concrete evidence of its outcome.",
+      `Task acceptance criteria:\n${task.acceptanceCriteria?.map(value => `- ${value}`).join("\n") || "Use the task description and goal criteria."}`,
+      `Expected deliverables:\n${task.expectedOutputs?.map(value => `- ${value}`).join("\n") || "Preserved changes and a factual outcome summary."}`,
+      `Repair instructions: ${this.taskDetail(task.id).repairInstructions ?? "None"}`, `Configured checks: ${JSON.stringify(this.taskDetail(task.id).checks)}`, "The factory will capture and integrate the exact candidate. Do not merge into another attempt's workspace. Project-configured deployment capabilities are authorized according to the goal policy; report any uncertain external effects explicitly."].join("\n\n");
   }
   private goals(): Goal[] { return this.options.store.list<Goal>(TABLE.goals); }
   private goal(id: string): Goal { const value = this.options.store.get<Goal>(TABLE.goals, id); if (!value) throw new Error("Goal not found."); return value; }

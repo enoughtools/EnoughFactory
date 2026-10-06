@@ -214,6 +214,49 @@ test("late success from a retired attempt cannot capture or integrate source", a
   assert.notEqual(factory.store.list<FactoryTask>("tasks")[0]!.status, "completed");
 });
 
+test("stale retirement cannot revoke a newer running repair attempt", async () => {
+  const factory = harness();
+  const execution = deferred<ExecutionResult>();
+  const entered = deferred<void>();
+  factory.executing(async () => {
+    if (factory.calls.execute === 1) return { status: "failed", text: "The route returned 404" };
+    entered.resolve(); return execution.promise;
+  });
+  const goal = factory.goal();
+  try {
+    await factory.coordinator.start();
+    await entered.promise;
+    const attempts = factory.store.list<Attempt>("attempts");
+    assert.deepEqual(attempts.map(attempt => attempt.generation), [1, 2]);
+    assert.equal(attempts[0]!.status, "failed");
+    const current = attempts[1]!;
+    const taskBefore = factory.store.get<FactoryTask>("tasks", current.taskId)!;
+    const decisionsBefore = factory.store.list<Decision>("decisions");
+    assert.equal(taskBefore.currentAttemptId, current.id);
+    assert.equal(current.status, "running");
+
+    await assert.rejects(factory.coordinator.retireAttempt(attempts[0]!.id), /no longer owns its task's execution authority/);
+    assert.deepEqual(factory.store.get<FactoryTask>("tasks", current.taskId), taskBefore);
+    assert.deepEqual(factory.store.list<Attempt>("attempts"), attempts);
+    assert.deepEqual(factory.store.list<Decision>("decisions"), decisionsBefore);
+    assert.equal(factory.calls.cancel, 0);
+    await factory.coordinator.tick();
+    assert.equal(factory.calls.execute, 2);
+    assert.equal(factory.store.list<Attempt>("attempts").length, 2);
+
+    execution.resolve({ status: "succeeded", text: "Repaired route and verified release" });
+    await factory.coordinator.waitForIdle();
+    assert.equal(factory.store.get<FactoryTask>("tasks", current.taskId)!.currentAttemptId, current.id);
+    assert.equal(factory.store.get<FactoryTask>("tasks", current.taskId)!.status, "completed");
+    assert.equal(factory.calls.integrate, 1);
+    assert.equal(factory.store.get<Goal>("goals", goal.id)!.status, "completed");
+  } finally {
+    factory.coordinator.stop();
+    execution.resolve({ status: "succeeded", text: "Cleanup retained execution" });
+    await factory.coordinator.waitForIdle();
+  }
+});
+
 test("cancellation revokes an integration already waiting at its write boundary", async () => {
   const factory = harness();
   const entered = deferred<void>();

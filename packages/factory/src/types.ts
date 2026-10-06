@@ -1,4 +1,4 @@
-import type { ApprovalMode, Attempt, AutonomyMode, Device, FactoryTask, Goal, Project, RuntimeKind } from "@enoughfactory/contracts";
+import type { ApprovalMode, Attempt, AttemptInspection, AutonomyMode, Device, FactoryTask, Goal, Project, RuntimeKind, TaskKind } from "@enoughfactory/contracts";
 
 /** All writes inside a transaction must commit together, including decisions. */
 export interface FactoryStore {
@@ -58,6 +58,7 @@ export interface FactoryRuntimePort {
 export interface PlannedTask {
   key: string; title: string; description: string; dependsOn: string[];
   checks: string[]; deviceId?: string;
+  kind?: TaskKind; acceptanceCriteria?: string[]; expectedOutputs?: string[];
 }
 export interface PlanResponse {
   summary: string; criteria: string[]; tasks: PlannedTask[]; checks: string[];
@@ -73,6 +74,7 @@ export interface TaskDetail {
 }
 export interface AttemptDetail {
   id: string; goalId: string; goalRevision: number; workspace?: WorkspaceRef;
+  contract?: AttemptInspection['contract'];
   candidate?: CandidateRef; result?: ExecutionResult; checks?: CheckResult[];
   integration?: IntegrationResult; cancellation: "none" | "requested" | "acknowledged";
   usageAccounted?: boolean; accountedSpend?: number;

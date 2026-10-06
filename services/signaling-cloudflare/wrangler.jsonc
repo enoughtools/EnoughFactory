@@ -1,0 +1,22 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "enoughfactory-network",
+  "main": "src/worker.ts",
+  "compatibility_date": "2026-10-05",
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": true,
+  "durable_objects": {
+    "bindings": [{ "name": "SIGNALING", "class_name": "SignalingHub" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["SignalingHub"] }],
+  "vars": {
+    "STUN_URLS": "stun:stun.cloudflare.com:3478",
+    "ENOUGH_SIGNALING_ALLOW_RELAY": "true",
+    "ENOUGH_SIGNALING_MAX_CONNECTIONS": "128",
+    "ENOUGH_SIGNALING_MAX_ROOM_CONNECTIONS": "32",
+    "ENOUGH_SIGNALING_MAX_IP_CONNECTIONS": "8",
+    "ENOUGH_SIGNALING_DAILY_MESSAGES": "10000",
+    "ENOUGH_SIGNALING_DAILY_RELAY_BYTES": "1073741824"
+  },
+  "observability": { "enabled": false }
+}

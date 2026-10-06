@@ -1,5 +1,6 @@
 const digest = value => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
 const packageFormats = { darwin: ['dmg', 'zip'], linux: ['appimage', 'tar.gz'] };
+import { verifyComponentQualification } from './verify-component-qualification.mjs';
 
 export function verifyArchiveReceipt(receipt, artifact, pins) {
   if (!receipt || receipt.formatVersion !== 1 || receipt.product !== 'EnoughFactory' || receipt.verificationScope !== 'desktop-archive' || receipt.version !== artifact.version || receipt.platform !== artifact.platform || receipt.arch !== artifact.arch || !/^[a-f0-9]{40}$/.test(receipt.sourceCommit ?? '') || !Number.isFinite(Date.parse(receipt.verifiedAt))) throw new Error(`Archive verification identity does not match ${artifact.filename}.`);
@@ -17,10 +18,12 @@ export function verifyArchiveReceipt(receipt, artifact, pins) {
   const components = [`docker-${artifact.platform}-${artifact.arch}`, ...(artifact.platform === 'darwin' ? [`lima-darwin-${artifact.arch}`, `docker-linux-${artifact.arch}`] : [`rootless-linux-${artifact.arch}`])];
   if (runtime?.assetsVerified !== true || runtime.dedicatedSocket !== 'inside-isolated-device-state' || runtime.dockerVersion !== pins.dockerVersion || (artifact.platform === 'darwin' && runtime.limaVersion !== pins.limaVersion) || !Array.isArray(runtime.archivePins) || runtime.archivePins.length !== components.length || components.some(component => !runtime.archivePins.some(pin => pin.component === component && pin.url === pins.archives[component].url && pin.sha256 === pins.archives[component].sha256))) throw new Error(`Pinned private runtime assets were not verified: ${artifact.filename}.`);
   engineSourceRequirements(receipt);
+  if (receipt.componentQualification !== undefined) verifyComponentQualification(receipt);
   return receipt;
 }
 
 export function verifyRuntimeJourney(receipt) {
+  if (receipt.componentQualification !== undefined) return verifyComponentQualification(receipt);
   const journey = receipt.runtimeJourney;
   if (journey?.formatVersion !== 1 || journey.product !== 'EnoughFactory' || journey.status !== 'passed' || journey.platform !== receipt.platform || journey.arch !== receipt.arch || !Number.isFinite(Date.parse(journey.startedAt)) || !Number.isFinite(Date.parse(journey.completedAt)) || Date.parse(journey.completedAt) < Date.parse(journey.startedAt) || journey.bundle?.sourceCommit !== receipt.sourceCommit || journey.bundle?.version !== receipt.version || journey.bundle?.platform !== receipt.platform || journey.bundle?.arch !== receipt.arch || journey.bundle?.manifestSha256 !== receipt.resources.bundleProvenanceSha256 || journey.runtimeProvenanceSha256 !== receipt.resources.manifest['runtime/container/provenance.json'] || journey.envmuxSha256 !== receipt.resources.manifest['envmux/envmux'] || journey.dockerVersion !== receipt.containerRuntime.dockerVersion || !Array.isArray(journey.checks) || journey.checks.length < 8 || journey.checks.some(check => typeof check !== 'string' || !check.trim()) || new Set(journey.checks).size !== journey.checks.length) throw new Error(`The private runtime journey is missing or does not match the actual archive: ${receipt.artifact.filename}.`);
   if (receipt.platform === 'linux') {

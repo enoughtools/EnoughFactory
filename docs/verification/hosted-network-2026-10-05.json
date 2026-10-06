@@ -1,0 +1,176 @@
+{
+  "schema": 1,
+  "startedAt": "2026-10-06T02:38:56.636Z",
+  "completedAt": "2026-10-06T02:39:13.964Z",
+  "localDate": "2026-10-05",
+  "localTimezone": "America/Mexico_City",
+  "endpoint": "https://enoughfactory-network.russellbloxwich.workers.dev",
+  "room": "proof_943692dfca604dcfaf40f76ae7974c1e",
+  "deploymentVersionReportedByParent": "4c214543-6b5f-469f-abf7-0fcedfeec119",
+  "source": {
+    "observedGitHead": "abdd216bdee24f758a7d0bff715e2dd61a8e9cd8",
+    "sourceHashes": {
+      "packages/peers/src/index.ts": "ca9bbfca34f29e2cae4b06a9f9dfd7c1601fcf4a258331eca6e6b90bf10eb4ad",
+      "packages/peers/src/identity.ts": "68aea25d0edc024ec775271712b469c6fb7e80346ca74906e4ef24ca90c0bb26",
+      "packages/peers/src/types.ts": "a6e6b6c6d7c4b02b216a0a89f14421468d32b763b2f1806b02da3833e26e6f00",
+      "services/signaling-cloudflare/src/worker.ts": "21bddc2ded5d741f3127a8b391aba5d6ed5d503c19dc0ff9923c03f2071b746f"
+    }
+  },
+  "topology": "Two production PeerManager instances on one Mac, separate disposable identities, deployed Cloudflare Worker.",
+  "status": "passed",
+  "health": {
+    "status": "ok",
+    "service": "enoughfactory-signaling",
+    "protocol": 1,
+    "transport": "cloudflare-hibernation"
+  },
+  "peerIdentities": {
+    "a": "539c94d574e73e699bda4fbb5ca07020",
+    "b": "032cc4cf130d8d7e026a552e7597a5e3"
+  },
+  "artifact": {
+    "bytes": 1048576,
+    "sourceSha256": "38ae960ed4a7d511916f624488fb202c37989ff2507439b526df6b7d2959da68",
+    "receivedSha256": "38ae960ed4a7d511916f624488fb202c37989ff2507439b526df6b7d2959da68"
+  },
+  "forcedTransport": "encrypted-wss-relay",
+  "sameIdentityRecreatedAndReconnected": true,
+  "wire": {
+    "relayEnvelopes": 94,
+    "encryptedBoxes": 94,
+    "plaintextMarkerSeen": false,
+    "deliveryReceipts": 112
+  },
+  "authentications": [
+    {
+      "peer": "a",
+      "relay": true,
+      "deliveryAcknowledgments": true,
+      "relayLimits": {
+        "bytesPerSecond": 524288,
+        "messagesPerSecond": 20
+      },
+      "iceUrls": [
+        "stun:stun.cloudflare.com:3478"
+      ],
+      "temporaryCredentials": false
+    },
+    {
+      "peer": "b",
+      "relay": true,
+      "deliveryAcknowledgments": true,
+      "relayLimits": {
+        "bytesPerSecond": 524288,
+        "messagesPerSecond": 20
+      },
+      "iceUrls": [
+        "stun:stun.cloudflare.com:3478"
+      ],
+      "temporaryCredentials": false
+    },
+    {
+      "peer": "b-restarted",
+      "relay": true,
+      "deliveryAcknowledgments": true,
+      "relayLimits": {
+        "bytesPerSecond": 524288,
+        "messagesPerSecond": 20
+      },
+      "iceUrls": [
+        "stun:stun.cloudflare.com:3478"
+      ],
+      "temporaryCredentials": false
+    }
+  ],
+  "errors": [],
+  "steps": [
+    {
+      "at": "2026-10-06T02:38:56.865Z",
+      "step": "deployed-health",
+      "detail": {
+        "status": "ok",
+        "service": "enoughfactory-signaling",
+        "protocol": 1,
+        "transport": "cloudflare-hibernation"
+      }
+    },
+    {
+      "at": "2026-10-06T02:38:57.670Z",
+      "step": "paired",
+      "detail": {
+        "a": "539c94d574e73e699bda4fbb5ca07020",
+        "b": "032cc4cf130d8d7e026a552e7597a5e3",
+        "transport": "relay"
+      }
+    },
+    {
+      "at": "2026-10-06T02:38:57.863Z",
+      "step": "authenticated-encrypted-rpc",
+      "detail": {
+        "status": 200,
+        "markerSha256": "e1c23a30e3ce30e1af7316073f80c95aa64ef5530f2b8e8289518a726d291f20"
+      }
+    },
+    {
+      "at": "2026-10-06T02:39:12.939Z",
+      "step": "artifact-sha256-verified",
+      "detail": {
+        "id": "live-proof-dbaa9b96-2878-4f9c-888b-c69dcc2f829c",
+        "bytes": 1048576,
+        "sourceSha256": "38ae960ed4a7d511916f624488fb202c37989ff2507439b526df6b7d2959da68",
+        "receivedSha256": "38ae960ed4a7d511916f624488fb202c37989ff2507439b526df6b7d2959da68"
+      }
+    },
+    {
+      "at": "2026-10-06T02:39:13.047Z",
+      "step": "owner-offline-observed"
+    },
+    {
+      "at": "2026-10-06T02:39:13.951Z",
+      "step": "same-identity-reconnect",
+      "detail": {
+        "deviceId": "032cc4cf130d8d7e026a552e7597a5e3",
+        "status": 200
+      }
+    }
+  ],
+  "scope": {
+    "nativeRtcStarted": false,
+    "containersStarted": false,
+    "modelTurns": 0,
+    "observedTurnCredentialsIssued": false,
+    "appOrDefaultChanges": false
+  },
+  "capacity": {
+    "pacedPerSocketBytesPerSecond": 524288,
+    "pacedRelayFramesPerSecond": 20,
+    "publicDailyJsonCap": 10000,
+    "publicDailyWssBytesCap": 1073741824,
+    "note": "One bounded check consumes shared service capacity; no stress/throughput benchmark."
+  },
+  "cleanup": {
+    "peersStopped": true,
+    "disposableIdentityAndArtifactHomesRemoved": true,
+    "privateKeysOrInvitationSecretsInReceipt": false
+  },
+  "previousAttempts": [
+    {
+      "receipt": "hosted-network-2026-10-05-first-attempt.json",
+      "status": "failed",
+      "cause": "Production forced-relay handshake deadline50ms expired before WAN handshake. Fixed deadline5s, stale timeout guard and duplicate retry."
+    },
+    {
+      "receipt": "hosted-network-2026-10-05-second-attempt.json",
+      "status": "failed",
+      "cause": "Harness waited for only endpointA before asserting endpointB. Corrected asynchronous observation to require both endpoint transports. No service errors."
+    }
+  ],
+  "postVerificationChanges": {
+    "evidence": "Read-only review identified stale legacy/direct heartbeat rejection callbacks that could disconnect a replacement link. Added link-identity guards in both clients and nativeonline. Hosted relay skips these RPC heartbeats; no further live run was performed. Peers and harness typechecks passed.",
+    "sourceHashes": {
+      "packages/peers/src/index.ts": "fe467e3daa94b10d0c48911012544b41d0aebc8335882877c65f847c6002dca0",
+      "packages/peers/src/browser.ts": "ba2d8540711363ce275aec2b79f69c58800c75960ee2781a62dfe68f1bda1a23"
+    },
+    "liveVerified": false
+  }
+}

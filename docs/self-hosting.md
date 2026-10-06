@@ -2,6 +2,8 @@
 
 The device service owns execution and local history. The signaling service exchanges presence and authenticated negotiation, issues optional temporary TURN credentials, and can forward encrypted relay frames. It stores no conversations or goals. A local-only factory needs no signaling service.
 
+EnoughFactory 0.1.3 adds **Use Enough networking** under Settings → Device connectivity. Select it and save to use `wss://enoughfactory-network.russellbloxwich.workers.dev/ws`. Existing custom settings are preserved until you choose to replace them. The hosted option requires the updated device service; loading the web UI does not update an installed service. Direct WebRTC is preferred, with end-to-end encrypted WebSocket fallback. Shared limits include 1 GiB of relay traffic and 10,000 network messages per UTC day; account capacity can be reached earlier. Hosted TURN is not enabled. The [hosted networking package](../services/signaling-cloudflare/README.md) documents deployment, limits and optional managed TURN. Use the independent Node service below for your own capacity.
+
 ## Private container runtime
 
 Every installed device service owns its execution engine. Mac bundles Lima 2.2.1 and Docker 29.8.2 for a private VM using Apple virtualization. Linux bundles Docker 29.8.2 and its rootless extras for a dedicated per-user engine. Host tools, endpoints and client configuration are explicit; the service does not reuse a default Docker context or daemon.

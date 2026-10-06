@@ -1,0 +1,52 @@
+{
+  "formatVersion": 1,
+  "status": "passed",
+  "verifiedAt": "2026-10-06T02:26:58.780Z",
+  "scope": "Actual source UI in the browser with clearly labeled deterministic data. No model, container or coordinator ran in this fixture. Separate production HTTP authentication/SQLite read-projection regression passed.",
+  "sourceBase": "abdd216bdee24f758a7d0bff715e2dd61a8e9cd8",
+  "source": "Uncommitted power-workspace iteration; not the immutable 0.1.2 installer.",
+  "screenshot": {
+    "path": "docs/verification/power-workspace-ui-fixture.jpg",
+    "sha256": "e75789297a55beebc723e8a08b0567d63b5062ebfbfb47eda4ee2fa036c9b084"
+  },
+  "observations": [
+    "Canonical EnoughUI paper/ink/indigo colors and approved Enough mark.",
+    "No promotional footer, tagline or decorative empty artwork.",
+    "Board exposes Planned, Execution, Capture, Checks, Integration and Accepted; missing phases remain empty.",
+    "Selected task contract, recorded attempt references and exact owning-device chat are available together.",
+    "Selecting the non-default accepted Architecture task, opening its exact full chat, then Back to goal retained that task selection.",
+    "Embedded chat loading did not scroll the goal workspace.",
+    "Independent board/evidence/chat scroll areas fit inside the wide desktop window."
+  ],
+  "layout": [
+    {
+      "viewportWidth": 1600,
+      "shellWidth": 1600,
+      "mainRight": 1600,
+      "documentWidth": 1600,
+      "workspaceScroll": 0
+    },
+    {
+      "viewportWidth": 864,
+      "documentWidth": 864,
+      "mainRight": 864
+    }
+  ],
+  "checks": {
+    "taskContracts": {
+      "tests": 3,
+      "status": "passed",
+      "includes": "Attempt retains its contract when the task later changes."
+    },
+    "authenticatedInspection": {
+      "tests": 2,
+      "status": "passed",
+      "includes": "Bearer authentication, exact receipts, no writes, no fabricated phase and unknown execution handling."
+    },
+    "staleAuthority": {
+      "status": "passed",
+      "tests": 2,
+      "scope": "Actual autonomous generation1 failure followed by generation2 execution; authenticated HTTP task controls including late cancellation/steering races."
+    }
+  }
+}

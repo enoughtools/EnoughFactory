@@ -9,7 +9,7 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const defaultBaseline = '5252bd83a9082d7711e7e3dcbf426daef0abc165';
 const digest = bytes => createHash('sha256').update(bytes).digest('hex');
 const git = args => execFileSync('git', args, { cwd: root, maxBuffer: 32 * 1024 * 1024 });
-const nativeRoots = ['vendor/envmux/src', 'vendor/envmux/Directory.Build.props', 'vendor/envmux/Directory.Build.targets', 'vendor/envmux/Directory.Packages.props', 'vendor/envmux/global.json', 'vendor/envmux/nuget.config', 'vendor/envmux/NuGet.Config', 'scripts/envmux-build.mjs', 'scripts/prepare-container-runtime.mjs', 'runtime/container/pins.json', 'runtime/container/relink-kit'];
+const nativeRoots = ['vendor/envmux/src', 'vendor/envmux/images/golden', 'vendor/envmux/skills', 'Directory.Build.props', 'Directory.Build.targets', 'Directory.Packages.props', 'global.json', 'nuget.config', 'NuGet.Config', 'vendor/envmux/Directory.Build.props', 'vendor/envmux/Directory.Build.targets', 'vendor/envmux/Directory.Packages.props', 'vendor/envmux/global.json', 'vendor/envmux/nuget.config', 'vendor/envmux/NuGet.Config', 'scripts/envmux-build.mjs', 'scripts/prepare-container-runtime.mjs', 'runtime/container/pins.json', 'runtime/container/relink-kit'];
 function changed(path) { const error = new Error(`Runtime reuse refused: source input changed, added or removed: ${path}`); error.code = 'RUNTIME_SOURCE_CHANGED'; return error; }
 
 /** Compare the inputs to the reused compiled assets, not application version strings. */
@@ -17,7 +17,11 @@ export async function verifyRuntimeSourceClosure(group, baseline = defaultBaseli
   if (!['native-assets', 'ubuntu-source'].includes(group) || !/^[a-f0-9]{40}$/.test(baseline)) throw new Error('Choose native-assets or ubuntu-source and a complete baseline commit.');
   git(['cat-file', '-e', `${baseline}^{commit}`]);
   const roots = group === 'native-assets' ? nativeRoots : ['runtime/container/os-source-kit', 'runtime/container/pins.json'];
-  const selected = path => !/\.md$/i.test(path) && !path.startsWith('runtime/container/relink-kit/verification/');
+  const selected = path => {
+    if (path.startsWith('vendor/envmux/skills/')) return /^vendor\/envmux\/skills\/envmux-[^/]+\/SKILL\.md$/.test(path);
+    if (path.startsWith('vendor/envmux/images/golden/')) return !path.split('/').some(part => part.startsWith('.'));
+    return !/\.md$/i.test(path) && !path.startsWith('runtime/container/relink-kit/verification/');
+  };
   const oldPaths = git(['ls-tree', '-r', '--name-only', '-z', baseline, '--', ...roots]).toString().split('\0').filter(path => path && selected(path));
   const currentPaths = git(['ls-files', '-z', '--cached', '--others', '--exclude-standard', '--', ...roots]).toString().split('\0').filter(path => path && selected(path));
   const paths = [...new Set([...oldPaths, ...currentPaths])].sort();

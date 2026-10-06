@@ -1,0 +1,85 @@
+{
+  "formatVersion": 1,
+  "status": "passed",
+  "verifiedAt": "2026-10-06T02:36:52.932Z",
+  "workerVersion": "1f408ce5-816e-47f5-bc2d-29049960ecab",
+  "sourceBase": "abdd216bdee24f758a7d0bff715e2dd61a8e9cd8",
+  "scope": "Updated shared hosted UI; unchanged immutable0.1.2 installer catalog. Actual Chrome connected to isolated released Mac0.1.2 service; private engine not started.",
+  "routes": [
+    {
+      "route": "/",
+      "status": 200,
+      "sha256": "ccdcd1338650b485f068b543785b7f55231f9d0f445ba09677a8800ab55d5d14",
+      "bytes": 23003
+    },
+    {
+      "route": "/docs",
+      "status": 200,
+      "sha256": "96e1df95a5274d8a92086cb21747515aba28f5e381ad42bcbac83ef05329639b",
+      "bytes": 16184
+    },
+    {
+      "route": "/downloads",
+      "status": 200,
+      "sha256": "a5b646e6623c7d7b8fa7d26f2e97a684dd2231a3c1ac949bc36bd333d4146358",
+      "bytes": 17856
+    },
+    {
+      "route": "/downloads/manifest.json",
+      "status": 200,
+      "sha256": "50b5f373a9315b9bafdbde9d33629d4d460e61c62541fe5d24df25827b46907d",
+      "bytes": 8731
+    },
+    {
+      "route": "/app",
+      "status": 200,
+      "sha256": "0d98ccb6a92be7cdef87029233995fd608ca476eae60a27e8c94c383b67f80fa",
+      "bytes": 632
+    }
+  ],
+  "appAsset": {
+    "path": "/app/assets/index-KA62UQkW.js",
+    "sha256": "f6840046695b449568c2e8871a5d7cd950a6f970cf27e822dbdaa8eba3c06e34",
+    "matchesBuiltBytes": true
+  },
+  "catalog": {
+    "version": "0.1.2",
+    "sourceCommit": "c71a3a91861c3dd3bd11ab90b9edbc740aa0f12e",
+    "installers": 6,
+    "sources": 13
+  },
+  "browser": {
+    "connection": "Release verification Mac / Device service connected",
+    "viewportWidth": 1488,
+    "documentWidth": 1488,
+    "mainRight": 1488,
+    "promotionalCopy": false
+  },
+  "screenshot": {
+    "path": "docs/verification/public-power-workspace.jpg",
+    "sha256": "ec5e550077e1a7bd9d9fb24e7ddaa32de0506cf63ac9646c61d8d57f56229dc3"
+  },
+  "taskWorkspace": {
+    "scope": "Actual deployed UI with clearly labeled deterministic task/attempt/chat data from isolated source DeviceApp HTTP service. No model, coordinator or container execution.",
+    "fixtureLabel": "Workspace inspection · UI fixture",
+    "viewportWidth": 1488,
+    "documentWidth": 1488,
+    "mainRight": 1488,
+    "workspaceScroll": 0,
+    "boardHeight": 150,
+    "chatHeight": 385.5234375,
+    "observations": [
+      "Six execution-stage columns, including empty capture/integration stages.",
+      "Selected feature contract and exact owning conversation visible together.",
+      "No right-hand page gap or global horizontal overflow."
+    ],
+    "screenshot": {
+      "path": "docs/verification/public-task-workspace-ui-fixture.jpg",
+      "sha256": "9f482d137fe654cbef932a048f68318142d28d424df3c66684863755ae80c802"
+    },
+    "verifiedAt": "2026-10-06T02:49:23.781Z",
+    "workerVersion": "1f408ce5-816e-47f5-bc2d-29049960ecab"
+  },
+  "initialVisualWorkerVersion": "8bfcc476-746b-493b-9f4c-3854f164888c",
+  "finalBundleVerifiedAt": "2026-10-06T02:45:01.796Z"
+}

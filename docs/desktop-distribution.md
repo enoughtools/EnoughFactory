@@ -122,7 +122,11 @@ Resources contain `runtime/node`, the private `runtime/container` engine/VM payl
 
 ## Release verification and notices
 
-For each required target, open its packaged application, confirm the bundled device service answers authenticated `/api/health` and `/api/runtime` requests, start its private engine, open a real session, and close/reopen the desktop while the session continues. Confirm a separate user/system Docker engine was untouched. Verify user startup installation and removal on that OS, including active-work refusal and preservation of runtime data. Use one complete factory journey for the assembled release rather than repeating extensive checks for every packaging change.
+For a new or changed private runtime, start its engine and open a real session on each required target, then close/reopen the desktop while the session continues. Confirm a separate user/system Docker engine was untouched. Use a representative factory journey for changed coordination or execution behavior.
+
+A later release can retain the published 0.1.2 private-engine/session evidence only through explicit component qualification. The qualifier authenticates the original public receipt bytes and compares the selected runtime executables, assets, implementation sources and dependency closure with the new package. Added, removed or changed inputs invalidate that reuse. The historical proof keeps its original source, version and verification time; the new qualification binds that proof to the current package and states exactly which behavior it covers.
+
+Every new release still checks its actual installed resources and extracted archive bytes, native Node/WebRTC startup, sandboxed desktop frame and continued authenticated service health. The login-service installation/update/removal and database retention checks run against the new service, as does its changed inspection API smoke check. These fresh records cover current application and service code; inherited engine evidence does not extend to changed code. Published older downloads and their receipts remain unchanged.
 
 The native user-service check runs an isolated installation with its own state directory, port, copied resources and startup definition. It requires a Mac login launchd domain or a Linux systemd user manager and refuses to take over an existing EnoughFactory startup registration or definition:
 

@@ -1,0 +1,8 @@
+# Optional restriction to known browser origins; native services have no Origin.
+ENOUGH_SIGNALING_ALLOWED_ORIGINS=
+# Optional device admission list. Required before any managed TURN credentials.
+ENOUGH_SIGNALING_DEVICE_IDS=
+# Disabled by default. Do not create provider keys or enable billing for basic WSS.
+CLOUDFLARE_TURN_KEY_ID=
+CLOUDFLARE_TURN_API_TOKEN=
+TURN_TTL_SECONDS=3600

@@ -1,6 +1,6 @@
 import type { RpcRequest, RpcResponse, StreamEvent } from '@enoughfactory/contracts';
 
-export interface IceServer { urls: string | string[]; username?: string; credential?: string }
+export type { IceServer } from './types.js';
 export interface SignedEnvelope {
   v: 1; type: 'signal' | 'relay'; from: string; to: string; session: string;
   seq: number; at: number; payload: unknown; signature: string;

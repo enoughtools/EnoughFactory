@@ -1,5 +1,6 @@
 import type { EvaluationResponse, PlanResponse, PlannedTask } from "./types.js";
 import { FactoryDecisionError } from "./errors.js";
+import type { TaskKind } from "@enoughfactory/contracts";
 
 /** Parse the last JSON object even when a provider wraps it in explanatory prose. */
 export function readJsonObject(text: string): Record<string, unknown> {
@@ -46,7 +47,11 @@ export function readTasks(value: unknown): PlannedTask[] {
     if (seen.has(item.key)) throw new FactoryDecisionError(`Task key ${item.key} is repeated.`);
     seen.add(item.key);
     if (typeof item.title !== "string" || !item.title.trim() || typeof item.description !== "string" || !item.description.trim()) throw new FactoryDecisionError(`Task ${item.key} needs a title and actionable description.`);
-    return { key: item.key, title: item.title.trim(), description: item.description.trim(), dependsOn: strings(item.dependsOn, `${item.key}.dependsOn`), checks: strings(item.checks, `${item.key}.checks`), ...(typeof item.deviceId === "string" ? { deviceId: item.deviceId } : {}) };
+    if (item.kind !== undefined && (typeof item.kind !== "string" || !["feature", "unit", "architecture", "test"].includes(item.kind))) throw new FactoryDecisionError(`Task ${item.key} has an unsupported kind. Choose feature, unit, architecture or test.`);
+    return { key: item.key, title: item.title.trim(), description: item.description.trim(), dependsOn: strings(item.dependsOn, `${item.key}.dependsOn`), checks: strings(item.checks, `${item.key}.checks`), ...(typeof item.deviceId === "string" ? { deviceId: item.deviceId } : {}),
+      ...(item.kind === undefined ? {} : { kind: item.kind as TaskKind }),
+      ...(item.acceptanceCriteria === undefined ? {} : { acceptanceCriteria: strings(item.acceptanceCriteria, `${item.key}.acceptanceCriteria`) }),
+      ...(item.expectedOutputs === undefined ? {} : { expectedOutputs: strings(item.expectedOutputs, `${item.key}.expectedOutputs`) }) };
   });
 }
 

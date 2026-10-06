@@ -1,5 +1,6 @@
 import type { Device, RpcRequest, RpcResponse, StreamEvent } from '@enoughfactory/contracts';
 import { canonical, signedPart, type ArtifactManifest, type Frame, type IceServer, type Lane, type SignedEnvelope, type StreamOptions } from './protocol.js';
+import { iceCredentialsNeedRefresh, liveRtcIceServers, negotiatedRelayLimits, type RelayLimits } from './types.js';
 
 export type { ArtifactManifest, IceServer, StreamOptions } from './protocol.js';
 
@@ -159,6 +160,10 @@ export class BrowserPeerClient extends EventTarget {
   private fragments = new Map<string, { peerId: string; next: number; total: number; size: number; parts: Uint8Array[]; timer: Timer }>();
   private socket?: WebSocket;
   private signalReady = false;
+  private deliveryAcknowledgments = false;
+  private signalingPongAt = 0;
+  private relayLimits?: RelayLimits;
+  private nextRelaySendAt = 0;
   private stopped = true;
   private reconnect?: Timer;
   private heartbeat?: ReturnType<typeof setInterval>;
@@ -196,12 +201,24 @@ export class BrowserPeerClient extends EventTarget {
   async start(): Promise<void> {
     if (!this.stopped) return; this.stopped = false; this.connectSignaling();
     this.heartbeat = setInterval(() => {
-      for (const link of this.links.values()) if (link.transport)
-        void this.request(link.id, { method: 'GET', path: '/__peers/ping' }, 5000).catch(() => this.disconnect(link.id, 'Connection heartbeat missed'));
+      if (this.signalReady && this.socket?.readyState === WebSocket.OPEN) {
+        if (this.deliveryAcknowledgments && Date.now() - this.signalingPongAt >= 30_000) {
+          const socket = this.socket;
+          // Browser close handshakes can stall on a dead network. Detach now so
+          // reconnect does not wait for the old socket's eventual close event.
+          this.signalingDisconnected(socket); socket.close(4000, 'Signaling heartbeat timed out');
+        } else {
+          if (this.deliveryAcknowledgments) this.socket.send('ping');
+          if (iceCredentialsNeedRefresh(this.iceServers)) this.socket.send(JSON.stringify({ v: 1, type: 'ice-request' }));
+        }
+      }
+      for (const link of this.links.values()) if (link.transport && !(link.transport === 'relay' && this.deliveryAcknowledgments))
+        void this.request(link.id, { method: 'GET', path: '/__peers/ping' }, 5000).catch(() => { if (this.links.get(link.id) === link) this.disconnect(link.id, 'Connection heartbeat missed'); });
     }, 15000);
   }
   async stop(): Promise<void> {
-    this.stopped = true; this.signalReady = false;
+    this.stopped = true; this.signalReady = false; this.deliveryAcknowledgments = false; this.signalingPongAt = 0;
+    this.relayLimits = undefined; this.nextRelaySendAt = 0;
     if (this.reconnect) clearTimeout(this.reconnect); if (this.heartbeat) clearInterval(this.heartbeat);
     this.socket?.close(); this.socket = undefined;
     for (const id of [...this.links.keys()]) this.disconnect(id, 'Browser client stopped');
@@ -235,7 +252,11 @@ export class BrowserPeerClient extends EventTarget {
     });
   }
   async forget(deviceId: string): Promise<void> {
-    this.catalog.delete(deviceId); this.disconnect(deviceId, 'Device unpaired'); await this.persist(); this.notify();
+    this.catalog.delete(deviceId); this.disconnect(deviceId, 'Device unpaired'); await this.persist(); this.discoverPeers(); this.notify();
+  }
+  private discoverPeers(): void {
+    if (this.deliveryAcknowledgments && this.socket?.readyState === WebSocket.OPEN)
+      this.socket.send(JSON.stringify({ v: 1, type: 'discover', devices: [...this.catalog.keys()] }));
   }
   private connectSignaling(): void {
     if (this.stopped || !this.options.signalingUrl) return;
@@ -245,17 +266,24 @@ export class BrowserPeerClient extends EventTarget {
         // Web Crypto is asynchronous. Serialize messages so authenticated sequence checks cannot race.
         this.signalReceive = this.signalReceive.catch(() => {}).then(async () => {
           if (this.socket !== socket || typeof event.data !== 'string' || event.data.length > 512 * 1024) return;
-          await this.handleSignal(JSON.parse(event.data));
+          if (event.data === 'pong') { this.signalingPongAt = Date.now(); return; }
+          const message = JSON.parse(event.data);
+          await this.handleSignal(message);
+          if (this.socket === socket && this.deliveryAcknowledgments && socket.readyState === WebSocket.OPEN && typeof message.deliveryId === 'string' && message.deliveryId.length <= 128)
+            socket.send(JSON.stringify({ v: 1, type: 'delivery-ack', id: message.deliveryId }));
         }).catch(error => this.error(error));
       };
       socket.onerror = () => this.error(new Error('Signaling connection failed'));
-      socket.onclose = () => {
-        if (this.socket !== socket) return; this.signalReady = false; this.socket = undefined;
-        this.dispatchEvent(new CustomEvent('signaling', { detail: false }));
-        for (const link of [...this.links.values()]) if (link.transport === 'relay') this.disconnect(link.id, 'Signaling relay disconnected');
-        if (!this.stopped) { this.reconnect = setTimeout(() => this.connectSignaling(), this.reconnectDelay); this.reconnectDelay = Math.min(15000, this.reconnectDelay * 2); }
-      };
+      socket.onclose = () => this.signalingDisconnected(socket);
     } catch (error) { this.error(error); }
+  }
+  private signalingDisconnected(socket: WebSocket): void {
+    if (this.socket !== socket) return;
+    this.signalReady = false; this.deliveryAcknowledgments = false; this.signalingPongAt = 0; this.socket = undefined;
+    this.relayLimits = undefined; this.nextRelaySendAt = 0;
+    this.dispatchEvent(new CustomEvent('signaling', { detail: false }));
+    for (const link of [...this.links.values()]) if (link.transport === 'relay') this.disconnect(link.id, 'Signaling relay disconnected');
+    if (!this.stopped) { this.reconnect = setTimeout(() => this.connectSignaling(), this.reconnectDelay); this.reconnectDelay = Math.min(15000, this.reconnectDelay * 2); }
   }
   private async sign(value: unknown): Promise<string> {
     return base64(new Uint8Array(await crypto.subtle.sign('Ed25519', this.privateKey, encoder.encode(canonical(value)))));
@@ -263,13 +291,16 @@ export class BrowserPeerClient extends EventTarget {
   private async handleSignal(message: any): Promise<void> {
     if (message.type === 'challenge') {
       const auth = { v: 1, type: 'auth', deviceId: this.identity.id, publicKey: this.identity.publicKey, name: this.localDevice.name, platform: 'browser', arch: 'web', nonce: message.nonce };
-      const signature = await this.sign(auth); if (this.socket?.readyState === WebSocket.OPEN) this.socket.send(JSON.stringify({ ...auth, signature })); return;
+      const signature = await this.sign(auth); if (this.socket?.readyState === WebSocket.OPEN) this.socket.send(JSON.stringify({ ...auth, signature, deliveryAcknowledgments: true, discoverPeers: [...this.catalog.keys()] })); return;
     }
     if (message.type === 'auth-ok') {
       if (message.deviceId !== this.identity.id) return; this.signalReady = true; this.reconnectDelay = 500; this.relayAllowed = message.relay !== false;
-      this.iceServers = [...this.options.iceServers ?? [], ...message.iceServers ?? []]; this.dispatchEvent(new CustomEvent('signaling', { detail: true })); return;
+      this.deliveryAcknowledgments = message.deliveryAcknowledgments === true;
+      this.signalingPongAt = Date.now();
+      this.relayLimits = negotiatedRelayLimits(message.relayLimits); this.nextRelaySendAt = 0;
+      await this.updateIceServers(message.iceServers ?? []); this.dispatchEvent(new CustomEvent('signaling', { detail: true })); return;
     }
-    if (message.type === 'ice') { this.iceServers = [...this.options.iceServers ?? [], ...message.iceServers ?? []]; return; }
+    if (message.type === 'ice') { await this.updateIceServers(message.iceServers ?? []); return; }
     if (message.type === 'presence') {
       const present = new Set<string>();
       for (const entry of message.devices ?? []) {
@@ -309,7 +340,7 @@ export class BrowserPeerClient extends EventTarget {
       if (previous) this.catalog.set(device.id, previous); else this.catalog.delete(device.id);
       clearTimeout(pending.timer); this.pendingPairs.delete(payload.requestId); pending.reject(errorValue(error)); return;
     }
-    clearTimeout(pending.timer); this.pendingPairs.delete(payload.requestId); this.notify(); pending.resolve({ ...device });
+    clearTimeout(pending.timer); this.pendingPairs.delete(payload.requestId); this.discoverPeers(); this.notify(); pending.resolve({ ...device });
     if (this.identity.id < device.id) void this.initiate(device.id).catch(error => this.error(error));
   }
   private signal(to: string, session: string, payload: unknown): Promise<void> {
@@ -341,12 +372,13 @@ export class BrowserPeerClient extends EventTarget {
     const link = await this.newLink(id, crypto.randomUUID(), true);
     await this.sendHello(link);
     if (this.options.transport !== 'relay') void this.native(link, true).catch(error => this.error(error));
+    // A relay hello activates immediately; its failure deadline must still allow a WAN round trip.
     link.connecting = setTimeout(() => {
       link.connecting = undefined; if (this.links.get(id) !== link || link.transport) return;
       if (this.options.transport !== 'webrtc' && this.options.relayFallback !== false && this.relayAllowed && link.relayKey)
         void this.signal(id, link.session, { kind: 'use-relay' }).then(() => this.online(link, 'relay')).catch(error => this.error(error));
       else this.disconnect(id, 'No direct or relay connection');
-    }, this.options.transport === 'relay' ? 150 : 5000);
+    }, 5000);
   }
   private async negotiate(id: string, session: string, payload: any): Promise<void> {
     let link = this.links.get(id);
@@ -383,11 +415,47 @@ export class BrowserPeerClient extends EventTarget {
       if (link.pc && link.described) await link.pc.addIceCandidate(candidate); else if (link.candidates.length < 128) link.candidates.push(candidate);
     }
   }
+  private async updateIceServers(servers: IceServer[]): Promise<void> {
+    const next = [...this.options.iceServers ?? [], ...servers];
+    const credentials = (values: IceServer[]) => JSON.stringify(values.map(({ expiresAt: _expiry, ...server }) => server));
+    const changed = credentials(this.iceServers) !== credentials(next);
+    this.iceServers = next;
+    const iceServers = liveRtcIceServers(this.iceServers);
+    await Promise.all([...this.links.values()].map(async link => {
+      const pc = link.pc;
+      if (!pc || pc.signalingState === 'closed') return;
+      try {
+        pc.setConfiguration({ ...pc.getConfiguration(), iceServers });
+        if (!changed || link.transport !== 'webrtc') return;
+        const stats = await pc.getStats();
+        const reports = new Map<string, Record<string, unknown>>();
+        stats.forEach((report, id) => reports.set(id, report));
+        const selected: string[] = [];
+        reports.forEach(report => {
+          if (report.type === 'transport' && typeof report.selectedCandidatePairId === 'string') selected.push(report.selectedCandidatePairId);
+        });
+        // Older RTC stats omit the transport reference but mark the active pair.
+        if (!selected.length) reports.forEach(report => {
+          if (report.type === 'candidate-pair' && typeof report.id === 'string' && (report.selected === true || report.nominated === true && report.state === 'succeeded')) selected.push(report.id);
+        });
+        const localRelay = selected.some(id => {
+          const pair = reports.get(id);
+          const candidate = pair && typeof pair.localCandidateId === 'string' ? reports.get(pair.localCandidateId) : undefined;
+          return candidate?.type === 'local-candidate' && candidate.candidateType === 'relay';
+        });
+        // setConfiguration prepares future gathering; it does not replace the
+        // existing TURN allocation. Fresh credentials require a fresh relay
+        // link. Keep direct/unknown paths live and retain offer ownership.
+        if (localRelay && this.links.get(link.id) === link && link.pc === pc)
+          this.disconnect(link.id, 'Temporary TURN credentials renewed; reconnecting relay');
+      } catch (error) { this.error(error); }
+    }));
+  }
   private native(link: Link, initiator: boolean): Promise<RTCPeerConnection> {
     if (link.creating) return link.creating;
     link.creating = (async () => {
       if (typeof RTCPeerConnection === 'undefined') throw new Error('WebRTC is unavailable in this browser; enable the encrypted relay');
-      const pc = new RTCPeerConnection({ iceServers: this.iceServers, iceTransportPolicy: this.options.relayOnlyIce ? 'relay' : 'all' }); link.pc = pc;
+      const pc = new RTCPeerConnection({ iceServers: liveRtcIceServers(this.iceServers), iceTransportPolicy: this.options.relayOnlyIce ? 'relay' : 'all' }); link.pc = pc;
       pc.onicecandidate = event => {
         if (event.candidate && this.links.get(link.id) === link)
           void this.signal(link.id, link.session, { kind: 'candidate', candidate: event.candidate.candidate, mid: event.candidate.sdpMid ?? '0' }).catch(error => this.error(error));
@@ -443,7 +511,7 @@ export class BrowserPeerClient extends EventTarget {
     for (const [fragmentId, fragment] of this.fragments) if (fragment.peerId === id) { clearTimeout(fragment.timer); this.fragments.delete(fragmentId); }
     this.dispatchEvent(new CustomEvent('offline', { detail: { deviceId: id, reason } }));
     if (retry && !this.stopped && this.signalReady && this.identity.id < id && this.catalog.has(id))
-      setTimeout(() => { void this.initiate(id).catch(error => this.error(error)); }, 1000);
+      setTimeout(() => { if (!this.links.has(id)) void this.initiate(id).catch(error => this.error(error)); }, 1000);
   }
   private async waitSignaling(): Promise<void> {
     if (this.stopped) await this.start(); const until = Date.now() + 10000;
@@ -483,11 +551,17 @@ export class BrowserPeerClient extends EventTarget {
             channel.send(item.wire);
           } else {
             if (!link.relayKey || !this.signalReady || this.socket?.readyState !== WebSocket.OPEN || this.socket.bufferedAmount > 256 * 1024) continue;
+            if (this.relayLimits && Date.now() < this.nextRelaySendAt) continue;
             const seq = ++link.seq; const payload = { box: await encrypt(link.relayKey, JSON.parse(item.wire), link.session + ':' + this.identity.id + ':' + seq) };
             const envelope: Omit<SignedEnvelope, 'signature'> = { v: 1, type: 'relay', from: this.identity.id, to: link.id, session: link.session, seq, at: Date.now(), payload };
             const signature = await this.sign(envelope);
             if (this.links.get(link.id) !== link || !this.signalReady || this.socket?.readyState !== WebSocket.OPEN) throw new Error('Relay disconnected');
-            this.socket.send(JSON.stringify({ ...envelope, signature }));
+            // Other links may send while Web Crypto yields. Recheck the shared
+            // socket budget immediately before accepting this queued frame.
+            if (this.relayLimits && Date.now() < this.nextRelaySendAt) continue;
+            const relayWire = JSON.stringify({ ...envelope, signature });
+            this.socket.send(relayWire);
+            if (this.relayLimits) this.nextRelaySendAt = Date.now() + Math.max(encoder.encode(relayWire).length / this.relayLimits.bytesPerSecond * 1000, 1000 / this.relayLimits.messagesPerSecond);
           }
           link.queue[lane].shift(); link.queueBytes[lane] -= item.size; item.resolve(); progress = true;
         }

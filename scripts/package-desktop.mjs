@@ -9,6 +9,7 @@ import { execFileSync } from 'node:child_process';
 import { createRequire } from 'node:module';
 import { ensureElectron } from '../apps/desktop/ensure-electron.mjs';
 import { prepareContainerRuntime } from './prepare-container-runtime.mjs';
+import { componentQualificationRequirements } from '../release/marketing/verify-component-qualification.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const nodeVersion = '22.22.0';
@@ -204,6 +205,25 @@ for (const notice of ['LICENSE', 'THIRD_PARTY_NOTICES.md']) {
 await prepareRuntime(opt.platform, opt.arch, resources);
 await prepareNative(opt.platform, opt.arch, resources);
 await prepareContainerRuntime(opt.platform, opt.arch, join(resources, 'runtime', 'container'));
+// Preserve the previously exercised guest payload byte for byte. Product source
+// companion filenames change separately; this does not claim a new engine run.
+if (opt.platform === 'darwin' && process.env.ENOUGHFACTORY_COMPONENT_BASELINE_DIR) {
+  const baseline = resolve(process.env.ENOUGHFACTORY_COMPONENT_BASELINE_DIR);
+  const required = componentQualificationRequirements(opt.platform, opt.arch);
+  const raw = await readFile(join(baseline, `${required.baseline.archive.filename}.verification.json`));
+  if (createHash('sha256').update(raw).digest('hex') !== required.baseline.archive.receiptSha256) throw new Error('The historical component receipt changed.');
+  const previous = JSON.parse(raw);
+  const container = join(resources, 'runtime', 'container');
+  const current = JSON.parse(await readFile(join(container, 'provenance.json'), 'utf8'));
+  const engine = JSON.parse(await readFile(join(container, 'engine-provenance.json'), 'utf8'));
+  if (current.dockerVersion !== previous.containerRuntime.dockerVersion || current.limaVersion !== previous.containerRuntime.limaVersion || JSON.stringify(current.archives) !== JSON.stringify(previous.containerRuntime.archivePins) || JSON.stringify(engine.components) !== JSON.stringify(previous.containerRuntime.engineSourceBuild.components)) throw new Error('The fresh staged runtime changed its tested engine inputs.');
+  const guest = await readFile(join(baseline, 'guest-engine.tgz'));
+  const sha256 = createHash('sha256').update(guest).digest('hex');
+  if (sha256 !== required.assets['runtime/container/docker/guest-engine.tgz']) throw new Error('The historical guest engine payload changed.');
+  await writeFile(join(container, 'docker', 'guest-engine.tgz'), guest);
+  current.engineArchive = { file: 'docker/guest-engine.tgz', sha256 };
+  await writeFile(join(container, 'provenance.json'), `${JSON.stringify(current, null, 2)}\n`);
+}
 await writeBundleProvenance(opt.platform, opt.arch, resources);
 const containerProof = JSON.parse(await readFile(join(resources, 'runtime/container/provenance.json'), 'utf8'));
 const companion = containerProof.sourceCompanion;

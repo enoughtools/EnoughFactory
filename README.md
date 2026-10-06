@@ -10,7 +10,7 @@ The shared React interface uses [EnoughUI](https://github.com/enoughtools/enough
 
 - Open Docker-backed environments with services, logs, independent terminals, previews and recoverable Git changes.
 - Work with Codex, Antigravity or Claude in container-owned conversations. Enough owns the supported approval decisions.
-- Pair devices through authenticated WebRTC, with self-hostable signaling and optional TURN or encrypted WebSocket relay.
+- Pair devices through authenticated WebRTC, with hosted or self-hosted signaling and encrypted WebSocket fallback. TURN is optional.
 - Coordinate dependent tasks using isolated Git or ArtifactFS workspaces, immutable candidates and serialized integration.
 - Run autonomous goals through planning, execution, evaluation and repair. An agent finishing a turn does not finish the factory's responsibility to a goal.
 
@@ -40,6 +40,8 @@ For live interface development, run `pnpm dev`, then `pnpm --filter @enoughfacto
 
 - [Install, connect an agent and create a goal](docs/install.md)
 - [Try a complete example project](examples/status-board/README.md)
+- [Inspect tasks, attempts and factory progress](docs/task-workspace.md)
+- [Hosted networking, capacity and optional TURN](services/signaling-cloudflare/README.md)
 - [Self-host signaling, relays and browser previews](docs/self-hosting.md)
 - [Desktop distribution and native packaging](docs/desktop-distribution.md)
 - [Build plan and product architecture](docs/build-plan.md)
@@ -55,6 +57,7 @@ For live interface development, run `pnpm dev`, then `pnpm --filter @enoughfacto
 | `apps/device` | Device-owned sessions, chats, networking and factory integration |
 | `packages` | Contracts, envmux adapter, runtimes, peers, previews, workspaces and coordinator |
 | `services/signaling` | Self-hostable presence, negotiation and optional relay |
+| `services/signaling-cloudflare` | Hibernating hosted signaling and encrypted fallback, with shared capacity limits |
 | `runtime` | Container agent bridges and ArtifactFS manager image |
 | `apps/marketing` | Product website and launch assets |
 | `vendor` | Pinned envmux and EnoughUI with provenance and original licenses |

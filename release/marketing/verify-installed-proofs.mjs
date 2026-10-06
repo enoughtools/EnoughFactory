@@ -1,4 +1,5 @@
 const digest = value => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
+import { verifyComponentQualification } from './verify-component-qualification.mjs';
 // Exact record/event fixture retained by scripts/installed-service-data-boundary.mjs.
 const retainedFixtureSha256 = '05e7b797d3631820402dcabd6d0191e48b88c029f854b6bf9dfb13908a31252a';
 
@@ -40,7 +41,35 @@ export function verifyInstalledProofs(archive, service, gui, screenshotSha256) {
 }
 
 export function verifyPackagedServiceProof(archive, proof) {
+  if (proof?.suite === 'packaged-service-smoke') return verifyPackagedServiceSmoke(archive, proof);
   const bundle = proof?.bundle;
   const requiredChecks = ['installed resource hashes and bundled Node match bundle provenance', 'installed device service authenticated health and unauthenticated rejection', 'installed service runtime start reaches its private Docker endpoint', 'installed service session reaches native envmux readiness', 'installed service restart preserves session identity and prior returned commit', 'installed runtime stop refuses unconfirmed active environments', 'installed service session permits full root writes', 'installed service session stop returns exact source commit', 'installed service authenticated runtime stop completes', 'installed service authenticated shutdown completes', 'inherited user Docker context and TLS settings ignored', 'user Docker configuration unchanged'];
   if (proof?.formatVersion !== 1 || proof.product !== 'EnoughFactory' || proof.suite !== 'packaged-service-runtime' || proof.status !== 'passed' || proof.platform !== archive.platform || proof.arch !== archive.arch || bundle?.sourceCommit !== archive.sourceCommit || bundle.version !== archive.version || bundle.platform !== archive.platform || bundle.arch !== archive.arch || bundle.manifestSha256 !== archive.resources.bundleProvenanceSha256 || proof.nodeVersion !== archive.native.node.version || proof.dockerVersion !== archive.containerRuntime.dockerVersion || proof.serviceSha256 !== archive.resources.manifest['device/service.cjs'] || proof.runtimeProvenanceSha256 !== archive.resources.manifest['runtime/container/provenance.json'] || proof.envmuxSha256 !== archive.resources.manifest['envmux/envmux'] || !Number.isFinite(Date.parse(proof.startedAt)) || !Number.isFinite(Date.parse(proof.completedAt)) || Date.parse(proof.completedAt) < Date.parse(proof.startedAt) || !Array.isArray(proof.checks) || requiredChecks.some(check => !proof.checks.includes(check))) throw new Error(`Packaged service/runtime API evidence does not match the final archive: ${archive.artifact.filename}.`);
+}
+
+export const packagedServiceSmokeChecks = Object.freeze([
+  'current bundled Node and service match the installed manifest',
+  'authenticated local health reports the current release',
+  'inspection endpoints reject unauthenticated requests',
+  'paused goal projects typed tasks and recovered controllers',
+  'task inspection preserves kind, criteria and expected outputs',
+  'attempt inspection exposes retained candidate and check receipts',
+  'legacy task inspection preserves absent optional fields',
+  'inspection hides private paths and leaves records unchanged',
+  'artifact content matches its immutable manifest',
+  'owned private runtime remains stopped',
+  'authenticated shutdown exits and closes the service',
+]);
+
+export function verifyPackagedServiceSmoke(archive, proof) {
+  verifyComponentQualification(archive);
+  const fail = () => { throw new Error(`The fresh packaged-service smoke does not establish the changed local service boundary: ${archive.artifact?.filename ?? 'installed resources'}.`); };
+  const bundle = proof?.bundle;
+  if (proof?.formatVersion !== 1 || proof.product !== 'EnoughFactory' || proof.suite !== 'packaged-service-smoke' || proof.status !== 'passed' || proof.version !== archive.version || proof.sourceCommit !== archive.sourceCommit || proof.platform !== archive.platform || proof.arch !== archive.arch || bundle?.sourceCommit !== archive.sourceCommit || bundle.version !== archive.version || bundle.platform !== archive.platform || bundle.arch !== archive.arch || bundle.manifestSha256 !== archive.resources.bundleProvenanceSha256 || proof.serviceSha256 !== archive.resources.manifest['device/service.cjs'] || proof.nodeSha256 !== archive.resources.manifest['runtime/node'] || !Number.isFinite(Date.parse(proof.startedAt)) || !Number.isFinite(Date.parse(proof.completedAt)) || Date.parse(proof.completedAt) < Date.parse(proof.startedAt) || !Array.isArray(proof.checks) || proof.checks.length !== packagedServiceSmokeChecks.length || new Set(proof.checks).size !== proof.checks.length || packagedServiceSmokeChecks.some(check => !proof.checks.includes(check))) fail();
+  const scope = proof.scope;
+  if (scope?.transport !== 'authenticated-local-http' || scope.pairedTransportTested !== false || scope.containerEngineStarted !== false || scope.agentOrModelStarted !== false) fail();
+  const inspection = proof.inspection;
+  if (inspection?.typedTaskKind !== 'feature' || inspection.controllerRecovery !== 'interrupted' || ['criteriaAndOutputsPreserved', 'retainedAttemptReceipts', 'legacyOptionalFieldsPreserved', 'privatePathsRedacted', 'readOnlyRecordsPreserved'].some(field => inspection[field] !== true)) fail();
+  if (proof.authentication?.unauthenticatedStatus !== 401 || proof.runtime?.kind !== (archive.platform === 'darwin' ? 'lima' : 'rootless') || proof.runtime.state !== 'stopped' || proof.runtime.ownedStateDirectory !== true || proof.runtime.ownedSocket !== true || ['authenticated', 'exitedCleanly', 'connectionClosed'].some(field => proof.shutdown?.[field] !== true) || proof.artifact?.sha256 !== 'bec1f1272275fe6ab67a2d69a50caa4cd5944e77fe4ea13e91ab965afdbbb55d' || proof.artifact.size !== 47 || proof.artifact.contentVerified !== true) fail();
+  return proof;
 }

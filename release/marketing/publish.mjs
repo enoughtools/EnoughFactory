@@ -4,7 +4,8 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { verifyArchiveReceipt, verifyPublishedCatalog, verifyRuntimeJourney } from './verify-receipt.mjs';
-import { verifyPublicAsset, verifySourceCatalog } from './source-companions.mjs';
+import { hashBytes, verifyPublicAsset, verifySourceCatalog } from './source-companions.mjs';
+import { verifyInstalledProofs, verifyPackagedServiceSmoke } from './verify-installed-proofs.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const publicRoot = resolve(root, 'apps/marketing/public');
@@ -15,6 +16,17 @@ for (const artifact of manifest.artifacts) {
   const receipt = verifyArchiveReceipt(JSON.parse(await readFile(resolve(publicRoot, `.${artifact.verificationUrl}`), 'utf8')), { ...artifact, version: manifest.version }, pins);
   if (receipt.sourceCommit !== manifest.sourceCommit) throw new Error(`Package verification source differs from the catalog: ${artifact.filename}.`);
   verifyRuntimeJourney(receipt);
+  if (receipt.componentQualification) {
+    const proofs = {};
+    for (const [name, suite] of [['service', 'service'], ['gui', 'gui'], ['smoke', 'packaged-service-smoke']]) {
+      const expected = `/downloads/${manifest.version}/${artifact.platform}-${artifact.arch}.${suite}.verification.json`;
+      if (artifact.verificationReceiptUrls?.[name] !== expected) throw new Error(`Qualified publication is missing the fresh ${name} evidence: ${artifact.filename}.`);
+      proofs[name] = JSON.parse(await readFile(resolve(publicRoot, `.${expected}`), 'utf8'));
+    }
+    const screenshot = await readFile(resolve(publicRoot, `.${artifact.verificationReceiptUrls.gui}.png`));
+    verifyInstalledProofs(receipt, proofs.service, proofs.gui, hashBytes(screenshot));
+    verifyPackagedServiceSmoke(receipt, proofs.smoke);
+  }
   receipts.push(receipt);
 }
 const indexBytes = await readFile(resolve(publicRoot, `downloads/${manifest.version}/Ubuntu-source-companion.json`));

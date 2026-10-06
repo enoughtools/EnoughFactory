@@ -4,6 +4,7 @@ import { copyFile, mkdir, readFile, stat, writeFile } from 'node:fs/promises';
 import { dirname, resolve, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { verifyArchiveReceipt, verifyPublishedCatalog, verifyRuntimeJourney } from './verify-receipt.mjs';
+import { verifyInstalledProofs, verifyPackagedServiceSmoke } from './verify-installed-proofs.mjs';
 import { engineSourceRequirements, hashBytes, hashFile, releaseAssetUrl, ubuntuSourceRequirements, verifyPublicAsset, verifySourceCatalog } from './source-companions.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
@@ -37,10 +38,33 @@ for (const artifact of spec.artifacts) {
   const sha256 = hash.digest('hex');
   if (artifact.sha256 && artifact.sha256 !== sha256) throw new Error(`Checksum does not match ${filename}`);
   let verificationUrl;
+  let verificationReceiptUrls;
   if (spec.status === 'published' && !artifact.verificationPath) throw new Error(`Published package requires an actual extracted archive verification receipt: ${filename}`);
   if (artifact.verificationPath) {
     const receipt = verifyArchiveReceipt(JSON.parse(await readFile(resolve(dirname(specPath), artifact.verificationPath), 'utf8')), { version: spec.version, filename, sha256, bytes: info.size, platform: artifact.platform, arch: artifact.arch, format }, pins);
     if (spec.status === 'published') verifyRuntimeJourney(receipt);
+    if (receipt.componentQualification) {
+      const proofs = {};
+      verificationReceiptUrls = {};
+      for (const [name, suite] of [['service', 'service'], ['gui', 'gui'], ['smoke', 'packaged-service-smoke']]) {
+        const input = artifact.verificationReceiptPaths?.[name];
+        const expected = `${artifact.platform}-${artifact.arch}.${suite}.verification.json`;
+        if (typeof input !== 'string' || basename(input) !== expected) throw new Error(`Qualified delivery requires the current ${name} proof: ${filename}.`);
+        const bytes = await readFile(resolve(dirname(specPath), input));
+        proofs[name] = JSON.parse(bytes);
+        verificationReceiptUrls[name] = `/downloads/${spec.version}/${expected}`;
+        await mkdir(resolve(downloadRoot, spec.version), { recursive: true });
+        await writeFile(resolve(downloadRoot, spec.version, expected), bytes);
+        if (spec.status === 'published') await verifyPublicAsset({ filename: expected, url: releaseAssetUrl(spec.releaseBaseUrl, expected, spec.sourceUrl), sha256: hashBytes(bytes), bytes: bytes.length });
+      }
+      const screenshotPath = `${resolve(dirname(specPath), artifact.verificationReceiptPaths.gui)}.png`;
+      const screenshot = await readFile(screenshotPath);
+      verifyInstalledProofs(receipt, proofs.service, proofs.gui, hashBytes(screenshot));
+      verifyPackagedServiceSmoke(receipt, proofs.smoke);
+      const screenshotFilename = basename(screenshotPath);
+      await writeFile(resolve(downloadRoot, spec.version, screenshotFilename), screenshot);
+      if (spec.status === 'published') await verifyPublicAsset({ filename: screenshotFilename, url: releaseAssetUrl(spec.releaseBaseUrl, screenshotFilename, spec.sourceUrl), sha256: hashBytes(screenshot), bytes: screenshot.length });
+    }
     receipts.push(receipt);
     await mkdir(resolve(downloadRoot, spec.version), { recursive: true });
     const publicReceipt = { ...receipt, ...(receipt.runtimeJourney ? { runtimeJourney: { ...receipt.runtimeJourney, proofDirectory: undefined } } : {}) };
@@ -68,7 +92,7 @@ for (const artifact of spec.artifacts) {
     await copyFile(path, resolve(downloadRoot, spec.version, filename));
     url = `/downloads/${spec.version}/${filename}`;
   }
-  artifacts.push({ platform: artifact.platform, arch: artifact.arch, format, filename, url, sha256, bytes: info.size, signing: artifact.signing, ...(verificationUrl ? { verificationUrl } : {}) });
+  artifacts.push({ platform: artifact.platform, arch: artifact.arch, format, filename, url, sha256, bytes: info.size, signing: artifact.signing, ...(verificationUrl ? { verificationUrl } : {}), ...(verificationReceiptUrls ? { verificationReceiptUrls } : {}) });
 }
 if (new Set(artifacts.map(a => a.filename)).size !== artifacts.length) throw new Error('Artifact filenames must be unique.');
 if (spec.status === 'published') {

@@ -6,20 +6,22 @@ import { chmod, copyFile, lstat, mkdir, mkdtemp, readFile, readdir, realpath, re
 import { tmpdir } from 'node:os';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { verifyComponentQualification } from '../release/marketing/verify-component-qualification.mjs';
 
-const usage = 'Usage: node scripts/check-desktop-archive.mjs --artifact <dmg|zip|AppImage|tar.gz> [--receipt <path>] [--source-commit <hash>] [--runtime-receipt <path>]';
+const usage = 'Usage: node scripts/check-desktop-archive.mjs --artifact <dmg|zip|AppImage|tar.gz> [--receipt <path>] [--source-commit <hash>] [--runtime-receipt <fresh journey>] [--component-qualification <unchanged 0.1.2 component proof>]';
 const options = {};
 for (let index = 2; index < process.argv.length; index++) {
   const flag = process.argv[index];
   if (flag === '--help') { console.log(usage); process.exit(0); }
-  if (!['--artifact', '--receipt', '--source-commit', '--runtime-receipt'].includes(flag) || options[flag] !== undefined || !process.argv[index + 1] || process.argv[index + 1].startsWith('--')) throw new Error(usage);
+  if (!['--artifact', '--receipt', '--source-commit', '--runtime-receipt', '--component-qualification'].includes(flag) || options[flag] !== undefined || !process.argv[index + 1] || process.argv[index + 1].startsWith('--')) throw new Error(usage);
   options[flag] = process.argv[++index];
 }
 if (!options['--artifact']) throw new Error(usage);
+if (options['--runtime-receipt'] && options['--component-qualification']) throw new Error('Choose fresh runtime evidence or explicitly qualified historical components.');
 if (options['--source-commit'] && !/^[a-f0-9]{40}$/.test(options['--source-commit'])) throw new Error('The source commit must be a complete lowercase Git SHA-1.');
 const artifactPath = resolve(options['--artifact']);
 const receiptPath = resolve(options['--receipt'] ?? `${artifactPath}.verification.json`);
-if (receiptPath === artifactPath || (options['--runtime-receipt'] && receiptPath === resolve(options['--runtime-receipt']))) throw new Error('Write the archive receipt separately from its artifact and runtime journey receipt.');
+if (receiptPath === artifactPath || ['--runtime-receipt', '--component-qualification'].some(flag => options[flag] && receiptPath === resolve(options[flag]))) throw new Error('Write the archive receipt separately from its artifact and runtime evidence.');
 const filename = basename(artifactPath);
 const format = /\.tar\.gz$/i.test(filename) ? 'tar.gz' : /\.appimage$/i.test(filename) ? 'AppImage' : /\.dmg$/i.test(filename) ? 'dmg' : /\.zip$/i.test(filename) ? 'zip' : undefined;
 if (!format) throw new Error('Supported desktop archive formats are DMG, ZIP, AppImage and tar.gz.');
@@ -232,7 +234,9 @@ try {
   }
   const current = await fingerprint(artifactPath);
   if (current.sha256 !== artifact.sha256 || current.bytes !== artifact.bytes) throw new Error('The archive changed during verification; no receipt was written.');
-  receipt = { ...proof, verificationScope: 'desktop-archive', verifiedAt: new Date().toISOString(), artifact, extraction: { format }, ...(runtimeJourney ? { runtimeJourney } : {}) };
+  const componentQualification = options['--component-qualification'] ? JSON.parse(await readFile(resolve(options['--component-qualification']), 'utf8')) : undefined;
+  receipt = { ...proof, verificationScope: 'desktop-archive', verifiedAt: new Date().toISOString(), artifact, extraction: { format }, ...(runtimeJourney ? { runtimeJourney } : {}), ...(componentQualification ? { componentQualification } : {}) };
+  if (componentQualification) verifyComponentQualification(receipt);
 } catch (error) { failure = error; }
 finally {
   if (attachAttempted) {

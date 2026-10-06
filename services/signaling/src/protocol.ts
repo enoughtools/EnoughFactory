@@ -29,6 +29,8 @@ export interface IceServer {
   urls: string[];
   username?: string;
   credential?: string;
+  /** Credential expiry as UNIX milliseconds; absent for STUN/static TURN. */
+  expiresAt?: number;
 }
 
 /** Recursively sorted JSON is the signed wire representation, not raw message JSON. */
