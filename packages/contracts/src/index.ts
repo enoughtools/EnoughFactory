@@ -8,6 +8,8 @@ export interface Project {
   id: string; name: string; path: string; deviceId: string; createdAt: string;
   runtime: RuntimeKind; approvalMode: ApprovalMode; rules: PolicyRule[];
   internal?: boolean; sourceProjectId?: string;
+  /** Reversible catalog removal. Repository files and retained history are unchanged. */
+  archivedAt?: string;
 }
 export type SessionStatus = "starting" | "ready" | "stopping" | "stopped" | "failed" | "unknown";
 export interface Service {
@@ -17,6 +19,8 @@ export interface Session {
   id: string; projectId: string; deviceId: string; name: string; status: SessionStatus;
   phase?: string; error?: string; createdAt: string; updatedAt: string; branch?: string;
   services: Service[]; containerId?: string; enginePid?: number;
+  /** Reversible catalog removal; execution and evidence records remain available by identity. */
+  archivedAt?: string;
 }
 export interface Device {
   id: string; name: string; platform: string; arch: string; online: boolean; lastSeen: string;
@@ -31,6 +35,7 @@ export interface RuntimeCapability {
 }
 export interface Chat {
   id: string; sessionId: string; deviceId: string; title: string; runtime: RuntimeKind;
+  attemptId?: string;
   approvalMode: ApprovalMode; status: "idle" | "running" | "waiting" | "failed" | "interrupted";
   createdAt: string; updatedAt: string; threadId?: string; error?: string;
 }

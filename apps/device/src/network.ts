@@ -19,6 +19,8 @@ function records<T>(value: unknown, predicate: (item: Record<string,unknown>)=>b
   return Array.isArray(value) ? value.filter(item=>predicate(object(item))).slice(0,10000) as T[] : [];
 }
 function publicCatalog(app: DeviceApp): Catalog {
+  // Keep removed identities in peer metadata for owner-aware restore and historical reads.
+  // DeviceApp.state filters the merged catalog only after this raw catalog is collected.
   return { id:app.device.id,updatedAt:now(),capacity:app.device.capacity,workerResources:app.device.workerResources,workspaceProviders:app.device.workspaceProviders,projects:app.store.list<Project>('projects').filter(project=>!project.internal),
     sessions:app.store.list<Session>('sessions').map(({enginePid,...session})=>session),
     chats:app.store.list<Chat>('chats').map(({threadId,...chat})=>chat),
@@ -121,7 +123,7 @@ export async function initializeNetwork(app: DeviceApp): Promise<{
   const remoteCatalogs=new Map(app.store.list<Catalog>('remote-catalog').map(catalog=>[catalog.id,catalog]));
   const liveApprovals=new Map<string,Approval[]>();
   let peers!: PeerManager;let remoteEvent=false;let closed=false;let lastPublished='';let lastApprovals='';
-  const localState=():FactoryState=>({product:'EnoughFactory',version:'0.1.1',device:app.device,devices:[app.device],
+  const localState=():FactoryState=>({product:'EnoughFactory',version:'0.1.5',device:app.device,devices:[app.device],
     ...publicCatalog(app),approvals:app.store.list('approvals'),diagnostics:app.diagnostics,
     settings:{...app.settings,turnCredential:undefined}});
   const saveCatalog=(peerId:string,value:unknown)=>{
@@ -138,6 +140,9 @@ export async function initializeNetwork(app: DeviceApp): Promise<{
   const catalogOwner=(bucket:keyof Pick<Catalog,'projects'|'sessions'|'chats'|'goals'|'tasks'|'attempts'>,id:string):string|undefined=>{
     if(app.store.get(bucket,id))return app.device.id;
     for(const catalog of remoteCatalogs.values())if(catalog[bucket].some(item=>item.id===id))return catalog.id;
+    // Internal factory project metadata is private to its owner, but a known environment
+    // still identifies which device can resolve that project's retained source reference.
+    if(bucket==='projects')for(const catalog of remoteCatalogs.values())if(catalog.sessions.some(session=>session.projectId===id))return catalog.id;
     return undefined;
   };
   const owner=(call:ApiCall):string|undefined=>{

@@ -1,6 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createInterface } from "node:readline";
 import { randomUUID } from "node:crypto";
+import { performance } from "node:perf_hooks";
 import { dockerInvocation, type DockerRuntimeEndpoint } from "@enoughfactory/runtime";
 import { AgentError } from "./types.ts";
 
@@ -13,6 +14,42 @@ export function checkContainerId(containerId: string): void {
   if (!/^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$/.test(containerId)) throw new AgentError("A Docker container identity is required.", "INVALID_CONTAINER");
 }
 export function quote(value: string): string { return `'${value.replace(/'/g, `'"'"'`)}'`; }
+
+interface TimeoutClock {
+  now(): number;
+  setTimeout(callback: () => void, delay: number): ReturnType<typeof setTimeout>;
+  clearTimeout(timer: ReturnType<typeof setTimeout>): void;
+}
+
+/** Budget active waiting time without expiring an entire command during host sleep. */
+export function suspendAwareTimeout(callback: () => void, duration: number, clock: TimeoutClock = {
+  now: () => performance.now(), setTimeout, clearTimeout,
+}): () => void {
+  let remaining = Number.isFinite(duration) && duration > 0 ? duration : 0;
+  let stopped = false;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const schedule = (): void => {
+    const slice = Math.min(1000, remaining);
+    const started = clock.now();
+    timer = clock.setTimeout(() => {
+      timer = undefined;
+      if (stopped) return;
+      const elapsed = Math.max(0, clock.now() - started);
+      // A long event-loop gap can mean the laptop slept. Charge the scheduled
+      // slice, retaining the remaining budget after resume rather than retrying
+      // a command whose container-side effects may already have happened.
+      remaining -= elapsed > slice + 5000 ? slice : elapsed;
+      if (remaining <= 0) { stopped = true; callback(); }
+      else schedule();
+    }, slice);
+  };
+  schedule();
+  return () => {
+    if (stopped) return;
+    stopped = true;
+    if (timer !== undefined) { clock.clearTimeout(timer); timer = undefined; }
+  };
+}
 
 export class ContainerProcess {
   readonly process: ChildProcessWithoutNullStreams;
@@ -63,18 +100,41 @@ export class ContainerProcess {
   }
 }
 
-export async function containerCommand(containerId: string, args: string[], options: { dockerEndpoint?: DockerRuntimeEndpoint; input?: string | Buffer; cwd?: string; timeout?: number; spawnProcess?: SpawnProcess } = {}): Promise<string> {
+export async function containerCommand(containerId: string, args: string[], options: { dockerEndpoint?: DockerRuntimeEndpoint; input?: string | Buffer; cwd?: string; timeout?: number; spawnProcess?: SpawnProcess; signal?: AbortSignal } = {}): Promise<string> {
   checkContainerId(containerId);
+  if (options.signal?.aborted) throw new AgentError("Container command interrupted.", "INTERRUPTED");
   const invocation = dockerInvocation(requireEndpoint(options.dockerEndpoint), ["exec", "-i", "--user", "0", ...(options.cwd ? ["--workdir", options.cwd] : []), containerId, ...args]);
   const child = (options.spawnProcess ?? spawn)(invocation.command, invocation.args, { stdio: "pipe", env: invocation.env });
   let out = "", err = "";
   child.stdout?.on("data", (chunk) => { out = (out + chunk.toString()).slice(-1_000_000); });
   child.stderr?.on("data", (chunk) => { err = (err + chunk.toString()).slice(-8_000); });
   child.stdin?.on("error", () => {});
-  child.stdin?.end(options.input);
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => { child.kill("SIGTERM"); reject(new AgentError("Container command timed out.", "RUNTIME_TIMEOUT")); }, options.timeout ?? 30_000);
-    child.once("error", (error) => { clearTimeout(timer); reject(new AgentError(error.message, "CONTAINER_UNAVAILABLE")); });
-    child.once("close", (code) => { clearTimeout(timer); code === 0 ? resolve(out.trim()) : reject(new AgentError(err.trim() || `Container command exited with ${code}.`, "CONTAINER_COMMAND_FAILED")); });
+    let settled = false;
+    let cancelTimer = () => {};
+    const cleanup = (): void => { cancelTimer(); options.signal?.removeEventListener("abort", onAbort); };
+    const fail = (error: AgentError, terminate = false): void => {
+      if (settled) return;
+      settled = true; cleanup();
+      if (terminate) {
+        child.stdin?.destroy();
+        // Terminating the Docker client does not confirm the outcome of arbitrary
+        // container effects. Callers must reconcile an uncertain timeout.
+        try { child.kill("SIGTERM"); } catch { /* Preserve the original interruption or timeout. */ }
+      }
+      reject(error);
+    };
+    const onAbort = (): void => fail(new AgentError("Container command interrupted.", "INTERRUPTED"), true);
+    child.once("error", (error) => fail(new AgentError(error.message, "CONTAINER_UNAVAILABLE")));
+    child.once("close", (code) => {
+      if (settled) return;
+      if (code !== 0) { fail(new AgentError(err.trim() || `Container command exited with ${code}.`, "CONTAINER_COMMAND_FAILED")); return; }
+      settled = true; cleanup(); resolve(out.trim());
+    });
+    options.signal?.addEventListener("abort", onAbort, { once: true });
+    // The signal can have changed while the child was being spawned.
+    if (options.signal?.aborted) { onAbort(); return; }
+    cancelTimer = suspendAwareTimeout(() => fail(new AgentError("Container command timed out.", "RUNTIME_TIMEOUT"), true), options.timeout ?? 30_000);
+    child.stdin?.end(options.input);
   });
 }

@@ -20,7 +20,7 @@ export class AgentManager {
   private provisioning = new Map<string, Promise<RuntimeCapability>>();
   constructor(private options: AgentManagerOptions = {}) {}
   availability(containerId: string): Promise<RuntimeCapability[]> { return availability(containerId, this.options); }
-  async provision(containerId: string, runtime: RuntimeKind, provision: ProvisionOptions = {}): Promise<RuntimeCapability> {
+  async provision(containerId: string, runtime: RuntimeKind, provision: ProvisionOptions = {}, signal?: AbortSignal): Promise<RuntimeCapability> {
     const key = `${containerId}:${runtime}`;
     const existing = this.provisioning.get(key);
     if (existing) {
@@ -28,7 +28,7 @@ export class AgentManager {
       if (provision.copyHostAuth) await copyMinimalAuth(containerId, runtime, provision, this.options);
       return result;
     }
-    const job = provisionRuntime(containerId, runtime, provision, this.options);
+    const job = provisionRuntime(containerId, runtime, provision, { ...this.options, signal });
     this.provisioning.set(key, job);
     try { return await job; } finally { this.provisioning.delete(key); }
   }
@@ -55,10 +55,10 @@ export class AgentManager {
     try {
       if (this.options.autoProvision !== false && input.antigravityTransport !== "cli") {
         await callbacks.onEvent({ kind: "status", text: "Preparing container runtime", data: { status: "starting", runtime: input.runtime } });
-        await this.provision(input.containerId, input.runtime, { copyHostAuth: this.options.copyHostAuth, hostAuthDir: this.options.hostAuthDir });
+        await this.provision(input.containerId, input.runtime, { copyHostAuth: this.options.copyHostAuth, hostAuthDir: this.options.hostAuthDir }, controller.signal);
       }
       if (controller.signal.aborted) throw new AgentError("Agent turn interrupted.", "INTERRUPTED");
-      const cwd = input.cwd ?? await containerCommand(input.containerId, ["sh", "-c", 'printf "%s" "${ENVMUX_WORKDIR:-/work}"'], this.options);
+      const cwd = input.cwd ?? await containerCommand(input.containerId, ["sh", "-c", 'printf "%s" "${ENVMUX_WORKDIR:-/work}"'], { ...this.options, signal: controller.signal });
       const selected = { ...input, cwd };
       let result: TurnResult;
       if (input.runtime === "codex" && input.codexTransport !== "exec") {
@@ -78,7 +78,8 @@ export class AgentManager {
       return result;
     } catch (error) {
       const failure = error instanceof Error ? error : new Error(String(error));
-      await callbacks.onEvent({ kind: "error", text: failure.message, data: { code: failure instanceof AgentError ? failure.code : "AGENT_RUNTIME_ERROR", interrupted: controller.signal.aborted } });
+      Object.assign(failure, { agentStarted: !!live.process });
+      await callbacks.onEvent({ kind: "error", text: failure.message, data: { code: failure instanceof AgentError ? failure.code : "AGENT_RUNTIME_ERROR", interrupted: controller.signal.aborted, agentStarted: !!live.process, phase: live.process ? "execution" : "preparation" } });
       throw failure;
     } finally {
       controller.abort(); await router.cancel(); await live.process?.stop();

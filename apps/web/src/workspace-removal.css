@@ -1,0 +1,20 @@
+.removal-confirmation .notice, .removal-confirmation .error-banner { margin: 0; }
+.removal-repository-path { overflow-wrap: anywhere; color: var(--factory-secondary); font-size: 12px; }
+.project-removal-section { margin-top: 4px; padding-top: 18px; border-top: 1px solid var(--factory-line); display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.project-removal-section .field-hint { max-width: 280px; }
+.removed-items-hint { margin-bottom: 16px; }
+.removed-environment-notice { align-self: stretch; padding: 16px; border: 1px solid var(--factory-line); background: var(--factory-surface); font-size: 12px; }
+.removed-environment-notice > strong { display: block; margin-bottom: 6px; font-weight: 500; }
+.removed-environment-notice > p { color: var(--factory-secondary); }
+.removed-items-list { display: flex; flex-direction: column; }
+.removed-item { display: flex; align-items: center; gap: 12px; min-width: 0; padding: 13px 0; }
+.removed-item + .removed-item { border-top: 1px solid var(--factory-line-soft); }
+.removed-item > svg { color: var(--factory-muted); }
+.removed-item-info { flex: 1; min-width: 0; }
+.removed-item-info strong { display: block; font-size: 12px; font-weight: 500; overflow-wrap: anywhere; }
+.removed-item-info span { display: block; color: var(--factory-muted); font-size: 11px; overflow-wrap: anywhere; }
+.removed-item-time { color: var(--factory-muted); font-size: 10px; white-space: nowrap; }
+@media (max-width: 600px) {
+  .project-removal-section { align-items: flex-start; flex-direction: column; }
+  .removed-item-time { display: none; }
+}

@@ -1,0 +1,31 @@
+.factory-activity { display: flex; flex-direction: column; flex: 1; min-width: 0; min-height: 380px; border: 1px solid var(--factory-line); background: var(--factory-surface); }
+.factory-activity-heading { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 12px; padding: 8px 10px; border-bottom: 1px solid var(--factory-line); font-size: 11px; }
+.factory-activity-heading > strong { display: flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 500; }
+.factory-activity-heading > span:not(.badge-status), .factory-activity-heading > time { color: var(--factory-secondary); }
+.factory-activity-heading > div { display: flex; gap: 4px; margin-left: auto; }
+.factory-activity-picker { display: flex; align-items: center; gap: 10px; padding: 6px 10px; font-size: 11px; border-bottom: 1px solid var(--factory-line); }
+.factory-activity-picker select { flex: 1; min-width: 0; padding: 4px 6px; border: 1px solid var(--factory-line); background: var(--factory-surface); color: var(--factory-ink); font-size: 11px; }
+.factory-activity-phase { padding: 6px 10px; font-size: 11px; color: var(--factory-secondary); border-bottom: 1px solid var(--factory-line); }
+.factory-activity-body { display: flex; flex-direction: column; flex: 1; min-width: 0; min-height: 0; }
+.factory-activity-pending { display: flex; align-items: center; gap: 10px; padding: 12px; font-size: 12px; color: var(--factory-secondary); }
+.factory-activity .factory-conversation { flex: 1; min-width: 0; min-height: 0; max-width: 100%; max-height: none; border: 0; }
+.factory-activity .message-list { min-width: 0; max-width: 100%; padding: 12px 16px; }
+.factory-activity .message-list [data-slot="message-group"], .factory-activity .message-list [data-slot="message"], .factory-activity .message-list [data-slot="message-content"], .factory-activity .message-text, .factory-activity .factory-prompt { min-width: 0; max-width: 100%; }
+.factory-activity .message-list [data-slot="message"] { padding: 10px 0; }
+.factory-activity .chat-message.role-user { width: 100%; margin-left: 0; margin-right: 0; }
+.factory-activity .factory-prompt { width: 100%; }
+.factory-activity .factory-prompt summary { cursor: pointer; font-size: 11px; color: var(--factory-ink); white-space: normal; overflow-wrap: anywhere; }
+.factory-activity .message-text { white-space: pre-wrap; overflow-wrap: anywhere; }
+.factory-activity .factory-prompt[open] .message-text { margin-top: 8px; font-size: 12px; }
+.factory-environment-output { display: flex; flex-direction: column; flex: 1; min-height: 0; }
+.factory-environment-output > div:first-child { display: flex; align-items: center; justify-content: space-between; padding: 8px 12px; font-size: 11px; border-bottom: 1px solid var(--factory-line); }
+.factory-environment-output label { display: flex; align-items: center; gap: 6px; color: var(--factory-secondary); }
+.factory-environment-output > pre { flex: 1; min-height: 0; overflow: auto; }
+.factory-activity .chat-activity .factory-command-output { padding: 8px 10px; margin-top: 6px; max-height: 220px; overflow: auto; white-space: pre-wrap; }
+.goal-workspace.activity-view { display: flex; flex-direction: column; min-height: min(700px, 85dvh); }
+.goal-workspace.activity-view .factory-activity { min-height: 300px; }
+@media (min-width: 1251px) {
+  .has-goal .goal-workspace.activity-view { min-height: 0; }
+  .has-goal .goal-workspace.activity-view .factory-activity { min-height: 0; }
+  .has-goal .goal-workspace.activity-view > .factory-activity { flex-shrink: 1; }
+}

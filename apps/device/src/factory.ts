@@ -16,12 +16,14 @@ import type { DeviceApp, ApiCall } from './app.ts';
 import type { ChatController } from './chats.ts';
 import { exec, HttpError, now } from './util.ts';
 import { inspectAttempt, inspectGoal, inspectTask, taskControlReason, taskDispatchBlocker } from './task-inspection.ts';
+import { factoryChatBinding } from './factory-chat.ts';
 
 interface WorkerRecord {
   id: string; coordinatorId: string; goal: Goal; task: FactoryTask; attempt: Attempt; project: Project;
   status: 'preparing' | 'prepared' | 'running' | 'succeeded' | 'failed' | 'unknown' | 'canceled';
   workspace?: WorkspaceRef; sessionId?: string; chatId?: string; result?: ExecutionResult;
   candidate?: CandidateRef; error?: string; updatedAt: string;
+  cancellationAcknowledged?: boolean;
 }
 interface ReceivedArtifact { id: string; peerId: string; manifest: ArtifactManifest; path: string; }
 interface GoalOptions { id: string; workspaceProvider: 'git' | 'artifactfs'; }
@@ -62,7 +64,7 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
     const running = operation().catch(error => {
       const record = worker(id);
       if (record.status === 'canceled') return;
-      const uncertain = ['RUNTIME_DISCONNECTED', 'PROTOCOL_TIMEOUT', 'PROTOCOL_ERROR', 'RUNTIME_TIMEOUT', 'CONTAINER_UNAVAILABLE'].includes(error.code);
+      const uncertain = error.agentStarted !== false && ['RUNTIME_DISCONNECTED', 'PROTOCOL_TIMEOUT', 'PROTOCOL_ERROR', 'RUNTIME_TIMEOUT', 'CONTAINER_UNAVAILABLE'].includes(error.code);
       const result: ExecutionResult = { status: uncertain ? 'unknown' : 'failed', text: '', error: error.message, sessionId: record.sessionId, chatId: record.chatId };
       patchWorker(id, { status: uncertain ? 'unknown' : 'failed', error: error.message, result });
     }).finally(() => jobs.delete(id));
@@ -189,13 +191,32 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
   async function reconcileLocal(id: string): Promise<WorkerRecord> {
     const record = worker(id);
     if (jobs.has(id)) return record;
-    if (record.status === 'running' && record.chatId) {
-      if (chats.isRunning(record.chatId)) return record;
-      const completed = app.store.get<{ id: string; result: TurnResult; attemptId?: string }>('chat-results', record.chatId);
+    if ((record.status === 'running' || record.status === 'unknown') && record.chatId) {
+      if (chats.isRunning(record.chatId)) {
+        if (record.status === 'unknown') patchWorker(id, { status: 'running', error: undefined, result: undefined });
+        return worker(id);
+      }
+      const completed = app.store.get<{ id: string; result: TurnResult; attemptId?: string; completedAt?: string }>('chat-results', record.chatId);
       if (completed?.attemptId === record.id) {
-        patchWorker(id, { status: 'succeeded', result: { status: 'succeeded', text: completed.result.text,
+        patchWorker(id, { status: 'succeeded', error: undefined, result: { status: 'succeeded', text: completed.result.text,
           chatId: record.chatId, sessionId: record.sessionId, spend: spend(completed.result) } });
-      } else patchWorker(id, { status: 'unknown', error: 'The runtime disconnected before its outcome was journaled. Inspect preserved work before retiring this attempt.' });
+      } else {
+        const chat = chats.get(record.chatId), binding = factoryChatBinding(app.store, chat, app.device.id);
+        // Older manual continuations lost their task binding. Reuse the assignment with its
+        // full prompt; an unbound response is not evidence that the assigned work finished.
+        const legacyContinuation = completed && completed.attemptId === undefined && binding?.attemptId === record.id &&
+          chat.status === 'idle' && completed.result.threadId && completed.result.threadId === chat.threadId &&
+          completed.completedAt && Date.parse(completed.completedAt) >= Date.parse(record.attempt.startedAt) && record.workspace;
+        if (legacyContinuation) {
+          app.store.set('chats', { ...chat, attemptId: record.id });
+          patchWorker(id, { status: 'prepared', error: undefined, result: undefined });
+        } else {
+          const failure = app.store.get<{ id: string; attemptId?: string; error: string; agentStarted?: boolean }>('chat-turn-failures', record.chatId);
+          if (failure?.attemptId === record.id && failure.agentStarted === false) {
+            patchWorker(id, { status: 'failed', error: failure.error, result: { status: 'failed', text: '', error: failure.error, chatId: record.chatId, sessionId: record.sessionId } });
+          } else patchWorker(id, { status: 'unknown', error: 'The runtime disconnected before its outcome was journaled. Inspect preserved work before retiring this attempt.' });
+        }
+      }
     } else if (record.status === 'preparing') {
       if (record.sessionId && record.workspace) {
         const session = app.sessions.record(record.sessionId);
@@ -400,7 +421,7 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
     },
   };
   async function cancelLocal(id: string): Promise<void> {
-    const record = worker(id); patchWorker(id, { status: 'canceled' });
+    const record = worker(id); patchWorker(id, { status: 'canceled', cancellationAcknowledged: false });
     if (record.chatId) {await chats.interrupt(record.chatId);await chats.waitForIdle(record.chatId);}
     if (record.sessionId && !['stopped', 'stopping', 'failed'].includes(app.sessions.record(record.sessionId).status)) await app.sessions.stop(record.sessionId);
     const running = jobs.get(id);
@@ -409,7 +430,7 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
     if (latest.sessionId && app.sessions.record(latest.sessionId).status !== 'stopped') {
       await app.sessions.stop(latest.sessionId); await app.sessions.waitStopped(latest.sessionId);
     }
-    patchWorker(id, { result: { status: 'failed', text: '', error: 'Cancellation acknowledged by the owning service.', sessionId: record.sessionId, chatId: record.chatId } });
+    patchWorker(id, { cancellationAcknowledged: true, result: { status: 'failed', text: '', error: 'Cancellation acknowledged by the owning service.', sessionId: record.sessionId, chatId: record.chatId } });
   }
   const coordinator = new FactoryCoordinator({ store: app.store, runtime, workspaces: workspacePort,
     deviceId: app.device.id, devices: () => app.devices, project: id => app.store.get<Project>('projects', id), onChange: () => app.changed() });

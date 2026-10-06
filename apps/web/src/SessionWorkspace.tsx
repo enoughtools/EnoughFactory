@@ -7,6 +7,7 @@ import type { DeviceClient } from './api';
 import { useResource } from './hooks';
 import { ChatPane } from './ChatPane';
 import { RuntimePanel } from './RuntimePanel';
+import { RemoveEnvironmentAction } from './WorkspaceRemoval';
 import { Button, EmptyState, Input, Loading, PageHeader, Panel, Status } from './ui';
 
 type Run = (action: () => Promise<unknown>) => Promise<void>;
@@ -60,9 +61,10 @@ function Preview({ client, session, hidden }: { client: DeviceClient; session: S
   return <div className="preview-pane"><form className="preview-toolbar" onSubmit={event => { event.preventDefault(); void navigate(); }}><Globe size={16} />{desktop && target && <><Button type="button" variant="ghost" size="icon" aria-label="Previous preview page" onClick={() => void window.enoughFactory?.previewNavigation?.('back')}><ArrowLeft size={14} /></Button><Button type="button" variant="ghost" size="icon" aria-label="Next preview page" onClick={() => void window.enoughFactory?.previewNavigation?.('forward')}><ArrowRight size={14} /></Button></>}<Input aria-label="Preview address" value={address} onChange={(event: ChangeEvent<HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement>) => setAddress(event.target.value)} placeholder="http://localhost:3000" /><Button variant="outline" size="sm" disabled={loading || session.status !== 'ready'} type="submit">{loading ? 'Opening…' : 'Open'}</Button>{target && <Button type="button" variant="ghost" size="icon" aria-label="Open preview in a separate window" onClick={() => { if (desktop) void window.enoughFactory?.openPreview?.({ sessionId: session.id, url: address }); else window.open(target, '_blank', 'noopener,noreferrer'); }}><ArrowUpRight size={16} /></Button>}</form>{error && <div className="error-banner">{error}</div>}<div className="preview-viewport" ref={viewport}>{target ? !desktop && <iframe title={`${session.name} preview`} src={target} className="preview-frame" referrerPolicy="no-referrer" /> : <EmptyState icon={<Globe size={32} />} title="Open a preview">Enter the URL of a service running in this environment.</EmptyState>}</div><p className="preview-hint">If this site blocks embedding, open it in a separate window.</p></div>;
 }
 
-export function SessionWorkspace({ client, session, state, run, modalOpen, initialChatId, compact, initialTab }: { client: DeviceClient; session: Session; state: FactoryState; run: Run; modalOpen: boolean; initialChatId?: string; compact?: boolean; initialTab?: SessionTab }) {
+export function SessionWorkspace({ client, session, state, run, modalOpen, initialChatId, compact, initialTab, onRemoved }: { client: DeviceClient; session: Session; state: FactoryState; run: Run; modalOpen: boolean; initialChatId?: string; compact?: boolean; initialTab?: SessionTab; onRemoved?: () => void }) {
   const [tab, setTab] = useState<SessionTab>(initialChatId ? 'agent' : initialTab ?? 'overview');
   const [outputTask, setOutputTask] = useState('stdout');
+  const [removalOpen, setRemovalOpen] = useState(false);
   const [panelOrientation, setPanelOrientation] = useState<'horizontal' | 'vertical'>(() => window.matchMedia('(max-width: 900px)').matches ? 'vertical' : 'horizontal');
   useEffect(() => {
     const query = window.matchMedia('(max-width: 900px)');
@@ -81,6 +83,7 @@ export function SessionWorkspace({ client, session, state, run, modalOpen, initi
       {session.status === 'stopped' || session.status === 'failed'
         ? <Button disabled={device?.online === false} onClick={() => void run(() => client.post(`/api/sessions/${session.id}/restart`))}><Play size={15} />Start environment</Button>
         : <Button variant="outline" disabled={session.status === 'stopping' || device?.online === false} onClick={() => void run(() => client.post(`/api/sessions/${session.id}/stop`))}><Square size={13} />Stop</Button>}
+      <RemoveEnvironmentAction session={session} client={client} run={run} disabled={device?.online === false} onRemoved={onRemoved} onOpenChange={setRemovalOpen} />
     </>} />
     {session.deviceId === state.device.id && state.diagnostics.containerRuntime && state.diagnostics.containerRuntime.state !== 'ready' && <RuntimePanel state={state} client={client} run={run} compact />}
     {session.error && <div className="error-banner">{session.error}</div>}
@@ -127,7 +130,7 @@ export function SessionWorkspace({ client, session, state, run, modalOpen, initi
       </ResizablePanelGroup>}
       {tab === 'agent' && <ChatPane client={client} session={session} state={state} run={run} initialChatId={initialChatId} />}
       {tab === 'terminal' && <Suspense fallback={<Loading>Opening terminal…</Loading>}><TerminalPane client={client} session={session} /></Suspense>}
-      {tab === 'preview' && <Preview client={client} session={session} hidden={modalOpen} />}
+      {tab === 'preview' && <Preview client={client} session={session} hidden={modalOpen || removalOpen} />}
       {tab === 'changes' && <Changes client={client} session={session} />}
     </div>
   </div>;

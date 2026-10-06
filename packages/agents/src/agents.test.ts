@@ -5,6 +5,9 @@ import { codexApprovalResponse } from "./codex.ts";
 import type { AgentEvent, TurnInput } from "./types.ts";
 import { ContainerProcess, containerCommand } from "./process.ts";
 import { spawn } from "node:child_process";
+import { EventEmitter } from "node:events";
+import { PassThrough } from "node:stream";
+import { AgentManager } from "./index.ts";
 
 const input: TurnInput = { chatId: "chat-a", sessionId: "session-a", containerId: "container-a", runtime: "codex", approvalMode: "approve-all", rules: [], prompt: "Work toward the goal", attemptId: "attempt-a", policyRevision: 3 };
 test("Approve all owns the decision without waiting for a UI callback", async () => {
@@ -63,4 +66,23 @@ test("Provision and credential commands preserve the explicitly selected runtime
   assert.equal(calls[0].environment.DOCKER_HOST, dockerEndpoint.host);
   assert.equal(calls[0].environment.DOCKER_CONFIG, dockerEndpoint.configDirectory);
   assert.equal(calls[0].environment.DOCKER_CONTEXT, undefined);
+});
+test("a preparation failure records that the task provider never started", async () => {
+  let starts = 0;
+  const spawnProcess = (() => {
+    starts++;
+    const child = new EventEmitter() as EventEmitter & { stdout: PassThrough; stderr: PassThrough; stdin: PassThrough; kill: () => boolean };
+    child.stdout = new PassThrough(); child.stderr = new PassThrough(); child.stdin = new PassThrough(); child.kill = () => true;
+    queueMicrotask(() => { child.stderr.write("container unavailable"); child.emit("close", 1); });
+    return child;
+  }) as unknown as typeof spawn;
+  const manager = new AgentManager({ dockerEndpoint: { cliPath: "/managed/docker", host: "unix:///managed/docker.sock", configDirectory: "/managed/config" }, spawnProcess });
+  const events: AgentEvent[] = [];
+  await assert.rejects(manager.runTurn(input, { onEvent: event => { events.push(event); }, onApproval: async () => true }), error => {
+    assert.equal((error as Error & { agentStarted?: boolean }).agentStarted, false);
+    return true;
+  });
+  assert.equal(starts, 1, "Only the preparation query may launch; never a task provider or replacement");
+  assert.equal(events.at(-1)?.data?.phase, "preparation");
+  assert.equal(events.at(-1)?.data?.agentStarted, false);
 });

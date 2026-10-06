@@ -7,7 +7,7 @@ import type { DockerRuntimeEndpoint } from "@enoughfactory/runtime";
 import { AgentError, RUNTIME_PINS, type ProvisionOptions } from "./types.ts";
 import { containerCommand, quote, type SpawnProcess } from "./process.ts";
 
-export interface RuntimeOptions { dockerEndpoint?: DockerRuntimeEndpoint; spawnProcess?: SpawnProcess; runtimeAssetsDir?: string; }
+export interface RuntimeOptions { dockerEndpoint?: DockerRuntimeEndpoint; spawnProcess?: SpawnProcess; runtimeAssetsDir?: string; signal?: AbortSignal; }
 const assetsDirectory = fileURLToPath(new URL("../../../runtime/agents/", import.meta.url));
 const paths = `export PATH=/opt/enoughfactory/node/bin:/root/.local/bin:$PATH; export HOME=/root;`;
 export async function availability(containerId: string, options: RuntimeOptions = {}): Promise<RuntimeCapability[]> {

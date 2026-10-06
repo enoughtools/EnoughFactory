@@ -7,8 +7,9 @@ import { homedir } from 'node:os';
 import { createConnection } from 'node:net';
 import { delimiter, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { connectExistingService, probeDeviceConnection, type DeviceConnection } from './service-connection.ts';
 
-interface Connection { url: string; token: string; pid?: number; version?: string }
+type Connection = DeviceConnection;
 interface PreviewOptions { sessionId: string; url: string; bounds?: Rectangle }
 interface PreviewGrant { id: string; proxyUrl: string; url: string; proxyAuth?: { username: string; password: string } }
 interface Preview { view: WebContentsView; grant: PreviewGrant; window?: BrowserWindow; owner: BrowserWindow; sessionId: string; popups: Set<BrowserWindow> }
@@ -55,33 +56,11 @@ function readConnection(): Connection | undefined {
 async function availableConnection(requireManagedRuntime = true): Promise<Connection | undefined> {
   const candidate = readConnection();
   if (!candidate) return;
-  let healthy = false;
-  try {
-    const response = await fetch(`${candidate.url}/api/health`, {
-      headers: { Authorization: `Bearer ${candidate.token}` }, signal: AbortSignal.timeout(900),
-    });
-    const health = await response.json() as { ok?: boolean; product?: string; version?: string };
-    healthy = response.ok && Boolean(health.ok) && health.product === 'EnoughFactory';
-    if (healthy && requireManagedRuntime && health.version !== expectedServiceVersion) {
-      throw new Error(`[DEVICE_SERVICE_UPDATE_REQUIRED] Update the device service to ${expectedServiceVersion} for this app’s factory features. Existing environments and work records are retained.`);
-    }
-  } catch (error) {
-    if (error instanceof Error && error.message.startsWith('[DEVICE_SERVICE_UPDATE_REQUIRED]')) throw error;
-    /* A stale connection is replaced only after readiness is checked. */
-  }
-  if (!healthy) return;
-  if (requireManagedRuntime) {
-    const response = await fetch(`${candidate.url}/api/runtime`, {
-      headers: { Authorization: `Bearer ${candidate.token}` }, signal: AbortSignal.timeout(20_000),
-    });
-    if (response.status === 404 || response.status === 405) throw new Error('[DEVICE_SERVICE_UPDATE_REQUIRED] Update the device service to use EnoughFactory’s private runtime. Existing environments and work records are retained.');
-    if (!response.ok) throw new Error('The running device service could not inspect its private runtime. Its details are in the device log.');
-    const runtime = await response.json() as { kind?: string; stateDirectory?: string; socketPath?: string };
-    if (!response.ok || !['lima', 'rootless'].includes(runtime.kind ?? '') || runtime.stateDirectory !== resolve(dataDirectory) || typeof runtime.socketPath !== 'string' || !runtime.socketPath.startsWith('/') || runtime.socketPath === '/var/run/docker.sock') {
-      throw new Error('[DEVICE_SERVICE_UPDATE_REQUIRED] Update the device service to use EnoughFactory’s private runtime. Existing environments and work records are retained.');
-    }
-  }
-  return candidate;
+  return probeDeviceConnection(candidate, { serviceVersion: expectedServiceVersion, stateDirectory: dataDirectory, requireManagedRuntime });
+}
+
+function existingService(): Promise<Connection | undefined> {
+  return connectExistingService({ readConnection, probe: candidate => probeDeviceConnection(candidate, { serviceVersion: expectedServiceVersion, stateDirectory: dataDirectory }), portOpen: servicePortOpen });
 }
 
 async function serviceResources(): Promise<string> {
@@ -105,9 +84,12 @@ async function serviceResources(): Promise<string> {
 }
 
 async function startOrConnectService(): Promise<Connection> {
-  const running = await availableConnection();
+  const running = await existingService();
   if (running) return running;
   const durable = await serviceResources();
+  // Another opener or a waking service may become ready while its resources copy.
+  const recovered = await existingService();
+  if (recovered) return recovered;
   const node = app.isPackaged ? join(durable, 'runtime/node') : (process.env.ENOUGHFACTORY_NODE ?? 'node');
   const device = app.isPackaged ? join(durable, 'device/service.cjs') : join(repository, 'apps/device/dist/service.cjs');
   if (!existsSync(device)) throw new Error('The device service is missing. Build the workspace before opening EnoughFactory.');

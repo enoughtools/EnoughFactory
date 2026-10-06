@@ -159,15 +159,16 @@ button.project-card { width: 100%; }
 .project-card-actions > button:not([data-slot="button"]) { display: grid; place-items: center; width: 30px; height: 30px; background: transparent; border: 0; color: var(--factory-secondary); }
 .project-card-actions > button:hover { color: var(--factory-accent); }
 .session-list { display: flex; flex-direction: column; margin: -16px; }
-.session-list-row { display: flex; width: 100%; align-items: center; gap: 13px; padding: 16px 21px; background: transparent; border: 0; border-bottom: 1px solid var(--factory-line-soft); color: var(--factory-ink); text-align: left; }
+.session-list-row { display: flex; width: 100%; align-items: center; gap: 8px; padding: 0 12px 0 0; background: transparent; border: 0; border-bottom: 1px solid var(--factory-line-soft); color: var(--factory-ink); text-align: left; }
 .session-list-row:last-child { border-bottom: 0; }
 .session-list-row:hover { background: var(--color-hover); }
 .session-row-icon { display: grid; place-items: center; width: 32px; height: 32px; background: var(--factory-paper); color: var(--factory-accent); border: 1px solid var(--factory-line); }
-.session-list-row > div:nth-child(2) { flex: 1; min-width: 0; }
+.session-row-main { display: flex; flex: 1; min-width: 0; align-items: center; gap: 13px; padding: 16px 0 16px 21px; background: transparent; border: 0; color: inherit; text-align: left; }
+.session-row-info { flex: 1; min-width: 0; }
 .session-list-row strong { display: block; font-size: 12px; font-weight: 500; }
-.session-list-row > div > span { display: block; color: var(--factory-muted); font-size: 10px; margin-top: 3px; }
+.session-row-info > span { display: block; color: var(--factory-muted); font-size: 10px; margin-top: 3px; }
 .session-row-time { color: var(--factory-muted); font-size: 10px; min-width: 58px; text-align: right; }
-.session-list-row > svg { color: var(--factory-muted); }
+.session-row-main > svg { color: var(--factory-muted); }
 .status-dot { display: inline-block; flex: 0 0 6px; width: 6px; height: 6px; background: var(--factory-muted); border-radius: 50% !important; vertical-align: middle; }
 .status-dot.running, .status-dot.ready, .status-dot.online, .status-dot.complete, .status-dot.connected, .status-dot.success, .status-dot.state-running, .status-dot.state-ready, .status-dot.state-online, .status-dot.state-completed, .status-dot.state-accepted, .status-dot[data-state="running"], .status-dot[data-state="ready"], .status-dot[data-state="online"] { background: var(--factory-ok); }
 .status-dot.preparing, .status-dot.starting, .status-dot.waiting, .status-dot.pending, .status-dot.blocked, .status-dot.state-preparing, .status-dot.state-starting, .status-dot.state-waiting, .status-dot.state-pending, .status-dot.state-blocked, .status-dot[data-state="starting"] { background: var(--factory-warn); }
@@ -584,10 +585,10 @@ button.project-card { width: 100%; }
   .device-card { padding: 18px; flex-wrap: wrap; gap: 13px; }
   .device-identity { gap: 12px; }
   .session-list, .artifact-list, .diagnostics-list { margin: -17px; }
-  .session-list-row, .artifact-row, .diagnostic-row { padding: 15px 17px; }
-  .session-list-row { flex-wrap: wrap; gap: 10px; }
+  .artifact-row, .diagnostic-row { padding: 15px 17px; }
+  .session-row-main { flex-wrap: wrap; gap: 10px; padding: 15px 0 15px 17px; }
   .session-row-time { display: none; }
-  .session-list-row > svg { display: none; }
+  .session-row-main > svg { display: none; }
   .session-list-row .badge-status { font-size: 9px; }
   .main-shell > .connection-banner, .main-shell > .error-banner { padding-left: 19px; padding-right: 19px; }
   .goal-steering { padding: 17px; }

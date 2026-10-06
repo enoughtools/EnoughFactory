@@ -5,11 +5,12 @@ import path from 'node:path';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { createReadStream } from 'node:fs';
 import WebSocket, { WebSocketServer } from 'ws';
-import type { FactoryState, Project, Session, Settings, Device, Diagnostics, ContainerRuntimeStatus } from '@enoughfactory/contracts';
+import type { FactoryState, Project, Session, Chat, Settings, Device, Diagnostics, ContainerRuntimeStatus } from '@enoughfactory/contracts';
 import { ManagedRuntimeManager, type DockerRuntimeEndpoint } from '@enoughfactory/runtime';
 import { PRODUCT } from '@enoughfactory/contracts';
 import { Store } from './store.ts';
 import { SessionController } from './sessions.ts';
+import { CatalogRemoval } from './catalog-removal.ts';
 import { equalSecret, exec, HttpError, id, now } from './util.ts';
 import { configuredWorkerCapacity, runtimeWorkerResources, validWorkerCapacity } from './worker-capacity.ts';
 
@@ -23,6 +24,7 @@ export class DeviceApp {
   readonly store = new Store(this.dataDir);
   readonly token: string;
   readonly sessions: SessionController;
+  readonly removals: CatalogRemoval;
   readonly runtime: ManagedRuntimeManager;
   readonly runtimeStopHooks: Array<()=>Promise<void>> = [];
   readonly server: http.Server;
@@ -60,6 +62,7 @@ export class DeviceApp {
       (process.env.ENOUGHFACTORY_RESOURCES?path.join(process.env.ENOUGHFACTORY_RESOURCES,'runtime/container'):path.join(this.repositoryRoot,'.cache/container-runtime',`${process.platform}-${process.arch}`)),onStatus:status=>this.runtimeStatus(status)});
     this.sessions=new SessionController(this.store,this.device.id,()=>this.changed(),(topic,data)=>this.emit(topic,data),{
       endpoint:this.runtime.endpoint,ensureReady:()=>this.ensureRuntimeReady(),bridgeHostAddress:()=>this.runtime.bridgeHostAddress()});
+    this.removals=new CatalogRemoval(this.store,this.sessions,()=>this.device.id,()=>this.changed());
     this.server=http.createServer((req,res)=>{void this.handle(req,res);});
     this.server.on('upgrade',(req,socket,head)=>{
       const url=new URL(req.url||'/',`http://127.0.0.1:${this.port}`);
@@ -119,8 +122,12 @@ export class DeviceApp {
     const promise=operation(controller.signal).finally(()=>this.runtimeOperations.delete(operationId));
     this.runtimeOperations.set(operationId,{controller,promise});return promise;
   }
-  state(): FactoryState {
-    return {product:PRODUCT,version:'0.1.4',device:{...this.device,lastSeen:now()},devices:this.devices,projects:this.store.list<Project>('projects').filter(p=>!p.internal),sessions:this.store.list('sessions'),chats:this.store.list('chats'),approvals:this.store.list('approvals'),goals:this.store.list('goals'),tasks:this.store.list('tasks'),attempts:this.store.list('attempts'),diagnostics:this.diagnostics,settings:{...this.settings,turnCredential:undefined},...this.catalog?.()};
+  state(includeArchived=false): FactoryState {
+    const state:FactoryState={product:PRODUCT,version:'0.1.5',device:{...this.device,lastSeen:now()},devices:this.devices,projects:this.store.list<Project>('projects').filter(p=>!p.internal),sessions:this.store.list('sessions'),chats:this.store.list('chats'),approvals:this.store.list('approvals'),goals:this.store.list('goals'),tasks:this.store.list('tasks'),attempts:this.store.list('attempts'),diagnostics:this.diagnostics,settings:{...this.settings,turnCredential:undefined},...this.catalog?.()};
+    if(includeArchived)return state;
+    const removedProjects=new Set([...this.store.list<Project>('projects'),...state.projects].filter(project=>project.archivedAt).map(project=>project.id));
+    const sessions=state.sessions.filter(session=>!session.archivedAt&&!removedProjects.has(session.projectId)),sessionIds=new Set(sessions.map(session=>session.id));
+    return {...state,projects:state.projects.filter(project=>!project.archivedAt),sessions,chats:state.chats.filter(chat=>sessionIds.has(chat.sessionId))};
   }
   emit(topic: string,data: unknown): void {
     if(this.closing)return;
@@ -132,7 +139,7 @@ export class DeviceApp {
   async dispatch(call: ApiCall): Promise<unknown> {
     const {method,url,body}=call;const route=url.pathname;
     if(this.routeRemote){const remote=await this.routeRemote(call);if(remote!==undefined)return remote;}
-    if(method==='GET' && route==='/api/health')return {ok:true,product:PRODUCT,version:'0.1.4',deviceId:this.device.id};
+    if(method==='GET' && route==='/api/health')return {ok:true,product:PRODUCT,version:'0.1.5',deviceId:this.device.id,runtime:{kind:process.platform==='darwin'?'lima':'rootless',stateDirectory:this.runtime.dataDirectory,socketPath:this.runtime.endpoint.host.slice(7)}};
     if(method==='GET' && route==='/api/state')return this.state();
     if(method==='POST' && route==='/api/service/shutdown'){setTimeout(()=>{void this.close().then(()=>process.exit(0));},200);return {ok:true};}
     if(method==='GET'&&route==='/api/runtime')return this.refreshRuntime();
@@ -163,20 +170,24 @@ export class DeviceApp {
       try {const updated=await this.runtime.configure(limits);this.runtimeStatus(updated);return updated;}catch(error){throw new HttpError(409,(error as Error).message);}
     }
     if(method==='GET' && route==='/api/diagnostics'){await this.refreshDiagnostics();return this.diagnostics;}
-    if(method==='GET' && route==='/api/projects')return this.store.list('projects');
+    if(method==='GET' && route==='/api/projects')return ['1','true'].includes(url.searchParams.get('archived')||'')?this.state(true).projects.filter(project=>project.archivedAt):this.state().projects;
     if(method==='POST' && route==='/api/projects'){
       if(typeof body.path!=='string'||!body.path.trim())throw new HttpError(400,'Choose a repository folder.');
       const projectPath=path.resolve(body.path);await exec('git',['-C',projectPath,'rev-parse','--show-toplevel']).catch(()=>{throw new HttpError(400,'This folder must contain a Git repository.');});
-      const existing=this.store.list<Project>('projects').find(p=>p.path===projectPath);if(existing)return existing;
+      const existing=this.store.list<Project>('projects').find(p=>!p.internal&&p.path===projectPath);if(existing)return existing.archivedAt?this.removals.restoreProject(existing.id):existing;
       const project:Project={id:id('project'),name:String(body.name||path.basename(projectPath)),path:projectPath,deviceId:this.device.id,createdAt:now(),runtime:['codex','antigravity','claude'].includes(String(body.runtime))?body.runtime as Project['runtime']:this.settings.defaultRuntime,approvalMode:['approve-all','rules','manual'].includes(String(body.approvalMode))?body.approvalMode as Project['approvalMode']:this.settings.defaultApprovalMode,rules:[]};
       this.store.set('projects',project);this.changed();return project;
     }
-    const projectRoute=route.match(/^\/api\/projects\/([^/]+)(?:\/(validate|config))?$/);
+    const projectRoute=route.match(/^\/api\/projects\/([^/]+)(?:\/(validate|config|archive|restore))?$/);
     if(projectRoute){const project=this.store.get<Project>('projects',projectRoute[1]);if(!project)throw new HttpError(404,'Project not found.');
+      if(method==='GET'&&!projectRoute[2])return project;
+      if(method==='POST'&&projectRoute[2]==='archive')return {ok:true,project:this.removals.archiveProject(project.id)};
+      if(method==='POST'&&projectRoute[2]==='restore')return this.removals.restoreProject(project.id);
       if(method==='GET'&&projectRoute[2]==='validate')return this.sessions.engine.validate(project.path);
       if(projectRoute[2]==='config'){
         const filename=path.join(project.path,'.envmux.json');
         if(method==='PUT'){
+          this.sessions.assertActiveProject(project);
           if(typeof body.content!=='string')throw new HttpError(400,'Environment configuration must be JSON text.');
           let config:unknown;try{config=JSON.parse(body.content);}catch{throw new HttpError(400,'Environment configuration must contain valid JSON.');}
           if(!config||typeof config!=='object'||Array.isArray(config))throw new HttpError(400,'Environment configuration must be an object.');
@@ -184,16 +195,22 @@ export class DeviceApp {
         }
         if(method==='GET'||method==='PUT'){const validation=await this.sessions.engine.validate(project.path);return {content:existsSync(filename)?readFileSync(filename,'utf8'):'{}',...validation};}
       }
-      if(method==='DELETE'){if(this.store.list<Session>('sessions').some(s=>s.projectId===project.id&&!['stopped','failed'].includes(s.status)))throw new HttpError(409,'Stop this project’s sessions before removing it.');this.store.delete('projects',project.id);this.changed();return {ok:true};}
-      if(method==='PATCH'){const next={...project};if(typeof body.name==='string')next.name=body.name;if(['codex','antigravity','claude'].includes(String(body.runtime)))next.runtime=body.runtime as Project['runtime'];if(['approve-all','rules','manual'].includes(String(body.approvalMode)))next.approvalMode=body.approvalMode as Project['approvalMode'];if(Array.isArray(body.rules))next.rules=body.rules as Project['rules'];this.store.set('projects',next);this.changed();return next;}
+      if(method==='DELETE'&&!projectRoute[2])return {ok:true,project:this.removals.archiveProject(project.id)};
+      if(method==='PATCH'&&!projectRoute[2]){const next={...project};if(typeof body.name==='string')next.name=body.name;if(['codex','antigravity','claude'].includes(String(body.runtime)))next.runtime=body.runtime as Project['runtime'];if(['approve-all','rules','manual'].includes(String(body.approvalMode)))next.approvalMode=body.approvalMode as Project['approvalMode'];if(Array.isArray(body.rules))next.rules=body.rules as Project['rules'];this.store.set('projects',next);this.changed();return next;}
     }
+    if(method==='GET'&&route==='/api/sessions')return ['1','true'].includes(url.searchParams.get('archived')||'')?this.state(true).sessions.filter(session=>session.archivedAt):this.state().sessions;
     if(method==='POST'&&route==='/api/sessions'){
       const project=this.store.get<Project>('projects',String(body.projectId));if(!project)throw new HttpError(404,'Project not found.');
+      this.sessions.assertActiveProject(project);
       this.allowRuntimeStart();
       return this.sessions.create(project,String(body.name||`work-${Date.now().toString(36)}`));
     }
     const sessionRoute=route.match(/^\/api\/sessions\/([^/]+)(?:\/(.+))?$/);
     if(sessionRoute){const sid=sessionRoute[1],action=sessionRoute[2];this.sessions.record(sid);
+      if(method==='DELETE'&&!action)return {ok:true,session:this.removals.archiveSession(sid)};
+      if(method==='POST'&&action==='archive')return {ok:true,session:this.removals.archiveSession(sid)};
+      if(method==='POST'&&action==='restore')return this.removals.restoreSession(sid);
+      if(method==='POST')this.sessions.assertWorkAvailable(sid);
       if(method==='GET'&&!action)return this.sessions.record(sid);
       if(method==='GET'&&action==='state')return this.sessions.get(sid).state();
       if(method==='GET'&&action==='changes')return this.sessions.changes(sid);
@@ -203,6 +220,10 @@ export class DeviceApp {
       const service=action?.match(/^services\/([^/]+)\/(start|stop|restart)$/);
       if(method==='POST'&&service){await this.sessions.get(sid).task(decodeURIComponent(service[1]),service[2] as 'start'|'stop'|'restart');return {ok:true};}
     }
+    if(method==='POST'&&route==='/api/goals')this.sessions.assertActiveProject(this.store.get<Project>('projects',String(body.projectId)));
+    if(method==='POST'&&route==='/api/chats')this.sessions.assertWorkAvailable(String(body.sessionId));
+    const chatRoute=route.match(/^\/api\/chats\/([^/]+)/);
+    if(method!=='GET'&&chatRoute){const chat=this.store.get<Chat>('chats',chatRoute[1]);if(chat)this.sessions.assertWorkAvailable(chat.sessionId);}
     if(method==='PATCH'&&route==='/api/settings'){
       if(body.workerCapacity!==undefined&&body.workerCapacity!==null&&!validWorkerCapacity(body.workerCapacity))throw new HttpError(400,'Choose 1–32 worker slots, or use automatic capacity.','INVALID_WORKER_CAPACITY');
       for(const key of ['deviceName','signalingUrl','defaultRuntime','defaultApprovalMode','turnUrls','turnUsername','turnCredential'] as const)if(body[key]!==undefined)(this.settings as unknown as Record<string,unknown>)[key]=body[key];
@@ -245,7 +266,7 @@ export class DeviceApp {
   async refreshDiagnostics():Promise<void>{const [info,status]=await Promise.all([this.sessions.engine.detect(),this.runtime.status()]);this.diagnostics={...this.diagnostics,containerRuntime:status,docker:{available:status.state==='ready',version:status.dockerVersion,error:status.error},envmux:{available:info.available,version:info.version,error:info.error}};this.syncRuntimeCapacity();this.changed();}
   async listen():Promise<void>{
     await new Promise<void>((resolve,reject)=>{this.server.once('error',reject);this.server.listen(this.port,'127.0.0.1',()=>resolve());});
-    writeFileSync(path.join(this.dataDir,'connection.json'),JSON.stringify({url:`http://127.0.0.1:${this.port}`,token:this.token,pid:process.pid,version:'0.1.4'},null,2),{mode:0o600});
+    writeFileSync(path.join(this.dataDir,'connection.json'),JSON.stringify({url:`http://127.0.0.1:${this.port}`,token:this.token,pid:process.pid,version:'0.1.5'},null,2),{mode:0o600});
     void this.refreshDiagnostics();await this.sessions.recover();
   }
   async close():Promise<void>{if(this.closing)return;this.closing=true;if(this.changeTimer)clearTimeout(this.changeTimer);for(const close of this.closers)await close();this.sessions.close();for(const res of this.sse)res.end();this.socketServer.close();await new Promise<void>(resolve=>this.server.close(()=>{this.store.close();resolve();}));}

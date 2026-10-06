@@ -26,16 +26,33 @@ export class SessionController {
   setDeviceId(deviceId: string): void {this.deviceId=deviceId;}
   owns(sessionId:string):boolean {return (this.store.get<LaunchRecord>('session-launch',sessionId)?.dockerHost||this.store.get<PrivateSession>('session-private',sessionId)?.ready.dockerHost)===this.runtime.endpoint.host;}
   needsTermination(sessionId:string):boolean {return this.owns(sessionId)&&this.record(sessionId).status!=='stopped'&&(this.live.has(sessionId)||this.starts.has(sessionId)||Boolean(this.store.get<PrivateSession>('session-private',sessionId)));}
+  assertCanArchive(sessionId:string):void {
+    const record=this.record(sessionId);
+    if(!['stopped','failed'].includes(record.status)||this.live.has(sessionId)||this.starts.has(sessionId)||this.launchJobs.has(sessionId)||this.stopJobs.has(sessionId)||this.stopping.has(sessionId)||this.needsTermination(sessionId))throw new HttpError(409,'Stop this environment and confirm its work has returned before removing it.','ENVIRONMENT_IN_USE');
+  }
+  assertActiveProject(project:Project|undefined):void {
+    if(!project)throw new HttpError(404,'The source project is no longer available.');
+    const visited=new Set<string>();let current:Project|undefined=project;
+    while(current&&!visited.has(current.id)){
+      if(current.archivedAt)throw new HttpError(409,'Restore this project before starting or restoring its environment.','PROJECT_REMOVED');
+      visited.add(current.id);current=current.sourceProjectId?this.store.get<Project>('projects',current.sourceProjectId):undefined;
+    }
+  }
+  assertWorkAvailable(sessionId:string):Session {
+    const record=this.record(sessionId);if(record.archivedAt)throw new HttpError(409,'Restore this environment before starting work.','ENVIRONMENT_REMOVED');
+    const project=this.store.get<Project>('projects',record.projectId);if(project)this.assertActiveProject(project);
+    return record;
+  }
   runtimeProgress(status:ContainerRuntimeStatus):void {for(const sessionId of this.runtimeWaits)this.patch(sessionId,{phase:status.phase||'Preparing EnoughFactory runtime'});}
   async recover(): Promise<void> {
     for (const saved of this.store.list<PrivateSession>('session-private')) {
       const record = this.store.get<Session>('sessions', saved.id);
-      if (!record || record.status === 'stopped') continue;
+      if (!record || record.archivedAt || record.status === 'stopped') continue;
       if(saved.ready.dockerHost!==this.runtime.endpoint.host){this.patch(saved.id,{status:'unknown',phase:'This session belongs to a previous container engine.',error:'EnoughFactory will not attach to your personal Docker. Preserve its work there and start a new EnoughFactory environment.'});continue;}
       try { await this.runtime.ensureReady();await this.attach(saved); }
       catch(error) { if(!(error instanceof SessionGenerationChangedError))this.patch(saved.id, {status:'unknown', phase:'The owned environment is not connected.',error:(error as Error).message}); }
     }
-    for (const record of this.store.list<Session>('sessions')) if (record.status === 'starting' && !this.live.has(record.id)) this.patch(record.id,{status:'unknown',phase:'Device service restarted during startup.'});
+    for (const record of this.store.list<Session>('sessions')) if (!record.archivedAt && record.status === 'starting' && !this.live.has(record.id)) this.patch(record.id,{status:'unknown',phase:'Device service restarted during startup.'});
   }
   private async attach(saved:PrivateSession):Promise<EnvmuxSession>{
     if(saved.ready.dockerHost!==this.runtime.endpoint.host)throw new HttpError(409,'This environment belongs to a previous container engine. Create a new EnoughFactory environment.');
@@ -46,6 +63,7 @@ export class SessionController {
     await this.update(saved.id,state);this.observe(saved.id,engine,generation);return engine;
   }
   async create(project: Project, name: string, options?: {workspace?: {bindSource:string;stateVolume:string}}): Promise<Session> {
+    this.assertActiveProject(project);
     if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$/.test(name)) throw new HttpError(400,'Use a session name with letters, numbers, dots, underscores or hyphens.');
     if (this.store.list<Session>('sessions').some(s=>s.projectId===project.id && s.name===name && !['stopped','failed'].includes(s.status))) throw new HttpError(409,'This session already exists.');
     const record: Session = {id:id('session'),projectId:project.id,deviceId:this.deviceId,name,status:'starting',phase:'Preparing EnoughFactory runtime',createdAt:now(),updatedAt:now(),services:[]};
@@ -82,6 +100,7 @@ export class SessionController {
     this.launchJobs.set(record.id,job);
   }
   get(sessionId: string): EnvmuxSession {
+    this.assertWorkAvailable(sessionId);
     const session=this.live.get(sessionId); if(!session) throw new HttpError(409,'This environment is not connected.','SESSION_UNAVAILABLE'); return session;
   }
   record(sessionId: string): Session { const r=this.store.get<Session>('sessions',sessionId); if(!r) throw new HttpError(404,'Session not found.'); return r; }
@@ -118,6 +137,7 @@ export class SessionController {
     this.streams.get(sessionId)?.abort();this.live.delete(sessionId);
   }
   async restart(sessionId: string): Promise<void> {
+    this.assertWorkAvailable(sessionId);
     if(this.stopJobs.has(sessionId)||this.stopping.has(sessionId))throw new HttpError(409,'Wait for this environment to finish returning its work before restarting.');
     const record=this.record(sessionId),connected=this.live.get(sessionId);
     if(connected){await connected.restart();await this.update(sessionId,await connected.state());return;}

@@ -34,6 +34,10 @@ pnpm desktop
 
 The desktop starts or reconnects to your local device service. Prepare and start the private container runtime, add a Git repository, create an environment, and connect the selected agent's credentials in that environment. The service stores local state under `~/.enoughfactory` by default. Asset preparation verifies pinned archive digests and does not invoke a host Docker daemon.
 
+Use **Workbench** or the logo to return to all projects. Remove an environment with its trash action, or remove a project in **Project settings**. Removal hides catalog entries and preserves repository files, branches, chats and factory evidence; **Workbench → Removed** restores them. Active environments and unresolved factory work must end or reconcile first.
+
+A goal’s **Activity** tab shows its planner, diagnosis and evaluator conversations, recorded instructions, tool activity and preparation output, including before the first tasks exist. **Settings** shows the connected device-service version.
+
 For live interface development, run `pnpm dev`, then `pnpm --filter @enoughfactory/desktop dev` in another terminal. This starts the device service on port 4317 and Vite on port 4318. See [installation and first use](docs/install.md) for browser connections, startup service installation and removal.
 
 ## Documentation

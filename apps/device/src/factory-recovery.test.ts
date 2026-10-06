@@ -1,0 +1,168 @@
+import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import test, { type TestContext } from 'node:test';
+import type { Attempt, Chat, FactoryTask, Goal, Project, Session } from '@enoughfactory/contracts';
+import type { AttemptDetail, WorkspaceRef } from '@enoughfactory/factory';
+import type { TurnInput, TurnResult } from '@enoughfactory/agents';
+import { DeviceApp } from './app.ts';
+import { ChatController } from './chats.ts';
+import { initializeFactory } from './factory.ts';
+
+interface WorkerReceipt {
+  id: string; coordinatorId: string; goal: Goal; task: FactoryTask; attempt: Attempt; project: Project;
+  status: 'running' | 'unknown' | 'prepared' | 'succeeded'; workspace: WorkspaceRef;
+  sessionId: string; chatId: string; updatedAt: string; error?: string; result?: unknown;
+}
+interface CompletionReceipt { id: string; result: TurnResult; attemptId?: string; completedAt?: string; }
+
+async function harness(t: TestContext) {
+  const directory = mkdtempSync(path.join(tmpdir(), 'enoughfactory-recovery-'));
+  const previousDirectory = process.env.ENOUGHFACTORY_HOME;
+  let app: DeviceApp;
+  try { process.env.ENOUGHFACTORY_HOME = directory; app = new DeviceApp(); }
+  finally {
+    if (previousDirectory === undefined) delete process.env.ENOUGHFACTORY_HOME;
+    else process.env.ENOUGHFACTORY_HOME = previousDirectory;
+  }
+  t.after(async () => { await app.close(); rmSync(directory, { recursive: true, force: true }); });
+  t.mock.method(app, 'ensureRuntimeReady', async () => assert.fail('Recovery observation must not launch a runtime'));
+  t.mock.method(app.runtime, 'prepareWorkspace', async () => assert.fail('Recovery must retain the existing workspace'));
+  let live = false;
+  const chats = {
+    isRunning: () => live,
+    get: (id: string) => app.store.get<Chat>('chats', id)!,
+    run: async () => assert.fail('Reconciliation must not rerun a provider turn'),
+    create: () => assert.fail('Reconciliation must not create a replacement conversation'),
+  } as unknown as ChatController;
+  const factory = await initializeFactory(app, chats);
+  factory.coordinator.stop();
+
+  function seed(status: WorkerReceipt['status'] = 'unknown') {
+    const startedAt = '2026-10-05T00:00:00.000Z', updatedAt = '2026-10-05T00:00:01.000Z';
+    const project: Project = { id: 'project', name: 'Product', path: path.join(directory, 'repository'), deviceId: app.device.id, runtime: 'codex', approvalMode: 'approve-all', rules: [], createdAt: startedAt };
+    const goal: Goal = { id: 'goal', projectId: project.id, coordinatorId: app.device.id, title: 'Deliver product', objective: 'Implement the complete requested behavior', criteria: ['Behavior works'], status: 'running', autonomy: 'autonomous', approvalMode: 'approve-all', runtime: 'codex', concurrency: 4, revision: 2, createdAt: startedAt, updatedAt };
+    const task: FactoryTask = { id: 'task', goalId: goal.id, title: 'Implement behavior', description: 'Deliver the actual behavior and focused evidence', acceptanceCriteria: ['Behavior works'], expectedOutputs: ['Preserved implementation'], dependsOn: [], status: 'running', currentAttemptId: 'attempt', deviceId: app.device.id, createdAt: startedAt, updatedAt };
+    const attempt: Attempt = { id: 'attempt', taskId: task.id, generation: 3, deviceId: app.device.id, status: 'unknown', sessionId: 'session', chatId: 'chat', startedAt };
+    const workspace: WorkspaceRef = { id: 'workspace', path: path.join(directory, 'workspace'), provider: 'git', baseCommit: 'original-base', sessionId: 'session', deviceId: app.device.id };
+    const chat: Chat = { id: 'chat', sessionId: 'session', deviceId: app.device.id, title: task.title, runtime: 'codex', approvalMode: 'approve-all', status: 'idle', threadId: 'provider-thread', createdAt: startedAt, updatedAt: '2026-10-05T00:00:02.000Z' };
+    const session: Session = { id: 'session', projectId: project.id, deviceId: app.device.id, name: 'existing-work', status: 'ready', services: [], createdAt: startedAt, updatedAt };
+    const worker: WorkerReceipt = { id: attempt.id, coordinatorId: app.device.id, goal: { ...goal, revision: 1 }, task, attempt, project, status, workspace, sessionId: session.id, chatId: chat.id, updatedAt, error: 'Connection was interrupted' };
+    const detail: AttemptDetail = { id: attempt.id, goalId: goal.id, goalRevision: goal.revision, assignmentGoalRevision: 1, cancellation: 'none', phase: 'executing', workspace };
+    const completion: CompletionReceipt = { id: chat.id, result: { threadId: chat.threadId, text: 'Legacy response which does not prove the full assigned task was completed' }, completedAt: '2026-10-05T00:00:02.000Z' };
+    app.store.transaction(() => {
+      app.store.set('projects', project); app.store.set('goals', goal); app.store.set('tasks', task);
+      app.store.set('attempts', attempt); app.store.set('factory-attempt-details', detail);
+      app.store.set('sessions', session); app.store.set('chats', chat); app.store.set('factory-workers', worker);
+      app.store.delete('chat-results', chat.id); app.store.delete('chat-turn-failures', chat.id);
+    });
+    return { worker, goal, task, attempt, detail, workspace, chat, completion };
+  }
+  return { app, factory, seed, setLive(value: boolean) { live = value; } };
+}
+
+test('unknown and running factory workers observe a live conversation without repeating execution', async t => {
+  const fixture = await harness(t);
+  for (const status of ['unknown', 'running'] as const) {
+    const state = fixture.seed(status);
+    fixture.setLive(true);
+    const report = await fixture.factory.runtime.reconcile(state.attempt);
+    assert.equal(report.status, 'running');
+    const saved = fixture.app.store.get<WorkerReceipt>('factory-workers', state.attempt.id)!;
+    assert.equal(saved.status, 'running');
+    assert.equal(saved.id, state.worker.id);
+    assert.deepEqual(saved.workspace, state.workspace);
+    assert.equal(saved.chatId, state.chat.id);
+    assert.equal(fixture.app.store.list<Attempt>('attempts').length, 1);
+  }
+});
+
+test('a completion receipt bound to the exact attempt recovers its journaled result', async t => {
+  const fixture = await harness(t);
+  const state = fixture.seed();
+  const completion = { ...state.completion, attemptId: state.attempt.id, result: { threadId: state.chat.threadId, text: 'The complete assigned task and relevant checks finished' } };
+  fixture.app.store.set('chat-results', completion);
+  const report = await fixture.factory.runtime.reconcile(state.attempt);
+  assert.equal(report.status, 'succeeded');
+  assert.equal(report.result!.status, 'succeeded');
+  assert.equal(report.result!.text, completion.result.text);
+  assert.equal(report.result!.chatId, state.chat.id);
+  assert.equal(report.result!.sessionId, state.worker.sessionId);
+  assert.equal(fixture.app.store.get<WorkerReceipt>('factory-workers', state.attempt.id)!.error, undefined);
+});
+
+test('an authenticated legacy completion re-prepares the same attempt and workspace without adopting unbound success', async t => {
+  const fixture = await harness(t);
+  const state = fixture.seed();
+  fixture.app.store.set('chat-results', state.completion);
+  fixture.app.store.set('factory-workers', { ...state.worker, updatedAt: '2026-10-05T00:00:03.000Z' });
+  const before = fixture.app.store.get<Attempt>('attempts', state.attempt.id);
+  const report = await fixture.factory.runtime.reconcile(state.attempt);
+  assert.equal(report.status, 'prepared');
+  assert.equal(report.result, undefined, 'the unbound response is not evidence of task completion');
+  assert.deepEqual(report.workspace, state.workspace);
+  assert.deepEqual(fixture.app.store.get<Attempt>('attempts', state.attempt.id), before);
+  const saved = fixture.app.store.get<WorkerReceipt>('factory-workers', state.attempt.id)!;
+  assert.equal(saved.status, 'prepared');
+  assert.equal(saved.result, undefined);
+  assert.equal(saved.sessionId, state.worker.sessionId);
+  assert.equal(saved.chatId, state.worker.chatId);
+  assert.equal(saved.attempt.generation, 3);
+  assert.equal(fixture.app.store.get<Chat>('chats', state.chat.id)!.attemptId, state.attempt.id);
+  assert.equal(fixture.app.store.get<AttemptDetail>('factory-attempt-details', state.attempt.id)!.goalRevision, 2);
+});
+
+test('a manual Continue turn preserves factory binding and passes the immutable task contract to the provider', async t => {
+  const fixture = await harness(t);
+  const state = fixture.seed();
+  fixture.app.store.set<AttemptDetail>('factory-attempt-details', { ...state.detail, contract: {
+    title: 'Original assigned task', description: 'Implement the original delivery contract',
+    acceptanceCriteria: ['The assigned scenario passes'], expectedOutputs: ['A verified implementation artifact'],
+    checks: ['verify/assigned-task'], dependsOn: [], planRevision: 1,
+  } });
+  fixture.app.store.set('tasks', { ...state.task, title: 'Later display title', description: 'Later description' });
+  t.mock.method(fixture.app.sessions, 'get', () => ({ ready: { instance: 'fake-container', workdir: '/workspace/existing' } }) as ReturnType<DeviceApp['sessions']['get']>);
+  const chats = new ChatController(fixture.app);
+  let received: TurnInput | undefined;
+  t.mock.method(chats.manager, 'runTurn', async (input: TurnInput) => {
+    received = input;
+    return { threadId: state.chat.threadId, text: 'Continued with the assigned context' };
+  });
+  await chats.run(state.chat.id, 'Continue');
+  assert.equal(received!.prompt, 'Continue');
+  assert.equal(received!.attemptId, state.attempt.id);
+  assert.equal(received!.sessionId, state.worker.sessionId);
+  assert.equal(received!.threadId, state.chat.threadId);
+  for (const context of [state.goal.objective, 'Behavior works', 'Original assigned task', 'Implement the original delivery contract', 'The assigned scenario passes', 'A verified implementation artifact', 'verify/assigned-task']) {
+    assert.ok(received!.systemInstructions!.includes(context), `Provider instructions retain ${context}`);
+  }
+  assert.ok(!received!.systemInstructions!.includes('Later description'));
+  assert.equal(fixture.app.store.get<CompletionReceipt>('chat-results', state.chat.id)!.attemptId, state.attempt.id);
+  assert.equal(chats.get(state.chat.id).attemptId, state.attempt.id);
+});
+
+test('stale authority and mismatched legacy receipts remain unknown instead of authorizing execution or success', async t => {
+  const fixture = await harness(t);
+  const changes: Array<[string, (state: ReturnType<typeof fixture.seed>) => void]> = [
+    ['retired authority', state => fixture.app.store.set('attempts', { ...state.attempt, status: 'retired' as const })],
+    ['replacement authority', state => fixture.app.store.set('tasks', { ...state.task, currentAttemptId: 'replacement' })],
+    ['replacement generation', state => fixture.app.store.set('attempts', { ...state.attempt, generation: state.attempt.generation + 1 })],
+    ['stale revision', state => fixture.app.store.set('factory-attempt-details', { ...state.detail, goalRevision: 1 })],
+    ['different session', state => fixture.app.store.set('chats', { ...state.chat, sessionId: 'other-session' })],
+    ['different provider thread', state => fixture.app.store.set('chat-results', { ...state.completion, result: { ...state.completion.result, threadId: 'other-thread' } })],
+    ['completion predates attempt start', state => fixture.app.store.set('factory-workers', { ...state.worker, attempt: { ...state.attempt, startedAt: '2026-10-05T00:00:03.000Z' } })],
+    ['receipt from another attempt', state => fixture.app.store.set('chat-results', { ...state.completion, attemptId: 'other-attempt' })],
+  ];
+  for (const [reason, change] of changes) {
+    const state = fixture.seed();
+    fixture.app.store.set('chat-results', state.completion);
+    change(state);
+    const report = await fixture.factory.runtime.reconcile(state.attempt);
+    assert.equal(report.status, 'unknown', reason);
+    assert.equal(report.workspace, undefined, reason);
+    assert.equal(report.result, undefined, reason);
+    assert.equal(fixture.app.store.get<WorkerReceipt>('factory-workers', state.attempt.id)!.status, 'unknown', reason);
+    assert.equal(fixture.app.store.get<Chat>('chats', state.chat.id)!.attemptId, undefined, reason);
+  }
+});
