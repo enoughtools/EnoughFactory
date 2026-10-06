@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test, { type TestContext } from 'node:test';
 import type { Attempt, Chat, FactoryTask, Goal, Project, Session } from '@enoughfactory/contracts';
-import type { AttemptDetail, WorkspaceRef } from '@enoughfactory/factory';
+import type { AttemptDetail, ControlRecord, WorkspaceRef } from '@enoughfactory/factory';
 import type { TurnInput, TurnResult } from '@enoughfactory/agents';
 import { DeviceApp } from './app.ts';
 import { ChatController } from './chats.ts';
@@ -165,4 +165,38 @@ test('stale authority and mismatched legacy receipts remain unknown instead of a
     assert.equal(fixture.app.store.get<WorkerReceipt>('factory-workers', state.attempt.id)!.status, 'unknown', reason);
     assert.equal(fixture.app.store.get<Chat>('chats', state.chat.id)!.attemptId, undefined, reason);
   }
+});
+
+test('real runtime readiness wakes availability waits without resuming paused or canceled goals', async t => {
+  const fixture = await harness(t);
+  const state = fixture.seed();
+  const base: ControlRecord = { id: state.goal.id, stage: 'plan', spent: 0, startedAt: state.goal.createdAt, steering: [], waitingFor: 'runtime-available', waitReason: 'The runtime was stopped', wakeAt: '2026-10-05T00:01:00Z' };
+  fixture.app.store.set('factory-task-details', { id: state.task.id, key: state.task.id, checks: [], planRevision: state.goal.revision, selected: true, failureSignatures: [] });
+  for (const status of ['waiting', 'paused', 'canceled'] as const) {
+    fixture.app.store.set('goals', { ...state.goal, status });
+    fixture.app.store.set('factory-control', base);
+    fixture.app.emit('runtime', { state: 'starting' });
+    assert.equal(fixture.app.store.get<Goal>('goals', state.goal.id)!.status, status);
+    fixture.app.emit('runtime', { state: 'ready' });
+    assert.equal(fixture.app.store.get<Goal>('goals', state.goal.id)!.status, status === 'waiting' ? 'planning' : status);
+    if (status === 'waiting') {
+      const control = fixture.app.store.get<ControlRecord>('factory-control', state.goal.id)!;
+      assert.equal(control.waitingFor, undefined);
+      assert.equal(control.wakeAt, undefined, 'a satisfied condition cannot leave an obsolete timer behind');
+    }
+  }
+  fixture.app.store.set('goals', { ...state.goal, status: 'waiting' });
+  fixture.app.store.set('factory-control', { ...base, waitingFor: 'credentials-changed', wakeAt: undefined });
+  fixture.app.emit('runtime', { state: 'ready' });
+  assert.equal(fixture.app.store.get<ControlRecord>('factory-control', state.goal.id)!.waitingFor, 'credentials-changed');
+  fixture.app.store.set('factory-control', { ...base, wakeAt: undefined });
+  t.mock.method(fixture.app.sessions.engine, 'detect', async () => ({ available: true, version: 'fixture' }));
+  t.mock.method(fixture.app.runtime, 'status', async () => ({ state: 'ready' } as Awaited<ReturnType<DeviceApp['runtime']['status']>>));
+  await fixture.app.refreshDiagnostics();
+  assert.equal(fixture.app.store.get<Goal>('goals', state.goal.id)!.status, 'planning', 'startup diagnostic readiness uses the same wake producer as an explicit runtime start');
+  fixture.app.store.set('goals', { ...state.goal, status: 'waiting' });
+  fixture.app.store.set('factory-control', base);
+  t.mock.method(fixture.app, 'assertRuntimeCanRun', () => { throw new Error('The runtime is suspended'); });
+  fixture.app.emit('runtime', { state: 'ready' });
+  assert.equal(fixture.app.store.get<Goal>('goals', state.goal.id)!.status, 'waiting', 'a ready socket cannot undo explicit runtime suspension');
 });

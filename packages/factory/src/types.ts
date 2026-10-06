@@ -112,6 +112,8 @@ export interface ControlRecord {
   operation?: { id: string; revision: number; kind: "planner" | "evaluator" | "diagnosis" };
   manualAction?: "plan" | "evaluate";
   decisionFailures?: { signature: string; count: number };
+  /** Persisted consecutive failures; service restarts cannot reset the retry budget. */
+  controllerFailures?: { revision: number; kind: "planner" | "evaluator" | "diagnosis"; count: number };
 }
 export interface CreateGoalInput {
   projectId: string; title?: string; objective: string; criteria?: string[];

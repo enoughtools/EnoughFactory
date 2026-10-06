@@ -1,5 +1,5 @@
 export { FactoryCoordinator } from "./coordinator.js";
-export { FactoryOperationError, FactoryDecisionError } from "./errors.js";
+export { FactoryOperationError, FactoryDecisionError, FactoryControllerError } from "./errors.js";
 export type * from "./types.js";
 export { readCheckCommands, readJsonObject, readPlan, readEvaluation, validateDependencies } from "./protocol.js";
 export { criticalPathMinutes, sortReadyTasks, tasksConflict, placementConstraint, descendants, taskSchedulingBlocker, activeExecutionTasks } from "./scheduler.js";

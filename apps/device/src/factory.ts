@@ -2,13 +2,13 @@ import { randomUUID, createHash } from 'node:crypto';
 import { createReadStream } from 'node:fs';
 import { mkdir, readFile, writeFile, lstat, readlink, open } from 'node:fs/promises';
 import path from 'node:path';
-import type { Attempt, FactoryTask, Goal, Project, Decision, ControllerRun } from '@enoughfactory/contracts';
+import type { Attempt, FactoryTask, Goal, Project, Decision, ControllerRun, ContainerRuntimeStatus } from '@enoughfactory/contracts';
 import {
   FactoryCoordinator, FactoryOperationError, type FactoryWorkspacePort, type FactoryRuntimePort, type WorkspaceRef,
   type CandidateRef, type ExecutionResult, type CheckResult, type CreateGoalInput,
   type RepositoryEvidence, type EvaluationRecord, type ControlRecord, type TaskDetail,
 } from '@enoughfactory/factory';
-import { WorkspaceManager, ArtifactFsWorkspaceProvider, dockerCheckExecutor, fingerprintWorkingDirectories, type WorkingDirectorySource, type WorkingDirectoryCapture, type ArtifactManifest, type Candidate, type CheckReport, type WorkspaceRecord } from '@enoughfactory/workspaces';
+import { WorkspaceManager, ArtifactFsWorkspaceProvider, dockerCheckExecutor, appleCheckExecutor, isAppleCheckCommand, appleCheckArtifacts, fingerprintWorkingDirectories, type WorkingDirectorySource, type WorkingDirectoryCapture, type ArtifactManifest, type Candidate, type CheckReport, type WorkspaceRecord } from '@enoughfactory/workspaces';
 import type { PeerManager } from '@enoughfactory/peers';
 import type { TurnResult } from '@enoughfactory/agents';
 import { dockerInvocation } from '@enoughfactory/runtime';
@@ -17,6 +17,8 @@ import type { ChatController } from './chats.ts';
 import { exec, HttpError, now } from './util.ts';
 import { inspectAttempt, inspectGoal, inspectTask, taskControlReason, taskDispatchBlocker } from './task-inspection.ts';
 import { factoryChatBinding } from './factory-chat.ts';
+import { controllerError } from './factory-controller-error.ts';
+import { prepareControllerContext } from './controller-context.ts';
 
 interface WorkerRecord {
   id: string; coordinatorId: string; goal: Goal; task: FactoryTask; attempt: Attempt; project: Project;
@@ -40,9 +42,20 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
     if (run.status === 'starting' || run.status === 'running') app.store.set('factory-controller-runs', { ...run, status: 'interrupted', error: 'The device service restarted before this decision completed. Its conversation and environment remain inspectable.', updatedAt: now() });
   }
   const checkExecutor=dockerCheckExecutor({ image:process.env.ENOUGHFACTORY_CHECK_IMAGE,dockerRuntime:app.runtime.endpoint });
-  const workspaces = new WorkspaceManager({
+  const workspaces: WorkspaceManager = new WorkspaceManager({
     dataDir: path.join(app.dataDir, 'workspace-data'), deviceId: app.device.id,
-    checkExecutor:Object.assign((context:Parameters<typeof checkExecutor>[0])=>app.withRuntimeOperation(async signal=>{await app.ensureRuntimeReady();await app.runtime.prepareWorkspace(context.path);for(const root of context.workingDirectories||[])await app.runtime.prepareWorkspace(root.path);return checkExecutor({...context,signal:context.signal?AbortSignal.any([signal,context.signal]):signal});}),{release:checkExecutor.release}),
+    checkExecutor: Object.assign((context: Parameters<typeof checkExecutor>[0]) => app.withRuntimeOperation(async signal => {
+      const check = { ...context, signal: context.signal ? AbortSignal.any([signal, context.signal]) : signal };
+      if (isAppleCheckCommand(context.command)) {
+        const result = await appleCheckExecutor({ checksRoot: path.join(app.dataDir, 'workspace-data', 'checks'), artifacts: workspaces.artifacts })(check);
+        rememberArtifacts(...appleCheckArtifacts(result));
+        return result;
+      }
+      await app.ensureRuntimeReady();
+      await app.runtime.prepareWorkspace(context.path);
+      for (const root of context.workingDirectories || []) await app.runtime.prepareWorkspace(root.path);
+      return checkExecutor(check);
+    }), { release: checkExecutor.release }),
     artifactFs: new ArtifactFsWorkspaceProvider({
       rootDirectory: path.join(app.dataDir, 'workspace-data'),
       dockerRuntime:app.runtime.endpoint,
@@ -94,6 +107,11 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
   }
   function rememberArtifacts(...manifests: ArtifactManifest[]) {
     for (const manifest of manifests) app.store.set('artifacts', manifest); app.changed();
+  }
+  function validationInstructions(): string {
+    const common = 'Authoring agents and ordinary shell checks run in Linux containers, including on a Mac device. Do not claim Xcode, simulator or native build evidence from a Linux shell. Choose checks that actually match each task and its available inputs; never require later implementation files to accept earlier architecture work. Keep repository paths portable across operating systems: do not create files or directories that differ only by letter case.';
+    if (process.platform !== 'darwin') return common;
+    return `${common} The coordinator can run fixed Apple validation profiles on exact saved candidates. Use a check string such as enoughfactory:apple-build {"tool":"swift","package":".","action":"build"} or enoughfactory:apple-build {"tool":"xcodebuild","project":"EnoughMail.xcodeproj","scheme":"EnoughMail","platform":"macos","configuration":"Debug"}; ios-simulator is also supported. These are structured check profiles, not container shell commands. Native validation has private build output, no network, personal files, keychain, signing or simulator launch. Vendor required dependencies inside the primary repository and use portable relative paths. A passing Xcode build retains unsigned app products as artifacts. Only the recorded check result is build evidence; a profile in a plan is not proof that it passed. Credential-dependent or signed distribution checks must remain explicitly unresolved until their real inputs exist.`;
   }
   async function artifactPath(manifest: ArtifactManifest): Promise<string> {
     const prior = verifiedArtifacts.get(manifest.sha256);
@@ -197,7 +215,7 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
     if (attempt) app.store.set('attempts', { ...attempt, sessionId: record.sessionId, chatId: chat.id });
     const repair = app.store.get<{ id: string; conflicts: string[]; message?: string }>('factory-repair-input', record.id);
     const result = await chats.run(chat.id, repair ? `${prompt}\n\nRetained work was merged as repair input. Resolve conflict markers in these files before completing: ${repair.conflicts.join(', ')}. ${repair.message || ''}` : prompt, { attemptId: record.id, autonomous: record.goal.autonomy === 'autonomous',
-      systemInstructions: `You are implementing an assigned EnoughFactory task toward this goal:\n${record.goal.objective}\n\nYou have full permissions inside this container. Enough owns the configured ${record.goal.approvalMode} policy. Make routine implementation decisions and execute the task completely. Do not stop at a plan or ask for permission already granted. Keep verification proportionate. Preserve changes and describe concrete evidence and any remaining work. The factory will independently capture, check, integrate and evaluate your result.` });
+      systemInstructions: `You are implementing an assigned EnoughFactory task toward this goal:\n${record.goal.objective}\n\nYou have full permissions inside this container. Enough owns the configured ${record.goal.approvalMode} policy. Make routine implementation decisions and execute the task completely. Do not stop at a plan or ask for permission already granted. Keep verification proportionate. Preserve changes and describe concrete evidence and any remaining work. The factory will independently capture, check, integrate and evaluate your result.\n\n${validationInstructions()}` });
     if (worker(record.id).status === 'canceled') return;
     patchWorker(record.id, { status: 'succeeded', result: { status: 'succeeded', text: result.text, sessionId: record.sessionId, chatId: chat.id, spend: spend(result) } });
   }
@@ -392,6 +410,7 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
   };
   const runtime: FactoryRuntimePort = {
     async complete({ goal, role, prompt, project, signal }) {
+      let providerInvoked = false;
       return app.withRuntimeOperation(async runtimeSignal=>{
       signal=signal?AbortSignal.any([signal,runtimeSignal]):runtimeSignal;
       if (signal?.aborted) throw new Error('The controller decision was revoked.');
@@ -399,11 +418,14 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
       const operation = randomUUID();
       const workspace = await workspaces.create({ projectPath: project.path, goalId: goal.id, taskId: `control-${role}`, attemptId: operation });
       await configureHandoff(workspace);
+      const context = await prepareControllerContext({ operation, goalId: goal.id, role, project, store: app.store,
+        workspaces, directoryManager: app.sessions.directoryManager, dataDir: app.dataDir });
       const owned = internalProject(project, workspace, `${goal.title} · ${role}`);
-      const session = await app.sessions.create(owned, sessionName(operation));
+      const session = await app.sessions.create(owned, sessionName(operation), { workingDirectorySources: context.workingDirectorySources });
       const record: ControllerRun = { id: operation, goalId: goal.id, role, sessionId: session.id, status: 'starting', updatedAt: now() };
       app.store.set('factory-controller-runs', record);
       let chatId: string | undefined;
+      let controllerFailure: unknown;
       const cancel = () => {
         if (chatId) void chats.interrupt(chatId).catch(() => {});
         else void app.sessions.stop(session.id).catch(() => {});
@@ -416,22 +438,30 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
         const chat = chats.create({ sessionId: session.id, runtime: goal.runtime, approvalMode: goal.approvalMode, title: `${goal.title} · ${role}` });
         chatId = chat.id;
         app.store.set('factory-controller-runs', { ...record, chatId: chat.id, status: 'running', updatedAt: now() });
+        providerInvoked = true;
         const result = await chats.run(chat.id, prompt, { autonomous: goal.autonomy === 'autonomous',
-          systemInstructions: `You are the EnoughFactory ${role}. This container contains an isolated snapshot of the current project repository. Inspect the actual source and relevant runtime evidence to make your decision. You have full container permissions under ${goal.approvalMode} policy. Your role is to decide the next factory action; implementation belongs to assigned worker tasks. Do not modify product source as part of this decision. Return the structured JSON requested in the prompt. Goal: ${goal.objective}` });
+          systemInstructions: [`You are the EnoughFactory ${role}. This container contains an isolated snapshot of the current project repository. Inspect the actual source and relevant runtime evidence to make your decision. You have full container permissions under ${goal.approvalMode} policy. Your role is to decide the next factory action; implementation belongs to assigned worker tasks. Do not modify product source as part of this decision. Return the structured JSON requested in the prompt. Goal: ${goal.objective}`, validationInstructions(), context.instructions].filter(Boolean).join('\n\n') });
         app.store.set('factory-controller-runs', { ...record, chatId: chat.id, status: 'completed', updatedAt: now(), result: result.text });
         return { text: result.text, chatId: chat.id, spend: spend(result) };
       } catch (error) {
+        controllerFailure = error;
         app.store.set('factory-controller-runs', { ...record, chatId, status: signal?.aborted ? 'interrupted' : 'failed', error: (error as Error).message, updatedAt: now() });
         throw error;
       } finally {
         signal?.removeEventListener('abort', cancel);
-        const current = app.sessions.record(session.id);
-        if (app.sessions.needsTermination(session.id)) {
-          if (current.status !== 'stopping') await app.sessions.stop(session.id);
-          await app.sessions.waitStopped(session.id);
+        try {
+          const current = app.sessions.record(session.id);
+          if (app.sessions.needsTermination(session.id)) {
+            if (current.status !== 'stopping') await app.sessions.stop(session.id);
+            await app.sessions.waitStopped(session.id);
+          }
+        } catch (error) {
+          // Cleanup cannot turn a known preparation failure into an unknown provider outcome.
+          app.store.set('factory-controller-cleanup', { id: operation, sessionId: session.id, error: (error as Error).message, updatedAt: now() });
+          if (controllerFailure === undefined) throw error;
         }
       }
-      });
+      }).catch(error => { throw controllerError(error, { providerInvoked, runtimeReady: app.diagnostics.containerRuntime?.state === 'ready' }); });
     },
     async execute({ attempt, goal, project, prompt, assignmentGoalRevision }) {
       const currentProject = app.store.get<Project>('projects', project.id) || project;
@@ -471,6 +501,14 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
   }
   const coordinator = new FactoryCoordinator({ store: app.store, runtime, workspaces: workspacePort,
     deviceId: app.device.id, devices: () => app.devices, project: id => app.store.get<Project>('projects', id), onChange: () => app.changed() });
+  const runtimeReady = (topic: string, data: unknown) => {
+    if (topic !== 'runtime' || (data as ContainerRuntimeStatus).state !== 'ready') return;
+    try { app.assertRuntimeCanRun(); } catch { return; }
+    coordinator.notifyCondition('runtime-available');
+  };
+  app.listeners.add(runtimeReady);
+  app.closers.push(() => { app.listeners.delete(runtimeReady); });
+  if (app.diagnostics.containerRuntime?.state === 'ready') runtimeReady('runtime', app.diagnostics.containerRuntime);
 
   app.extensions.push(async (call: ApiCall) => {
     const { method, url, body } = call, route = url.pathname;

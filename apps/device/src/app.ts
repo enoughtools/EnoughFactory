@@ -304,7 +304,7 @@ export class DeviceApp {
     if(!existsSync(target)){res.writeHead(503,{'Content-Type':'text/plain'});res.end('EnoughFactory is starting. Build the web application or run the development server.');return;}
     res.writeHead(200,{'Content-Type':MIME[path.extname(target)]||'application/octet-stream'});const stream=createReadStream(target);stream.on('error',()=>res.end());stream.pipe(res);
   }
-  async refreshDiagnostics():Promise<void>{const [info,status]=await Promise.all([this.sessions.engine.detect(),this.runtime.status()]);this.diagnostics={...this.diagnostics,containerRuntime:status,docker:{available:status.state==='ready',version:status.dockerVersion,error:status.error},envmux:{available:info.available,version:info.version,error:info.error}};this.syncRuntimeCapacity();this.changed();}
+  async refreshDiagnostics():Promise<void>{const [info,status]=await Promise.all([this.sessions.engine.detect(),this.runtime.status()]);this.diagnostics={...this.diagnostics,envmux:{available:info.available,version:info.version,error:info.error}};this.runtimeStatus(status);}
   async listen():Promise<void>{
     await new Promise<void>((resolve,reject)=>{this.server.once('error',reject);this.server.listen(this.port,'127.0.0.1',()=>resolve());});
     writeFileSync(path.join(this.dataDir,'connection.json'),JSON.stringify({url:`http://127.0.0.1:${this.port}`,token:this.token,pid:process.pid,version:'0.1.6'},null,2),{mode:0o600});

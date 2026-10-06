@@ -5,7 +5,7 @@ import type {
   EvaluationRecord, ExecutionResult, GoalCheckRecord, PlanRecord, PlannedTask, RepositoryEvidence, TaskDetail,
 } from "./types.js";
 import { readCheckCommands, readEvaluation, readJsonObject, readPlan, readTasks, validateDependencies } from "./protocol.js";
-import { FactoryOperationError, FactoryDecisionError } from "./errors.js";
+import { FactoryOperationError, FactoryDecisionError, FactoryControllerError } from "./errors.js";
 import { activeExecutionTasks, descendants, placementConstraint, sortReadyTasks, taskSchedulingBlocker } from "./scheduler.js";
 
 const TABLE = {
@@ -15,6 +15,7 @@ const TABLE = {
 } as const;
 const terminalGoals = new Set<Goal["status"]>(["completed", "canceled", "failed"]);
 const activeAttempts = new Set<Attempt["status"]>(["created", "running", "unknown"]);
+const controllerRetryDelays = [30_000, 120_000, 300_000];
 
 /** Durable, single-authority coordinator. A turn ending is an input, never completion. */
 export class FactoryCoordinator {
@@ -131,6 +132,12 @@ export class FactoryCoordinator {
           continue;
         }
         let current = this.goal(goal.id), control = this.control(goal.id);
+        // Localized repair keeps unrelated work running, so its timed wait is not
+        // represented by goal.status === "waiting".
+        if (control.waitingFor === "controller-retry" && control.wakeAt && Date.parse(control.wakeAt) <= Date.parse(this.now())) {
+          this.wake(current.id, "Retry the controller after its preparation backoff.");
+          current = this.goal(goal.id); control = this.control(goal.id);
+        }
         if (current.status === "waiting") {
           if (control.waitingFor === "device-online" && this.hasAvailableDevice(current)) this.wake(current.id, "A worker device is available.");
           else if (control.wakeAt && Date.parse(control.wakeAt) <= Date.parse(this.now())) this.wake(current.id, "The configured wait has elapsed.");
@@ -176,7 +183,7 @@ export class FactoryCoordinator {
     if (terminalGoals.has(goal.status)) throw new Error("A terminal goal cannot be resumed. Create a new goal to continue it.");
     const control = this.control(goalId);
     this.options.store.transaction(() => {
-      this.options.store.set(TABLE.control, { ...control, waitingFor: undefined, waitReason: undefined, wakeAt: undefined, stage: control.stage === "wait" ? this.nextStage(goalId) : control.stage });
+      this.options.store.set(TABLE.control, { ...control, waitingFor: undefined, waitReason: undefined, wakeAt: undefined, controllerFailures: undefined, stage: control.stage === "wait" ? this.nextStage(goalId) : control.stage });
       this.writeGoal(goalId, { status: control.stage === "plan" ? "planning" : "running", error: undefined, nextAction: "Resume from current durable state" });
       this.decision(goalId, "resumed", "Coordination resumed from its retained plan and attempts.");
     });
@@ -189,7 +196,7 @@ export class FactoryCoordinator {
     if (terminalGoals.has(goal.status)) throw new Error("The goal is terminal.");
     if (this.attempts(goalId).some(attempt => activeAttempts.has(attempt.status)) || this.tasks(goalId).some(task => task.status === "review")) throw new Error("Work is active or awaiting integration. Use goal steering to revise and revoke it explicitly.");
     this.options.store.transaction(() => {
-      this.options.store.set(TABLE.control, { ...this.control(goalId), stage: "plan", manualAction: "plan", operation: undefined, replanReason: "A fresh plan was requested.", waitingFor: undefined, waitReason: undefined });
+      this.options.store.set(TABLE.control, { ...this.control(goalId), stage: "plan", manualAction: "plan", operation: undefined, replanReason: "A fresh plan was requested.", waitingFor: undefined, waitReason: undefined, wakeAt: undefined, controllerFailures: undefined });
       this.writeGoal(goalId, { revision: goal.revision + 1, status: goal.status === "paused" ? "paused" : "planning", nextAction: "Plan the requested work" });
       for (const task of this.tasks(goalId).filter(task => task.status !== "completed")) this.writeTask(task.id, { status: "canceled" });
       this.decision(goalId, "plan-requested", "A new plan was requested from current accepted work; pending proposals were replaced.");
@@ -226,7 +233,7 @@ export class FactoryCoordinator {
     if (terminalGoals.has(goal.status)) throw new Error("The goal is terminal.");
     if (this.busyGoals.has(goalId)) throw new Error("A controller decision is still running. Pause or steer it before requesting a different decision.");
     if (this.tasks(goalId).some(task => !["completed", "canceled"].includes(task.status))) throw new Error("Complete or retire outstanding work before evaluating the full goal.");
-    this.options.store.set(TABLE.control, { ...this.control(goalId), stage: "evaluate", manualAction: "evaluate" });
+    this.options.store.set(TABLE.control, { ...this.control(goalId), stage: "evaluate", manualAction: "evaluate", waitingFor: undefined, waitReason: undefined, wakeAt: undefined, controllerFailures: undefined });
     this.writeGoal(goalId, { status: "running", nextAction: "Evaluate current completion evidence" }); this.changed();
   }
 
@@ -253,7 +260,7 @@ export class FactoryCoordinator {
     const attempts = this.attempts(goalId).filter(attempt => activeAttempts.has(attempt.status));
     this.options.store.transaction(() => {
       const control = this.control(goalId);
-      this.options.store.set(TABLE.control, { ...control, stage: "plan", operation: undefined, steering: input.context ? [...control.steering, input.context.trim()] : control.steering, replanReason: "User steering changed the goal context.", waitingFor: undefined, waitReason: undefined });
+      this.options.store.set(TABLE.control, { ...control, stage: "plan", operation: undefined, steering: input.context ? [...control.steering, input.context.trim()] : control.steering, replanReason: "User steering changed the goal context.", waitingFor: undefined, waitReason: undefined, wakeAt: undefined, controllerFailures: undefined });
       this.writeGoal(goalId, {
         revision: goal.revision + 1, status: goal.status === "paused" ? "paused" : "planning", nextAction: "Revise the plan for the updated goal",
         ...(input.objective === undefined ? {} : { objective: input.objective.trim() }),
@@ -316,7 +323,7 @@ export class FactoryCoordinator {
       if (control.waitingFor !== condition || terminalGoals.has(goal.status)) continue;
       if (goal.status === "waiting") this.wake(goal.id, `Condition satisfied: ${condition}`);
       else if (control.stage === "diagnose" || (control.stage === "plan" && control.replanTaskIds?.length)) {
-        this.options.store.set(TABLE.control, { ...control, waitingFor: undefined, waitReason: undefined });
+        this.options.store.set(TABLE.control, { ...control, waitingFor: undefined, waitReason: undefined, wakeAt: undefined });
         this.decision(goal.id, "controller-woken", `Repair controller condition satisfied: ${condition}`);
       }
     }
@@ -332,9 +339,9 @@ export class FactoryCoordinator {
       "You are the EnoughFactory planner. Build the entire objective, preserving all explicit requirements. Make routine implementation decisions yourself.",
       "Return one JSON object: {summary,criteria:string[],checks:string[],tasks:[{key,title,description,kind:'feature'|'unit'|'architecture'|'test',acceptanceCriteria:string[],expectedOutputs:string[],dependsOn:string[],checks:string[],estimatedMinutes?:number,writePaths?:string[],resources?:{cpus?:number,memoryGiB?:number},deviceId?:string}]}. Stable task keys must be unique, dependencies acyclic, checks focused and executable inside the isolated runtime.",
       "Choose task kinds by outcome: feature delivers observable product behavior; unit implements a bounded component or change; architecture resolves a structural decision and preserves its rationale and handoff; test supplies focused verification for an identified uncertainty. Give each task concrete acceptance criteria and expected deliverables. Do not invent extra architecture/test tasks or mandatory reviews when the work does not need them.",
-      "Every checks entry is a shell command, never an instruction or explanation. For example use 'sh scripts/check-foundation.sh', not 'Run scripts/check-foundation.sh to validate the foundation'. Task checks verify only outputs available when that task and its actual prerequisites finish. An architecture or interface task should verify its deliverables without requiring the future application, packages or tests to exist. Plan-level checks are final whole-goal checks, run once on the integrated result after all tasks finish; do not copy them into every task or require expensive full-product verification at every layer. Empty task checks are acceptable when concrete deliverable evidence is the appropriate verification.",
+      "Every ordinary checks entry is a shell command, never an instruction or explanation. A structured validation profile explicitly advertised by the runtime is also a valid check; preserve its exact prefix and JSON rather than wrapping it in a shell command. For example use 'sh scripts/check-foundation.sh', not 'Run scripts/check-foundation.sh to validate the foundation'. Task checks verify only outputs available when that task and its actual prerequisites finish. An architecture or interface task should verify its deliverables without requiring the future application, packages or tests to exist. Plan-level checks are final whole-goal checks, run once on the integrated result after all tasks finish; do not copy them into every task or require expensive full-product verification at every layer. Empty task checks are acceptable when concrete deliverable evidence is the appropriate verification.",
       "Maximize useful parallel work: establish shared interfaces/contracts in small prerequisite tasks, then give independent implementations disjoint ownership. DependsOn is for actual required outputs, not preferred chronology or artificial phases. Avoid making every task depend on a broad setup task. Declare repository-relative writePaths (files, directories or globs) for likely writes, estimatedMinutes for effort and resources for meaningful CPU/memory needs. Estimates guide scheduling; do not invent precision. Keep verification proportionate; do not require human approval or ceremonies unless the goal's actual policy requires them.",
-      "Do not claim implementation or completion. A task may include configured release/deployment actions. Derive explicit observable criteria when the user omitted them.",
+      "Do not claim implementation or completion. A task may include configured release/deployment actions. Recorded goal completion criteria are authoritative: return their exact text unchanged, including criteria added through user steering. Derive explicit observable goal criteria only when none are recorded. Put implementation-specific requirements in task acceptanceCriteria; routine replanning must not add paraphrased or duplicate goal criteria.",
       this.context(goal),
       `Devices: ${JSON.stringify(this.options.devices())}`,
       `Already integrated work: ${JSON.stringify(completed.map(task => ({ key: this.taskDetail(task.id).key, title: task.title, description: task.description, attempt: this.options.store.get(TABLE.attemptDetails, task.currentAttemptId ?? "") })))}`,
@@ -353,8 +360,9 @@ export class FactoryCoordinator {
       if (plan.tasks.some(task => preservedKeys.has(task.key))) throw new FactoryDecisionError("The planner repeated a preserved task key. Use a new key for improvement work and leave unrelated work unchanged.");
       this.options.store.transaction(() => {
         this.applyTasks(goal.id, plan.tasks, plan.summary, plan.checks, new Set(preserved.map(task => task.id)));
-        this.writeGoal(goal.id, { criteria: [...new Set([...this.goal(goal.id).criteria, ...plan.criteria])], status: "running", error: undefined, nextAction: plan.tasks.length ? "Dispatch work whose dependencies are complete" : "Evaluate existing product evidence" });
-          this.options.store.set(TABLE.control, { ...this.control(goal.id), stage: plan.tasks.length || preserved.some(task => task.status !== "completed") ? "dispatch" : "evaluate", operation: undefined, manualAction: undefined, decisionFailures: undefined, replanTaskIds: undefined });
+        const recordedCriteria = this.goal(goal.id).criteria;
+        this.writeGoal(goal.id, { criteria: recordedCriteria.length ? recordedCriteria : [...new Set(plan.criteria)], status: "running", error: undefined, nextAction: plan.tasks.length ? "Dispatch work whose dependencies are complete" : "Evaluate existing product evidence" });
+          this.options.store.set(TABLE.control, { ...this.control(goal.id), stage: plan.tasks.length || preserved.some(task => task.status !== "completed") ? "dispatch" : "evaluate", operation: undefined, manualAction: undefined, decisionFailures: undefined, controllerFailures: undefined, replanTaskIds: undefined });
         this.decision(goal.id, "plan", plan.summary, { chatId: response.chatId, taskCount: plan.tasks.length, revision: this.goal(goal.id).revision });
       });
       this.changed();
@@ -625,7 +633,7 @@ export class FactoryCoordinator {
       const decision = readJsonObject(response.text);
       if (!["retry", "replan", "wait"].includes(String(decision.action)) || typeof decision.reason !== "string" || !decision.reason.trim()) throw new FactoryDecisionError("Repair decision must specify retry, replan or wait and a reason.");
       if (repeated && decision.action === "retry") decision.action = "replan";
-      this.options.store.set(TABLE.control, { ...this.control(goal.id), decisionFailures: undefined });
+      this.options.store.set(TABLE.control, { ...this.control(goal.id), decisionFailures: undefined, controllerFailures: undefined });
       this.decision(goal.id, "repair", decision.reason, { action: decision.action, taskId, chatId: response.chatId });
       if (decision.action === "wait") {
         this.options.store.transaction(() => {
@@ -717,7 +725,7 @@ export class FactoryCoordinator {
         validateDependencies(extra, completedKeys);
         if (extra.some(task => completedKeys.has(task.key))) throw new FactoryDecisionError("Evaluation reused a completed task key for unfinished work.");
       }
-      this.options.store.set(TABLE.control, { ...this.control(goal.id), decisionFailures: undefined });
+      this.options.store.set(TABLE.control, { ...this.control(goal.id), decisionFailures: undefined, controllerFailures: undefined });
       if (evaluation.complete && allSatisfied && goalChecksPassed && !extra.length && !this.tasks(goal.id).some(task => !["completed", "canceled"].includes(task.status))) {
         this.options.store.transaction(() => {
           this.options.store.set(TABLE.control, { ...this.control(goal.id), stage: "done", operation: undefined, manualAction: undefined });
@@ -774,7 +782,7 @@ export class FactoryCoordinator {
     const attempts = this.attempts(goalId).filter(attempt => (activeAttempts.has(attempt.status) || this.task(attempt.taskId).status === "review") && (!scope || scope.has(attempt.taskId)));
     this.options.store.transaction(() => {
       this.writeGoal(goalId, { revision: goal.revision + 1, status: "planning", nextAction: "Revise the plan from retained evidence" });
-      this.options.store.set(TABLE.control, { ...this.control(goalId), stage: "plan", operation: undefined, replanReason: reason, diagnosisTaskId: undefined, replanTaskIds: scope ? affected.map(task => task.id) : undefined });
+      this.options.store.set(TABLE.control, { ...this.control(goalId), stage: "plan", operation: undefined, replanReason: reason, diagnosisTaskId: undefined, replanTaskIds: scope ? affected.map(task => task.id) : undefined, waitingFor: undefined, waitReason: undefined, wakeAt: undefined, controllerFailures: undefined });
       for (const task of affected) this.writeTask(task.id, { status: "canceled" });
       for (const attempt of attempts) this.revoke(attempt);
       if (scope) {
@@ -802,21 +810,33 @@ export class FactoryCoordinator {
   }
   private operationFailed(goalId: string, id: string, error: unknown): void {
     if (!this.operationCurrent(goalId, id)) return;
-    const control = this.control(goalId);
-    if (error instanceof FactoryDecisionError) {
-      const signature = createHash("sha256").update(this.error(error)).digest("hex");
-      const count = (control.decisionFailures?.count ?? 0) + 1;
-      this.options.store.set(TABLE.control, { ...control, operation: undefined, decisionFailures: { signature, count }, replanReason: `${control.replanReason ?? ""}\nThe previous structured decision was rejected: ${this.error(error)}\nReturn the requested JSON schema exactly and correct that failure.` });
-      this.decision(goalId, "decision-repair", `The factory is correcting an invalid structured decision: ${this.error(error)}`, { count });
-      if (count < 3) { this.writeGoal(goalId, { nextAction: "Correct the structured factory decision", error: undefined }); this.changed(); return; }
-    }
-    this.options.store.set(TABLE.control, { ...this.control(goalId), operation: undefined });
-    this.decision(goalId, "controller-error", this.error(error));
-    if (control.stage === "diagnose" || (control.stage === "plan" && control.replanTaskIds?.length)) {
-      this.options.store.set(TABLE.control, { ...this.control(goalId), waitingFor: "runtime-available", waitReason: this.error(error) });
-      this.writeGoal(goalId, { status: "running", nextAction: "Repair controller is waiting; independent work can continue" });
-      this.changed();
-    } else this.wait(goalId, this.error(error), "runtime-available");
+    this.options.store.transaction(() => {
+      const control = this.control(goalId);
+      if (error instanceof FactoryDecisionError) {
+        const signature = createHash("sha256").update(this.error(error)).digest("hex");
+        const count = (control.decisionFailures?.count ?? 0) + 1;
+        this.options.store.set(TABLE.control, { ...control, operation: undefined, decisionFailures: { signature, count }, replanReason: `${control.replanReason ?? ""}\nThe previous structured decision was rejected: ${this.error(error)}\nReturn the requested JSON schema exactly and correct that failure.` });
+        this.decision(goalId, "decision-repair", `The factory is correcting an invalid structured decision: ${this.error(error)}`, { count });
+        if (count < 3) { this.writeGoal(goalId, { nextAction: "Correct the structured factory decision", error: undefined }); this.changed(); return; }
+      }
+      const operation = control.operation!;
+      const previous = control.controllerFailures;
+      const count = (previous?.revision === operation.revision && previous.kind === operation.kind ? previous.count : 0) + 1;
+      const delay = error instanceof FactoryControllerError && error.recovery === "retry" ? controllerRetryDelays[count - 1] : undefined;
+      const condition = delay !== undefined ? "controller-retry" : error instanceof FactoryControllerError && error.recovery !== "retry" ? error.recovery : "controller-retry-required";
+      const reason = delay !== undefined ? `${this.error(error)} Retry ${count}/${controllerRetryDelays.length} is scheduled after preparation backoff.` : this.error(error);
+      this.options.store.set(TABLE.control, { ...this.control(goalId), operation: undefined,
+        controllerFailures: { revision: operation.revision, kind: operation.kind, count },
+        wakeAt: delay === undefined ? undefined : new Date(Date.parse(this.now()) + delay).toISOString(),
+      });
+      this.decision(goalId, "controller-error", this.error(error));
+      if (delay !== undefined) this.decision(goalId, "controller-retry-scheduled", reason, { count, wakeAt: this.control(goalId).wakeAt });
+      if (control.stage === "diagnose" || (control.stage === "plan" && control.replanTaskIds?.length)) {
+        this.options.store.set(TABLE.control, { ...this.control(goalId), waitingFor: condition, waitReason: reason });
+        this.writeGoal(goalId, { status: "running", nextAction: delay !== undefined ? "Repair controller will retry preparation; independent work can continue" : "Repair controller is waiting; independent work can continue" });
+        this.changed();
+      } else this.wait(goalId, reason, condition, this.control(goalId).wakeAt);
+    });
   }
   private isCurrent(attempt: Attempt): boolean {
     const stored = this.options.store.get<Attempt>(TABLE.attempts, attempt.id), task = this.options.store.get<FactoryTask>(TABLE.tasks, attempt.taskId);
@@ -902,16 +922,17 @@ export class FactoryCoordinator {
     if (this.tasks(goalId).some(task => !["completed", "canceled"].includes(task.status))) return "dispatch";
     return "evaluate";
   }
-  private wait(goalId: string, reason: string, condition: string): void {
+  private wait(goalId: string, reason: string, condition: string, wakeAt?: string): void {
     if (terminalGoals.has(this.goal(goalId).status) || this.goal(goalId).status === "paused") return;
     this.options.store.transaction(() => {
-      this.options.store.set(TABLE.control, { ...this.control(goalId), waitingFor: condition, waitReason: reason, operation: undefined });
+      this.options.store.set(TABLE.control, { ...this.control(goalId), waitingFor: condition, waitReason: reason, wakeAt, operation: undefined });
       this.writeGoal(goalId, { status: "waiting", error: reason, nextAction: reason });
       this.decision(goalId, "waiting", reason, { condition });
     }); this.changed();
   }
   private wake(goalId: string, reason: string): void {
-    const goal = this.goal(goalId), stage = this.nextStage(goalId);
+    const goal = this.goal(goalId), control = this.control(goalId);
+    const stage = control.controllerFailures && ["plan", "diagnose", "evaluate"].includes(control.stage) ? control.stage : this.nextStage(goalId);
     this.options.store.transaction(() => {
       this.options.store.set(TABLE.control, { ...this.control(goalId), stage, waitingFor: undefined, waitReason: undefined, wakeAt: undefined });
       this.writeGoal(goalId, { status: stage === "plan" ? "planning" : "running", error: undefined, nextAction: reason });

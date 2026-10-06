@@ -3,9 +3,10 @@ import test from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
 import type { Attempt, Decision, Device, FactoryTask, Goal, Project } from "@enoughfactory/contracts";
 import { FactoryCoordinator } from "./coordinator.js";
+import { FactoryControllerError } from "./errors.js";
 import { readPlan } from "./protocol.js";
 import type {
-  AttemptDetail, CandidateRef, EvaluationRecord, EvaluationResponse, ExecutionResult, FactoryRuntimePort,
+  AttemptDetail, CandidateRef, ControlRecord, EvaluationRecord, EvaluationResponse, ExecutionResult, FactoryRuntimePort,
   FactoryStore, FactoryWorkspacePort, PlanRecord, PlanResponse,
 } from "./types.js";
 
@@ -53,7 +54,7 @@ const completeEvaluation: EvaluationResponse = {
   criteria: criteria.map((criterion, index) => ({ criterion, satisfied: true, evidence: [`artifact:proof-${index}`] })),
 };
 
-function harness(devices: Device[] = [device]) {
+function harness(devices: Device[] = [device], now?: () => Date) {
   const store = new MemoryStore();
   const calls = { planner: 0, evaluator: 0, diagnosis: 0, execute: 0, reconcile: 0, cancel: 0, prepare: 0, capture: 0, check: 0, goalCheck: 0, integrate: 0, integrationFences: 0, reconcileIntegration: 0 };
   const executionPrompts: string[] = [];
@@ -110,7 +111,7 @@ function harness(devices: Device[] = [device]) {
     },
     async release() {},
   };
-  const options = { store, runtime, workspaces, deviceId: device.id, devices: () => devices, project: (id: string) => id === project.id ? project : undefined };
+  const options = { store, runtime, workspaces, deviceId: device.id, devices: () => devices, project: (id: string) => id === project.id ? project : undefined, now };
   const coordinator = new FactoryCoordinator(options);
   const goal = () => coordinator.create({ projectId: project.id, objective: "Build the feature and publish its release", criteria, autonomy: "autonomous", approvalMode: "approve-all", concurrency: 1 });
   return {
@@ -677,4 +678,133 @@ test("autonomous continuation repairs a confirmed failure and reaches evaluated 
     assert.equal(decisions.some(decision => decision.kind === "repair"), true);
     assert.equal(decisions.some(decision => decision.kind === "completed"), true);
   } finally { factory.coordinator.stop(); }
+});
+
+test("controller preparation retries retain deadlines and a bounded budget across service recovery", async t => {
+  let at = Date.parse("2026-10-06T00:00:00Z");
+  const factory = harness([device], () => new Date(at));
+  factory.planning(async () => { throw new FactoryControllerError(`Download connection failure ${factory.calls.planner}`, "retry"); });
+  const goal = factory.goal();
+  await factory.coordinator.tick(); await factory.coordinator.waitForIdle();
+  assert.equal(factory.calls.planner, 1);
+  const first = factory.store.get<ControlRecord>("factory-control", goal.id)!;
+  assert.equal(first.waitingFor, "controller-retry");
+  assert.equal(Date.parse(first.wakeAt!) - at, 30_000);
+
+  const recovered = factory.recover();
+  t.after(() => recovered.stop());
+  await recovered.start(); await recovered.waitForIdle();
+  assert.equal(factory.calls.planner, 1, "restarting the service does not consume the wait or reset its budget");
+  for (const [index, delayMs] of [30_000, 120_000, 300_000].entries()) {
+    const current = factory.store.get<ControlRecord>("factory-control", goal.id)!;
+    assert.equal(current.controllerFailures!.count, index + 1);
+    assert.equal(Date.parse(current.wakeAt!) - at, delayMs);
+    at = Date.parse(current.wakeAt!) - 1;
+    await recovered.tick(); await recovered.waitForIdle();
+    assert.equal(factory.calls.planner, index + 1, "a regular tick cannot bypass backoff");
+    at++;
+    await recovered.tick(); await recovered.waitForIdle();
+    assert.equal(factory.calls.planner, index + 2);
+  }
+  const exhausted = factory.store.get<ControlRecord>("factory-control", goal.id)!;
+  assert.equal(exhausted.controllerFailures!.count, 4);
+  assert.equal(exhausted.waitingFor, "controller-retry-required");
+  assert.equal(exhausted.wakeAt, undefined);
+  at += 3_600_000;
+  await recovered.tick(); await recovered.waitForIdle();
+  assert.equal(factory.calls.planner, 4, "equivalent transient errors eventually require changed conditions or explicit intervention");
+});
+
+test("localized planning retries preserve their scope while independent work completes", async () => {
+  let at = Date.parse("2026-10-06T00:00:00Z");
+  const factory = harness([device], () => new Date(at));
+  factory.planning(async () => factory.calls.planner === 1 ? { ...plan, tasks: [
+    { ...plan.tasks[0]!, key: "repair", title: "Repair branch" },
+    { ...plan.tasks[0]!, key: "independent", title: "Independent branch" },
+  ] } : factory.calls.planner === 2 ? Promise.reject(new FactoryControllerError("curl: (56) unexpected EOF", "retry")) : { ...plan, tasks: [{ ...plan.tasks[0]!, key: "repair", title: "Revised branch" }] });
+  const goal = factory.goal();
+  await factory.coordinator.tick(); await factory.coordinator.waitForIdle();
+  const tasks = factory.store.list<FactoryTask>("tasks");
+  const affected = tasks.find(task => task.title === "Repair branch")!;
+  const independent = tasks.find(task => task.title === "Independent branch")!;
+  const control = factory.store.get<ControlRecord>("factory-control", goal.id)!;
+  factory.store.set("tasks", { ...affected, status: "canceled" as const });
+  factory.store.set("factory-control", { ...control, stage: "plan", replanTaskIds: [affected.id], replanReason: "Correct the affected branch" });
+  await factory.coordinator.tick(); await factory.coordinator.waitForIdle();
+  const waiting = factory.store.get<ControlRecord>("factory-control", goal.id)!;
+  assert.equal(factory.store.get<Goal>("goals", goal.id)!.status, "running");
+  assert.equal(waiting.waitingFor, "controller-retry");
+  assert.equal(waiting.stage, "plan");
+  assert.deepEqual(waiting.replanTaskIds, [affected.id]);
+  assert.equal(factory.store.get<FactoryTask>("tasks", independent.id)!.status, "completed", "repair preparation cannot stop a separate branch");
+  at = Date.parse(waiting.wakeAt!);
+  await factory.coordinator.tick(); await factory.coordinator.waitForIdle();
+  assert.equal(factory.calls.planner, 3);
+  assert.equal(factory.store.get<FactoryTask>("tasks", independent.id)!.status, "completed");
+  const after = factory.store.get<ControlRecord>("factory-control", goal.id)!;
+  assert.equal(after.controllerFailures, undefined, "a successful structured plan resets the consecutive failure budget");
+  assert.equal(after.waitingFor, undefined);
+  assert.equal(after.wakeAt, undefined);
+});
+
+test("unknown controller outcomes and external waits never acquire an automatic deadline", async () => {
+  for (const error of [new Error("Provider acknowledgement was lost"), new FactoryControllerError("Sign in to the provider", "credentials-changed"), new FactoryControllerError("Provider quota exceeded", "provider-available")]) {
+    let at = Date.parse("2026-10-06T00:00:00Z");
+    const factory = harness([device], () => new Date(at));
+    factory.planning(async () => { throw error; });
+    const goal = factory.goal();
+    await factory.coordinator.tick(); await factory.coordinator.waitForIdle();
+    const control = factory.store.get<ControlRecord>("factory-control", goal.id)!;
+    assert.equal(control.waitingFor, error instanceof FactoryControllerError ? error.recovery : "controller-retry-required");
+    assert.equal(control.wakeAt, undefined);
+    at += 3_600_000;
+    factory.coordinator.notifyCondition("runtime-available");
+    await factory.coordinator.tick(); await factory.coordinator.waitForIdle();
+    assert.equal(factory.calls.planner, 1, "runtime refresh does not substitute for authentication, quota or a reconciled outcome");
+  }
+});
+
+test("pausing, cancellation and changed goal authority fence scheduled controller retries", async () => {
+  for (const action of ["pause", "cancel", "steer"] as const) {
+    let at = Date.parse("2026-10-06T00:00:00Z");
+    const factory = harness([device], () => new Date(at));
+    factory.planning(async () => { throw new FactoryControllerError("Download interrupted", "retry"); });
+    const goal = factory.goal();
+    await factory.coordinator.tick(); await factory.coordinator.waitForIdle();
+    const wait = factory.store.get<ControlRecord>("factory-control", goal.id)!;
+    if (action === "pause") factory.coordinator.pause(goal.id);
+    if (action === "cancel") await factory.coordinator.cancel(goal.id);
+    if (action === "steer") {
+      factory.coordinator.pause(goal.id);
+      await factory.coordinator.steer(goal.id, { context: "Use the revised delivery requirements" });
+      const revised = factory.store.get<ControlRecord>("factory-control", goal.id)!;
+      assert.equal(revised.controllerFailures, undefined);
+      assert.equal(revised.wakeAt, undefined);
+    }
+    at = Date.parse(wait.wakeAt!) + 1;
+    factory.coordinator.notifyCondition("controller-retry");
+    await factory.coordinator.tick(); await factory.coordinator.waitForIdle();
+    assert.equal(factory.calls.planner, 1, `${action} cannot be undone by a queued deadline or condition notification`);
+    assert.equal(factory.store.get<Goal>("goals", goal.id)!.status, action === "cancel" ? "canceled" : "paused");
+  }
+});
+
+test("replanning preserves authoritative goal criteria and explicit steering without accumulating planner paraphrases", async () => {
+  for (const explicitCriteria of [criteria, []]) {
+    const factory = harness();
+    factory.planning(async () => ({ ...plan, criteria: factory.calls.planner === 1
+      ? ["The requested app and release are usable"]
+      : ["The application works", "The app is complete", "Publish a usable release"] }));
+    const goal = factory.coordinator.create({ projectId: project.id, objective: "Build and release the complete app", criteria: explicitCriteria });
+    await factory.coordinator.tick(); await factory.coordinator.waitForIdle();
+    const authoritative = explicitCriteria.length ? explicitCriteria : ["The requested app and release are usable"];
+    assert.deepEqual(factory.store.get<Goal>("goals", goal.id)!.criteria, authoritative, "only a goal without criteria derives them from the initial plan");
+    factory.coordinator.requestPlan(goal.id);
+    await factory.coordinator.tick(); await factory.coordinator.waitForIdle();
+    assert.deepEqual(factory.store.get<Goal>("goals", goal.id)!.criteria, authoritative, "a new plan cannot multiply exact-match evaluator obligations");
+    const steeredCriteria = [...authoritative, "The new user-requested offline scenario works"];
+    await factory.coordinator.steer(goal.id, { criteria: steeredCriteria, context: "Include the additional offline scenario" });
+    await factory.coordinator.tick(); await factory.coordinator.waitForIdle();
+    assert.deepEqual(factory.store.get<Goal>("goals", goal.id)!.criteria, steeredCriteria, "explicit user scope remains authoritative after steering triggers another plan");
+  }
 });
