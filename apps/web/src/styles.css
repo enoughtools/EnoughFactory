@@ -477,7 +477,7 @@ button.project-card { width: 100%; }
 .main-shell > .connection-banner, .main-shell > .error-banner { margin: 0; border-width: 0 0 1px; padding-left: 36px; padding-right: 36px; align-items: center; }
 .main-shell > .error-banner > span, .main-shell > .connection-banner > span { flex: 1; }
 .error-banner > button:not([data-slot="button"]) { display: grid; place-items: center; width: 25px; height: 25px; padding: 0; border: 0; color: var(--factory-danger); background: transparent; }
-.loading-spinner { display: inline-block; width: 15px; height: 15px; flex-shrink: 0; border: 1.5px solid var(--factory-line); border-top-color: var(--factory-accent); border-radius: 50% !important; animation: factory-spin 800ms linear infinite; }
+.loading-spinner { display: inline-block; flex-shrink: 0; color: var(--factory-accent); animation: factory-spin 800ms linear infinite; }
 .keyboard-hint { color: var(--factory-muted); border: 1px solid var(--factory-line); padding: 1px 5px; font-size: 10px; line-height: 1.6; background: var(--factory-surface); font-family: var(--font-sans); }
 [data-slot="button"] { display: inline-flex; align-items: center; justify-content: center; gap: 7px; min-height: 36px; padding: 8px 13px; border-radius: 0; font-family: var(--font-sans); font-size: 12px; line-height: 1.45; font-weight: 500; box-shadow: none; }
 [data-slot="button"] svg { width: 14px; height: 14px; stroke-width: 1.7; }
@@ -611,6 +611,7 @@ button.project-card { width: 100%; }
 }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
+  .loading-spinner { animation: none !important; }
 }
 
 /* Controls introduced alongside the connected factory. */
