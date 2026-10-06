@@ -1,0 +1,226 @@
+{
+  "formatVersion": 1,
+  "product": "EnoughFactory",
+  "version": "0.1.2",
+  "sourceCommit": "c71a3a91861c3dd3bd11ab90b9edbc740aa0f12e",
+  "verificationScope": "public-release-catalog-and-website",
+  "verifiedAt": "2026-10-06T01:39:04.109Z",
+  "routeCheckStartedAt": "2026-10-06T01:39:03.831Z",
+  "status": "passed",
+  "deployment": {
+    "provider": "Cloudflare Workers",
+    "worker": "enoughfactory",
+    "versionId": "d47f38f7-40a7-49f3-84d7-8ebf4cf9fcb4",
+    "origin": "https://factory.enoughtools.com"
+  },
+  "releaseUrl": "https://github.com/enoughtools/EnoughFactory/releases/tag/v0.1.2",
+  "publicBytes": {
+    "method": "prepare-release.mjs actual public installer and source streams compared with final local sizes and SHA-256",
+    "passCount": 1,
+    "installers": [
+      {
+        "filename": "EnoughFactory-0.1.2-linux-arm64.AppImage",
+        "url": "https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.2/EnoughFactory-0.1.2-linux-arm64.AppImage",
+        "bytes": 361674452,
+        "sha256": "6747032f84e9184014ceebdc58ed466a3b17fb0abaf753e894dc07305ccda30a"
+      },
+      {
+        "filename": "EnoughFactory-0.1.2-linux-arm64.tar.gz",
+        "url": "https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.2/EnoughFactory-0.1.2-linux-arm64.tar.gz",
+        "bytes": 349310172,
+        "sha256": "43b9d6fca70f46c8d26ca01b673165f23192dffebc5e34017973764d2ab5f47e"
+      },
+      {
+        "filename": "EnoughFactory-0.1.2-linux-x64.AppImage",
+        "url": "https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.2/EnoughFactory-0.1.2-linux-x64.AppImage",
+        "bytes": 371578632,
+        "sha256": "e47c3b62a23f949fb04a777eb2e5299e317d45aa949078953f5e459a08c7f25c"
+      },
+      {
+        "filename": "EnoughFactory-0.1.2-linux-x64.tar.gz",
+        "url": "https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.2/EnoughFactory-0.1.2-linux-x64.tar.gz",
+        "bytes": 359575568,
+        "sha256": "861a18c0774380c98b2c8a06954d7d7ce3c3e0452baa7256ce344deca7afc5a4"
+      },
+      {
+        "filename": "EnoughFactory-0.1.2-mac-arm64.dmg",
+        "url": "https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.2/EnoughFactory-0.1.2-mac-arm64.dmg",
+        "bytes": 1028323204,
+        "sha256": "cf59cc6c2ea78a8062642621b59d2d8aca47e4887bd0a5e527addd59c5c35b41"
+      },
+      {
+        "filename": "EnoughFactory-0.1.2-mac-arm64.zip",
+        "url": "https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.2/EnoughFactory-0.1.2-mac-arm64.zip",
+        "bytes": 1024522382,
+        "sha256": "ab62304268dbb9eed0814bae53fe874036650a496152ec2c028a508b91f2fc02"
+      }
+    ],
+    "sources": [
+      {
+        "filename": "EnoughFactory-0.1.2-linux-arm64-container-sources.tar.gz",
+        "url": "https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.2/EnoughFactory-0.1.2-linux-arm64-container-sources.tar.gz",
+        "bytes": 56036891,
+        "sha256": "7faa0b0711f97f8c6e837f9e7d3c94fc0e3820db8c3f9f1c0a9d5ff3cd3941c1"
+      },
+      {
+        "filename": "EnoughFactory-0.1.2-linux-arm64-container-sources.tar.gz.json",
+        "url": "https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.2/EnoughFactory-0.1.2-linux-arm64-container-sources.tar.gz.json",
+        "bytes": 6270,
+        "sha256": "34c5bc8455de1b8ebcd07679933e1bb7ceecff4fe04ea1f471d8d21e2018776e"
+      },
+      {
+        "filename": "EnoughFactory-0.1.2-linux-x64-container-sources.tar.gz",
+        "url": "https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.2/EnoughFactory-0.1.2-linux-x64-container-sources.tar.gz",
+        "bytes": 55840197,
+        "sha256": "8a63fd73739c9f395488fe26e3b84e401862cef175091664d7fcbb1561ede864"
+      },
+      {
+        "filename": "EnoughFactory-0.1.2-linux-x64-container-sources.tar.gz.json",
+        "url": "https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.2/EnoughFactory-0.1.2-linux-x64-container-sources.tar.gz.json",
+        "bytes": 6262,
+        "sha256": "760dc95de3843de60660e175cd81c90cd950163f23dc6eb90ad1110d10d484eb"
+      },
+      {
+        "filename": "EnoughFactory-0.1.2-darwin-arm64-container-sources.tar.gz",
+        "url": "https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.2/EnoughFactory-0.1.2-darwin-arm64-container-sources.tar.gz",
+        "bytes": 63940433,
+        "sha256": "18680ab52d8d1fcfe4eea6858c0f558433ad0a45e7a1b9b260fbb4bbfd932a46"
+      },
+      {
+        "filename": "EnoughFactory-0.1.2-darwin-arm64-container-sources.tar.gz.json",
+        "url": "https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.2/EnoughFactory-0.1.2-darwin-arm64-container-sources.tar.gz.json",
+        "bytes": 6869,
+        "sha256": "fddcaa175328c943a5209f7b090109229ad5fa291ea6602d869a9f8a476d8473"
+      },
+      {
+        "filename": "EnoughFactory-Ubuntu-24.04-20260926-sources-part01.tar.gz",
+        "url": "https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.2/EnoughFactory-Ubuntu-24.04-20260926-sources-part01.tar.gz",
+        "bytes": 766180065,
+        "sha256": "de08b49f7ab2882b803f2b3bff3b44feaf193f4e7a75eb5ad8a0ff7f191d3704"
+      },
+      {
+        "filename": "EnoughFactory-Ubuntu-24.04-20260926-sources-part02.tar.gz",
+        "url": "https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.2/EnoughFactory-Ubuntu-24.04-20260926-sources-part02.tar.gz",
+        "bytes": 611450171,
+        "sha256": "6b27dc2436620fdc7e057facfc454d4b504b983e603c7fe5d079116ffcebaa86"
+      },
+      {
+        "filename": "Ubuntu-archive-evidence.tar.gz",
+        "url": "https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.2/Ubuntu-archive-evidence.tar.gz",
+        "bytes": 99066216,
+        "sha256": "fc6d93e8ebd64963b2993f96e7ba6ef8f51a0c4e7d975128d2c36fbb25040643"
+      },
+      {
+        "filename": "Ubuntu-sources.lock.json",
+        "url": "https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.2/Ubuntu-sources.lock.json",
+        "bytes": 1444926,
+        "sha256": "69970920a7e8b558c7b9f762090b8c737106e9d8c2146d36381e707429046522"
+      },
+      {
+        "filename": "Ubuntu-source-companion.json",
+        "url": "https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.2/Ubuntu-source-companion.json",
+        "bytes": 41707,
+        "sha256": "70aae28ae71172ff64897506285cf2fd6963fe52bf648c430073ff7e7b63c81b"
+      },
+      {
+        "filename": "Ubuntu-source-companion-SHA256SUMS",
+        "url": "https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.2/Ubuntu-source-companion-SHA256SUMS",
+        "bytes": 436,
+        "sha256": "a976eaa483453e488bb724b64a01fe9a05cecea71298c05a738a9a9c3b542248"
+      },
+      {
+        "filename": "Ubuntu-source-companion-README.md",
+        "url": "https://github.com/enoughtools/EnoughFactory/releases/download/v0.1.2/Ubuntu-source-companion-README.md",
+        "bytes": 6192,
+        "sha256": "28bb9839cad63a8883ed4bc256b254c36e87e33687e6caab57172519883d335e"
+      }
+    ],
+    "installerCount": 6,
+    "sourceCount": 13,
+    "ubuntuSourceIndexSha256": "70aae28ae71172ff64897506285cf2fd6963fe52bf648c430073ff7e7b63c81b"
+  },
+  "website": {
+    "marketingBuild": "passed",
+    "hostedBrowserStage": "passed",
+    "deploy": "passed",
+    "routes": [
+      {
+        "path": "/",
+        "url": "https://factory.enoughtools.com/",
+        "status": 200,
+        "finalUrl": "https://factory.enoughtools.com/",
+        "contentType": "text/html",
+        "bytes": 23003,
+        "sha256": "ccdcd1338650b485f068b543785b7f55231f9d0f445ba09677a8800ab55d5d14"
+      },
+      {
+        "path": "/docs",
+        "url": "https://factory.enoughtools.com/docs",
+        "status": 200,
+        "finalUrl": "https://factory.enoughtools.com/docs",
+        "contentType": "text/html",
+        "bytes": 16184,
+        "sha256": "96e1df95a5274d8a92086cb21747515aba28f5e381ad42bcbac83ef05329639b"
+      },
+      {
+        "path": "/downloads",
+        "url": "https://factory.enoughtools.com/downloads",
+        "status": 200,
+        "finalUrl": "https://factory.enoughtools.com/downloads",
+        "contentType": "text/html",
+        "bytes": 17856,
+        "sha256": "a5b646e6623c7d7b8fa7d26f2e97a684dd2231a3c1ac949bc36bd333d4146358"
+      },
+      {
+        "path": "/downloads/manifest.json",
+        "url": "https://factory.enoughtools.com/downloads/manifest.json",
+        "status": 200,
+        "finalUrl": "https://factory.enoughtools.com/downloads/manifest.json",
+        "contentType": "application/json",
+        "bytes": 8731,
+        "sha256": "50b5f373a9315b9bafdbde9d33629d4d460e61c62541fe5d24df25827b46907d"
+      },
+      {
+        "path": "/app",
+        "url": "https://factory.enoughtools.com/app",
+        "status": 200,
+        "finalUrl": "https://factory.enoughtools.com/app",
+        "contentType": "text/html",
+        "bytes": 646,
+        "sha256": "fbe84ae004c3ce99d3c6e0621a30173a64eb285b55d7cfd76367b81f40b3aeb2"
+      }
+    ],
+    "catalogSha256": "50b5f373a9315b9bafdbde9d33629d4d460e61c62541fe5d24df25827b46907d",
+    "catalogBytesMatchPreparedFile": true,
+    "statusBoardGuideLink": "verified",
+    "signing": "unsigned",
+    "macNotarization": "not-notarized"
+  },
+  "scope": "Actual public installer/source bytes and five public HTTPS routes. Browser visuals and browser-to-device permissions are verified separately by the release operator; no device-connection claim is made here.",
+  "browserInspection": {
+    "verifiedAt": "2026-10-06T01:41:29.745Z",
+    "pages": [
+      "https://factory.enoughtools.com/",
+      "https://factory.enoughtools.com/downloads",
+      "https://factory.enoughtools.com/docs"
+    ],
+    "observations": [
+      "Live homepage displays version 0.1.2",
+      "Six installer links and thirteen runtime-source links point to the published release",
+      "Mac DMG checksum disclosure matches the exact selected archive",
+      "Native archive verification record link is available",
+      "Installation guide links the status-board example at frozen source c71a3a91861c3dd3bd11ab90b9edbc740aa0f12e"
+    ],
+    "screenshot": {
+      "path": "docs/verification/public-launch-0.1.2.jpg",
+      "sha256": "dd8b98b86b7bc337e8011326317ac79dbded4be9f28a8f5edadbb0ae3dfc6ac7"
+    }
+  },
+  "browserToDevice": {
+    "status": "awaiting-user-permission",
+    "permission": "Chrome local-device access for factory.enoughtools.com",
+    "scope": "Empty isolated service from final released Mac resources; no container engine started",
+    "reason": "Browser-control policy requires confirmation before accepting an unexpected site permission",
+    "permissionAccepted": false
+  }
+}

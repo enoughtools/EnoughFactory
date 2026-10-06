@@ -52,6 +52,18 @@ https://factory.enoughtools.com
 
 An open-source software factory for Mac and Linux. Isolated environments, connected devices, coding agents and durable autonomous goals in one EnoughUI workspace.
 
+## 0.1.2 release facts
+
+Version 0.1.2 is public at [factory.enoughtools.com](https://factory.enoughtools.com) and on [GitHub](https://github.com/enoughtools/EnoughFactory/releases/tag/v0.1.2), from source `c71a3a91861c3dd3bd11ab90b9edbc740aa0f12e`. The live catalog contains six installer archives and thirteen corresponding runtime source files. Every download passed its actual public-byte size and SHA-256 check. Packages are unsigned, and Mac packages are not notarized.
+
+- Version-aware startup adopts the supported legacy state in a transaction and rejects newer or malformed data formats. The final native installed-service journeys retain the known record and event at cursor 41 through resource update/restart and normal removal, with the same device/access identity. Negative child startups create no connection or listener and preserve the database bytes.
+- The [status-board example](https://github.com/enoughtools/EnoughFactory/tree/c71a3a91861c3dd3bd11ab90b9edbc740aa0f12e/examples/status-board) is a small Node HTTP app with no npm dependencies, current envmux setup, a scoped Valkey cache, checks, preview and a goal users can copy. Make it an independent repository before adding it to the factory.
+- The hosted browser onboarding correction is included in the new source: an unconfigured visitor sees the device connection form without polling a website API or displaying an HTML error document.
+- The [completed distributed journey](https://github.com/enoughtools/EnoughFactory/blob/c71a3a91861c3dd3bd11ab90b9edbc740aa0f12e/docs/verification/distributed-factory-evidence.json) used a Mac ARM64 coordinator and native Linux ARM64 worker in an EnoughFactory-owned VZ guest on the same physical Mac. A real Codex goal transferred verified source/candidate artifacts over authenticated direct WebRTC, retained its candidate across coordinator restart, integrated once at `3fb317c8587b611cd830d3f3e0f9655ed32db002` and satisfied all ten retained criteria. Five private-engine checks passed, including 21 CLI cases. The recorded topology has two operating systems and independent services on one physical Mac.
+- Approval evidence is a separate deterministic typed callback fixture over an actual native WebRTC connection, using production Enough policy decisions and Codex response mappings. The real full-access worker emitted zero native approval requests. Describe these scopes separately.
+
+The distributed journey retains historical 0.1.1 native provenance underneath its immutable 0.1.2 service. Final 0.1.2 Mac ARM64 and Linux x64/ARM64 packages have their own fresh runtime, sandboxed desktop, installed-service and exact archive proofs. Their service hash matches the real distributed journey. Keep those native package records separate from the product composition result.
+
 ## Demonstration sequence
 
 Use a real project and actual product state. Keep provider credentials, local private paths and unrelated projects outside the capture.
