@@ -145,7 +145,7 @@ async function stage(directory, reportPath) {
   const runEvidence = await verifyNativeRun();
   await draft();
   for (const file of ['runtime/container/pins.json', 'runtime/container/os-source-kit/Ubuntu-sources.lock.json']) {
-    const frozen = execFileSync('git', ['show', `${delivery.sourceCommit}:${file}`], { cwd: root });
+    const frozen = execFileSync('git', ['show', `${delivery.sourceCommit}:${file}`], { cwd: root, maxBuffer: 32 * 1024 * 1024 });
     assert.equal(hashBytes(await readFile(join(root, file))), hashBytes(frozen), 'Delivery inputs differ from the frozen package revision.');
   }
   const sourceClosure = await verifyRuntimeSourceClosure('ubuntu-source');
