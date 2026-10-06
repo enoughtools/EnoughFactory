@@ -118,6 +118,9 @@ importers:
       '@enoughfactory/contracts':
         specifier: workspace:*
         version: link:../../packages/contracts
+      '@enoughfactory/factory':
+        specifier: workspace:*
+        version: link:../../packages/factory
       '@enoughfactory/peers':
         specifier: workspace:*
         version: link:../../packages/peers

@@ -1,0 +1,30 @@
+{
+  "version": "0.1.4",
+  "scope": "Dependency scheduling, localized repair, configurable capacity and graph UI; native delivery recorded separately",
+  "checks": [
+    "45 factory tests including nine coordinator parallel/recovery journeys",
+    "Six focused device capacity/lifecycle tests",
+    "Two focused production inspection/manual action tests",
+    "Three graph layout tests",
+    "Factory, contracts, device, desktop and web typechecks",
+    "Shared renderer and desktop builds",
+    "Actual GoalsPage graph fixture visually inspected; task selection opens prerequisites and precise blockers",
+    "Hosted asset bytes match the produced browser build"
+  ],
+  "deployment": "b1ffec66-3c1f-49a4-bf85-29ff3d46d7a2",
+  "url": "https://factory.enoughtools.com/app",
+  "assets": [
+    {
+      "path": "/app/assets/index-D9j9Bij0.js",
+      "sha256": "0ee23f44906182925b957c30335c35404aa6d7477c0d24847f90c5e648942097",
+      "matchesBuild": true
+    },
+    {
+      "path": "/app/assets/index-BA1pu6pk.css",
+      "sha256": "770998392f7e3205614464b5fb8fdc557ecdac5dab4c4755c41f01c1e0cc7a17",
+      "matchesBuild": true
+    }
+  ],
+  "visual": "parallel-work-ui.png",
+  "visualContext": "Deterministic production-component fixture; displayed tasks and workers are sample data. No new paid-agent or Docker journey."
+}

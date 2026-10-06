@@ -37,6 +37,37 @@ function strings(value: unknown, name: string, required = false): string[] {
   return [...new Set(value.map(item => (item as string).trim()))];
 }
 
+function positiveNumber(value: unknown, name: string, maximum: number): number {
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0 || value > maximum) {
+    throw new FactoryDecisionError(`${name} must be a positive finite number no greater than ${maximum}.`);
+  }
+  return value;
+}
+
+function resources(value: unknown, name: string): { cpus?: number; memoryGiB?: number } {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new FactoryDecisionError(`${name} must be an object containing cpus or memoryGiB.`);
+  const item = value as Record<string, unknown>;
+  if (Object.keys(item).some(key => key !== "cpus" && key !== "memoryGiB")) throw new FactoryDecisionError(`${name} supports only cpus and memoryGiB.`);
+  return {
+    ...(item.cpus === undefined ? {} : { cpus: positiveNumber(item.cpus, `${name}.cpus`, 512) }),
+    ...(item.memoryGiB === undefined ? {} : { memoryGiB: positiveNumber(item.memoryGiB, `${name}.memoryGiB`, 4096) }),
+  };
+}
+
+function writePaths(value: unknown, name: string): string[] {
+  const normalized = strings(value, name, true).map(path => {
+    const slashes = path.replaceAll("\\", "/");
+    const segments = slashes.split("/");
+    if (slashes.startsWith("/") || /^[a-zA-Z]:/.test(slashes) || segments.includes("..") || /[\u0000-\u001f\u007f]/.test(slashes)) {
+      throw new FactoryDecisionError(`${name} must contain repository-relative paths or globs without absolute paths or parent traversal.`);
+    }
+    const relative = segments.filter(segment => segment && segment !== ".").join("/");
+    if (!relative) throw new FactoryDecisionError(`${name} must contain non-empty repository-relative paths or globs.`);
+    return relative;
+  });
+  return [...new Set(normalized)];
+}
+
 export function readTasks(value: unknown): PlannedTask[] {
   if (!Array.isArray(value)) throw new FactoryDecisionError("The plan must contain a tasks array.");
   const seen = new Set<string>();
@@ -51,7 +82,10 @@ export function readTasks(value: unknown): PlannedTask[] {
     return { key: item.key, title: item.title.trim(), description: item.description.trim(), dependsOn: strings(item.dependsOn, `${item.key}.dependsOn`), checks: strings(item.checks, `${item.key}.checks`), ...(typeof item.deviceId === "string" ? { deviceId: item.deviceId } : {}),
       ...(item.kind === undefined ? {} : { kind: item.kind as TaskKind }),
       ...(item.acceptanceCriteria === undefined ? {} : { acceptanceCriteria: strings(item.acceptanceCriteria, `${item.key}.acceptanceCriteria`) }),
-      ...(item.expectedOutputs === undefined ? {} : { expectedOutputs: strings(item.expectedOutputs, `${item.key}.expectedOutputs`) }) };
+      ...(item.expectedOutputs === undefined ? {} : { expectedOutputs: strings(item.expectedOutputs, `${item.key}.expectedOutputs`) }),
+      ...(item.estimatedMinutes === undefined ? {} : { estimatedMinutes: positiveNumber(item.estimatedMinutes, `${item.key}.estimatedMinutes`, 10080) }),
+      ...(item.resources === undefined ? {} : { resources: resources(item.resources, `${item.key}.resources`) }),
+      ...(item.writePaths === undefined ? {} : { writePaths: writePaths(item.writePaths, `${item.key}.writePaths`) }) };
   });
 }
 

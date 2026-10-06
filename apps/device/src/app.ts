@@ -11,6 +11,7 @@ import { PRODUCT } from '@enoughfactory/contracts';
 import { Store } from './store.ts';
 import { SessionController } from './sessions.ts';
 import { equalSecret, exec, HttpError, id, now } from './util.ts';
+import { configuredWorkerCapacity, runtimeWorkerResources, validWorkerCapacity } from './worker-capacity.ts';
 
 export interface ApiCall { method: string; url: URL; body: Record<string, unknown>; peerId?: string; }
 export type Extension = (call: ApiCall) => Promise<unknown | undefined>;
@@ -90,7 +91,8 @@ export class DeviceApp {
   private syncRuntimeCapacity():void {
     const state=this.diagnostics.containerRuntime?.state;
     const unavailable=this.runtimeSuspended||this.runtimeStopping||state==='stopping'||state==='unavailable'||state==='failed';
-    this.device={...this.device,capacity:unavailable?0:2,workspaceProviders:this.diagnostics.containerRuntime?.artifactFsSupported?['git','artifactfs']:['git']};
+    const workerResources=runtimeWorkerResources(this.diagnostics.containerRuntime);
+    this.device={...this.device,capacity:unavailable?0:configuredWorkerCapacity(this.settings,workerResources),workerResources,workspaceProviders:this.diagnostics.containerRuntime?.artifactFsSupported?['git','artifactfs']:['git']};
     this.devices=[this.device,...this.devices.filter(device=>!device.local&&device.id!==this.device.id)];
   }
   setDevice(device: Device): void {this.device=device;this.syncRuntimeCapacity();this.sessions.setDeviceId(device.id);}
@@ -118,7 +120,7 @@ export class DeviceApp {
     this.runtimeOperations.set(operationId,{controller,promise});return promise;
   }
   state(): FactoryState {
-    return {product:PRODUCT,version:'0.1.3',device:{...this.device,lastSeen:now()},devices:this.devices,projects:this.store.list<Project>('projects').filter(p=>!p.internal),sessions:this.store.list('sessions'),chats:this.store.list('chats'),approvals:this.store.list('approvals'),goals:this.store.list('goals'),tasks:this.store.list('tasks'),attempts:this.store.list('attempts'),diagnostics:this.diagnostics,settings:{...this.settings,turnCredential:undefined},...this.catalog?.()};
+    return {product:PRODUCT,version:'0.1.4',device:{...this.device,lastSeen:now()},devices:this.devices,projects:this.store.list<Project>('projects').filter(p=>!p.internal),sessions:this.store.list('sessions'),chats:this.store.list('chats'),approvals:this.store.list('approvals'),goals:this.store.list('goals'),tasks:this.store.list('tasks'),attempts:this.store.list('attempts'),diagnostics:this.diagnostics,settings:{...this.settings,turnCredential:undefined},...this.catalog?.()};
   }
   emit(topic: string,data: unknown): void {
     if(this.closing)return;
@@ -130,7 +132,7 @@ export class DeviceApp {
   async dispatch(call: ApiCall): Promise<unknown> {
     const {method,url,body}=call;const route=url.pathname;
     if(this.routeRemote){const remote=await this.routeRemote(call);if(remote!==undefined)return remote;}
-    if(method==='GET' && route==='/api/health')return {ok:true,product:PRODUCT,version:'0.1.3',deviceId:this.device.id};
+    if(method==='GET' && route==='/api/health')return {ok:true,product:PRODUCT,version:'0.1.4',deviceId:this.device.id};
     if(method==='GET' && route==='/api/state')return this.state();
     if(method==='POST' && route==='/api/service/shutdown'){setTimeout(()=>{void this.close().then(()=>process.exit(0));},200);return {ok:true};}
     if(method==='GET'&&route==='/api/runtime')return this.refreshRuntime();
@@ -202,8 +204,11 @@ export class DeviceApp {
       if(method==='POST'&&service){await this.sessions.get(sid).task(decodeURIComponent(service[1]),service[2] as 'start'|'stop'|'restart');return {ok:true};}
     }
     if(method==='PATCH'&&route==='/api/settings'){
+      if(body.workerCapacity!==undefined&&body.workerCapacity!==null&&!validWorkerCapacity(body.workerCapacity))throw new HttpError(400,'Choose 1–32 worker slots, or use automatic capacity.','INVALID_WORKER_CAPACITY');
       for(const key of ['deviceName','signalingUrl','defaultRuntime','defaultApprovalMode','turnUrls','turnUsername','turnCredential'] as const)if(body[key]!==undefined)(this.settings as unknown as Record<string,unknown>)[key]=body[key];
-      this.store.set('settings',{id:'main',...this.settings});this.device.name=this.settings.deviceName;this.changed();return this.state().settings;
+      if(body.workerCapacity===null)delete this.settings.workerCapacity;
+      else if(validWorkerCapacity(body.workerCapacity))this.settings.workerCapacity=body.workerCapacity;
+      this.store.set('settings',{id:'main',...this.settings});this.device.name=this.settings.deviceName;this.syncRuntimeCapacity();this.changed();return this.state().settings;
     }
     for(const extension of this.extensions){const value=await extension(call);if(value!==undefined)return value;}
     throw new HttpError(404,'This operation was not found.');
@@ -240,7 +245,7 @@ export class DeviceApp {
   async refreshDiagnostics():Promise<void>{const [info,status]=await Promise.all([this.sessions.engine.detect(),this.runtime.status()]);this.diagnostics={...this.diagnostics,containerRuntime:status,docker:{available:status.state==='ready',version:status.dockerVersion,error:status.error},envmux:{available:info.available,version:info.version,error:info.error}};this.syncRuntimeCapacity();this.changed();}
   async listen():Promise<void>{
     await new Promise<void>((resolve,reject)=>{this.server.once('error',reject);this.server.listen(this.port,'127.0.0.1',()=>resolve());});
-    writeFileSync(path.join(this.dataDir,'connection.json'),JSON.stringify({url:`http://127.0.0.1:${this.port}`,token:this.token,pid:process.pid,version:'0.1.3'},null,2),{mode:0o600});
+    writeFileSync(path.join(this.dataDir,'connection.json'),JSON.stringify({url:`http://127.0.0.1:${this.port}`,token:this.token,pid:process.pid,version:'0.1.4'},null,2),{mode:0o600});
     void this.refreshDiagnostics();await this.sessions.recover();
   }
   async close():Promise<void>{if(this.closing)return;this.closing=true;if(this.changeTimer)clearTimeout(this.changeTimer);for(const close of this.closers)await close();this.sessions.close();for(const res of this.sse)res.end();this.socketServer.close();await new Promise<void>(resolve=>this.server.close(()=>{this.store.close();resolve();}));}

@@ -6,7 +6,7 @@ import type { Attempt, FactoryTask, Goal, Project, Decision, ControllerRun } fro
 import {
   FactoryCoordinator, FactoryOperationError, type FactoryWorkspacePort, type FactoryRuntimePort, type WorkspaceRef,
   type CandidateRef, type ExecutionResult, type CheckResult, type CreateGoalInput,
-  type RepositoryEvidence, type EvaluationRecord, type ControlRecord,
+  type RepositoryEvidence, type EvaluationRecord, type ControlRecord, type TaskDetail,
 } from '@enoughfactory/factory';
 import { WorkspaceManager, ArtifactFsWorkspaceProvider, dockerCheckExecutor, type ArtifactManifest, type Candidate, type CheckReport, type WorkspaceRecord } from '@enoughfactory/workspaces';
 import type { PeerManager } from '@enoughfactory/peers';
@@ -15,7 +15,7 @@ import { dockerInvocation } from '@enoughfactory/runtime';
 import type { DeviceApp, ApiCall } from './app.ts';
 import type { ChatController } from './chats.ts';
 import { exec, HttpError, now } from './util.ts';
-import { inspectAttempt, inspectGoal, inspectTask } from './task-inspection.ts';
+import { inspectAttempt, inspectGoal, inspectTask, taskControlReason, taskDispatchBlocker } from './task-inspection.ts';
 
 interface WorkerRecord {
   id: string; coordinatorId: string; goal: Goal; task: FactoryTask; attempt: Attempt; project: Project;
@@ -375,12 +375,15 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
       }
       });
     },
-    async execute({ attempt, goal, project, prompt }) {
+    async execute({ attempt, goal, project, prompt, assignmentGoalRevision }) {
       const currentProject = app.store.get<Project>('projects', project.id) || project;
       if (local(attempt.deviceId)) {
         const record = worker(attempt.id);
         if (record.status === 'prepared') { patchWorker(record.id, { goal, project: currentProject }); track(record.id, () => executeLocal(worker(record.id), prompt)); }
-      } else await rpc(attempt.deviceId, 'POST', `/api/factory/worker/${attempt.id}/execute`, { prompt, goal, project: { ...currentProject, path: '' } });
+      } else await rpc(attempt.deviceId, 'POST', `/api/factory/worker/${attempt.id}/execute`, {
+        // A branch repair advances coordinator authority without replacing this worker's assignment.
+        prompt, goal: { ...goal, revision: assignmentGoalRevision ?? goal.revision }, project: { ...currentProject, path: '' },
+      });
       const record = await waitWorker(attempt.deviceId, attempt.id, 'finished');
       return record.result || { status: record.status === 'failed' ? 'failed' : 'unknown', text: '', error: record.error, sessionId: record.sessionId, chatId: record.chatId };
     },
@@ -479,23 +482,38 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
         const task = app.store.get<FactoryTask>('tasks', taskRoute[1]); if (!task) throw new HttpError(404, 'Task not found.');
         const goal = app.store.get<Goal>('goals', task.goalId); if (!goal) throw new HttpError(404, 'Goal not found.');
         const control = app.store.get<ControlRecord>('factory-control', goal.id);
-        if ((expectedRevision !== undefined && goal.revision !== expectedRevision) || !['draft', 'running', 'waiting'].includes(goal.status) || control?.stage !== 'dispatch') throw new HttpError(409, 'The goal changed or is coordinating another action. Refresh its task before running or retrying.');
-        return { task, goal };
+        const reason = taskControlReason(task, control);
+        const goalAvailable = ['draft', 'running', 'waiting'].includes(goal.status) || (goal.status === 'planning' && control?.stage === 'plan' && !!control.replanTaskIds?.length);
+        if (goal.coordinatorId !== app.device.id || (expectedRevision !== undefined && goal.revision !== expectedRevision) || !goalAvailable || !control || !['dispatch', 'diagnose', 'plan'].includes(control.stage) || reason) throw new HttpError(409, reason || 'The goal changed or is coordinating another action. Refresh its task before running or retrying.');
+        return { task, goal, control };
       };
-      const { task, goal } = currentState(body.expectedGoalRevision);
+      const { task, goal, control } = currentState(body.expectedGoalRevision);
+      let dispatchControl = control;
+      const eligible = (candidate: FactoryTask, currentGoal: Goal) => {
+        const blocker = taskDispatchBlocker(app.store, app.devices, candidate, currentGoal);
+        if (blocker) throw new HttpError(409, blocker.reason);
+      };
       if (taskRoute[2] === 'run') {
-        if (!['queued', 'ready'].includes(task.status) || !task.dependsOn.every(id => app.store.get<FactoryTask>('tasks', id)?.status === 'completed')) throw new HttpError(409, 'This task is no longer eligible to run. Refresh its current state.');
+        if (!['queued', 'ready'].includes(task.status)) throw new HttpError(409, 'This task is no longer eligible to run. Refresh its current state.');
+        eligible(task, goal);
       } else {
         const attempt = task.currentAttemptId ? app.store.get<Attempt>('attempts', task.currentAttemptId) : undefined;
         if (task.status !== 'failed' || (task.currentAttemptId && attempt?.status !== 'failed') || (body.expectedAttemptId !== undefined && body.expectedAttemptId !== (task.currentAttemptId ?? null))) throw new HttpError(409, 'This failed attempt has changed. Refresh its current state before retrying.');
+        eligible({ ...task, status: 'queued', currentAttemptId: undefined }, goal);
         if (task.currentAttemptId) {
-          try { await coordinator.retireAttempt(task.currentAttemptId); }
+          try { await coordinator.retireAttempt(task.currentAttemptId, { preserveController: true }); }
           catch (error) { if (error instanceof FactoryOperationError && error.kind === 'stale') throw new HttpError(409, error.message); throw error; }
-          const after = currentState(goal.revision).task;
-          if (after.status !== 'queued' || after.currentAttemptId) throw new HttpError(409, 'Coordination advanced while cancellation was acknowledged. Refresh the current attempt.');
+          const after = currentState(goal.revision);
+          if (after.task.status !== 'queued' || after.task.currentAttemptId) throw new HttpError(409, 'Coordination advanced while cancellation was acknowledged. Refresh the current attempt.');
+          eligible(after.task, after.goal);
+          dispatchControl = after.control;
+        } else {
+          app.store.set('tasks', { ...task, status: 'queued', updatedAt: now() });
         }
+        const detail = app.store.get<TaskDetail>('factory-task-details', task.id);
+        if (detail?.waitingFor) app.store.set('factory-task-details', { ...detail, waitingFor: undefined, waitReason: undefined });
       }
-      coordinator.selectTasks(task.goalId, [task.id]); return { ok: true };
+      coordinator.selectTasks(task.goalId, [task.id], { additive: true, preserveController: dispatchControl.stage === 'diagnose' || dispatchControl.stage === 'plan' }); return { ok: true };
     }
     const attemptRoute = route.match(/^\/api\/attempts\/([^/]+)\/retire$/);
     if (method === 'POST' && attemptRoute) {

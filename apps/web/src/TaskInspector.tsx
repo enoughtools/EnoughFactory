@@ -1,10 +1,12 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import type { Artifact, AttemptInspection, FactoryState, FactoryTask, Goal, TaskCheck, TaskInspection } from '@enoughfactory/contracts';
+import { criticalPathMinutes } from '@enoughfactory/factory/scheduler';
 import { ArrowRight, ArrowUpRight, Clock3, Download, FileText, History, ListChecks, MessageSquare, Play, RotateCcw, ShieldOff } from 'lucide-react';
 import type { DeviceClient } from './api';
 import { downloadArtifact } from './artifacts';
 import { relativeTime } from './hooks';
 import { Button, Status } from './ui';
+import { taskGraphLayout } from './task-graph-layout';
 import './task-inspector.css';
 
 type InspectorTab = 'contract' | 'evidence' | 'activity';
@@ -48,11 +50,12 @@ function Commit({ label, value }: { label: string; value?: string }) {
 function TaskLinks({ label, tasks, onSelect }: { label: string; tasks: FactoryTask[]; onSelect: (id: string) => void }) {
   return <section className="ti-section"><h3>{label} <span>{tasks.length}</span></h3>{tasks.length ? <ul className="ti-linked-tasks">{tasks.map(task => <li key={task.id}><button onClick={() => onSelect(task.id)}><span>{task.title}</span><Status state={task.status} /><ArrowRight size={13} /></button></li>)}</ul> : <p className="ti-muted">None recorded.</p>}</section>;
 }
-function Contract({ inspection, onSelectTask }: Pick<TaskInspectorProps, 'inspection' | 'onSelectTask'>) {
+function Contract({ inspection, onSelectTask, criticalMinutes }: Pick<TaskInspectorProps, 'inspection' | 'onSelectTask'> & { criticalMinutes?: number }) {
   const { task } = inspection;
   return <div className="ti-content"><section className="ti-section"><h3>Task description</h3><p className="ti-preserve">{task.description || 'No description recorded.'}</p></section>
     <section className="ti-section"><h3>Acceptance criteria</h3>{task.acceptanceCriteria?.length ? <ul className="ti-contract-list">{task.acceptanceCriteria.map((criterion, index) => <li key={index}>{criterion}</li>)}</ul> : <p className="ti-muted">No task-specific criteria recorded.</p>}</section>
     <section className="ti-section"><h3>Expected outputs</h3>{task.expectedOutputs?.length ? <ul className="ti-contract-list">{task.expectedOutputs.map((output, index) => <li key={index}>{output}</li>)}</ul> : <p className="ti-muted">No explicit outputs recorded.</p>}</section>
+    <section className="ti-section"><h3>Scheduling declarations</h3><dl className="ti-references"><div><dt>Estimated work</dt><dd>{task.estimatedMinutes ? `${task.estimatedMinutes} minutes` : 'No estimate recorded · scheduling uses 1 minute'}</dd></div>{criticalMinutes !== undefined && criticalMinutes > 0 && <div><dt>Remaining dependency path</dt><dd>{criticalMinutes} minutes estimated</dd></div>}<div><dt>Requested resources</dt><dd>{task.resources?.cpus || task.resources?.memoryGiB ? [task.resources.cpus ? `${task.resources.cpus} CPUs` : undefined, task.resources.memoryGiB ? `${task.resources.memoryGiB} GiB memory` : undefined].filter(Boolean).join(' · ') : 'Device placement defaults'}</dd></div></dl><h4 className="ti-scope-heading">Expected write scope</h4>{task.writePaths?.length ? <ul className="ti-command-list">{task.writePaths.map(path => <li key={path}><code>{path}</code></li>)}</ul> : <p className="ti-muted">No write scope declared.</p>}<p className="ti-muted ti-scheduling-caption">Planner estimates guide priority, placement and overlap avoidance. Resource requests are scheduling reservations, not container limits.</p></section>
     <div className="ti-dependencies"><TaskLinks label="Prerequisites" tasks={inspection.dependencies} onSelect={onSelectTask} /><TaskLinks label="Dependents" tasks={inspection.dependents} onSelect={onSelectTask} /></div>
     <section className="ti-section"><h3>Configured checks</h3>{inspection.detailsAvailable === false ? <p className="ti-muted">Configured checks and receipts are unavailable from this service.</p> : inspection.checks.length ? <ul className="ti-command-list">{inspection.checks.map((command, index) => <li key={index}><code>{command}</code></li>)}</ul> : <p className="ti-muted">No command checks configured for this task.</p>}</section>
     {inspection.repairInstructions && <section className="ti-section ti-repair"><h3>Instructions for the next attempt</h3><p className="ti-preserve">{inspection.repairInstructions}</p></section>}
@@ -103,6 +106,11 @@ export function TaskInspector({ inspection, state, goal, selectedAttemptId, disp
   const [busy, setBusy] = useState<string | null>(null);
   useEffect(() => { setTab('contract'); }, [inspection.task.id]);
   const { task } = inspection;
+  const criticalMinutes = useMemo(() => {
+    const tasks = state.tasks.filter(item => item.goalId === goal.id).map(item => item.id === task.id ? task : item);
+    const graph = taskGraphLayout(tasks);
+    return !graph.unresolved.length && !graph.missing.length && !graph.duplicates.length ? criticalPathMinutes(tasks).get(task.id) : undefined;
+  }, [state.tasks, task, goal.id]);
   const attempts = [...inspection.attempts].sort((a, b) => b.attempt.generation - a.attempt.generation);
   const item = attempts.find(value => value.attempt.id === selectedAttemptId) ?? attempts.find(value => value.attempt.id === task.currentAttemptId) ?? attempts[0];
   const attempt = item?.attempt;
@@ -140,7 +148,7 @@ export function TaskInspector({ inspection, state, goal, selectedAttemptId, disp
       if (next !== undefined) { event.preventDefault(); setTab(tabs[next].id); (event.currentTarget.parentElement?.children[next] as HTMLElement | undefined)?.focus(); }
     }}><Icon size={14} />{label}{id === 'activity' && attempts.length > 0 && <span>{attempts.length}</span>}</button>)}</div>
     <div role="tabpanel" id={`ti-panel-${task.id}-${tab}`} aria-labelledby={`ti-tab-${task.id}-${tab}`} tabIndex={0}>
-      {tab === 'contract' && <>{item?.contract && <p className="ti-contract-revision">Contract for attempt {attempt?.generation} · plan {item.contract.planRevision}</p>}<Contract inspection={item?.contract ? { ...inspection, task: { ...task, ...item.contract }, dependencies: state.tasks.filter(dependency => item.contract!.dependsOn.includes(dependency.id)), checks: item.contract.checks } : inspection} onSelectTask={onSelectTask} /></>}
+      {tab === 'contract' && <>{item?.contract && <p className="ti-contract-revision">Contract for attempt {attempt?.generation} · plan {item.contract.planRevision}</p>}<Contract inspection={item?.contract ? { ...inspection, task: { ...task, ...item.contract }, dependencies: state.tasks.filter(dependency => item.contract!.dependsOn.includes(dependency.id)), checks: item.contract.checks } : inspection} criticalMinutes={!attempt || attempt.id === task.currentAttemptId ? criticalMinutes : undefined} onSelectTask={onSelectTask} /></>}
       {tab === 'evidence' && <div className="ti-content">{attempts.length > 1 && <label className="ti-attempt-picker">Evidence for<select value={attempt?.id ?? ''} onChange={event => selectAttempt(event.target.value)}>{attempts.map(value => <option key={value.attempt.id} value={value.attempt.id}>Attempt {value.attempt.generation} · {value.attempt.status}</option>)}</select></label>}<AttemptEvidence item={item} configuredChecks={item?.contract?.checks ?? (attempt?.id === task.currentAttemptId ? inspection.checks : [])} detailsAvailable={inspection.detailsAvailable !== false} />{inspection.detailsAvailable !== false && <ArtifactList artifacts={inspection.artifacts} goal={goal} client={client} run={run} />}</div>}
       {tab === 'activity' && <div className="ti-content"><AttemptHistory attempts={attempts} selectedId={attempt?.id} state={state} onSelect={selectAttempt} />{item?.result?.status === 'waiting' && item.result.wakeCondition && attempt?.id === task.currentAttemptId && attempt?.status !== 'retired' && goal.status === 'waiting' && <div className="ti-wake"><p>Waiting for <strong>{item.result.wakeCondition}</strong>{item.result.waitReason ? `: ${item.result.waitReason}` : ''}</p><Button variant="outline" size="sm" disabled={busy !== null} onClick={() => void act('wake', () => client.post(`/api/goals/${encodeURIComponent(goal.id)}/wake`, { condition: item?.result?.wakeCondition }))}><Play size={13} />Condition satisfied · Resume</Button></div>}{device?.online === false && <p className="ti-muted">Live tools and device-local chats are unavailable while {device.name} is offline. Recorded task evidence remains here.</p>}</div>}
     </div>

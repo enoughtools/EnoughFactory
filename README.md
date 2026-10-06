@@ -41,6 +41,7 @@ For live interface development, run `pnpm dev`, then `pnpm --filter @enoughfacto
 - [Install, connect an agent and create a goal](docs/install.md)
 - [Try a complete example project](examples/status-board/README.md)
 - [Inspect tasks, attempts and factory progress](docs/task-workspace.md)
+- [Plan parallel work and configure device capacity](docs/parallel-work.md)
 - [Hosted networking, capacity and optional TURN](services/signaling-cloudflare/README.md)
 - [Self-host signaling, relays and browser previews](docs/self-hosting.md)
 - [Desktop distribution and native packaging](docs/desktop-distribution.md)

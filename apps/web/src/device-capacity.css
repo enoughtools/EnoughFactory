@@ -1,0 +1,7 @@
+.device-capacity-resources { border-top: 1px solid var(--factory-line-soft); padding: 12px 0; display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 12px; font-size: 11px; }
+.device-capacity-resources span { color: var(--factory-muted); font-size: 10px; }
+.device-capacity-controls { border-top: 1px solid var(--factory-line-soft); padding: 14px 0; }
+.device-capacity-fields { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 12px; }
+.device-capacity-fields .form-field { margin: 0; }
+.device-capacity-controls .field-hint { margin: 10px 0; }
+.device-grid .device-stats { gap: 20px; flex-wrap: wrap; }

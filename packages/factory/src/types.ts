@@ -49,7 +49,7 @@ export interface ExecutionResult {
 }
 export interface FactoryRuntimePort {
   complete(input: { goal: Goal; role: "planner" | "evaluator" | "diagnosis"; prompt: string; project: Project; signal?: AbortSignal }): Promise<{ text: string; chatId?: string; spend?: number }>;
-  execute(input: { goal: Goal; task: FactoryTask; attempt: Attempt; workspace: WorkspaceRef; prompt: string; project: Project }): Promise<ExecutionResult>;
+  execute(input: { goal: Goal; task: FactoryTask; attempt: Attempt; workspace: WorkspaceRef; prompt: string; project: Project; assignmentGoalRevision?: number }): Promise<ExecutionResult>;
   reconcile(attempt: Attempt): Promise<{ status: "prepared" | "running" | "succeeded" | "failed" | "unknown"; result?: ExecutionResult; workspace?: WorkspaceRef }>;
   /** Returns after the owner acknowledges cancellation; rejection leaves termination unknown. */
   cancel(attempt: Attempt): Promise<void>;
@@ -59,6 +59,7 @@ export interface PlannedTask {
   key: string; title: string; description: string; dependsOn: string[];
   checks: string[]; deviceId?: string;
   kind?: TaskKind; acceptanceCriteria?: string[]; expectedOutputs?: string[];
+  estimatedMinutes?: number; writePaths?: string[]; resources?: { cpus?: number; memoryGiB?: number };
 }
 export interface PlanResponse {
   summary: string; criteria: string[]; tasks: PlannedTask[]; checks: string[];
@@ -69,11 +70,14 @@ export interface PlanRecord {
 }
 export interface TaskDetail {
   id: string; key: string; checks: string[]; planRevision: number;
+  planChecks?: string[]; waitingFor?: string; waitReason?: string;
   lastError?: string; lastCandidate?: CandidateRef; repairInstructions?: string;
   selected: boolean; failureSignatures: string[];
 }
 export interface AttemptDetail {
   id: string; goalId: string; goalRevision: number; workspace?: WorkspaceRef;
+  /** Worker assignment binding remains fixed when unrelated work survives a repair revision. */
+  assignmentGoalRevision?: number;
   contract?: AttemptInspection['contract'];
   candidate?: CandidateRef; result?: ExecutionResult; checks?: CheckResult[];
   integration?: IntegrationResult; cancellation: "none" | "requested" | "acknowledged";
@@ -94,6 +98,8 @@ export interface ControlRecord {
   spent: number; unpricedTurns?: number; startedAt: string; maxDurationMs?: number;
   waitingFor?: string; waitReason?: string; wakeAt?: string;
   diagnosisTaskId?: string; steering: string[]; replanReason?: string;
+  /** Only these unfinished tasks are replaced by a localized repair plan. */
+  replanTaskIds?: string[];
   operation?: { id: string; revision: number; kind: "planner" | "evaluator" | "diagnosis" };
   manualAction?: "plan" | "evaluate";
   decisionFailures?: { signature: string; count: number };

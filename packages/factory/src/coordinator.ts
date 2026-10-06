@@ -6,6 +6,7 @@ import type {
 } from "./types.js";
 import { readEvaluation, readJsonObject, readPlan, readTasks, validateDependencies } from "./protocol.js";
 import { FactoryOperationError, FactoryDecisionError } from "./errors.js";
+import { activeExecutionTasks, descendants, placementConstraint, sortReadyTasks, taskSchedulingBlocker } from "./scheduler.js";
 
 const TABLE = {
   goals: "goals", tasks: "tasks", attempts: "attempts", decisions: "decisions",
@@ -24,6 +25,7 @@ export class FactoryCoordinator {
   private readonly reconciling = new Set<string>();
   private readonly lastObservation = new Map<string, number>();
   private readonly operationControllers = new Map<string, AbortController>();
+  private readonly cancellations = new Map<string, Promise<void>>();
   private timer?: ReturnType<typeof setInterval>;
   private enabled = false;
   private queued = false;
@@ -49,7 +51,7 @@ export class FactoryCoordinator {
       approvalMode: input.approvalMode ?? project.approvalMode ?? "approve-all", runtime: input.runtime ?? project.runtime,
       createdAt: at, updatedAt: at, revision: 1,
       nextAction: autonomy === "manual" ? "Plan when requested" : "Plan the goal and its completion criteria",
-      concurrency: Math.max(1, Math.min(32, Math.floor(input.concurrency ?? 2))),
+      concurrency: Math.max(1, Math.min(32, Math.floor(input.concurrency ?? 8))),
       ...(input.maxSpend === undefined ? {} : { maxSpend: input.maxSpend }),
       ...(input.maxAttempts === undefined ? {} : { maxAttempts: input.maxAttempts }),
     };
@@ -101,6 +103,14 @@ export class FactoryCoordinator {
     if (this.ticking) return;
     this.ticking = true;
     try {
+      for (const attempt of this.options.store.list<Attempt>(TABLE.attempts)) {
+        if (attempt.status !== "retired" || this.options.store.get<AttemptDetail>(TABLE.attemptDetails, attempt.id)?.cancellation !== "requested" || this.cancellations.has(attempt.id)) continue;
+        if (!this.options.devices().some(device => device.id === attempt.deviceId && device.online) || this.reconciling.has(attempt.id)) continue;
+        if (this.enabled && Date.now() - (this.lastObservation.get(attempt.id) ?? 0) < 10_000) continue;
+        this.lastObservation.set(attempt.id, Date.now());
+        this.reconciling.add(attempt.id);
+        this.track(this.acknowledgeCancel(attempt).finally(() => this.reconciling.delete(attempt.id)));
+      }
       for (const goal of this.goals()) {
         if (goal.coordinatorId !== this.options.deviceId || terminalGoals.has(goal.status)) continue;
         for (const attempt of this.attempts(goal.id)) {
@@ -110,7 +120,12 @@ export class FactoryCoordinator {
             this.track(this.reconcileAttempt(attempt).finally(() => this.reconciling.delete(attempt.id)));
           }
         }
-        if (this.busyGoals.has(goal.id) || goal.status === "paused") continue;
+        if (goal.status === "paused") continue;
+        if (this.busyGoals.has(goal.id)) {
+          const control = this.control(goal.id);
+          if (control.stage === "diagnose" || (control.stage === "plan" && control.replanTaskIds?.length)) this.dispatch(this.goal(goal.id), false);
+          continue;
+        }
         let current = this.goal(goal.id), control = this.control(goal.id);
         if (current.status === "waiting") {
           if (control.waitingFor === "device-online" && this.hasAvailableDevice(current)) this.wake(current.id, "A worker device is available.");
@@ -121,8 +136,16 @@ export class FactoryCoordinator {
         if (current.status === "draft" && !control.manualAction && !this.tasks(current.id).some(task => this.taskDetail(task.id).selected)) continue;
         if (this.checkBudget(current)) continue;
         if (!this.options.project(current.projectId)) { this.wait(current.id, "The goal's project is unavailable.", "project-available"); continue; }
-        if (control.stage === "plan" && (current.autonomy !== "manual" || control.manualAction === "plan")) this.scheduleGoal(current.id, () => this.plan(current));
-        else if (control.stage === "diagnose") this.scheduleGoal(current.id, () => this.diagnose(current));
+        if (control.waitingFor && (control.stage === "diagnose" || (control.stage === "plan" && control.replanTaskIds?.length))) {
+          this.dispatch(current, false); continue;
+        }
+        if (control.stage === "plan" && (current.autonomy !== "manual" || control.manualAction === "plan")) {
+          if (control.replanTaskIds?.length) this.dispatch(current, false);
+          this.scheduleGoal(current.id, () => this.plan(this.goal(current.id)));
+        } else if (control.stage === "diagnose") {
+          this.dispatch(current, false);
+          this.scheduleGoal(current.id, () => this.diagnose(this.goal(current.id)));
+        }
         else if (control.stage === "dispatch") this.dispatch(current);
         else if (control.stage === "evaluate" && (current.autonomy !== "manual" || control.manualAction === "evaluate")) this.scheduleGoal(current.id, () => this.evaluate(current));
       }
@@ -203,15 +226,17 @@ export class FactoryCoordinator {
     this.writeGoal(goalId, { status: "running", nextAction: "Evaluate current completion evidence" }); this.changed();
   }
 
-  selectTasks(goalId: string, taskIds: string[]): void {
+  selectTasks(goalId: string, taskIds: string[], options: { preserveController?: boolean; additive?: boolean } = {}): void {
     const goal = this.goal(goalId);
     if (terminalGoals.has(goal.status)) throw new Error("The goal is terminal.");
     const ids = new Set(taskIds);
     for (const id of ids) if (!this.tasks(goalId).some(task => task.id === id)) throw new Error("Selected task does not belong to this goal.");
     this.options.store.transaction(() => {
-      for (const task of this.tasks(goalId)) this.options.store.set(TABLE.taskDetails, { ...this.taskDetail(task.id), selected: ids.has(task.id) });
-      this.options.store.set(TABLE.control, { ...this.control(goalId), stage: "dispatch", manualAction: undefined });
-      this.writeGoal(goalId, { status: "running", nextAction: "Execute the selected work" });
+      for (const task of this.tasks(goalId)) this.options.store.set(TABLE.taskDetails, { ...this.taskDetail(task.id), selected: ids.has(task.id) || (!!options.additive && this.taskDetail(task.id).selected) });
+      const control = this.control(goalId);
+      const preserving = options.preserveController && (control.stage === "diagnose" || (control.stage === "plan" && !!control.replanTaskIds?.length));
+      if (!preserving) this.options.store.set(TABLE.control, { ...control, stage: "dispatch", manualAction: undefined });
+      this.writeGoal(goalId, { ...(preserving ? {} : { status: "running" as const }), nextAction: "Execute the selected work" });
       this.decision(goalId, "work-selected", `${ids.size} task${ids.size === 1 ? "" : "s"} selected for execution.`, { taskIds });
     });
     this.changed();
@@ -255,7 +280,7 @@ export class FactoryCoordinator {
     this.changed(); await Promise.allSettled(attempts.map(attempt => this.acknowledgeCancel(attempt)));
   }
 
-  async retireAttempt(attemptId: string): Promise<void> {
+  async retireAttempt(attemptId: string, options: { preserveController?: boolean } = {}): Promise<void> {
     const attempt = this.attempt(attemptId), task = this.task(attempt.taskId), goal = this.goal(task.goalId);
     if (terminalGoals.has(goal.status) || task.status === "completed") throw new Error("Integrated or terminal work cannot be retired as a live attempt.");
     if (!this.isCurrent(attempt)) throw new FactoryOperationError("stale", "This attempt no longer owns its task's execution authority.");
@@ -263,15 +288,33 @@ export class FactoryCoordinator {
       this.revoke(attempt); this.writeTask(task.id, { status: "queued", currentAttemptId: undefined });
       this.decision(goal.id, "attempt-retired", "Attempt authority was retired explicitly. A new isolated attempt may now be placed; external effects still require reconciliation.", { attemptId });
       this.writeGoal(goal.id, { nextAction: "Place a replacement for the explicitly retired attempt" });
-      this.options.store.set(TABLE.control, { ...this.control(goal.id), stage: "dispatch", waitingFor: undefined, waitReason: undefined });
+      const control = this.control(goal.id);
+      const preserving = options.preserveController && (control.stage === "diagnose" || (control.stage === "plan" && !!control.replanTaskIds?.length));
+      if (!preserving) this.options.store.set(TABLE.control, { ...control, stage: "dispatch", waitingFor: undefined, waitReason: undefined });
     });
     this.changed(); await this.acknowledgeCancel(attempt);
   }
 
   notifyCondition(condition: string, goalId?: string): void {
-    for (const goal of this.goals().filter(goal => goal.status === "waiting")) {
+    for (const task of this.options.store.list<FactoryTask>(TABLE.tasks)) {
+      if (goalId && task.goalId !== goalId) continue;
+      const goal = this.goal(task.goalId), detail = this.taskDetail(task.id);
+      if (terminalGoals.has(goal.status) || detail.waitingFor !== condition || task.status !== "failed") continue;
+      this.options.store.transaction(() => {
+        this.writeTask(task.id, { status: "queued", currentAttemptId: undefined });
+        this.options.store.set(TABLE.taskDetails, { ...detail, waitingFor: undefined, waitReason: undefined });
+        this.decision(goal.id, "task-woken", `Condition satisfied for ${task.title}: ${condition}`, { taskId: task.id });
+      });
+    }
+    for (const goal of this.goals()) {
       if (goalId && goal.id !== goalId) continue;
-      if (this.control(goal.id).waitingFor === condition) this.wake(goal.id, `Condition satisfied: ${condition}`);
+      const control = this.control(goal.id);
+      if (control.waitingFor !== condition || terminalGoals.has(goal.status)) continue;
+      if (goal.status === "waiting") this.wake(goal.id, `Condition satisfied: ${condition}`);
+      else if (control.stage === "diagnose" || (control.stage === "plan" && control.replanTaskIds?.length)) {
+        this.options.store.set(TABLE.control, { ...control, waitingFor: undefined, waitReason: undefined });
+        this.decision(goal.id, "controller-woken", `Repair controller condition satisfied: ${condition}`);
+      }
     }
     this.changed();
   }
@@ -279,16 +322,19 @@ export class FactoryCoordinator {
   private async plan(goal: Goal): Promise<void> {
     const operation = this.beginOperation(goal, "planner"), project = this.project(goal);
     const completed = this.tasks(goal.id).filter(task => task.status === "completed");
+    const scope = this.control(goal.id).replanTaskIds;
+    const preserved = scope ? this.tasks(goal.id).filter(task => !scope.includes(task.id) && task.status !== "canceled") : completed;
     const prompt = [
       "You are the EnoughFactory planner. Build the entire objective, preserving all explicit requirements. Make routine implementation decisions yourself.",
-      "Return one JSON object: {summary,criteria:string[],checks:string[],tasks:[{key,title,description,kind:'feature'|'unit'|'architecture'|'test',acceptanceCriteria:string[],expectedOutputs:string[],dependsOn:string[],checks:string[],deviceId?:string}]}. Stable task keys must be unique, dependencies acyclic, checks focused and executable inside the isolated runtime.",
+      "Return one JSON object: {summary,criteria:string[],checks:string[],tasks:[{key,title,description,kind:'feature'|'unit'|'architecture'|'test',acceptanceCriteria:string[],expectedOutputs:string[],dependsOn:string[],checks:string[],estimatedMinutes?:number,writePaths?:string[],resources?:{cpus?:number,memoryGiB?:number},deviceId?:string}]}. Stable task keys must be unique, dependencies acyclic, checks focused and executable inside the isolated runtime.",
       "Choose task kinds by outcome: feature delivers observable product behavior; unit implements a bounded component or change; architecture resolves a structural decision and preserves its rationale and handoff; test supplies focused verification for an identified uncertainty. Give each task concrete acceptance criteria and expected deliverables. Do not invent extra architecture/test tasks or mandatory reviews when the work does not need them.",
-      "Use independent parallel tasks where useful. Keep verification proportionate; do not require human approval or ceremonies unless the goal's actual policy requires them.",
+      "Maximize useful parallel work: establish shared interfaces/contracts in small prerequisite tasks, then give independent implementations disjoint ownership. DependsOn is for actual required outputs, not preferred chronology or artificial phases. Avoid making every task depend on a broad setup task. Declare repository-relative writePaths (files, directories or globs) for likely writes, estimatedMinutes for effort and resources for meaningful CPU/memory needs. Estimates guide scheduling; do not invent precision. Keep verification proportionate; do not require human approval or ceremonies unless the goal's actual policy requires them.",
       "Do not claim implementation or completion. A task may include configured release/deployment actions. Derive explicit observable criteria when the user omitted them.",
       this.context(goal),
       `Devices: ${JSON.stringify(this.options.devices())}`,
       `Already integrated work: ${JSON.stringify(completed.map(task => ({ key: this.taskDetail(task.id).key, title: task.title, description: task.description, attempt: this.options.store.get(TABLE.attemptDetails, task.currentAttemptId ?? "") })))}`,
-      `Retained unfinished work: ${JSON.stringify(this.tasks(goal.id).filter(task => task.status !== "completed").map(task => ({ key: this.taskDetail(task.id).key, title: task.title, description: task.description, failure: this.taskDetail(task.id).lastError, candidate: this.taskDetail(task.id).lastCandidate, repairInstructions: this.taskDetail(task.id).repairInstructions })))}`,
+      `Retained unfinished work: ${JSON.stringify(this.tasks(goal.id).filter(task => task.status !== "completed" && (!scope || scope.includes(task.id))).map(task => ({ key: this.taskDetail(task.id).key, title: task.title, description: task.description, failure: this.taskDetail(task.id).lastError, candidate: this.taskDetail(task.id).lastCandidate, repairInstructions: this.taskDetail(task.id).repairInstructions })))}`,
+      ...(scope ? [`This is a localized repair. Replace only the affected work above. Preserve these unrelated tasks exactly; their keys may be dependencies but must not be repeated: ${JSON.stringify(preserved.map(task => ({ key: this.taskDetail(task.id).key, title: task.title, status: task.status, dependsOn: task.dependsOn.map(id => this.taskDetail(id).key) })))}`] : []),
       "Do not repeat completed tasks. Their keys may be referenced as dependencies.",
       "Reuse a retained unfinished task's stable key when continuing the same work. Its isolated candidate can seed a replacement workspace; use a new key when the task's purpose changes.",
     ].join("\n\n");
@@ -297,53 +343,60 @@ export class FactoryCoordinator {
       if (!this.operationCurrent(goal.id, operation)) return;
       this.recordSpend(goal.id, response.spend);
       const plan = readPlan(response.text);
-      const completedKeys = new Set(completed.map(task => this.taskDetail(task.id).key));
-      validateDependencies(plan.tasks, completedKeys);
-      if (plan.tasks.some(task => completedKeys.has(task.key))) throw new FactoryDecisionError("The planner repeated an already integrated task key. Use a new key for improvement work.");
+      const preservedKeys = new Set(preserved.map(task => this.taskDetail(task.id).key));
+      validateDependencies(plan.tasks, preservedKeys);
+      if (plan.tasks.some(task => preservedKeys.has(task.key))) throw new FactoryDecisionError("The planner repeated a preserved task key. Use a new key for improvement work and leave unrelated work unchanged.");
       this.options.store.transaction(() => {
-        this.applyTasks(goal.id, plan.tasks, plan.summary, plan.checks);
+        this.applyTasks(goal.id, plan.tasks, plan.summary, plan.checks, new Set(preserved.map(task => task.id)));
         this.writeGoal(goal.id, { criteria: [...new Set([...this.goal(goal.id).criteria, ...plan.criteria])], status: "running", error: undefined, nextAction: plan.tasks.length ? "Dispatch work whose dependencies are complete" : "Evaluate existing product evidence" });
-          this.options.store.set(TABLE.control, { ...this.control(goal.id), stage: plan.tasks.length ? "dispatch" : "evaluate", operation: undefined, manualAction: undefined, decisionFailures: undefined });
+          this.options.store.set(TABLE.control, { ...this.control(goal.id), stage: plan.tasks.length || preserved.some(task => task.status !== "completed") ? "dispatch" : "evaluate", operation: undefined, manualAction: undefined, decisionFailures: undefined, replanTaskIds: undefined });
         this.decision(goal.id, "plan", plan.summary, { chatId: response.chatId, taskCount: plan.tasks.length, revision: this.goal(goal.id).revision });
       });
       this.changed();
     } catch (error) { this.operationFailed(goal.id, operation, error); }
   }
 
-  private dispatch(goal: Goal): void {
+  private dispatch(goal: Goal, manageController = true): void {
     const tasks = this.tasks(goal.id).filter(task => task.status !== "canceled");
-    const unknown = this.attempts(goal.id).filter(attempt => attempt.status === "unknown" && this.isCurrent(attempt));
-    if (unknown.length) {
-      this.writeGoal(goal.id, { nextAction: "Reconcile unknown execution outcomes before placing replacement work" }); return;
-    }
     for (const task of tasks.filter(task => task.status === "review")) {
       if (!task.currentAttemptId || this.busyAttempts.has(task.currentAttemptId) || this.reconciling.has(task.currentAttemptId)) continue;
       const attempt = this.attempt(task.currentAttemptId);
       this.busyAttempts.add(attempt.id);
       this.track(this.processResult(attempt, this.attemptDetail(attempt.id).result ?? { status: "succeeded", text: "Recovered retained candidate." }).finally(() => this.busyAttempts.delete(attempt.id)));
     }
-    const failed = tasks.find(task => task.status === "failed");
-    if (failed) {
+    const failed = tasks.find(task => task.status === "failed" && !this.taskDetail(task.id).waitingFor);
+    if (failed && manageController) {
       if (goal.autonomy === "autonomous" || this.taskDetail(failed.id).selected) {
         this.options.store.set(TABLE.control, { ...this.control(goal.id), stage: "diagnose", diagnosisTaskId: failed.id });
         this.writeGoal(goal.id, { nextAction: `Diagnose and repair ${failed.title}` }); this.changed();
       }
-      return;
     }
-    if (tasks.every(task => task.status === "completed")) {
+    if (manageController && !failed && tasks.every(task => task.status === "completed")) {
       this.options.store.set(TABLE.control, { ...this.control(goal.id), stage: "evaluate" });
       this.writeGoal(goal.id, { nextAction: goal.autonomy === "manual" ? "Evaluate completion when requested" : "Evaluate the complete goal against current evidence" });
       if (goal.autonomy !== "manual") this.scheduleGoal(goal.id, () => this.evaluate(this.goal(goal.id)));
       this.changed(); return;
     }
-    const running = tasks.filter(task => task.status === "running" || task.status === "review").length;
+    const running = this.activeWork().filter(task => task.goalId === goal.id).length;
     let capacity = Math.max(0, goal.concurrency - running);
     let eligible = 0, placed = 0;
-    for (const task of tasks.filter(task => task.status === "queued" || task.status === "ready")) {
+    const stableKeys = new Map(tasks.map(task => [task.id, this.taskDetail(task.id).key]));
+    for (const task of sortReadyTasks(tasks, stableKeys)) {
       if (capacity === 0) break;
       const detail = this.taskDetail(task.id);
       if (goal.autonomy !== "autonomous" && !detail.selected) continue;
-      if (!task.dependsOn.every(id => this.options.store.get<FactoryTask>(TABLE.tasks, id)?.status === "completed")) continue;
+      if (this.control(goal.id).replanTaskIds?.includes(task.id)) continue;
+      const active = this.activeWork();
+      const repository = this.options.project(goal.projectId)?.path ?? goal.projectId;
+      const conflicts = active.filter(other => {
+        const projectId = this.options.store.get<Goal>(TABLE.goals, other.goalId)?.projectId;
+        return projectId !== undefined && (this.options.project(projectId)?.path ?? projectId) === repository;
+      });
+      const blocker = taskSchedulingBlocker(task, goal, tasks, active, conflicts, this.options.devices());
+      if (blocker) {
+        if (["device-unavailable", "device-capacity", "resource"].includes(blocker.kind)) eligible++;
+        continue;
+      }
       eligible++;
       const device = this.place(task);
       if (!device) continue;
@@ -352,8 +405,8 @@ export class FactoryCoordinator {
       const attempt: Attempt = { id: randomUUID(), taskId: task.id, generation: Math.max(0, ...attempts.map(item => item.generation)) + 1, deviceId: device.id, status: "created", startedAt: this.now() };
       this.options.store.transaction(() => {
         this.options.store.set(TABLE.attempts, attempt);
-        this.options.store.set<AttemptDetail>(TABLE.attemptDetails, { id: attempt.id, goalId: goal.id, goalRevision: goal.revision, cancellation: "none", phase: "preparing",
-          contract: { title: task.title, description: task.description, kind: task.kind, acceptanceCriteria: task.acceptanceCriteria, expectedOutputs: task.expectedOutputs, dependsOn: [...task.dependsOn], checks: [...new Set([...(this.planRecord(goal.id)?.checks ?? []), ...detail.checks])], planRevision: detail.planRevision } });
+        this.options.store.set<AttemptDetail>(TABLE.attemptDetails, { id: attempt.id, goalId: goal.id, goalRevision: goal.revision, assignmentGoalRevision: goal.revision, cancellation: "none", phase: "preparing",
+          contract: { title: task.title, description: task.description, kind: task.kind, acceptanceCriteria: task.acceptanceCriteria, expectedOutputs: task.expectedOutputs, estimatedMinutes: task.estimatedMinutes, writePaths: task.writePaths, resources: task.resources, dependsOn: [...task.dependsOn], checks: [...new Set([...(detail.planChecks ?? this.planRecord(goal.id)?.checks ?? []), ...detail.checks])], planRevision: detail.planRevision } });
         this.writeTask(task.id, { status: "running", currentAttemptId: attempt.id, deviceId: device.id });
         this.decision(goal.id, "dispatch", `Dispatched ${task.title} to ${device.name}.`, { taskId: task.id, attemptId: attempt.id, generation: attempt.generation, deviceId: device.id });
       });
@@ -361,7 +414,7 @@ export class FactoryCoordinator {
       this.track(this.execute(attempt).finally(() => this.busyAttempts.delete(attempt.id)));
     }
     if (placed) this.changed();
-    else if (eligible && !running) this.wait(goal.id, goal.workspaceProvider === "artifactfs" ? "Waiting for an online worker with ArtifactFS support and capacity." : "Waiting for an online worker with capacity.", "device-online");
+    else if (manageController && !failed && eligible && !running) this.wait(goal.id, goal.workspaceProvider === "artifactfs" ? "Waiting for an online worker with ArtifactFS support and capacity." : "Waiting for an online worker with capacity.", "device-online");
     else if (!running && goal.autonomy !== "autonomous") this.writeGoal(goal.id, { nextAction: "Select the next tasks to execute" });
   }
 
@@ -376,7 +429,7 @@ export class FactoryCoordinator {
         this.writeAttempt(attempt.id, { status: "running", baseCommit: workspace.baseCommit, ...(workspace.sessionId ? { sessionId: workspace.sessionId } : {}) });
       });
       executing = true;
-      const result = await this.options.runtime.execute({ goal: this.goal(goal.id), task: this.task(task.id), attempt: this.attempt(attempt.id), workspace, project, prompt: this.executionPrompt(goal, task) });
+      const result = await this.options.runtime.execute({ goal: this.goal(goal.id), task: this.task(task.id), attempt: this.attempt(attempt.id), workspace, project, prompt: this.executionPrompt(goal, task), assignmentGoalRevision: this.attemptDetail(attempt.id).assignmentGoalRevision ?? this.attemptDetail(attempt.id).goalRevision });
       if (!this.isCurrent(attempt)) return;
       await this.processResult(attempt, result);
     } catch (error) {
@@ -439,7 +492,7 @@ export class FactoryCoordinator {
         });
       }
       if (this.goal(goal.id).status === "paused") { this.writeGoal(goal.id, { nextAction: "Candidate retained; integration waits for resume" }); this.changed(); return; }
-      const checks = [...new Set([...this.planRecord(goal.id)?.checks ?? [], ...this.taskDetail(task.id).checks])];
+      const checks = this.attemptDetail(attempt.id).contract?.checks ?? [...new Set([...(this.taskDetail(task.id).planChecks ?? this.planRecord(goal.id)?.checks ?? []), ...this.taskDetail(task.id).checks])];
       let checkResults = this.attemptDetail(attempt.id).checks;
       if (!checkResults) {
         checkResults = await this.options.workspaces.check(project, candidate, checks);
@@ -520,7 +573,7 @@ export class FactoryCoordinator {
           if (!detail.workspace || !suspended) this.decision(goal.id, "preparation-recovered", suspended ? "The owner confirmed a prepared workspace. It remains retained until goal execution resumes." : "The owner confirmed a prepared workspace without prior execution. Continue the same attempt and generation.", { attemptId: attempt.id });
         });
         if (suspended) { this.changed(); return; }
-        const result = await this.options.runtime.execute({ goal: this.goal(goal.id), task: this.task(task.id), attempt: this.attempt(attempt.id), workspace, project: this.project(goal), prompt: this.executionPrompt(goal, task) });
+        const result = await this.options.runtime.execute({ goal: this.goal(goal.id), task: this.task(task.id), attempt: this.attempt(attempt.id), workspace, project: this.project(goal), prompt: this.executionPrompt(goal, task), assignmentGoalRevision: this.attemptDetail(attempt.id).assignmentGoalRevision ?? this.attemptDetail(attempt.id).goalRevision });
         if (this.isCurrent(attempt)) await this.processResult(attempt, result);
         return;
       }
@@ -557,10 +610,13 @@ export class FactoryCoordinator {
       this.options.store.set(TABLE.control, { ...this.control(goal.id), decisionFailures: undefined });
       this.decision(goal.id, "repair", decision.reason, { action: decision.action, taskId, chatId: response.chatId });
       if (decision.action === "wait") {
-        this.options.store.set(TABLE.control, { ...this.control(goal.id), operation: undefined });
-        this.wait(goal.id, typeof decision.waitReason === "string" ? decision.waitReason : decision.reason, typeof decision.wakeCondition === "string" ? decision.wakeCondition : "external-condition");
+        this.options.store.transaction(() => {
+          this.options.store.set(TABLE.taskDetails, { ...this.taskDetail(taskId), waitingFor: typeof decision.wakeCondition === "string" ? decision.wakeCondition : "external-condition", waitReason: typeof decision.waitReason === "string" ? decision.waitReason : decision.reason });
+          this.options.store.set(TABLE.control, { ...this.control(goal.id), stage: "dispatch", operation: undefined, diagnosisTaskId: undefined });
+          this.writeGoal(goal.id, { nextAction: `Waiting for ${task.title}; independent work can continue` });
+        });
       } else if (decision.action === "replan") {
-        await this.replan(goal.id, decision.reason);
+        await this.replan(goal.id, decision.reason, taskId);
       } else {
         this.options.store.transaction(() => {
           this.writeTask(taskId, { status: "queued", currentAttemptId: undefined });
@@ -636,9 +692,14 @@ export class FactoryCoordinator {
     } catch (error) { this.operationFailed(goal.id, operation, error); }
   }
 
-  private applyTasks(goalId: string, tasks: PlannedTask[], summary: string, checks: string[]): void {
+  private applyTasks(goalId: string, tasks: PlannedTask[], summary: string, checks: string[], preserveTaskIds = new Set<string>()): void {
     const goal = this.goal(goalId), at = this.now(), all = this.tasks(goalId);
-    const existing = all.filter(task => task.status === "completed");
+    const existing = all.filter(task => task.status === "completed" || preserveTaskIds.has(task.id));
+    const previousPlanChecks = this.planRecord(goalId)?.checks ?? [];
+    for (const task of existing) {
+      const detail = this.taskDetail(task.id);
+      if (detail.planChecks === undefined) this.options.store.set(TABLE.taskDetails, { ...detail, planChecks: previousPlanChecks });
+    }
     const retained = new Map(all.filter(task => task.status !== "completed").sort((a, b) => a.updatedAt.localeCompare(b.updatedAt)).map(task => [this.taskDetail(task.id).key, task]));
     const taskKeys = Object.fromEntries(existing.map(task => [this.taskDetail(task.id).key, task.id]));
     for (const task of tasks) taskKeys[task.key] = retained.get(task.key)?.id ?? randomUUID();
@@ -647,20 +708,32 @@ export class FactoryCoordinator {
       this.options.store.set<FactoryTask>(TABLE.tasks, { id, goalId, title: task.title, description: task.description, dependsOn: task.dependsOn.map(key => taskKeys[key]!), status: "queued", createdAt: previous?.createdAt ?? at, updatedAt: at, ...(task.deviceId ? { deviceId: task.deviceId } : {}),
         ...(task.kind ?? previous?.kind ? { kind: task.kind ?? previous?.kind } : {}),
         ...(task.acceptanceCriteria ?? previous?.acceptanceCriteria ? { acceptanceCriteria: task.acceptanceCriteria ?? previous?.acceptanceCriteria } : {}),
-        ...(task.expectedOutputs ?? previous?.expectedOutputs ? { expectedOutputs: task.expectedOutputs ?? previous?.expectedOutputs } : {}) });
-      this.options.store.set<TaskDetail>(TABLE.taskDetails, { ...previousDetail, id, key: task.key, checks: task.checks, planRevision: goal.revision, selected: goal.autonomy === "autonomous", failureSignatures: previousDetail?.failureSignatures ?? [] });
+        ...(task.expectedOutputs ?? previous?.expectedOutputs ? { expectedOutputs: task.expectedOutputs ?? previous?.expectedOutputs } : {}),
+        ...(task.estimatedMinutes ?? previous?.estimatedMinutes ? { estimatedMinutes: task.estimatedMinutes ?? previous?.estimatedMinutes } : {}),
+        ...(task.writePaths ?? previous?.writePaths ? { writePaths: task.writePaths ?? previous?.writePaths } : {}),
+        ...(task.resources ?? previous?.resources ? { resources: task.resources ?? previous?.resources } : {}) });
+      this.options.store.set<TaskDetail>(TABLE.taskDetails, { ...previousDetail, id, key: task.key, checks: task.checks, planChecks: checks, planRevision: goal.revision, waitingFor: undefined, waitReason: undefined, selected: goal.autonomy === "autonomous", failureSignatures: previousDetail?.failureSignatures ?? [] });
     }
     this.options.store.set<PlanRecord>(TABLE.plans, { id: goalId, goalId, revision: goal.revision, summary, checks, taskKeys, createdAt: at });
   }
 
-  private async replan(goalId: string, reason: string): Promise<void> {
-    const goal = this.goal(goalId), attempts = this.attempts(goalId).filter(attempt => activeAttempts.has(attempt.status));
+  private async replan(goalId: string, reason: string, failedTaskId?: string): Promise<void> {
+    const goal = this.goal(goalId), tasks = this.tasks(goalId);
+    const scope = failedTaskId ? new Set([failedTaskId, ...descendants(tasks, [failedTaskId])]) : undefined;
+    const affected = tasks.filter(task => task.status !== "completed" && (!scope || scope.has(task.id)));
+    const attempts = this.attempts(goalId).filter(attempt => (activeAttempts.has(attempt.status) || this.task(attempt.taskId).status === "review") && (!scope || scope.has(attempt.taskId)));
     this.options.store.transaction(() => {
       this.writeGoal(goalId, { revision: goal.revision + 1, status: "planning", nextAction: "Revise the plan from retained evidence" });
-      this.options.store.set(TABLE.control, { ...this.control(goalId), stage: "plan", operation: undefined, replanReason: reason, diagnosisTaskId: undefined });
-      for (const task of this.tasks(goalId).filter(task => task.status !== "completed")) this.writeTask(task.id, { status: "canceled" });
+      this.options.store.set(TABLE.control, { ...this.control(goalId), stage: "plan", operation: undefined, replanReason: reason, diagnosisTaskId: undefined, replanTaskIds: scope ? affected.map(task => task.id) : undefined });
+      for (const task of affected) this.writeTask(task.id, { status: "canceled" });
       for (const attempt of attempts) this.revoke(attempt);
-      this.decision(goalId, "replan", reason);
+      if (scope) {
+        for (const attempt of this.attempts(goalId).filter(attempt => !scope.has(attempt.taskId) && this.task(attempt.taskId).currentAttemptId === attempt.id && attempt.status !== "retired")) {
+          const detail = this.attemptDetail(attempt.id);
+          this.options.store.set(TABLE.attemptDetails, { ...detail, assignmentGoalRevision: detail.assignmentGoalRevision ?? detail.goalRevision, goalRevision: goal.revision + 1 });
+        }
+      }
+      this.decision(goalId, "replan", reason, { taskIds: affected.map(task => task.id), preservedTaskIds: scope ? tasks.filter(task => !scope.has(task.id) && task.status !== "canceled").map(task => task.id) : [] });
     });
     this.operationControllers.get(goalId)?.abort();
     this.changed(); await Promise.allSettled(attempts.map(attempt => this.acknowledgeCancel(attempt)));
@@ -689,7 +762,11 @@ export class FactoryCoordinator {
     }
     this.options.store.set(TABLE.control, { ...this.control(goalId), operation: undefined });
     this.decision(goalId, "controller-error", this.error(error));
-    this.wait(goalId, this.error(error), "runtime-available");
+    if (control.stage === "diagnose" || (control.stage === "plan" && control.replanTaskIds?.length)) {
+      this.options.store.set(TABLE.control, { ...this.control(goalId), waitingFor: "runtime-available", waitReason: this.error(error) });
+      this.writeGoal(goalId, { status: "running", nextAction: "Repair controller is waiting; independent work can continue" });
+      this.changed();
+    } else this.wait(goalId, this.error(error), "runtime-available");
   }
   private isCurrent(attempt: Attempt): boolean {
     const stored = this.options.store.get<Attempt>(TABLE.attempts, attempt.id), task = this.options.store.get<FactoryTask>(TABLE.tasks, attempt.taskId);
@@ -703,6 +780,13 @@ export class FactoryCoordinator {
     this.options.store.set(TABLE.attemptDetails, { ...this.attemptDetail(attempt.id), cancellation: "requested" as const });
   }
   private async acknowledgeCancel(attempt: Attempt): Promise<void> {
+    const existing = this.cancellations.get(attempt.id);
+    if (existing) return existing;
+    const operation = this.observeCancellation(attempt).finally(() => this.cancellations.delete(attempt.id));
+    this.cancellations.set(attempt.id, operation);
+    await operation;
+  }
+  private async observeCancellation(attempt: Attempt): Promise<void> {
     const goalId = this.task(attempt.taskId).goalId;
     try {
       await this.options.runtime.cancel(attempt);
@@ -732,10 +816,16 @@ export class FactoryCoordinator {
     }); this.changed();
   }
   private place(task: FactoryTask) {
-    const load = this.options.store.list<Attempt>(TABLE.attempts).filter(attempt => activeAttempts.has(attempt.status));
+    const load = this.activeWork();
     const provider = this.goal(task.goalId).workspaceProvider ?? 'git';
-    return this.options.devices().filter(device => device.online && (provider === 'git' || device.workspaceProviders?.includes(provider)) && (!task.deviceId || task.deviceId === device.id) && load.filter(attempt => attempt.deviceId === device.id).length < (device.capacity ?? 2))
-      .sort((a, b) => load.filter(attempt => attempt.deviceId === a.id).length - load.filter(attempt => attempt.deviceId === b.id).length || Number(b.local) - Number(a.local))[0];
+    return this.options.devices().filter(device => device.online && (provider === 'git' || device.workspaceProviders?.includes(provider)) && (!task.deviceId || task.deviceId === device.id) && !placementConstraint(task, device, load))
+      .sort((a, b) => load.filter(item => item.deviceId === a.id).length / (a.capacity ?? 2) - load.filter(item => item.deviceId === b.id).length / (b.capacity ?? 2) || Number(b.local) - Number(a.local) || a.id.localeCompare(b.id))[0];
+  }
+  private activeWork(): FactoryTask[] {
+    const attempts = this.options.store.list<Attempt>(TABLE.attempts);
+    const details = new Map(attempts.map(attempt => [attempt.id, this.options.store.get<AttemptDetail>(TABLE.attemptDetails, attempt.id)]));
+    const unconfirmed = new Set(attempts.filter(attempt => attempt.status === "retired" && details.get(attempt.id)?.cancellation === "requested").map(attempt => attempt.id));
+    return activeExecutionTasks(this.options.store.list<FactoryTask>(TABLE.tasks), attempts, unconfirmed, new Map(attempts.map(attempt => [attempt.id, details.get(attempt.id)?.contract])));
   }
   private hasAvailableDevice(goal: Goal): boolean {
     return this.tasks(goal.id).filter(task => ["queued", "ready"].includes(task.status)).some(task => !!this.place(task));
@@ -756,8 +846,9 @@ export class FactoryCoordinator {
     this.options.store.set(TABLE.control, { ...control, spent: control.spent + spend });
   }
   private nextStage(goalId: string): ControlRecord["stage"] {
-    if (!this.planRecord(goalId)) return "plan";
-    if (this.tasks(goalId).some(task => task.status === "failed")) return "diagnose";
+    if (!this.planRecord(goalId) || this.control(goalId).replanTaskIds?.length) return "plan";
+    // Dispatch chooses a current nonwaiting failed task and persists its diagnosis identity.
+    // A branch waiting on its own condition must not stop the other branches when a device returns.
     if (this.tasks(goalId).some(task => !["completed", "canceled"].includes(task.status))) return "dispatch";
     return "evaluate";
   }
@@ -791,6 +882,7 @@ export class FactoryCoordinator {
     return ["You are executing an EnoughFactory task inside its isolated full-permission container. Make routine decisions and deliver the requested outcome. Run focused relevant checks, preserve useful work, and finish with evidence of what actually changed. Do not stop at a proposal.", this.context(goal), `Task: ${task.title}\n${task.description}`, task.kind ? guidance[task.kind] : "Generic task contract: complete the described work and provide concrete evidence of its outcome.",
       `Task acceptance criteria:\n${task.acceptanceCriteria?.map(value => `- ${value}`).join("\n") || "Use the task description and goal criteria."}`,
       `Expected deliverables:\n${task.expectedOutputs?.map(value => `- ${value}`).join("\n") || "Preserved changes and a factual outcome summary."}`,
+      `Planned write paths: ${JSON.stringify(task.writePaths ?? "Not declared on this legacy task")}. Other independent work may run in parallel. Preserve shared interfaces, keep changes focused on this task and report any necessary changes outside its declared scope. These paths coordinate ownership; your container retains full permissions.`,
       `Repair instructions: ${this.taskDetail(task.id).repairInstructions ?? "None"}`, `Configured checks: ${JSON.stringify(this.taskDetail(task.id).checks)}`, "The factory will capture and integrate the exact candidate. Do not merge into another attempt's workspace. Project-configured deployment capabilities are authorized according to the goal policy; report any uncertain external effects explicitly."].join("\n\n");
   }
   private goals(): Goal[] { return this.options.store.list<Goal>(TABLE.goals); }

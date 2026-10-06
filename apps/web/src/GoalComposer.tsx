@@ -36,7 +36,7 @@ function ProjectDraft({ state, client, run, projectId, busy, onSubmit, creationE
   const [autonomy, setAutonomy] = useState<AutonomyMode>('autonomous');
   const [approvalMode, setApprovalMode] = useState<ApprovalMode>(state.settings.defaultApprovalMode);
   const [runtime, setRuntime] = useState<RuntimeKind>(state.settings.defaultRuntime);
-  const [concurrency, setConcurrency] = useState(2);
+  const [concurrency, setConcurrency] = useState(8);
   const [workspaceProvider, setWorkspaceProvider] = useState<'git' | 'artifactfs'>('git');
   const [starting, setStarting] = useState(false);
   const [assistantError, setAssistantError] = useState<string | null>(null);
@@ -90,7 +90,7 @@ function ProjectDraft({ state, client, run, projectId, busy, onSubmit, creationE
           <Field label="Approval policy"><select value={approvalMode} onChange={event => setApprovalMode(event.target.value as ApprovalMode)}>{policies.map(policy => <option key={policy.mode} value={policy.mode}>{policy.label}</option>)}</select></Field>
           <Field label="Execution agent"><select value={runtime} onChange={event => setRuntime(event.target.value as RuntimeKind)}><option value="codex">Codex</option><option value="antigravity">Antigravity</option><option value="claude">Claude</option></select></Field>
           <Field label="Repository workspace"><select value={workspaceProvider} onChange={event => setWorkspaceProvider(event.target.value as 'git' | 'artifactfs')}><option value="git">Git — isolated worktree</option><option value="artifactfs" disabled={!artifactFsAvailable}>ArtifactFS — lazy Git mount</option></select></Field>
-          <Field label="Concurrent workers"><Input required type="number" min={1} max={16} value={concurrency} onChange={event => setConcurrency(Number(event.target.value))} /></Field>
+          <Field label="Concurrent workers" hint="The scheduler also respects each device’s capacity and task resource requirements."><Input required type="number" min={1} max={32} value={concurrency} onChange={event => setConcurrency(Number(event.target.value))} /></Field>
         </div></details>
       </div>
       {creationError && <div className="error-banner" role="alert">{creationError}</div>}

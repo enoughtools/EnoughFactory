@@ -6,8 +6,9 @@ import { PreviewGateway, connectSessionProxy, type PreviewTarget } from '@enough
 import type { Approval, Attempt, Chat, Device, FactoryState, FactoryTask, Goal, Project, RpcRequest, RpcResponse, Session, Settings } from '@enoughfactory/contracts';
 import { DeviceApp, type ApiCall } from './app.ts';
 import { HttpError, now } from './util.ts';
+import { parseWorkerResources } from './worker-capacity.ts';
 
-type Catalog = Pick<FactoryState,'projects'|'sessions'|'chats'|'goals'|'tasks'|'attempts'> & { id: string; updatedAt: string; capacity?: number; workspaceProviders?: Device['workspaceProviders'] };
+type Catalog = Pick<FactoryState,'projects'|'sessions'|'chats'|'goals'|'tasks'|'attempts'> & { id: string; updatedAt: string; capacity?: number; workerResources?: Device['workerResources']; workspaceProviders?: Device['workspaceProviders'] };
 type Packet = Record<string,unknown>;
 const maxStreamBuffer = 1024 * 1024;
 
@@ -18,7 +19,7 @@ function records<T>(value: unknown, predicate: (item: Record<string,unknown>)=>b
   return Array.isArray(value) ? value.filter(item=>predicate(object(item))).slice(0,10000) as T[] : [];
 }
 function publicCatalog(app: DeviceApp): Catalog {
-  return { id:app.device.id,updatedAt:now(),capacity:app.device.capacity,workspaceProviders:app.device.workspaceProviders,projects:app.store.list<Project>('projects').filter(project=>!project.internal),
+  return { id:app.device.id,updatedAt:now(),capacity:app.device.capacity,workerResources:app.device.workerResources,workspaceProviders:app.device.workspaceProviders,projects:app.store.list<Project>('projects').filter(project=>!project.internal),
     sessions:app.store.list<Session>('sessions').map(({enginePid,...session})=>session),
     chats:app.store.list<Chat>('chats').map(({threadId,...chat})=>chat),
     goals:app.store.list<Goal>('goals').filter(goal=>goal.coordinatorId===app.device.id),
@@ -38,9 +39,10 @@ function receiveCatalog(peerId: string, value: unknown): Catalog {
   const taskIds=new Set(tasks.map(task=>task.id));
   const attempts=records<Attempt>(data.attempts,item=>typeof item.id==='string'&&taskIds.has(String(item.taskId)));
   const capacity=Number(data.capacity??object(data.device).capacity);
+  const workerResources=parseWorkerResources(data.workerResources??object(data.device).workerResources);
   const providers=data.workspaceProviders??object(data.device).workspaceProviders;
   const workspaceProviders=Array.isArray(providers)?providers.filter((provider):provider is 'git'|'artifactfs'=>provider==='git'||provider==='artifactfs'):undefined;
-  return {id:peerId,updatedAt:now(),...(Number.isInteger(capacity)&&capacity>=0&&capacity<=64?{capacity}:{}),workspaceProviders,projects,sessions,chats,goals,tasks,attempts};
+  return {id:peerId,updatedAt:now(),...(Number.isInteger(capacity)&&capacity>=0&&capacity<=64?{capacity}:{}),workerResources,workspaceProviders,projects,sessions,chats,goals,tasks,attempts};
 }
 function iceServers(settings: Settings): IceServer[] {
   return settings.turnUrls?.length ? [{urls:settings.turnUrls,username:settings.turnUsername,credential:settings.turnCredential}] : [];
@@ -124,7 +126,7 @@ export async function initializeNetwork(app: DeviceApp): Promise<{
     settings:{...app.settings,turnCredential:undefined}});
   const saveCatalog=(peerId:string,value:unknown)=>{
     const catalog=receiveCatalog(peerId,value);remoteCatalogs.set(peerId,catalog);app.store.set('remote-catalog',catalog);
-    app.devices=app.devices.map(device=>device.id===peerId?{...device,capacity:device.platform==='browser'?0:catalog.capacity??device.capacity,workspaceProviders:catalog.workspaceProviders}:device);app.changed();
+    app.devices=app.devices.map(device=>device.id===peerId?{...device,capacity:device.platform==='browser'?0:catalog.capacity??device.capacity,workerResources:device.platform==='browser'?undefined:catalog.workerResources,workspaceProviders:catalog.workspaceProviders}:device);app.changed();
   };
   const browserEvent=(topic:string,data:unknown,cursor?:number)=>{for(const device of app.devices)if(device.platform==='browser'&&device.online)void peers.publishTo(device.id,topic,data,cursor).catch(()=>{});};
   const refreshPeer=async(peerId:string)=>{
@@ -182,7 +184,7 @@ export async function initializeNetwork(app: DeviceApp): Promise<{
     iceServers:iceServers(app.settings),relayFallback:true,onRequest:request,
     onDevices(devices){
       const old=new Map(app.devices.map(device=>[device.id,device.online]));
-      app.devices=devices.map(device=>device.local?{...app.device,...device,capacity:app.device.capacity,workspaceProviders:app.device.workspaceProviders}:device.platform==='browser'?{...device,capacity:0}:{...device,capacity:remoteCatalogs.get(device.id)?.capacity??device.capacity,workspaceProviders:remoteCatalogs.get(device.id)?.workspaceProviders});
+      app.devices=devices.map(device=>device.local?{...app.device,...device,capacity:app.device.capacity,workerResources:app.device.workerResources,workspaceProviders:app.device.workspaceProviders}:device.platform==='browser'?{...device,capacity:0,workerResources:undefined}:{...device,capacity:remoteCatalogs.get(device.id)?.capacity??device.capacity,workerResources:remoteCatalogs.get(device.id)?.workerResources,workspaceProviders:remoteCatalogs.get(device.id)?.workspaceProviders});
       const paired=new Set(devices.filter(device=>!device.local).map(device=>device.id));
       for(const peerId of remoteCatalogs.keys())if(!paired.has(peerId)){remoteCatalogs.delete(peerId);app.store.delete('remote-catalog',peerId);liveApprovals.delete(peerId);}
       for(const device of devices){if(!device.online)liveApprovals.delete(device.id);else if(!device.local&&device.platform!=='browser'&&!old.get(device.id))void refreshPeer(device.id);}
@@ -216,12 +218,12 @@ export async function initializeNetwork(app: DeviceApp): Promise<{
   });
   // Replace the provisional install ID before creating any environments and migrate
   // existing owner references once. The signing identity survives window/service restarts.
-  const previousId=app.device.id;const device={...peers.localDevice,capacity:app.device.capacity??2};
+  const previousId=app.device.id;const device={...peers.localDevice,capacity:app.device.capacity??2,workerResources:app.device.workerResources};
   if(previousId!==device.id)app.store.transaction(()=>{
     for(const bucket of ['projects','sessions','chats','tasks','attempts'])for(const saved of app.store.list<Record<string,unknown>&{id:string}>(bucket))if(saved.deviceId===previousId)app.store.set(bucket,{...saved,deviceId:device.id});
     for(const goal of app.store.list<Goal>('goals'))if(goal.coordinatorId===previousId)app.store.set('goals',{...goal,coordinatorId:device.id});
   });
-  app.setDevice(device);app.devices=peers.devices().map(item=>item.local?device:item.platform==='browser'?{...item,capacity:0}:item);
+  app.setDevice(device);app.devices=peers.devices().map(item=>item.local?app.device:item.platform==='browser'?{...item,capacity:0,workerResources:undefined}:item);
   const catalogBefore=app.catalog;
   app.catalog=()=>{
     const prior=catalogBefore?.()||{};const local=publicCatalog(app);

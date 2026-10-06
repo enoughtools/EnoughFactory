@@ -21,6 +21,8 @@ export interface Session {
 export interface Device {
   id: string; name: string; platform: string; arch: string; online: boolean; lastSeen: string;
   local: boolean; publicKey?: string; transport?: "local" | "webrtc" | "relay"; capacity?: number;
+  /** CPU and memory available to this device's owned container runtime. */
+  workerResources?: { cpus: number; memoryGiB: number };
   workspaceProviders?: ("git" | "artifactfs")[];
 }
 export interface RuntimeCapability {
@@ -52,10 +54,12 @@ export interface Goal {
   workspaceProvider?: "git" | "artifactfs";
 }
 export type TaskKind = "feature" | "unit" | "architecture" | "test";
+export interface TaskResources { cpus?: number; memoryGiB?: number; }
 export interface FactoryTask {
   id: string; goalId: string; title: string; description: string; dependsOn: string[];
   /** Absent on legacy generic tasks. Kind changes the worker's delivery contract. */
   kind?: TaskKind; acceptanceCriteria?: string[]; expectedOutputs?: string[];
+  estimatedMinutes?: number; writePaths?: string[]; resources?: TaskResources;
   status: "queued" | "ready" | "running" | "review" | "completed" | "failed" | "canceled";
   deviceId?: string; sessionId?: string; currentAttemptId?: string; createdAt: string; updatedAt: string;
 }
@@ -72,7 +76,7 @@ export interface TaskCheck {
 }
 export interface AttemptInspection {
   attempt: Attempt; phase?: AttemptPhase; cancellation?: "none" | "requested" | "acknowledged";
-  contract?: { title: string; description: string; kind?: TaskKind; acceptanceCriteria?: string[]; expectedOutputs?: string[]; dependsOn: string[]; checks: string[]; planRevision: number };
+  contract?: { title: string; description: string; kind?: TaskKind; acceptanceCriteria?: string[]; expectedOutputs?: string[]; estimatedMinutes?: number; writePaths?: string[]; resources?: TaskResources; dependsOn: string[]; checks: string[]; planRevision: number };
   workspace?: { id: string; provider: "git" | "artifactfs"; baseCommit: string; sessionId?: string; deviceId?: string };
   candidate?: { id: string; commit: string; baseCommit: string; branch?: string; tree?: string; deviceId?: string };
   result?: { status: string; text: string; error?: string; waitReason?: string; wakeCondition?: string };
@@ -93,7 +97,7 @@ export interface ControllerRun {
 export interface GoalInspection {
   goal: Goal; tasks: TaskOverview[]; controllers: ControllerRun[];
   plan?: { revision: number; summary: string; checks: string[]; createdAt: string };
-  control?: { stage: "plan" | "dispatch" | "evaluate" | "diagnose" | "wait" | "done"; waitingFor?: string; waitReason?: string; wakeAt?: string; replanReason?: string; diagnosisTaskId?: string; operation?: { kind: "planner" | "evaluator" | "diagnosis"; revision: number }; spent: number; unpricedTurns?: number; maxDurationMs?: number };
+  control?: { stage: "plan" | "dispatch" | "evaluate" | "diagnose" | "wait" | "done"; waitingFor?: string; waitReason?: string; wakeAt?: string; replanReason?: string; diagnosisTaskId?: string; replanTaskIds?: string[]; operation?: { kind: "planner" | "evaluator" | "diagnosis"; revision: number }; spent: number; unpricedTurns?: number; maxDurationMs?: number };
 }
 export interface Decision { id: string; goalId: string; at: string; kind: string; text: string; data?: unknown; }
 export interface Artifact { id: string; goalId?: string; taskId?: string; attemptId?: string; name: string; mime: string; sha256: string; size: number; deviceId: string; createdAt: string; }
@@ -115,6 +119,8 @@ export interface Diagnostics {
 export interface Settings {
   deviceName: string; signalingUrl?: string; turnUrls?: string[]; turnUsername?: string;
   turnCredential?: string; defaultRuntime: RuntimeKind; defaultApprovalMode: ApprovalMode;
+  /** Concurrent factory attempts on this device; absent selects capacity from runtime resources. */
+  workerCapacity?: number;
 }
 export interface FactoryState {
   product: typeof PRODUCT; version: string; device: Device; devices: Device[];

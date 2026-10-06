@@ -19,6 +19,11 @@ const resources = app.isPackaged ? process.resourcesPath : repository;
 const development = process.argv.includes('--dev') || Boolean(process.env.ENOUGHFACTORY_DEV_URL);
 const developmentUrl = process.env.ENOUGHFACTORY_DEV_URL ?? 'http://127.0.0.1:4318';
 const uiFile = app.isPackaged ? join(resources, 'web/index.html') : join(repository, 'apps/web/dist/index.html');
+const expectedServiceVersion = (() => {
+  if (!app.isPackaged) return JSON.parse(readFileSync(join(repository, 'apps/device/package.json'), 'utf8')).version as string;
+  const provenance = JSON.parse(readFileSync(join(resources, 'bundle-provenance.json'), 'utf8')) as { version: string; localUpdate?: { serviceVersion?: string } };
+  return provenance.localUpdate?.serviceVersion ?? provenance.version;
+})();
 const trustedUi = development ? new URL(developmentUrl).origin : pathToFileURL(uiFile).href;
 const executablePath = [...new Set([
   ...(process.env.PATH ?? '').split(delimiter),
@@ -55,9 +60,15 @@ async function availableConnection(requireManagedRuntime = true): Promise<Connec
     const response = await fetch(`${candidate.url}/api/health`, {
       headers: { Authorization: `Bearer ${candidate.token}` }, signal: AbortSignal.timeout(900),
     });
-    const health = await response.json() as { ok?: boolean; product?: string };
+    const health = await response.json() as { ok?: boolean; product?: string; version?: string };
     healthy = response.ok && Boolean(health.ok) && health.product === 'EnoughFactory';
-  } catch { /* A stale connection is replaced only after readiness is checked. */ }
+    if (healthy && requireManagedRuntime && health.version !== expectedServiceVersion) {
+      throw new Error(`[DEVICE_SERVICE_UPDATE_REQUIRED] Update the device service to ${expectedServiceVersion} for this app’s factory features. Existing environments and work records are retained.`);
+    }
+  } catch (error) {
+    if (error instanceof Error && error.message.startsWith('[DEVICE_SERVICE_UPDATE_REQUIRED]')) throw error;
+    /* A stale connection is replaced only after readiness is checked. */
+  }
   if (!healthy) return;
   if (requireManagedRuntime) {
     const response = await fetch(`${candidate.url}/api/runtime`, {
