@@ -12,7 +12,7 @@ import { verifyArchiveReceipt, verifyRuntimeJourney } from '../release/marketing
 import { verifyInstalledProofs } from '../release/marketing/verify-installed-proofs.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-export const delivery = Object.freeze({ version: '0.1.2', sourceCommit: 'c71a3a91861c3dd3bd11ab90b9edbc740aa0f12e', runId: 37396429671, releaseId: 404207020, serviceSha256: 'a1e0efdfc322fcfd46cbc42a1d7649f5b92052128d9494d7aa6ed40181756bd7', artifactIds: { arm64: 11384465049, x64: 11384120421 } });
+export const delivery = Object.freeze({ version: '0.1.2', sourceCommit: 'c71a3a91861c3dd3bd11ab90b9edbc740aa0f12e', runId: 37396429671, releaseId: 404207020, serviceSha256: 'a1e0efdfc322fcfd46cbc42a1d7649f5b92052128d9494d7aa6ed40181756bd7', jobIds: { arm64: 112053403458, x64: 112053403776 }, artifactIds: { arm64: 11384465049, x64: 11384120421 } });
 
 export function verifyRunEvidence(run, jobs, artifacts) {
   assert.equal(run.id, delivery.runId);
@@ -27,10 +27,13 @@ export function verifyRunEvidence(run, jobs, artifacts) {
     const selected = jobs.filter(job => job.name === `linux ${arch}`);
     assert.equal(selected.length, 1, 'A unique successful native job is required.');
     const job = selected[0];
+    assert.equal(job.id, delivery.jobIds[arch], 'The selected native job identity changed.');
     assert.equal(job.head_sha, delivery.sourceCommit);
     assert.equal(job.status, 'completed');
     assert.equal(job.conclusion, 'success');
-    for (const name of requiredSteps) {
+    // GitHub can omit step summaries for completed jobs. Exact job/source success
+    // and the downloaded package's strict native receipts remain mandatory.
+    for (const name of job.steps?.length ? requiredSteps : []) {
       const step = job.steps.find(step => step.name === name);
       assert.equal(step?.status, 'completed', `Native proof step did not complete: ${name}.`);
       assert.equal(step.conclusion, 'success', `Native proof step did not pass: ${name}.`);
@@ -55,7 +58,7 @@ export async function verifyNativeRun() {
   assert.equal(artifactPage.artifacts.length, artifactPage.total_count, 'Unexpected artifact pagination.');
   verifyRunEvidence(run, jobPage.jobs, artifactPage.artifacts);
   console.log(`Verified completed native Linux run ${delivery.runId} at ${delivery.sourceCommit}.`);
-  return { runId: run.id, sourceCommit: run.head_sha, jobs: jobPage.jobs.filter(job => job.name.startsWith('linux ')).map(job => ({ id: job.id, name: job.name, conclusion: job.conclusion })), artifacts: artifactPage.artifacts.filter(artifact => artifact.name.startsWith('EnoughFactory-linux-')).map(artifact => ({ id: artifact.id, name: artifact.name })) };
+  return { runId: run.id, sourceCommit: run.head_sha, jobs: jobPage.jobs.filter(job => job.name.startsWith('linux ')).map(job => ({ id: job.id, name: job.name, conclusion: job.conclusion, stepDetailsAvailable: Boolean(job.steps?.length) })), artifacts: artifactPage.artifacts.filter(artifact => artifact.name.startsWith('EnoughFactory-linux-')).map(artifact => ({ id: artifact.id, name: artifact.name })) };
 }
 
 export function verifyDraftIdentity(release) {
