@@ -1,14 +1,13 @@
 import { useEffect, useState } from 'react';
 import type { FactoryState, GoalStatus } from '@enoughfactory/contracts';
 import { Sidebar, SidebarContent, SidebarFooter, SidebarHeader } from '@enoughtools/ui-react';
-import { ChevronDown, Folder, Laptop, LayoutGrid, Monitor, Plus, Settings2, ShieldCheck, Target } from 'lucide-react';
+import { ChevronDown, Folder, LayoutGrid, Monitor, Network, Plus, RefreshCw, Settings2, ShieldCheck } from 'lucide-react';
 import './factory-sidebar-goals.css';
 import { BuildVersion } from './BuildVersion';
 
 const brandMark = new URL('./assets/mark-ink.svg', import.meta.url).href;
 const navigation = [
   { id: 'workbench', label: 'Workbench', icon: LayoutGrid },
-  { id: 'goals', label: 'Goals', icon: Target },
   { id: 'devices', label: 'Devices', icon: Monitor },
   { id: 'approvals', label: 'Approvals', icon: ShieldCheck },
 ] as const;
@@ -31,12 +30,14 @@ export interface FactorySidebarProps {
   onStartGoal: (projectId?: string) => void;
   onAddProject: () => void;
   onConnect: () => void;
+  onRefresh: () => void;
 }
 
-export function FactorySidebar({ state, view, projectId, goalId, sessionSelected, error, desktopVersion, onNavigate, onProject, onGoal, onStartGoal, onAddProject, onConnect }: FactorySidebarProps) {
+export function FactorySidebar({ state, view, projectId, goalId, sessionSelected, error, desktopVersion, onNavigate, onProject, onGoal, onStartGoal, onAddProject, onConnect, onRefresh }: FactorySidebarProps) {
   const [collapsed, setCollapsed] = useState<Set<string>>(() => new Set());
   const activeGoal = view === 'goals' && !sessionSelected ? state?.goals.find(goal => goal.id === goalId) : undefined;
   const activeGoalProjectId = activeGoal?.projectId;
+  const onlineWorkers = state?.devices.filter(device => device.platform !== 'browser' && device.online).length ?? 0;
   const pending = state?.approvals.filter(approval => approval.status === 'pending').length ?? 0;
   useEffect(() => {
     if (!activeGoalProjectId) return;
@@ -107,12 +108,12 @@ export function FactorySidebar({ state, view, projectId, goalId, sessionSelected
     </SidebarContent>
     <SidebarFooter className="sidebar-footer">
       <button type="button" className={`nav-item ${view === 'settings' ? 'active' : ''}`} aria-current={view === 'settings' ? 'page' : undefined} onClick={() => onNavigate('settings')}><Settings2 size={17} /><span>Settings</span></button>
-      <button type="button" className="device-status" onClick={onConnect}>
+      <button type="button" className="device-status" onClick={() => state && !error ? onNavigate('devices') : onConnect()} title={state ? `Workspace hosted by ${state.device.name}. Open Devices to manage the computers available for work.` : 'Connect to a workspace'}>
         <span className={`status-dot state-${error ? 'offline' : state ? 'ready' : 'starting'}`} aria-hidden="true" />
-        <div><strong>{state?.device.name ?? 'Your device'}</strong><span>{error ? 'Connection unavailable' : state ? 'Device service connected' : 'Connecting…'}</span></div>
-        <Laptop size={15} />
+        <div><strong>{error ? 'Workspace offline' : state ? 'Workspace connected' : 'Connect workspace'}</strong><span>{error ? `Last connected to ${state?.device.name ?? 'device'}` : state ? `${state.device.name} · ${onlineWorkers} device${onlineWorkers === 1 ? '' : 's'} online` : 'No device connected'}</span></div>
+        <Network size={15} />
       </button>
-      <BuildVersion desktopVersion={desktopVersion} serviceVersion={state?.version} serviceOnline={!!state && !error} />
+      <div className="sidebar-build-row"><BuildVersion desktopVersion={desktopVersion} serviceVersion={state?.version} serviceOnline={!!state && !error} /><button type="button" className="sidebar-refresh" aria-label="Refresh workspace" title="Refresh workspace" onClick={onRefresh}><RefreshCw size={13} /></button></div>
     </SidebarFooter>
   </Sidebar>;
 }

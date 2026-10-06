@@ -1,0 +1,13 @@
+.settings-context { color: var(--factory-secondary); font-size: 11px; line-height: 1.65; margin: 0 0 16px; }
+.settings-connection-summary { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; margin-bottom: 10px; font-size: 12px; }
+.settings-disclosure { border-top: 1px solid var(--factory-line-soft); margin-top: 18px; padding-top: 12px; font-size: 11px; }
+.settings-disclosure > summary { color: var(--factory-secondary); cursor: pointer; width: fit-content; }
+.settings-disclosure[open] > summary { margin-bottom: 14px; }
+.settings-disclosure > .field-hint { margin-bottom: 14px; }
+.settings-disclosure-first { border-top: 0; padding-top: 0; margin-top: 0; }
+.settings-diagnostics-heading { display: flex; align-items: start; gap: 16px; margin-bottom: 8px; }
+.settings-diagnostics-heading > p { flex: 1; }
+.runtime-resource-note { color: var(--factory-muted); font-size: 11px; line-height: 1.65; margin: -6px 0 16px; }
+.runtime-resource-limit { padding: 12px; border: 1px solid var(--factory-line); background: var(--factory-paper); font-size: 11px; line-height: 1.65; }
+.runtime-resource-limit p { margin: 0 0 10px; }
+.runtime-resource-limit p:last-child { margin-bottom: 0; }

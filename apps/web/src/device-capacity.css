@@ -5,3 +5,8 @@
 .device-capacity-fields .form-field { margin: 0; }
 .device-capacity-controls .field-hint { margin: 10px 0; }
 .device-grid .device-stats { gap: 20px; flex-wrap: wrap; }
+.device-capacity-controls > summary { color: var(--factory-secondary); cursor: pointer; font-size: 11px; line-height: 1.6; }
+.device-capacity-content { padding-top: 16px; }
+.device-capacity-resources > button { margin-left: auto; }
+.device-page-context { color: var(--factory-muted); font-size: 11px; line-height: 1.65; margin: 0 0 20px; max-width: 760px; }
+.device-grid .device-card > .device-execution-note { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin: 8px 0; color: var(--factory-secondary); font-size: 11px; }
