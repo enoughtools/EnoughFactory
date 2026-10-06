@@ -2,11 +2,17 @@ name: Desktop release
 
 on:
   workflow_dispatch:
+    inputs:
+      linux_only:
+        description: Build only Linux desktop bundles
+        type: boolean
+        default: false
   push:
     tags: ['v*']
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: desktop-release-${{ github.ref }}
@@ -19,13 +25,62 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 22.22.0
+      - name: Compare Ubuntu source inputs with the verified baseline
+        id: ubuntu_sources
+        run: |
+          node --input-type=module <<'NODE'
+          import { spawnSync } from 'node:child_process';
+          import { appendFile, mkdir, writeFile } from 'node:fs/promises';
+          const result = spawnSync(process.execPath, ['scripts/verify-runtime-source-closure.mjs', '--group', 'ubuntu-source', '--baseline', '5252bd83a9082d7711e7e3dcbf426daef0abc165'], { encoding: 'utf8', maxBuffer: 4 * 1024 * 1024 });
+          if (result.error || ![0, 2].includes(result.status)) throw new Error(result.error?.message ?? result.stderr ?? 'Ubuntu source comparison failed.');
+          const proof = JSON.parse(result.stdout);
+          if (proof.status !== (result.status === 0 ? 'equal' : 'changed')) throw new Error('Unexpected Ubuntu source comparison result.');
+          await mkdir('.cache', { recursive: true });
+          await writeFile('.cache/ubuntu-source-closure.json', result.stdout);
+          await appendFile(process.env.GITHUB_OUTPUT, `reuse=${result.status === 0}\n`);
+          console.log(JSON.stringify({ status: proof.status, baseline: proof.baseline, sha256: proof.sha256 }));
+          NODE
+      - name: Confirm the prior Ubuntu source job succeeded at its pinned revision
+        if: steps.ubuntu_sources.outputs.reuse == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/37379810420" > .cache/ubuntu-prior-run.json
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/37379810420/jobs?per_page=100" > .cache/ubuntu-prior-jobs.json
+          node --input-type=module <<'NODE'
+          import { readFile } from 'node:fs/promises';
+          const run = JSON.parse(await readFile('.cache/ubuntu-prior-run.json', 'utf8'));
+          const { jobs } = JSON.parse(await readFile('.cache/ubuntu-prior-jobs.json', 'utf8'));
+          const job = jobs.find(job => job.name === 'Bundled Ubuntu corresponding sources');
+          if (run.head_sha !== '5252bd83a9082d7711e7e3dcbf426daef0abc165' || run.status !== 'completed' || job?.status !== 'completed' || job.conclusion !== 'success') throw new Error('The selected Ubuntu source job is not a successful run of the pinned baseline.');
+          NODE
+      - name: Download the unchanged verified Ubuntu source companion
+        if: steps.ubuntu_sources.outputs.reuse == 'true'
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: EnoughFactory-Ubuntu-sources
+          path: dist/ubuntu-source-companion
+          run-id: 37379810420
+          github-token: ${{ github.token }}
+      - name: Verify every reused Ubuntu source archive and member against the current lock
+        if: steps.ubuntu_sources.outputs.reuse == 'true'
+        run: |
+          cmp runtime/container/os-source-kit/Ubuntu-sources.lock.json dist/ubuntu-source-companion/Ubuntu-sources.lock.json
+          python3 runtime/container/os-source-kit/prepare-source-companion.py verify --output dist/ubuntu-source-companion
       - name: Resolve and verify the locked Ubuntu source set
+        if: steps.ubuntu_sources.outputs.reuse != 'true'
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y gpgv zstd
           python3 runtime/container/os-source-kit/prepare-source-companion.py resolve --cache .cache/ubuntu-source-companion --lock .cache/ubuntu-source-companion/Ubuntu-sources.resolved.json --output dist/ubuntu-source-companion
           cmp runtime/container/os-source-kit/Ubuntu-sources.lock.json .cache/ubuntu-source-companion/Ubuntu-sources.resolved.json
       - name: Deliver exact source archives and signed metadata
+        if: steps.ubuntu_sources.outputs.reuse != 'true'
         run: |
           python3 runtime/container/os-source-kit/prepare-source-companion.py download --cache .cache/ubuntu-source-companion --output dist/ubuntu-source-companion
           python3 runtime/container/os-source-kit/prepare-source-companion.py archive --cache .cache/ubuntu-source-companion --output dist/ubuntu-source-companion
@@ -45,12 +100,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - { platform: darwin, arch: arm64, rid: osx-arm64, runner: macos-15, installedResources: releases/mac-arm64/EnoughFactory.app/Contents/Resources }
-          - { platform: linux, arch: x64, rid: linux-x64, runner: ubuntu-24.04, installedResources: releases/linux-unpacked/resources }
-          - { platform: linux, arch: arm64, rid: linux-arm64, runner: ubuntu-24.04-arm, installedResources: releases/linux-arm64-unpacked/resources }
+        include: >-
+          ${{ fromJSON(
+            github.event_name == 'workflow_dispatch' && inputs.linux_only == true &&
+            '[{"platform":"linux","arch":"x64","rid":"linux-x64","runner":"ubuntu-24.04","installedResources":"releases/linux-unpacked/resources"},{"platform":"linux","arch":"arm64","rid":"linux-arm64","runner":"ubuntu-24.04-arm","installedResources":"releases/linux-arm64-unpacked/resources"}]' ||
+            '[{"platform":"darwin","arch":"arm64","rid":"osx-arm64","runner":"macos-15","installedResources":"releases/mac-arm64/EnoughFactory.app/Contents/Resources"},{"platform":"linux","arch":"x64","rid":"linux-x64","runner":"ubuntu-24.04","installedResources":"releases/linux-unpacked/resources"},{"platform":"linux","arch":"arm64","rid":"linux-arm64","runner":"ubuntu-24.04-arm","installedResources":"releases/linux-arm64-unpacked/resources"}]'
+          ) }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
       - uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa # v4
         with:
           version: 10.34.5
@@ -73,10 +132,62 @@ jobs:
           const version = JSON.parse(await readFile('package.json', 'utf8')).version;
           if (process.env.RELEASE_REF.startsWith('refs/tags/') && process.env.RELEASE_REF !== `refs/tags/v${version}`) throw new Error('Release tag must match the package version.');
           NODE
-      - name: Publish native engine
+      - name: Compare native Linux build inputs with the verified baseline
+        if: matrix.platform == 'linux'
+        id: native_sources
+        run: |
+          node --input-type=module <<'NODE'
+          import { spawnSync } from 'node:child_process';
+          import { appendFile, mkdir, writeFile } from 'node:fs/promises';
+          const result = spawnSync(process.execPath, ['scripts/verify-runtime-source-closure.mjs', '--group', 'native-assets', '--baseline', '5252bd83a9082d7711e7e3dcbf426daef0abc165'], { encoding: 'utf8', maxBuffer: 4 * 1024 * 1024 });
+          if (result.error || ![0, 2].includes(result.status)) throw new Error(result.error?.message ?? result.stderr ?? 'Native source comparison failed.');
+          const proof = JSON.parse(result.stdout);
+          if (proof.status !== (result.status === 0 ? 'equal' : 'changed')) throw new Error('Unexpected native source comparison result.');
+          await mkdir('.cache', { recursive: true });
+          await writeFile('.cache/native-source-closure.json', result.stdout);
+          await appendFile(process.env.GITHUB_OUTPUT, `reuse=${result.status === 0}\n`);
+          console.log(JSON.stringify({ status: proof.status, baseline: proof.baseline, sha256: proof.sha256 }));
+          NODE
+      - name: Confirm the prior native Linux job succeeded at its pinned revision
+        if: matrix.platform == 'linux' && steps.native_sources.outputs.reuse == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PRIOR_NATIVE_ARCH: ${{ matrix.arch }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/37379810420" > .cache/native-prior-run.json
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/37379810420/jobs?per_page=100" > .cache/native-prior-jobs.json
+          node --input-type=module <<'NODE'
+          import { readFile } from 'node:fs/promises';
+          const run = JSON.parse(await readFile('.cache/native-prior-run.json', 'utf8'));
+          const { jobs } = JSON.parse(await readFile('.cache/native-prior-jobs.json', 'utf8'));
+          const job = jobs.find(job => job.name === `linux ${process.env.PRIOR_NATIVE_ARCH}`);
+          if (run.head_sha !== '5252bd83a9082d7711e7e3dcbf426daef0abc165' || run.status !== 'completed' || job?.status !== 'completed' || job.conclusion !== 'success') throw new Error('The selected native Linux job is not a successful run of the pinned baseline.');
+          NODE
+      - name: Download the exact prior native Linux archive and receipts
+        if: matrix.platform == 'linux' && steps.native_sources.outputs.reuse == 'true'
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: EnoughFactory-linux-${{ matrix.arch }}
+          path: .cache/verified-native-prior
+          run-id: 37379810420
+          github-token: ${{ github.token }}
+      - name: Seed only source-identical verified native Linux assets
+        if: matrix.platform == 'linux' && steps.native_sources.outputs.reuse == 'true'
+        env:
+          PRIOR_NATIVE_ARCH: ${{ matrix.arch }}
+        run: |
+          node scripts/seed-native-release-assets.mjs --archive ".cache/verified-native-prior/EnoughFactory-0.1.1-linux-$PRIOR_NATIVE_ARCH.tar.gz" --receipt ".cache/verified-native-prior/EnoughFactory-0.1.1-linux-$PRIOR_NATIVE_ARCH.tar.gz.verification.json" --source-commit 5252bd83a9082d7711e7e3dcbf426daef0abc165 --platform linux --arch "$PRIOR_NATIVE_ARCH" --output ".cache/verified-native-seed/linux-$PRIOR_NATIVE_ARCH" --activate-envmux
+          node --input-type=module <<'NODE'
+          import { appendFile } from 'node:fs/promises';
+          import { resolve } from 'node:path';
+          const seed = resolve(`.cache/verified-native-seed/linux-${process.env.PRIOR_NATIVE_ARCH}`);
+          await appendFile(process.env.GITHUB_ENV, `ENOUGHFACTORY_CONTAINER_BUILD_DIR=${seed}/engine-build\nENOUGHFACTORY_CONTAINER_SOURCE_ARTIFACT=${seed}/container-sources.tar.gz\n`);
+          NODE
+      - name: Publish native engine from current source
+        if: matrix.platform != 'linux' || steps.native_sources.outputs.reuse != 'true'
         run: node scripts/envmux-build.mjs "${{ matrix.rid }}"
       - name: Prepare native Linux source-build tools
-        if: matrix.platform == 'linux'
+        if: matrix.platform == 'linux' && steps.native_sources.outputs.reuse != 'true'
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y gperf make python3 file binutils
