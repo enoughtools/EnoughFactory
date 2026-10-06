@@ -14,6 +14,39 @@ export interface ArtifactManifest {
   metadata?: Record<string, unknown>;
 }
 
+/** A user-selected source. Its files are read only; agents receive a private snapshot. */
+export interface WorkingDirectoryConfig {
+  id: string;
+  name: string;
+  path: string;
+}
+
+export interface WorkingDirectorySource {
+  id: string;
+  name: string;
+  kind: "git" | "folder";
+  containerPath: string;
+  baseCommit: string;
+  sourceCommit?: string;
+  sourceArtifact: ArtifactManifest;
+}
+
+/** The local private path is never part of the transferred source contract. */
+export interface WorkingDirectorySnapshot extends WorkingDirectorySource {
+  path: string;
+}
+
+export interface WorkingDirectoryCapture {
+  id: string;
+  name: string;
+  kind: "git" | "folder";
+  containerPath: string;
+  baseCommit: string;
+  commit: string;
+  bundleArtifact: ArtifactManifest;
+  diffArtifact: ArtifactManifest;
+}
+
 export interface WorkspaceRecord {
   id: string;
   goalId: string;
@@ -45,6 +78,7 @@ export interface Candidate {
   diffArtifact: ArtifactManifest;
   createdAt: string;
   repairConflicts?: string[];
+  workingDirectories?: WorkingDirectoryCapture[];
 }
 
 export interface CommandResult {
@@ -64,6 +98,7 @@ export interface CheckContext {
   command: string;
   timeoutMs: number;
   signal?: AbortSignal;
+  workingDirectories?: Array<{ path: string; containerPath: string; commit: string }>;
 }
 
 export interface CheckExecutor {

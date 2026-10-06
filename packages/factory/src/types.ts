@@ -35,6 +35,8 @@ export interface FactoryWorkspacePort {
   prepare(input: { goal: Goal; task: FactoryTask; attempt: Attempt; project: Project; previousCandidate?: CandidateRef }): Promise<WorkspaceRef>;
   capture(workspace: WorkspaceRef, input: { goal: Goal; task: FactoryTask; attempt: Attempt }): Promise<CandidateRef>;
   check(project: Project, candidate: CandidateRef, commands: string[]): Promise<CheckResult[]>;
+  /** Check an isolated exact final repository snapshot after task dependencies integrate. */
+  checkGoal?(project: Project, commands: string[]): Promise<{ repository: RepositoryEvidence; checks: CheckResult[] }>;
   /** Recheck the combined result when HEAD changed. Fence immediately before writing. */
   integrate(project: Project, candidate: CandidateRef, input: { checks: string[]; isCurrent: () => boolean }): Promise<IntegrationResult>;
   inspect(project: Project): Promise<RepositoryEvidence>;
@@ -66,6 +68,8 @@ export interface PlanResponse {
 }
 export interface PlanRecord {
   id: string; goalId: string; revision: number; summary: string; checks: string[];
+  /** Absent on old plans which attached project checks to every task attempt. */
+  checkScope?: "goal";
   taskKeys: Record<string, string>; createdAt: string;
 }
 export interface TaskDetail {
@@ -92,6 +96,11 @@ export interface EvaluationResponse {
 export interface EvaluationRecord {
   id: string; goalId: string; revision: number; at: string; head: string;
   evaluation: EvaluationResponse;
+  goalChecks?: GoalCheckRecord;
+}
+export interface GoalCheckRecord {
+  id: string; goalId: string; revision: number; at: string;
+  repository: RepositoryEvidence; commands: string[]; checks: CheckResult[];
 }
 export interface ControlRecord {
   id: string; stage: "plan" | "dispatch" | "evaluate" | "diagnose" | "wait" | "done";

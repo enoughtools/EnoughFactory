@@ -7,6 +7,6 @@
   "dependencies": { "@enoughfactory/runtime": "workspace:*" },
   "scripts": {
     "typecheck": "tsc -p tsconfig.json",
-    "test": "tsx --test tests/*.test.ts"
+    "test": "tsx --test tests/*.test.ts src/working-directories.test.ts"
   }
 }

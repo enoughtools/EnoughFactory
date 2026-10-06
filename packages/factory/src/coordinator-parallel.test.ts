@@ -3,7 +3,7 @@ import test from "node:test";
 import { setImmediate as nextEvent } from "node:timers/promises";
 import type { Attempt, Device, FactoryTask, Goal, Project } from "@enoughfactory/contracts";
 import { FactoryCoordinator } from "./coordinator.js";
-import type { AttemptDetail, ControlRecord, ExecutionResult, FactoryRuntimePort, FactoryStore, FactoryWorkspacePort, PlanResponse, PlannedTask, TaskDetail } from "./types.js";
+import type { AttemptDetail, ControlRecord, ExecutionResult, FactoryRuntimePort, FactoryStore, FactoryWorkspacePort, PlanRecord, PlanResponse, PlannedTask, TaskDetail } from "./types.js";
 
 class MemoryStore implements FactoryStore {
   private tables = new Map<string, Map<string, unknown>>();
@@ -125,6 +125,10 @@ test("localized replanning preserves unrelated running authority, immutable chec
   ]));
   try {
     await factory.startPlan();
+    const legacyPlan = factory.store.get<PlanRecord>("factory-plans", factory.goal.id)!;
+    delete legacyPlan.checkScope;
+    factory.store.set("factory-plans", legacyPlan);
+    factory.store.set("factory-task-details", { ...factory.detail("app"), planChecks: ["original-project-check"] });
     const legacyDocs = factory.detail("docs");
     delete legacyDocs.planChecks;
     factory.store.set("factory-task-details", legacyDocs);

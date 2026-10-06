@@ -37,6 +37,20 @@ function strings(value: unknown, name: string, required = false): string[] {
   return [...new Set(value.map(item => (item as string).trim()))];
 }
 
+/** Reject obvious instructions without restricting the commands a project can run. */
+export function readCheckCommands(value: unknown, name = "checks"): string[] {
+  const commands = strings(value, name);
+  for (const command of commands) {
+    const markdown = /^(?:```|~~~|[-*+]\s+|\d+[.)]\s+)/.test(command);
+    const instruction = /^(?:please\s+)?(?:(?:run|execute|invoke)\s+(?:the\s+(?:tests?|checks?|scripts?|commands?|build|validation|test\s+suite)\b|all\s+(?:tests|checks)\b)|(?:verify|validate|confirm|ensure|check)\s+(?:that|the|all|every|each)\s+)/i.test(command);
+    const purpose = /^(?:please\s+)?(?:run|execute|invoke)\s+[a-zA-Z0-9_./:@=-]+(?:\s+[a-zA-Z0-9_./:@=-]+)*\s+(?:to|and(?:\s+then)?|then)\s+(?:validate|verify|check|confirm|ensure|test|prove)\b/i.test(command);
+    if (command.includes("\0") || markdown || instruction || purpose) {
+      throw new FactoryDecisionError(`${name} must contain actual shell commands without prose, Markdown wrappers or NUL characters. For example, use "sh scripts/check-foundation.sh" rather than "Run scripts/check-foundation.sh to validate...".`);
+    }
+  }
+  return commands;
+}
+
 function positiveNumber(value: unknown, name: string, maximum: number): number {
   if (typeof value !== "number" || !Number.isFinite(value) || value <= 0 || value > maximum) {
     throw new FactoryDecisionError(`${name} must be a positive finite number no greater than ${maximum}.`);
@@ -79,7 +93,7 @@ export function readTasks(value: unknown): PlannedTask[] {
     seen.add(item.key);
     if (typeof item.title !== "string" || !item.title.trim() || typeof item.description !== "string" || !item.description.trim()) throw new FactoryDecisionError(`Task ${item.key} needs a title and actionable description.`);
     if (item.kind !== undefined && (typeof item.kind !== "string" || !["feature", "unit", "architecture", "test"].includes(item.kind))) throw new FactoryDecisionError(`Task ${item.key} has an unsupported kind. Choose feature, unit, architecture or test.`);
-    return { key: item.key, title: item.title.trim(), description: item.description.trim(), dependsOn: strings(item.dependsOn, `${item.key}.dependsOn`), checks: strings(item.checks, `${item.key}.checks`), ...(typeof item.deviceId === "string" ? { deviceId: item.deviceId } : {}),
+    return { key: item.key, title: item.title.trim(), description: item.description.trim(), dependsOn: strings(item.dependsOn, `${item.key}.dependsOn`), checks: readCheckCommands(item.checks, `${item.key}.checks`), ...(typeof item.deviceId === "string" ? { deviceId: item.deviceId } : {}),
       ...(item.kind === undefined ? {} : { kind: item.kind as TaskKind }),
       ...(item.acceptanceCriteria === undefined ? {} : { acceptanceCriteria: strings(item.acceptanceCriteria, `${item.key}.acceptanceCriteria`) }),
       ...(item.expectedOutputs === undefined ? {} : { expectedOutputs: strings(item.expectedOutputs, `${item.key}.expectedOutputs`) }),
@@ -109,7 +123,7 @@ export function readPlan(text: string): PlanResponse {
   if (typeof object.summary !== "string" || !object.summary.trim()) throw new FactoryDecisionError("The plan needs a summary.");
   const criteria = strings(object.criteria, "criteria", true);
   if (!criteria.length) throw new FactoryDecisionError("The plan needs explicit completion criteria.");
-  return { summary: object.summary.trim(), criteria, tasks: readTasks(object.tasks), checks: strings(object.checks, "checks") };
+  return { summary: object.summary.trim(), criteria, tasks: readTasks(object.tasks), checks: readCheckCommands(object.checks) };
 }
 
 export function readEvaluation(text: string): EvaluationResponse {

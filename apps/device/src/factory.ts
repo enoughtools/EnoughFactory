@@ -8,7 +8,7 @@ import {
   type CandidateRef, type ExecutionResult, type CheckResult, type CreateGoalInput,
   type RepositoryEvidence, type EvaluationRecord, type ControlRecord, type TaskDetail,
 } from '@enoughfactory/factory';
-import { WorkspaceManager, ArtifactFsWorkspaceProvider, dockerCheckExecutor, type ArtifactManifest, type Candidate, type CheckReport, type WorkspaceRecord } from '@enoughfactory/workspaces';
+import { WorkspaceManager, ArtifactFsWorkspaceProvider, dockerCheckExecutor, fingerprintWorkingDirectories, type WorkingDirectorySource, type WorkingDirectoryCapture, type ArtifactManifest, type Candidate, type CheckReport, type WorkspaceRecord } from '@enoughfactory/workspaces';
 import type { PeerManager } from '@enoughfactory/peers';
 import type { TurnResult } from '@enoughfactory/agents';
 import { dockerInvocation } from '@enoughfactory/runtime';
@@ -24,11 +24,15 @@ interface WorkerRecord {
   workspace?: WorkspaceRef; sessionId?: string; chatId?: string; result?: ExecutionResult;
   candidate?: CandidateRef; error?: string; updatedAt: string;
   cancellationAcknowledged?: boolean;
+  workingDirectorySources?: WorkingDirectorySource[];
 }
 interface ReceivedArtifact { id: string; peerId: string; manifest: ArtifactManifest; path: string; }
 interface GoalOptions { id: string; workspaceProvider: 'git' | 'artifactfs'; }
 const journal = 'factory-workers';
 const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
+function candidateArtifacts(candidate:Candidate):ArtifactManifest[]{return [candidate.bundleArtifact,candidate.diffArtifact,...(candidate.workingDirectories||[]).flatMap(root=>[root.bundleArtifact,root.diffArtifact])];}
+function publicWorkerProject(project:Project):Project{return {...project,path:'',workingDirectories:project.workingDirectories?.map(root=>({...root,path:''}))};}
+function assertCapturedRoots(roots:WorkingDirectoryCapture[],expected:Array<{id:string;name:string;baseCommit:string}>):void{if(roots.length!==expected.length||expected.some(source=>!roots.some(root=>root.id===source.id&&root.name===source.name&&root.baseCommit===source.baseCommit)))throw new Error('Every prepared working folder must have an exact retained capture before this attempt can be accepted.');}
 
 /** The service owns execution and the supervisor; no open window is required. */
 export async function initializeFactory(app: DeviceApp, chats: ChatController, network?: { peers: PeerManager }) {
@@ -38,7 +42,7 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
   const checkExecutor=dockerCheckExecutor({ image:process.env.ENOUGHFACTORY_CHECK_IMAGE,dockerRuntime:app.runtime.endpoint });
   const workspaces = new WorkspaceManager({
     dataDir: path.join(app.dataDir, 'workspace-data'), deviceId: app.device.id,
-    checkExecutor:context=>app.withRuntimeOperation(async signal=>{await app.ensureRuntimeReady();await app.runtime.prepareWorkspace(context.path);return checkExecutor({...context,signal:context.signal?AbortSignal.any([signal,context.signal]):signal});}),
+    checkExecutor:Object.assign((context:Parameters<typeof checkExecutor>[0])=>app.withRuntimeOperation(async signal=>{await app.ensureRuntimeReady();await app.runtime.prepareWorkspace(context.path);for(const root of context.workingDirectories||[])await app.runtime.prepareWorkspace(root.path);return checkExecutor({...context,signal:context.signal?AbortSignal.any([signal,context.signal]):signal});}),{release:checkExecutor.release}),
     artifactFs: new ArtifactFsWorkspaceProvider({
       rootDirectory: path.join(app.dataDir, 'workspace-data'),
       dockerRuntime:app.runtime.endpoint,
@@ -134,6 +138,12 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
     return { ...record, ...(sessionId ? { sessionId } : {}) };
   }
   function candidateRef(candidate: Candidate): CandidateRef { return { ...candidate }; }
+  async function sourceRootsForAttempt(attemptId:string,project:Project,previous?:CandidateRef):Promise<WorkingDirectorySource[]>{
+    const prior=previous?.workingDirectories as WorkingDirectoryCapture[]|undefined;
+    if(!prior?.length)return app.sessions.workingDirectorySources(attemptId,project);
+    const sources=[];for(const root of prior){const target=path.join(app.dataDir,'workspace-data','working-directory-repair',attemptId,root.id);await app.sessions.directoryManager.importCapture(root,target);sources.push({id:root.id,name:root.name,path:target});}
+    return app.sessions.workingDirectorySources(attemptId,{...project,workingDirectories:sources});
+  }
   async function prepareLocal(record: WorkerRecord, project = record.project, previousCandidate?: CandidateRef): Promise<void> {
     return app.withRuntimeOperation(async()=>{
     await app.ensureRuntimeReady();
@@ -149,12 +159,15 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
     }
     if (worker(record.id).status === 'canceled') return;
     await configureHandoff(workspace);
+    const workingDirectorySources=record.workingDirectorySources||await sourceRootsForAttempt(record.id,project,previousCandidate);
+    patchWorker(record.id,{workingDirectorySources});
     const owned = internalProject(project, workspace, record.task.title);
     const state = workspace.providerState;
-    const session = await app.sessions.create(owned, name, state && typeof state.bindSource === 'string' && typeof state.stateVolume === 'string'
-      ? { workspace: { bindSource: state.bindSource, stateVolume: state.stateVolume } } : undefined);
+    const session = await app.sessions.create(owned, name,{workingDirectorySources,...(state && typeof state.bindSource === 'string' && typeof state.stateVolume === 'string'
+      ? { workspace: { bindSource: state.bindSource, stateVolume: state.stateVolume } } : {})});
     patchWorker(record.id, { workspace: ref(workspace, session.id), sessionId: session.id });
     await app.sessions.waitReady(session.id);
+    patchWorker(record.id,{workspace:{...ref(workspace,session.id),workingDirectories:app.sessions.record(session.id).workingDirectories}});
     if (worker(record.id).status === 'canceled') { await app.sessions.stop(session.id); return; }
     patchWorker(record.id, { status: 'prepared' });
     });
@@ -261,22 +274,25 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
         await app.sessions.stop(session.id);
       }
       await app.sessions.waitStopped(session.id);
+      const workingDirectories=await app.sessions.captureWorkingDirectories(session.id);
+      assertCapturedRoots(workingDirectories,(record.workspace!.workingDirectories as import('@enoughfactory/contracts').WorkingDirectoryMount[]|undefined)||app.sessions.record(session.id).workingDirectories||[]);
       const candidate = await workspaces.capture({ workspaceId: record.workspace!.id,
+        workingDirectories,
         ...(record.workspace!.provider === 'git' ? { reference: commit || session.branch || `envmux/${session.name}` } : {}) });
-      rememberArtifacts(candidate.bundleArtifact, candidate.diffArtifact);
+      rememberArtifacts(candidate.bundleArtifact, candidate.diffArtifact,...workingDirectories.flatMap(root=>[root.bundleArtifact,root.diffArtifact]));
       const value = candidateRef(candidate); patchWorker(id, { candidate: value }); return value;
     }).finally(() => captureJobs.delete(id));
     captureJobs.set(id, operation); return operation;
   }
   async function acceptRemoteCandidate(peerId: string, candidate: CandidateRef): Promise<void> {
     const value = candidate as unknown as Candidate;
-    for (const manifest of [value.bundleArtifact, value.diffArtifact]) {
+    for (const manifest of candidateArtifacts(value)) {
       const received = app.store.get<ReceivedArtifact>('peer-artifacts', manifest.id);
       if (!received || received.peerId !== peerId) throw new Error('Candidate bytes have not arrived from the owning worker.');
       await workspaces.artifacts.importFile(received.path, manifest);
     }
     await workspaces.acceptCandidate(value, await workspaces.artifacts.path(value.bundleArtifact), await workspaces.artifacts.path(value.diffArtifact));
-    rememberArtifacts(value.bundleArtifact, value.diffArtifact);
+    rememberArtifacts(...candidateArtifacts(value));
   }
   const workspacePort: FactoryWorkspacePort = {
     async prepare({ goal, task, attempt, project, previousCandidate }) {
@@ -284,18 +300,24 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
         const record = beginWorker({ id: attempt.id, coordinatorId: app.device.id, goal, task, attempt, project });
         if (record.status === 'preparing') track(record.id, () => prepareLocal(record, project, previousCandidate));
       } else {
+        if(project.workingDirectories?.length||(previousCandidate?.workingDirectories as unknown[]|undefined)?.length){const health=await rpc<{deviceId:string;capabilities?:{workingDirectories?:boolean}}>(attempt.deviceId,'GET','/api/health');if(health.deviceId!==attempt.deviceId||health.capabilities?.workingDirectories!==true)throw new Error('Update the selected worker device before using additional working folders.');}
         const source = await workspaces.exportSource({ projectPath: project.path }); rememberArtifacts(source);
         await sendArtifact(attempt.deviceId, source);
+        const workingDirectorySources=await sourceRootsForAttempt(attempt.id,project,previousCandidate);
+        for(const root of workingDirectorySources){rememberArtifacts(root.sourceArtifact);await sendArtifact(attempt.deviceId,root.sourceArtifact);}
         if (previousCandidate) {
           const prior = await workspaces.candidate(previousCandidate.id);
-          await sendArtifact(attempt.deviceId, prior.bundleArtifact); await sendArtifact(attempt.deviceId, prior.diffArtifact);
+          for(const artifact of candidateArtifacts(prior))await sendArtifact(attempt.deviceId,artifact);
         }
         await rpc(attempt.deviceId, 'POST', '/api/factory/worker/prepare', { goal, task, attempt,
-          project: { ...project, path: '' }, source, config: await projectConfig(project), previousCandidate,
+          project: publicWorkerProject(project), source, workingDirectorySources, config: await projectConfig(project), previousCandidate,
           workspaceProvider: sourceProvider(goal) });
       }
       const record = await waitWorker(attempt.deviceId, attempt.id, 'prepared');
       if (!record.workspace || !['prepared', 'running', 'succeeded'].includes(record.status)) throw new Error(record.error || 'Worker preparation did not complete.');
+      const sources=local(attempt.deviceId)?worker(attempt.id).workingDirectorySources||[]:await app.sessions.directoryManager.sourceSnapshots(attempt.id);
+      const mounts=record.workspace.workingDirectories as import('@enoughfactory/contracts').WorkingDirectoryMount[]|undefined;
+      if(sources.length&&(!mounts||mounts.length!==sources.length||sources.some(source=>!mounts.some(root=>root.id===source.id&&root.name===source.name&&root.path===source.containerPath&&root.baseCommit===source.baseCommit&&root.kind===source.kind))))throw new Error('The worker did not confirm the exact additional working folder snapshots. No task execution was authorized.');
       return record.workspace;
     },
     async capture(workspace, { attempt }) {
@@ -305,7 +327,8 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
         const record = await rpc<WorkerRecord>(workspace.deviceId!, 'GET', `/api/factory/worker/${attempt.id}`);
         if (record.candidate) {
           const value = record.candidate as unknown as Candidate;
-          if ([value.bundleArtifact, value.diffArtifact].every(manifest => app.store.get<ReceivedArtifact>('peer-artifacts', manifest.id)?.peerId === workspace.deviceId)) {
+          assertCapturedRoots(value.workingDirectories||[],(workspace.workingDirectories as import('@enoughfactory/contracts').WorkingDirectoryMount[]|undefined)||[]);
+          if (candidateArtifacts(value).every(manifest => app.store.get<ReceivedArtifact>('peer-artifacts', manifest.id)?.peerId === workspace.deviceId)) {
             await acceptRemoteCandidate(workspace.deviceId!, record.candidate); return record.candidate;
           }
         }
@@ -340,7 +363,21 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
         if (stat.isSymbolicLink()) hash.update(await readlink(filename));
         else for await (const chunk of createReadStream(filename)) hash.update(chunk);
       }
+      hash.update(await fingerprintWorkingDirectories(project.workingDirectories||[]));
       return { head, branch, status, summary, diff, fingerprint: hash.digest('hex') };
+    },
+    async checkGoal(project,commands){
+      const repository=await workspacePort.inspect(project),operation=randomUUID();
+      if(repository.status.trim())throw new Error('Goal checks require a clean primary working tree so they can verify the integrated commit. Commit or preserve the remaining primary edits before evaluating.');
+      const workspace=await workspaces.create({projectPath:project.path,goalId:operation,taskId:'goal-check',attemptId:operation,baseCommit:repository.head});
+      try{
+        const roots=await app.sessions.directoryManager.prepare({identity:operation,sources:project.workingDirectories||[]});
+        const workingDirectories:WorkingDirectoryCapture[]=[];for(const root of roots)workingDirectories.push(await app.sessions.directoryManager.captureFromPath(root,root.path));
+        const candidate=await workspaces.capture({workspaceId:workspace.id,reference:workspace.branch,workingDirectories});
+        rememberArtifacts(...candidateArtifacts(candidate));
+        const report=await workspaces.verify({candidateId:candidate.id,commands});rememberArtifacts(report.logArtifact);
+        return {repository,checks:checkResults(report,candidate.commit)};
+      }finally{await workspaces.dispose(workspace.id);}
     },
     async reconcileIntegration(project, candidate) {
       const result = await workspaces.reconcileIntegration({ candidateId: candidate.id, projectPath: project.path });
@@ -403,7 +440,7 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
         if (record.status === 'prepared') { patchWorker(record.id, { goal, project: currentProject }); track(record.id, () => executeLocal(worker(record.id), prompt)); }
       } else await rpc(attempt.deviceId, 'POST', `/api/factory/worker/${attempt.id}/execute`, {
         // A branch repair advances coordinator authority without replacing this worker's assignment.
-        prompt, goal: { ...goal, revision: assignmentGoalRevision ?? goal.revision }, project: { ...currentProject, path: '' },
+        prompt, goal: { ...goal, revision: assignmentGoalRevision ?? goal.revision }, project: publicWorkerProject(currentProject),
       });
       const record = await waitWorker(attempt.deviceId, attempt.id, 'finished');
       return record.result || { status: record.status === 'failed' ? 'failed' : 'unknown', text: '', error: record.error, sessionId: record.sessionId, chatId: record.chatId };
@@ -570,10 +607,13 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
         throw new HttpError(400, 'The worker assignment does not match its coordinator, task and device.');
       for (const value of [attempt.id, task.id, goal.id]) if (typeof value !== 'string' || !/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,79}$/.test(value)) throw new HttpError(400, 'Invalid factory identity.');
       const source = body.source as ArtifactManifest; await importReceived(peerId, source);
+      const workingDirectorySources=body.workingDirectorySources as WorkingDirectorySource[]|undefined;
+      if(project.workingDirectories?.length&&!workingDirectorySources?.length)throw new HttpError(409,'The coordinator did not transfer the configured additional working folders.');
+      for(const root of workingDirectorySources||[])await importReceived(peerId,root.sourceArtifact);
       const previousCandidate = body.previousCandidate as CandidateRef | undefined;
       if (previousCandidate) await acceptRemoteCandidate(peerId, previousCandidate);
       app.assertRuntimeCanRun();
-      const record = beginWorker({ id: attempt.id, coordinatorId: peerId, goal, task, attempt, project });
+      const record = beginWorker({ id: attempt.id, coordinatorId: peerId, goal, task, attempt, project, workingDirectorySources });
       app.store.set<GoalOptions>('factory-options', { id: goal.id, workspaceProvider: body.workspaceProvider === 'artifactfs' ? 'artifactfs' : 'git' });
       if (record.status === 'preparing') track(record.id, async () => {
         const sourcePath = path.join(app.dataDir, 'worker-source', record.id);
@@ -609,7 +649,7 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
       track(`capture-${record.id}`, async () => {
         try {
           const candidate = await captureLocal(record.id) as unknown as Candidate;
-          await sendArtifact(peerId, candidate.bundleArtifact); await sendArtifact(peerId, candidate.diffArtifact);
+          for(const artifact of candidateArtifacts(candidate))await sendArtifact(peerId,artifact);
           patchWorker(record.id, { error: undefined });
         } catch (error) { patchWorker(record.id, { error: (error as Error).message }); }
       });

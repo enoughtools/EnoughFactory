@@ -1,0 +1,24 @@
+.working-directory-mounts { min-width: 0; color: var(--factory-ink); }
+.task-inspector .working-directory-mounts { margin-bottom: 18px; }
+.working-directory-mounts > h3 { display: flex; align-items: center; gap: 8px; margin: 0 0 8px; font-size: 12px; font-weight: 500; }
+.working-directory-mounts > h3 > span { color: var(--factory-secondary); font-weight: 400; }
+.working-directory-mounts .wdm-caption { margin: 6px 0; color: var(--factory-secondary); font-size: 11px; line-height: 1.45; overflow-wrap: anywhere; }
+.working-directory-mounts .wdm-list { margin: 8px 0 0; padding: 0; list-style: none; }
+.working-directory-mounts .wdm-mount { min-width: 0; padding: 10px 0; border-top: 1px solid var(--factory-line); }
+.working-directory-mounts .wdm-heading { display: flex; align-items: center; flex-wrap: wrap; gap: 5px 10px; min-width: 0; }
+.working-directory-mounts .wdm-heading > strong { min-width: 0; overflow-wrap: anywhere; font-size: 12px; font-weight: 500; }
+.working-directory-mounts .wdm-kind { color: var(--factory-secondary); font-size: 10px; }
+.working-directory-mounts .wdm-heading .badge-status { font-size: 10px; }
+.working-directory-mounts .wdm-path { display: block; margin-top: 6px; font-size: 11px; line-height: 1.5; overflow-wrap: anywhere; white-space: pre-wrap; }
+.working-directory-mounts .wdm-details { margin-top: 7px; font-size: 11px; }
+.working-directory-mounts .wdm-details > summary { cursor: pointer; color: var(--factory-secondary); }
+.working-directory-mounts .wdm-details dl { display: grid; gap: 5px; margin: 8px 0 0; }
+.working-directory-mounts .wdm-details dl > div { display: grid; grid-template-columns: minmax(90px, .35fr) minmax(0, 1fr); gap: 8px; }
+.working-directory-mounts .wdm-details dt { color: var(--factory-secondary); }
+.working-directory-mounts .wdm-details dd { min-width: 0; margin: 0; overflow-wrap: anywhere; }
+.working-directory-mounts .wdm-exports { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
+.working-directory-mounts .wdm-exports [data-slot="button"] { height: 26px; min-height: 26px; padding: 4px 7px; font-size: 11px; }
+.working-directory-mounts .wdm-error { margin: 6px 0; color: var(--factory-danger, #b23b32); font-size: 11px; line-height: 1.45; overflow-wrap: anywhere; white-space: pre-wrap; }
+.working-directory-mounts.compact > h3 { margin-bottom: 5px; font-size: 11px; }
+.working-directory-mounts.compact .wdm-mount { padding: 8px 0; }
+.working-directory-mounts.compact .wdm-caption { font-size: 10px; }

@@ -4,7 +4,8 @@ import { join, resolve, dirname, isAbsolute } from "node:path";
 import { ArtifactStore, writeAtomic } from "./artifacts.ts";
 import { dockerCheckExecutor } from "./checks.ts";
 import { git, run, safeId } from "./process.ts";
-import type { ArtifactManifest, Candidate, CheckExecutor, CheckReport, IntegrationResult, ManagedWorkspaceProvider, WorkspaceProvider, WorkspaceRecord } from "./types.ts";
+import { WorkingDirectoryManager, workingDirectoryEmptyDirectories } from "./working-directories.ts";
+import type { ArtifactManifest, Candidate, CheckContext, CheckExecutor, CheckReport, IntegrationResult, ManagedWorkspaceProvider, WorkingDirectoryCapture, WorkspaceProvider, WorkspaceRecord } from "./types.ts";
 
 export interface WorkspaceManagerOptions {
   dataDir: string;
@@ -18,12 +19,14 @@ export class WorkspaceManager {
   readonly artifacts: ArtifactStore;
   private readonly root: string;
   private readonly executor: CheckExecutor;
+  private readonly workingDirectories: WorkingDirectoryManager;
   private readonly integrations = new Map<string, Promise<unknown>>();
 
   constructor(private readonly options: WorkspaceManagerOptions) {
     this.root = resolve(options.dataDir);
     this.artifacts = new ArtifactStore(join(this.root, "artifacts"), options.deviceId);
     this.executor = options.checkExecutor ?? dockerCheckExecutor();
+    this.workingDirectories = new WorkingDirectoryManager({ dataDir: this.root, artifacts: this.artifacts });
   }
 
   async create(input: { projectPath: string; goalId: string; taskId: string; attemptId: string; baseCommit?: string; provider?: WorkspaceProvider; fallbackToGit?: boolean; sessionName?: string; workspaceBranch?: string }): Promise<WorkspaceRecord> {
@@ -80,7 +83,7 @@ export class WorkspaceManager {
   }
 
   /** Call after writers stop and envmux harvests. Providers may create an explicit preservation commit in their private attempt. */
-  async capture(input: { workspaceId: string; repositoryPath?: string; reference?: string }): Promise<Candidate> {
+  async capture(input: { workspaceId: string; repositoryPath?: string; reference?: string; workingDirectories?: WorkingDirectoryCapture[] }): Promise<Candidate> {
     const workspace = await this.workspace(input.workspaceId);
     const provided = workspace.provider === "artifactfs" ? await this.options.artifactFs?.capture?.(workspace) : undefined;
     const path = input.repositoryPath ?? provided?.repositoryPath ?? workspace.path;
@@ -109,7 +112,8 @@ export class WorkspaceManager {
       const bundleArtifact = await this.artifacts.putFile(bundlePath, { ...metadata, name: `candidate-${id}.bundle`, mime: "application/x-git-bundle", metadata: { commit, ref, baseCommit: workspace.baseCommit } });
       const diff = await git(path, "diff", "--binary", workspace.baseCommit, commit);
       const diffArtifact = await this.artifacts.put(diff, { ...metadata, name: `candidate-${id}.patch`, mime: "text/x-diff", metadata: { commit, baseCommit: workspace.baseCommit } });
-      const candidate: Candidate = { id, workspaceId: workspace.id, ...metadata, deviceId: this.options.deviceId, baseCommit: workspace.baseCommit, commit, branch: reference, bundleArtifact, diffArtifact, repairConflicts: workspace.repairConflicts, createdAt: new Date().toISOString() };
+      const candidate: Candidate = { id, workspaceId: workspace.id, ...metadata, deviceId: this.options.deviceId, baseCommit: workspace.baseCommit, commit, branch: reference, bundleArtifact, diffArtifact, repairConflicts: workspace.repairConflicts, workingDirectories: input.workingDirectories, createdAt: new Date().toISOString() };
+      validateCandidate(candidate);
       await mkdir(join(this.root, "candidates"), { recursive: true });
       await writeFile(join(this.root, "candidates", `${id}.json`), JSON.stringify(candidate), { flag: "wx", mode: 0o600 });
       return candidate;
@@ -125,13 +129,17 @@ export class WorkspaceManager {
     try {
       await this.cloneCandidate(candidate, temporary);
       await git(temporary, "merge-base", "--is-ancestor", candidate.baseCommit, candidate.commit);
+      await this.importWorkingDirectories(candidate, `${temporary}-working-directories`);
       await mkdir(join(this.root, "candidates"), { recursive: true });
       const candidatePath = join(this.root, "candidates", `${candidate.id}.json`);
       try { await writeFile(candidatePath, JSON.stringify(candidate), { flag: "wx", mode: 0o600 }); } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
         if (JSON.stringify(await this.candidate(candidate.id)) !== JSON.stringify(candidate)) throw new Error("Candidate identifier already belongs to different immutable evidence");
       }
-    } finally { await rm(temporary, { recursive: true, force: true }); }
+    } finally {
+      await rm(temporary, { recursive: true, force: true });
+      await rm(`${temporary}-working-directories`, { recursive: true, force: true });
+    }
   }
 
   async exportSource(input: { projectPath: string; reference?: string }): Promise<ArtifactManifest> {
@@ -178,6 +186,30 @@ export class WorkspaceManager {
     if (actual !== candidate.commit) throw new Error("Candidate bundle does not resolve to its claimed exact commit");
   }
 
+  private async importWorkingDirectories(candidate: Candidate, directory: string): Promise<NonNullable<CheckContext["workingDirectories"]>> {
+    const roots: NonNullable<CheckContext["workingDirectories"]> = [];
+    for (const capture of candidate.workingDirectories ?? []) {
+      // The captured bundle and patch must already be cached at this authority. Importing into
+      // a fresh owned repository proves the advertised commit and baseline before any checks.
+      await this.artifacts.path(capture.diffArtifact);
+      const path = join(directory, safeId(capture.id));
+      await this.workingDirectories.importCapture(capture, path);
+      const actual = await workingDirectoryGit(path, "rev-parse", "HEAD");
+      if (actual !== capture.commit) throw new Error("Working-directory snapshot does not resolve to its claimed exact commit");
+      await workingDirectoryGit(path, "merge-base", "--is-ancestor", capture.baseCommit, capture.commit);
+      roots.push({ path, containerPath: capture.containerPath, commit: capture.commit });
+    }
+    return roots;
+  }
+
+  private async releaseCheck(path: string): Promise<void> {
+    try { await this.executor.release?.(path); }
+    finally {
+      await rm(path, { recursive: true, force: true });
+      await rm(`${path}-working-directories`, { recursive: true, force: true });
+    }
+  }
+
   async verify(input: { candidateId: string; commands: string[]; baseCommit?: string; signal?: AbortSignal }): Promise<CheckReport> {
     const candidate = await this.candidate(input.candidateId);
     const path = join(this.root, "checks", randomUUID());
@@ -187,15 +219,16 @@ export class WorkspaceManager {
         throw new Error("Combined checks require integrate() so the current target commit is imported and merged exactly");
       }
       return await this.checkAt(candidate, path, candidate.commit, input.commands, input.signal, input.baseCommit);
-    } finally { await this.executor.release?.(path); await rm(path, { recursive: true, force: true }); }
+    } finally { await this.releaseCheck(path); }
   }
 
   private async checkAt(candidate: Candidate, path: string, commit: string, commands: string[], signal?: AbortSignal, baseCommit?: string): Promise<CheckReport> {
+    const workingDirectories = await this.importWorkingDirectories(candidate, `${path}-working-directories`);
     const report: CheckReport = { id: randomUUID(), candidateId: candidate.id, commit, baseCommit, status: commands.length ? "passed" : "not-configured", commands: [], logArtifact: undefined as unknown as ArtifactManifest, createdAt: new Date().toISOString() };
     for (const command of commands) {
       if (signal?.aborted) { report.status = "canceled"; break; }
       let result;
-      try { result = await this.executor({ path, commit, candidate, command, timeoutMs: this.options.checkTimeoutMs ?? 15 * 60 * 1000, signal }); }
+      try { result = await this.executor({ path, commit, candidate, workingDirectories, command, timeoutMs: this.options.checkTimeoutMs ?? 15 * 60 * 1000, signal }); }
       catch (error) { result = { command, exitCode: 1, stdout: "", stderr: error instanceof Error ? error.message : String(error), startedAt: new Date().toISOString(), endedAt: new Date().toISOString() }; }
       report.commands.push(result);
       if (result.exitCode !== 0 || result.timedOut) { report.status = signal?.aborted ? "canceled" : "failed"; break; }
@@ -203,6 +236,11 @@ export class WorkspaceManager {
     // Checks that edit tracked files cannot attest the original candidate after those edits.
     const dirty = await git(path, "status", "--porcelain", "--untracked-files=no");
     const actualHead = await git(path, "rev-parse", "HEAD");
+    const rootStates = await Promise.all(workingDirectories.map(async (root, index) => {
+      const expectedEmptyDirectories = candidate.workingDirectories![index]!.bundleArtifact.metadata?.emptyDirectories ?? [];
+      const emptyDirectories = await workingDirectoryEmptyDirectories(root.path);
+      return { containerPath: root.containerPath, commit: root.commit, dirty: await workingDirectoryGit(root.path, "status", "--porcelain", "--untracked-files=all"), actualHead: await workingDirectoryGit(root.path, "rev-parse", "HEAD"), emptyDirectories, expectedEmptyDirectories, emptyDirectoriesMatch: JSON.stringify(emptyDirectories) === JSON.stringify(expectedEmptyDirectories) };
+    }));
     const unresolved: string[] = [];
     for (const file of candidate.repairConflicts ?? []) {
       // Read the immutable Git object; a candidate symlink must never cause a host filesystem read.
@@ -210,8 +248,8 @@ export class WorkspaceManager {
       const contents = blob.exitCode === 0 ? blob.stdout : "";
       if (/^<{7} /m.test(contents) && /^>{7} /m.test(contents)) unresolved.push(file);
     }
-    if (dirty || actualHead !== commit || unresolved.length) report.status = "failed";
-    report.logArtifact = await this.artifacts.put(JSON.stringify({ ...report, logArtifact: undefined, dirty, actualHead, unresolved }), { name: `checks-${report.id}.json`, mime: "application/json", goalId: candidate.goalId, taskId: candidate.taskId, attemptId: candidate.attemptId, metadata: { commit, candidateId: candidate.id } });
+    if (dirty || actualHead !== commit || unresolved.length || rootStates.some(root => root.dirty || root.actualHead !== root.commit || !root.emptyDirectoriesMatch)) report.status = "failed";
+    report.logArtifact = await this.artifacts.put(JSON.stringify({ ...report, logArtifact: undefined, dirty, actualHead, unresolved, workingDirectories: rootStates }), { name: `checks-${report.id}.json`, mime: "application/json", goalId: candidate.goalId, taskId: candidate.taskId, attemptId: candidate.attemptId, metadata: { commit, candidateId: candidate.id } });
     await mkdir(join(this.root, "reports"), { recursive: true });
     await writeFile(join(this.root, "reports", `${report.id}.json`), JSON.stringify(report), { flag: "wx", mode: 0o600 });
     return report;
@@ -279,8 +317,7 @@ export class WorkspaceManager {
       return accepted;
     } finally {
       await git(input.projectPath, "update-ref", "-d", temporaryRef).catch(() => undefined);
-      await this.executor.release?.(path);
-      await rm(path, { recursive: true, force: true });
+      await this.releaseCheck(path);
     }
   }
 
@@ -355,11 +392,31 @@ export class WorkspaceManager {
 }
 
 async function exists(path: string): Promise<boolean> { try { await access(path); return true; } catch { return false; } }
+async function workingDirectoryGit(path: string, ...args: string[]): Promise<string> {
+  // Imported trees can contain attributes, but their interpretation must never invoke a user's
+  // global Git filters or monitors while the service attests the private captured snapshot.
+  const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("GIT_")));
+  const result = await run("git", ["-C", path, "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", "-c", "core.attributesFile=/dev/null", ...args], { inheritEnv: false, env: { ...env, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null", GIT_OPTIONAL_LOCKS: "0", GIT_TERMINAL_PROMPT: "0" }, timeoutMs: 30_000 });
+  if (result.exitCode !== 0) throw new Error(`Working-directory Git ${args[0]} failed: ${result.stderr.trim() || result.stdout.trim()}`);
+  return result.stdout.trim();
+}
 function validateCandidate(candidate: Candidate): void {
   for (const value of [candidate.id, candidate.workspaceId, candidate.goalId, candidate.taskId, candidate.attemptId]) safeId(value);
   for (const commit of [candidate.baseCommit, candidate.commit]) if (!/^[a-f0-9]{40,64}$/.test(commit)) throw new Error("Candidate must identify exact Git commits");
   for (const path of candidate.repairConflicts ?? []) {
     if (isAbsolute(path) || path.includes("\0") || path.split(/[\\/]/).includes("..")) throw new Error("Invalid candidate conflict path");
+  }
+  const rootIds = new Set<string>();
+  const destinations = new Set<string>();
+  if (candidate.workingDirectories && (!Array.isArray(candidate.workingDirectories) || candidate.workingDirectories.length > 8)) throw new Error("Candidate supports at most eight working-directory snapshots");
+  for (const root of candidate.workingDirectories ?? []) {
+    safeId(root.id);
+    if (rootIds.has(root.id.toLowerCase()) || destinations.has(root.containerPath.toLowerCase())) throw new Error("Candidate repeats a working-directory snapshot");
+    if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,47}$/.test(root.name) || root.containerPath !== `/workspaces/${root.name}`) throw new Error("Invalid candidate working-directory destination");
+    if (root.kind !== "git" && root.kind !== "folder") throw new Error("Invalid candidate working-directory kind");
+    for (const commit of [root.baseCommit, root.commit]) if (!/^[a-f0-9]{40,64}$/.test(commit)) throw new Error("Working-directory snapshots must identify exact Git commits");
+    rootIds.add(root.id.toLowerCase());
+    destinations.add(root.containerPath.toLowerCase());
   }
 }
 async function copyIdentity(source: string, target: string): Promise<void> {

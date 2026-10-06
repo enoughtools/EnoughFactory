@@ -1,6 +1,8 @@
 import type { Artifact, Attempt, AttemptInspection, ControllerRun, Device, FactoryTask, Goal, GoalInspection, Project, TaskCheck, TaskInspection, TaskOverview } from '@enoughfactory/contracts';
 import type { AttemptDetail, ControlRecord, FactoryStore, PlanRecord, TaskDetail } from '@enoughfactory/factory';
 import { activeExecutionTasks, taskSchedulingBlocker } from '@enoughfactory/factory';
+import type { WorkingDirectoryCapture } from '@enoughfactory/workspaces';
+import type { WorkingDirectoryMount } from '@enoughfactory/contracts';
 
 /** Shared by read inspection and manual dispatch. Current execution contracts own reservations. */
 export function taskDispatchBlocker(store: FactoryStore, devices: Device[], task: FactoryTask, goal: Goal) {
@@ -31,8 +33,10 @@ export function taskControlReason(task: FactoryTask, control: ControlRecord | un
 export function inspectAttempt(store: FactoryStore, attempt: Attempt): AttemptInspection {
   const detail = store.get<AttemptDetail>('factory-attempt-details', attempt.id);
   const candidate = detail?.candidate, workspace = detail?.workspace, result = detail?.result, integration = detail?.integration;
+  const captures=candidate?.workingDirectories as WorkingDirectoryCapture[]|undefined;
+  const workingDirectories=captures?.map(root=>({id:root.id,name:root.name,path:root.containerPath,kind:root.kind,baseCommit:root.baseCommit,status:'captured' as const,capture:{commit:root.commit,bundleArtifactId:root.bundleArtifact.id,diffArtifactId:root.diffArtifact.id}}))||workspace?.workingDirectories as WorkingDirectoryMount[]|undefined;
   return { attempt, phase: detail?.phase, cancellation: detail?.cancellation, contract: detail?.contract,
-    ...(workspace ? { workspace: { id: workspace.id, provider: workspace.provider, baseCommit: workspace.baseCommit, sessionId: workspace.sessionId, deviceId: workspace.deviceId } } : {}),
+    ...(workspace ? { workspace: { id: workspace.id, provider: workspace.provider, baseCommit: workspace.baseCommit, sessionId: workspace.sessionId, deviceId: workspace.deviceId,workingDirectories } } : {}),
     ...(candidate ? { candidate: { id: candidate.id, commit: candidate.commit, baseCommit: candidate.baseCommit, branch: candidate.branch, tree: candidate.tree, deviceId: candidate.deviceId } } : {}),
     ...(result ? { result: { status: result.status, text: result.text, error: result.error, waitReason: result.waitReason, wakeCondition: result.wakeCondition } } : {}),
     ...(detail?.checks ? { checks: detail.checks.map(publicCheck) } : {}),

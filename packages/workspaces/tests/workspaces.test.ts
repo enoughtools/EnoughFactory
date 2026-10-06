@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtemp, mkdir, writeFile, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { WorkspaceManager, ArtifactStore, dockerCheckExecutor } from "../src/index.ts";
+import { WorkspaceManager, WorkingDirectoryManager, ArtifactStore, dockerCheckExecutor } from "../src/index.ts";
 import { git, run } from "../src/process.ts";
 import type { CheckExecutor } from "../src/types.ts";
 
@@ -98,6 +98,55 @@ test("conflicting candidates retain immutable evidence and corrupt peer artifact
     const corrupt = join(root, "corrupt.bundle"); await writeFile(corrupt, "wrong bytes");
     const artifacts = new ArtifactStore(join(root, "receiver"), "device-b");
     await assert.rejects(artifacts.importFile(corrupt, candidate.bundleArtifact), /does not match/);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("checks use retained secondary snapshots, reject their changed trees or heads and leave source folders untouched", async () => {
+  const { root, project, manager } = await fixture();
+  try {
+    const source = join(root, "secondary-source");
+    await mkdir(source);
+    await writeFile(join(source, "reference.txt"), "original source\n");
+    const directories = new WorkingDirectoryManager({ dataDir: join(root, "data"), artifacts: manager.artifacts });
+    const [snapshot] = await directories.prepare({ identity: "secondary-attempt", sources: [{ id: "reference", name: "reference", path: source }] });
+    const exported = join(root, "data", "secondary-export");
+    await mkdir(exported);
+    await writeFile(join(exported, "reference.txt"), "retained output\n");
+    const capture = await directories.captureFromPath(snapshot!, exported);
+    const workspace = await manager.create({ projectPath: project, goalId: "goal", taskId: "task", attemptId: "secondary-attempt" });
+    const candidate = await manager.capture({ workspaceId: workspace.id, workingDirectories: [capture] });
+    const contexts = new Map<string, string>();
+    const check: CheckExecutor = async context => {
+      const [secondary] = context.workingDirectories ?? [];
+      assert.ok(secondary);
+      assert.equal(secondary.containerPath, "/workspaces/reference");
+      assert.equal(secondary.commit, capture.commit);
+      assert.notEqual(secondary.path, source);
+      assert.notEqual(secondary.path, snapshot!.path);
+      assert.equal(await git(secondary.path, "rev-parse", "HEAD"), capture.commit);
+      assert.equal(await readFile(join(secondary.path, "reference.txt"), "utf8"), "retained output\n");
+      if (contexts.has(context.path)) assert.equal(secondary.path, contexts.get(context.path));
+      contexts.set(context.path, secondary.path);
+      if (context.command === "change-tree") await writeFile(join(secondary.path, "reference.txt"), "check mutation\n");
+      if (context.command === "change-head") await git(secondary.path, "reset", "--hard", capture.baseCommit);
+      if (context.command === "add-untracked") await writeFile(join(secondary.path, "unexpected.txt"), "unchecked input\n");
+      return { command: context.command, exitCode: 0, stdout: "", stderr: "", startedAt: new Date().toISOString(), endedAt: new Date().toISOString() };
+    };
+    const receiver = new WorkspaceManager({ dataDir: join(root, "receiver"), deviceId: "device-b", checkExecutor: check });
+    for (const artifact of [capture.bundleArtifact, capture.diffArtifact]) await receiver.artifacts.importFile(await manager.artifacts.path(artifact), artifact);
+    await receiver.acceptCandidate(candidate, await manager.artifacts.path(candidate.bundleArtifact), await manager.artifacts.path(candidate.diffArtifact));
+    assert.equal((await receiver.verify({ candidateId: candidate.id, commands: ["inspect", "inspect"] })).status, "passed");
+    for (const command of ["change-tree", "change-head", "add-untracked"]) {
+      const report = await receiver.verify({ candidateId: candidate.id, commands: [command] });
+      assert.equal(report.status, "failed");
+      const evidence = JSON.parse((await receiver.artifacts.read(report.logArtifact)).toString());
+      assert.equal(evidence.workingDirectories[0].containerPath, "/workspaces/reference");
+      assert.ok(evidence.workingDirectories[0].dirty || evidence.workingDirectories[0].actualHead !== capture.commit);
+    }
+    assert.equal((await receiver.integrate({ candidateId: candidate.id, projectPath: project, commands: ["inspect"], isCurrent: () => true })).status, "integrated");
+    assert.equal(await readFile(join(source, "reference.txt"), "utf8"), "original source\n");
+    assert.equal(await git(project, "status", "--porcelain"), "");
+    for (const path of contexts.values()) await assert.rejects(readFile(join(path, "reference.txt")), /ENOENT/);
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 

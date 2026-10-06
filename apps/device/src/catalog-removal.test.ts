@@ -97,7 +97,7 @@ test('idle service handoff rechecks activity atomically and blocks new work whil
   t.mock.method(app,'scheduleServiceShutdown',()=>{scheduled++;});
   app.serviceHandoffHooks.push(()=>{claimed++;});
   const status=()=>request<{canUpdate:boolean;idleShutdown:boolean;busy:string[]}>('GET','/api/service/update-status');
-  const shutdown=()=>request('POST','/api/service/shutdown',{onlyIfIdle:true,expectedVersion:'0.1.5'});
+  const shutdown=()=>request('POST','/api/service/shutdown',{onlyIfIdle:true,expectedVersion:'0.1.6'});
   assert.equal((await request('GET','/api/service/update-status',undefined,false)).status,401);
   assert.deepEqual((await status()).body,{canUpdate:true,idleShutdown:true,busy:[]});
   const chat:Chat={id:'working-chat',sessionId:'environment',deviceId:app.device.id,title:'Working',runtime:'codex',approvalMode:'approve-all',status:'running',createdAt:at,updatedAt:at};

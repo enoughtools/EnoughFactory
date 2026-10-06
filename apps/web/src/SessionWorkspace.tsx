@@ -1,6 +1,6 @@
 import type { ChangeEvent } from "react";
 import { lazy, Suspense, useEffect, useRef, useState } from 'react';
-import type { FactoryState, RepositoryChanges, Session } from '@enoughfactory/contracts';
+import type { FactoryState, RepositoryChanges, Session, WorkingDirectoryMount } from '@enoughfactory/contracts';
 import { ResizableHandle, ResizablePanel, ResizablePanelGroup } from '@enoughtools/ui-react';
 import { Activity, ArrowLeft, ArrowRight, ArrowUpRight, Box, GitBranch, Globe, LoaderCircle, MessageSquare, Play, RotateCcw, Square, TerminalSquare } from 'lucide-react';
 import type { DeviceClient } from './api';
@@ -8,6 +8,7 @@ import { useResource } from './hooks';
 import { ChatPane } from './ChatPane';
 import { RuntimePanel } from './RuntimePanel';
 import { RemoveEnvironmentAction } from './WorkspaceRemoval';
+import { WorkingDirectoryMounts } from './WorkingDirectoryMounts';
 import { Button, EmptyState, Input, Loading, PageHeader, Panel, Status } from './ui';
 import './repository-changes.css';
 
@@ -23,23 +24,53 @@ function Output({ client, session, task }: { client: DeviceClient; session: Sess
   return <div className="output-pane"><div className="output-toolbar"><span><Activity size={14} />{task === 'stdout' ? 'Environment output' : task}</span><label><input type="checkbox" checked={following} onChange={(event: ChangeEvent<HTMLInputElement>) => setFollowing(event.target.checked)} />Follow output</label></div>{loading ? <Loading>Loading output…</Loading> : error ? <div className="error-banner">{error}</div> : <pre ref={output} className="code-output live-output">{data || 'No output yet.'}</pre>}</div>;
 }
 
-function Changes({ client, session }: { client: DeviceClient; session: Session }) {
+function RepositoryChangesView({ client, session, rootId }: { client: DeviceClient; session: Session; rootId: string }) {
   const [selectedPath, setSelectedPath] = useState<string | null>(null);
-  const { data, error, loading } = useResource<RepositoryChanges>(client, `/api/sessions/${session.id}/changes`, session.status === 'ready' ? 5000 : 0);
-  const selected = useResource<RepositoryChanges>(client, selectedPath ? `/api/sessions/${session.id}/changes?path=${encodeURIComponent(selectedPath)}` : null, selectedPath && session.status === 'ready' ? 5000 : 0);
+  const rootQuery = rootId ? `root=${encodeURIComponent(rootId)}` : '';
+  const endpoint = `/api/sessions/${encodeURIComponent(session.id)}/changes`;
+  const { data, error, loading } = useResource<RepositoryChanges>(client, `${endpoint}${rootQuery ? `?${rootQuery}` : ''}`, session.status === 'ready' ? 5000 : 0);
+  const selected = useResource<RepositoryChanges>(client, selectedPath ? `${endpoint}?${rootQuery ? `${rootQuery}&` : ''}path=${encodeURIComponent(selectedPath)}` : null, selectedPath && session.status === 'ready' ? 5000 : 0);
   useEffect(() => setSelectedPath(null), [session.id]);
   if (loading) return <Loading>Reading repository changes…</Loading>;
   if (error) return <EmptyState icon={<GitBranch size={32} />} title="Changes are unavailable">{error}</EmptyState>;
   const selectedMatches = selected.data?.path === selectedPath;
   const view = selectedPath ? selectedMatches ? selected.data : null : data;
   const hasChanges = Boolean(data?.files?.length || data?.status);
-  return <div className="changes-pane"><div className="changes-header"><GitBranch size={16} /><strong>{data?.branch || session.branch || 'Working tree'}</strong>{data?.head && <span>{data.head.slice(0, 8)}</span>}</div>
+  return <div className="repository-changes-content"><div className="changes-header"><GitBranch size={16} /><strong>{data?.branch || (!rootId && session.branch) || 'Working tree'}</strong>{data?.head && <span>{data.head.slice(0, 8)}</span>}</div>
     {data?.files?.length ? <div className="changed-files" aria-label="Changed files">
       <button className={!selectedPath ? 'selected' : ''} aria-pressed={!selectedPath} onClick={() => setSelectedPath(null)}>Tracked changes<span>{data.files.length} changed {data.files.length === 1 ? 'file' : 'files'}</span></button>
       {data.files.map(file => <button key={file.path} className={selectedPath === file.path ? 'selected' : ''} aria-pressed={selectedPath === file.path} onClick={() => setSelectedPath(file.path)}><code>{file.path}</code><span>{file.indexStatus === '?' && file.workingTreeStatus === '?' ? 'New file' : file.indexStatus === 'D' || file.workingTreeStatus === 'D' ? 'Deleted' : file.indexStatus === 'R' || file.workingTreeStatus === 'R' ? 'Renamed' : 'Modified'}</span></button>)}
     </div> : data?.status && <pre className="code-output git-status">{data.status}</pre>}
     {selectedPath && <div className="changes-file-heading"><code>{selectedPath}</code></div>}
     {selectedPath && (selected.loading || (!selectedMatches && !selected.error)) ? <Loading>Reading file changes…</Loading> : selectedPath && selected.error ? <div className="error-banner">{selected.error}</div> : view?.diff ? <><pre className="code-output git-diff">{view.diff.split('\n').map((line, index) => <span className={line.startsWith('+') && !line.startsWith('+++') ? 'diff-added' : line.startsWith('-') && !line.startsWith('---') ? 'diff-removed' : line.startsWith('@@') ? 'diff-context' : ''} key={index}>{line}{'\n'}</span>)}</pre>{view.truncated && <p className="changes-file-heading">Diff limited to the first 2 MiB.</p>}</> : <EmptyState icon={<GitBranch size={32} />} title={selectedPath ? 'No text diff' : hasChanges ? 'Files have uncommitted changes' : 'No uncommitted changes'}>{selectedPath ? 'This changed file has no text patch to display.' : hasChanges ? 'Select a file to read its changes, including new files.' : 'Changes in this live workspace appear here as you work.'}</EmptyState>}
+  </div>;
+}
+
+function Changes({ client, session, state, run }: { client: DeviceClient; session: Session; state: FactoryState; run: Run }) {
+  const [rootId, setRootId] = useState('');
+  const [capturing, setCapturing] = useState(false);
+  const [captureError, setCaptureError] = useState<string | null>(null);
+  const recordedRoots = session.workingDirectories ?? [];
+  const mounted = useResource<WorkingDirectoryMount[]>(client, recordedRoots.length ? `/api/sessions/${encodeURIComponent(session.id)}/working-directories` : null, recordedRoots.length && session.status === 'ready' ? 5000 : 0);
+  const roots = mounted.data ?? recordedRoots;
+  const root = roots.find(item => item.id === rootId);
+  const offline = state.devices.find(device => device.id === session.deviceId)?.online === false;
+  const agentActive = state.chats.some(chat => chat.sessionId === session.id && ['running', 'waiting'].includes(chat.status));
+  useEffect(() => { setRootId(''); setCaptureError(null); }, [session.id]);
+  useEffect(() => { if (rootId && !roots.some(item => item.id === rootId)) setRootId(''); }, [rootId, roots]);
+  async function capture() {
+    if (capturing) return;
+    setCapturing(true); setCaptureError(null);
+    try {
+      await run(async () => {
+        try { await client.post(`/api/sessions/${encodeURIComponent(session.id)}/working-directories/capture`); await mounted.refresh(); }
+        catch (cause) { setCaptureError(cause instanceof Error ? cause.message : String(cause)); throw cause; }
+      });
+    } finally { setCapturing(false); }
+  }
+  return <div className="changes-pane">
+    {roots.length > 0 && <><div className="changes-root-toolbar"><label htmlFor={`changes-root-${session.id}`}>Working folder</label><select id={`changes-root-${session.id}`} value={rootId} onChange={event => setRootId(event.target.value)}><option value="">Primary repository · automatic integration</option>{roots.map(item => <option key={item.id} value={item.id}>{item.name} · {item.kind === 'git' ? 'Repository' : 'Folder'} · {item.status}</option>)}</select><Button variant="outline" size="sm" disabled={capturing || offline || session.status !== 'ready' || agentActive} onClick={() => void capture()} title={agentActive ? 'Wait for the agent to finish before capturing additional folders.' : 'Retain the current edits in all additional folders.'}>{capturing ? 'Capturing…' : 'Capture folders'}</Button></div>{agentActive && <p className="changes-root-hint">Additional folders can be captured after the agent finishes. Their current changes remain inspectable.</p>}{mounted.error && <p className="changes-root-error" role="status">Mount status unavailable: {mounted.error}</p>}{captureError && <div className="error-banner" role="alert">{captureError}</div>}{root ? <WorkingDirectoryMounts key={root.id} mounts={[root]} deviceId={session.deviceId} client={client} run={run} offline={offline} compact /> : <details className="changes-mounted-roots"><summary>Additional working folders · {roots.length}</summary><WorkingDirectoryMounts mounts={roots} deviceId={session.deviceId} client={client} run={run} offline={offline} compact /></details>}</>}
+    <RepositoryChangesView key={`${session.id}:${rootId}`} client={client} session={session} rootId={rootId} />
   </div>;
 }
 
@@ -145,7 +176,7 @@ export function SessionWorkspace({ client, session, state, run, modalOpen, initi
       {tab === 'agent' && <ChatPane client={client} session={session} state={state} run={run} initialChatId={initialChatId} />}
       {tab === 'terminal' && <Suspense fallback={<Loading>Opening terminal…</Loading>}><TerminalPane client={client} session={session} /></Suspense>}
       {tab === 'preview' && <Preview client={client} session={session} hidden={modalOpen || removalOpen} />}
-      {tab === 'changes' && <Changes client={client} session={session} />}
+      {tab === 'changes' && <Changes client={client} session={session} state={state} run={run} />}
     </div>
   </div>;
 }

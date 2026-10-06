@@ -45,6 +45,7 @@ export class ChatController {
       return undefined;
     });
     app.closers.push(()=>this.manager.shutdown());
+    app.sessions.beforeStop.push(async sessionId=>{for(const chatId of [...this.running.keys()])if(this.get(chatId).sessionId===sessionId){await this.interrupt(chatId);await this.waitForIdle(chatId);}});
     app.runtimeStopHooks.push(async()=>{for(const chatId of [...this.running.keys()])await this.interrupt(chatId);});
   }
   get(chatId:string):Chat{const chat=this.app.store.get<Chat>('chats',chatId);if(!chat)throw new HttpError(404,'Conversation not found.');return chat;}
@@ -68,9 +69,12 @@ export class ChatController {
   run(chatId:string,prompt:string,options:RunOptions={}):Promise<TurnResult>{
     this.app.assertRuntimeCanRun();
     const chat=this.get(chatId);if(!prompt.trim())throw new HttpError(400,'Write a message.');if(this.running.has(chatId))throw new HttpError(409,'This agent is already working.');
+    this.app.sessions.assertCanStartWork(chat.sessionId);
     const binding=factoryChatBinding(this.app.store,chat,this.app.device.id);
     if(binding && !options.attemptId)options={...options,attemptId:binding.attemptId,systemInstructions:binding.instructions,autonomous:true};
     const engine=this.app.sessions.get(chat.sessionId),session=this.app.sessions.record(chat.sessionId),project=this.app.store.get<Project>('projects',session.projectId);
+    if(session.workingDirectories?.length)options={...options,systemInstructions:[options.systemInstructions,
+      `Working directories: primary repository ${engine.ready.workdir}; additional writable isolated snapshots:\n${session.workingDirectories.map(root=>`- ${root.name}: ${root.path} (${root.kind}, baseline ${root.baseCommit})`).join('\n')}\nThe factory automatically integrates only the primary repository. Edits in additional folders are captured and retained as exportable bundles and patches; originals are not automatically updated. Use these actual paths for cross-repository inspection and commands. Do not claim extra changes were applied to their original folders.`].filter(Boolean).join('\n\n')};
     if(options.systemInstructions)this.event(chatId,{kind:'message',role:'system',text:options.systemInstructions});
     this.app.store.delete('chat-results',chatId);this.app.store.delete('chat-turn-failures',chatId);
     this.event(chatId,{kind:'message',role:'user',text:prompt});this.patch(chatId,{status:'running',error:undefined,...(options.attemptId?{attemptId:options.attemptId}:{}),title:chat.title==='New conversation'?prompt.slice(0,64):chat.title});

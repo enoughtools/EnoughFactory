@@ -1,14 +1,18 @@
 import { EnvmuxEngine, type EnvmuxSession, type EnvmuxReady, type EnvmuxState } from '@enoughfactory/envmux';
-import type { Project, Session, RepositoryChanges, ContainerRuntimeStatus } from '@enoughfactory/contracts';
-import type { DockerRuntimeEndpoint } from '@enoughfactory/runtime';
+import type { Project, Session, RepositoryChanges, ContainerRuntimeStatus, WorkingDirectoryMount, Chat } from '@enoughfactory/contracts';
+import { dockerInvocation, type DockerRuntimeEndpoint } from '@enoughfactory/runtime';
+import { ArtifactStore, WorkingDirectoryManager, type WorkingDirectorySource, type WorkingDirectorySnapshot, type WorkingDirectoryCapture } from '@enoughfactory/workspaces';
 import { Store } from './store.ts';
-import { HttpError, id, now } from './util.ts';
+import { exec, HttpError, id, now } from './util.ts';
 import path from 'node:path';
+import { mkdir } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
 import { managedRepositoryReader, readRepositoryChanges } from './repository-changes.ts';
 
 interface WorkspaceBinding { bindSource:string; stateVolume:string; }
 interface PrivateSession { id: string; ready: EnvmuxReady; projectPath: string; pid?: number; workspace?:WorkspaceBinding; }
-interface LaunchRecord { id:string;projectPath:string;generation:number;dockerHost:string;workspace?:WorkspaceBinding; }
+interface LaunchRecord { id:string;projectPath:string;generation:number;dockerHost:string;workspace?:WorkspaceBinding; workingDirectorySources?:WorkingDirectorySource[]; }
+interface LaunchOptions { workspace?:WorkspaceBinding; workingDirectorySources?:WorkingDirectorySource[]; }
 interface RuntimeAccess { endpoint:DockerRuntimeEndpoint; ensureReady():Promise<DockerRuntimeEndpoint>; bridgeHostAddress():string|undefined; }
 class SessionGenerationChangedError extends HttpError {constructor(){super(409,'A newer environment connection replaced this request.');}}
 export class SessionController {
@@ -21,10 +25,14 @@ export class SessionController {
   private stopJobs = new Map<string,Promise<void>>();
   private generations = new Map<string,number>();
   private runtimeWaits = new Set<string>();
-  constructor(private store: Store, private deviceId: string, private changed: () => void, private event: (topic: string, data: unknown) => void, private runtime:RuntimeAccess) {
+  readonly beforeStop: Array<(sessionId:string)=>Promise<void>> = [];
+  directoryManager: WorkingDirectoryManager;
+  private directoryCaptures = new Map<string,Promise<WorkingDirectoryCapture[]>>();
+  constructor(private store: Store, private deviceId: string, private changed: () => void, private event: (topic: string, data: unknown) => void, private runtime:RuntimeAccess, private workspaceDataDir=path.join(path.dirname(path.dirname(runtime.endpoint.configDirectory)),'workspace-data')) {
     this.engine = new EnvmuxEngine({binary: process.env.ENOUGHFACTORY_ENVMUX_PATH,dockerRuntime:runtime.endpoint,containerHostAddress:runtime.bridgeHostAddress(),workspaceRoot: process.env.ENOUGHFACTORY_REPO||process.env.ENOUGHFACTORY_RESOURCES||path.resolve(process.cwd(),process.cwd().endsWith('/apps/device')?'../..':'.')});
+    this.directoryManager=new WorkingDirectoryManager({dataDir:workspaceDataDir,artifacts:new ArtifactStore(path.join(workspaceDataDir,'artifacts'),deviceId)});
   }
-  setDeviceId(deviceId: string): void {this.deviceId=deviceId;}
+  setDeviceId(deviceId: string): void {this.deviceId=deviceId;this.directoryManager=new WorkingDirectoryManager({dataDir:this.workspaceDataDir,artifacts:new ArtifactStore(path.join(this.workspaceDataDir,'artifacts'),deviceId)});}
   owns(sessionId:string):boolean {return (this.store.get<LaunchRecord>('session-launch',sessionId)?.dockerHost||this.store.get<PrivateSession>('session-private',sessionId)?.ready.dockerHost)===this.runtime.endpoint.host;}
   needsTermination(sessionId:string):boolean {return this.owns(sessionId)&&this.record(sessionId).status!=='stopped'&&(this.live.has(sessionId)||this.starts.has(sessionId)||Boolean(this.store.get<PrivateSession>('session-private',sessionId)));}
   serviceActivity():{starting:number;stopping:number} {return {starting:new Set([...this.starts.keys(),...this.launchJobs.keys()]).size,stopping:new Set([...this.stopping,...this.stopJobs.keys()]).size};}
@@ -61,10 +69,12 @@ export class SessionController {
     const generation=(this.generations.get(saved.id)||this.store.get<LaunchRecord>('session-launch',saved.id)?.generation||0)+1;this.generations.set(saved.id,generation);
     const current=()=>this.generations.get(saved.id)===generation;
     const engine=await this.engine.attach(saved);if(!current())throw new SessionGenerationChangedError();
-    this.live.set(saved.id,engine);const state=await engine.state();if(!current()||this.live.get(saved.id)!==engine)throw new SessionGenerationChangedError();
+    this.live.set(saved.id,engine);
+    if(this.record(saved.id).workingDirectories?.length&&!this.store.get<{id:string;complete:boolean}>('session-working-directory-provision',saved.id)?.complete)throw new HttpError(409,'Additional folders were not fully provisioned. The retained container has not been reseeded; inspect its files before restarting.');
+    const state=await engine.state();if(!current()||this.live.get(saved.id)!==engine)throw new SessionGenerationChangedError();
     await this.update(saved.id,state);this.observe(saved.id,engine,generation);return engine;
   }
-  async create(project: Project, name: string, options?: {workspace?: {bindSource:string;stateVolume:string}}): Promise<Session> {
+  async create(project: Project, name: string, options?: LaunchOptions): Promise<Session> {
     this.assertActiveProject(project);
     if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$/.test(name)) throw new HttpError(400,'Use a session name with letters, numbers, dots, underscores or hyphens.');
     if (this.store.list<Session>('sessions').some(s=>s.projectId===project.id && s.name===name && !['stopped','failed'].includes(s.status))) throw new HttpError(409,'This session already exists.');
@@ -72,12 +82,23 @@ export class SessionController {
     this.store.set('sessions',record); this.changed();
     this.launch(record,project,options);return record;
   }
-  private launch(record:Session,project:Project,options?:{workspace?:WorkspaceBinding}):void{
+  private launch(record:Session,project:Project,options?:LaunchOptions):void{
     const generation=(this.generations.get(record.id)||this.store.get<LaunchRecord>('session-launch',record.id)?.generation||0)+1;this.generations.set(record.id,generation);
-    this.store.set<LaunchRecord>('session-launch',{id:record.id,projectPath:project.path,generation,dockerHost:this.runtime.endpoint.host,workspace:options?.workspace});
+    this.store.set<LaunchRecord>('session-launch',{id:record.id,projectPath:project.path,generation,dockerHost:this.runtime.endpoint.host,workspace:options?.workspace,workingDirectorySources:options?.workingDirectorySources});
     const current=()=>this.generations.get(record.id)===generation;
     const abort = new AbortController(); this.starts.set(record.id,abort);this.runtimeWaits.add(record.id);
     const job=(async()=>{await this.runtime.ensureReady();this.runtimeWaits.delete(record.id);if(abort.signal.aborted)throw new Error('Environment startup canceled.');
+      if(options?.workingDirectorySources!==undefined?options.workingDirectorySources.length:project.workingDirectories?.length){
+        this.patch(record.id,{phase:'Snapshotting additional working folders'});
+        let roots=await this.directoryManager.sourceSnapshots(record.id);
+        if(!roots.length)roots=await this.directoryManager.prepare({identity:record.id,...(options?.workingDirectorySources?{transferred:options.workingDirectorySources}:{sources:project.workingDirectories})});
+        this.patch(record.id,{workingDirectories:roots.map(root=>this.publicRoot(root,'preparing'))});
+        this.store.set('session-launch',{...this.store.get<LaunchRecord>('session-launch',record.id)!,workingDirectorySources:roots.map(({path:_,...source})=>source)});
+        this.store.set('session-working-directory-provision',{id:record.id,complete:false});
+      }else{
+        this.store.set('session-launch',{...this.store.get<LaunchRecord>('session-launch',record.id)!,workingDirectorySources:[]});
+      }
+      if(abort.signal.aborted)throw new Error('Environment startup canceled.');
       if(current())this.patch(record.id,{phase:'Preparing environment',error:undefined});
       return this.engine.start({projectPath:project.path,name:record.name,workspace:options?.workspace,signal:abort.signal,onEvent: e=>{
       if(!current())return;
@@ -94,17 +115,19 @@ export class SessionController {
       if(!current()){await engine.stop();return;}
       this.live.set(record.id,engine);
       this.store.set<PrivateSession>('session-private',{id:record.id,ready:engine.ready,projectPath:project.path,pid:engine.process?.pid,workspace:options?.workspace});
+      await this.provisionWorkingDirectories(record.id,engine,true);
       this.patch(record.id,{status:'ready',containerId:engine.ready.instance,enginePid:engine.process?.pid,branch:engine.ready.branch});
       engine.process?.once('exit',code=>{if(!current())return; this.streams.get(record.id)?.abort(); this.streams.delete(record.id); this.live.delete(record.id);const requested=this.stopping.has(record.id);this.stopping.delete(record.id);this.patch(record.id,{status:code!==0?'failed':requested?'stopped':'unknown',phase:code!==0?'Environment stopped with an error':requested?'Work returned to Git':'Engine disconnected',error:code!==0?`Engine exited with ${code}; inspect retained work before retrying.`:undefined}); });
       const state=await engine.state();if(!current()||this.live.get(record.id)!==engine)return;
       await this.update(record.id,state); this.observe(record.id,engine,generation);
-    }).catch(error=>{if(!current())return;if(abort.signal.aborted&&this.stopping.has(record.id)){this.stopping.delete(record.id);this.patch(record.id,{status:'stopped',error:undefined,phase:'Startup canceled; retained work is preserved'});}else this.patch(record.id,{status:'failed',error:error.message,phase:'Could not prepare the environment'});}).finally(()=>{this.runtimeWaits.delete(record.id);if(this.starts.get(record.id)===abort)this.starts.delete(record.id);if(this.launchJobs.get(record.id)===job)this.launchJobs.delete(record.id);});
+    }).catch(error=>{if(!current())return;if(abort.signal.aborted&&this.stopping.has(record.id)&&!this.live.has(record.id)){this.stopping.delete(record.id);this.patch(record.id,{status:'stopped',error:undefined,phase:'Startup canceled; retained work is preserved'});}else this.patch(record.id,{status:this.live.has(record.id)?'unknown':'failed',error:error.message,phase:this.live.has(record.id)?'Environment retained; additional setup was not confirmed':'Could not prepare the environment'});}).finally(()=>{this.runtimeWaits.delete(record.id);if(this.starts.get(record.id)===abort)this.starts.delete(record.id);if(this.launchJobs.get(record.id)===job)this.launchJobs.delete(record.id);});
     this.launchJobs.set(record.id,job);
   }
   get(sessionId: string): EnvmuxSession {
     this.assertWorkAvailable(sessionId);
     const session=this.live.get(sessionId); if(!session) throw new HttpError(409,'This environment is not connected.','SESSION_UNAVAILABLE'); return session;
   }
+  assertCanStartWork(sessionId:string):void{this.assertWorkAvailable(sessionId);if(this.record(sessionId).status!=='ready'||this.stopping.has(sessionId)||this.stopJobs.has(sessionId)||this.directoryCaptures.has(sessionId))throw new HttpError(409,'Wait until the environment is ready and its working folders have finished being preserved.','ENVIRONMENT_BUSY');}
   record(sessionId: string): Session { const r=this.store.get<Session>('sessions',sessionId); if(!r) throw new HttpError(404,'Session not found.'); return r; }
   async waitReady(sessionId:string,timeoutMs=30*60_000):Promise<EnvmuxSession>{
     const started=Date.now();while(Date.now()-started<timeoutMs){const record=this.record(sessionId);if(record.status==='ready')return this.get(sessionId);if(['failed','stopped','unknown'].includes(record.status))throw new Error(record.error||record.phase||'Environment unavailable');await new Promise(resolve=>setTimeout(resolve,200));}throw new Error('Environment startup timed out.');
@@ -133,8 +156,9 @@ export class SessionController {
   private async stopSession(sessionId:string):Promise<void>{
     this.stopping.add(sessionId);
     this.patch(sessionId,{status:'stopping',phase:'Returning work to Git'});
-    if(this.starts.has(sessionId)){this.starts.get(sessionId)!.abort();await this.launchJobs.get(sessionId);if(this.record(sessionId).status==='failed')throw new Error(this.record(sessionId).error||'Startup has not confirmed termination.');return;}
-    try {let engine=this.live.get(sessionId);if(!engine){const saved=this.store.get<PrivateSession>('session-private',sessionId);if(!saved)throw new HttpError(409,'The environment owner has not confirmed its state.');engine=await this.attach(saved);}await engine.stop();}catch(error){this.stopping.delete(sessionId);this.patch(sessionId,{status:'unknown',phase:'Could not confirm work was returned',error:(error as Error).message});throw error;}
+    if(this.starts.has(sessionId)&&!this.live.has(sessionId)){this.starts.get(sessionId)!.abort();await this.launchJobs.get(sessionId);if(this.record(sessionId).status==='failed')throw new Error(this.record(sessionId).error||'Startup has not confirmed termination.');return;}
+    if(this.starts.has(sessionId))await this.launchJobs.get(sessionId);
+    try {for(const hook of this.beforeStop)await hook(sessionId);let engine=this.live.get(sessionId);if(!engine){const saved=this.store.get<PrivateSession>('session-private',sessionId);if(!saved)throw new HttpError(409,'The environment owner has not confirmed its state.');engine=await this.attach(saved);}await this.captureWorkingDirectories(sessionId);await engine.stop();}catch(error){this.stopping.delete(sessionId);this.patch(sessionId,{status:'unknown',phase:'Could not confirm work was returned; environment retained',error:(error as Error).message});throw error;}
     this.stopping.delete(sessionId);this.patch(sessionId,{status:'stopped',phase:'Work returned to Git'});
     this.streams.get(sessionId)?.abort();this.live.delete(sessionId);
   }
@@ -147,11 +171,57 @@ export class SessionController {
     if(record.status!=='stopped'){if(!saved)throw new HttpError(409,'Reconnect or inspect the environment before restarting uncertain work.');await this.runtime.ensureReady();const engine=await this.attach(saved);await engine.restart();await this.update(sessionId,await engine.state());return;}
     if((launch?.dockerHost||saved?.ready.dockerHost)!==this.runtime.endpoint.host)throw new HttpError(409,'This session used a previous container engine. Create a new EnoughFactory environment from its returned Git branch.');
     const project=this.store.get<Project>('projects',record.projectId);if(!project)throw new HttpError(404,'The source project is no longer available.');
-    this.patch(sessionId,{status:'starting',phase:'Preparing EnoughFactory runtime',error:undefined,services:[]});this.launch(record,project,{workspace:launch?.workspace||saved?.workspace});
+    this.patch(sessionId,{status:'starting',phase:'Preparing EnoughFactory runtime',error:undefined,services:[]});this.launch(record,project,{workspace:launch?.workspace||saved?.workspace,workingDirectorySources:launch?.workingDirectorySources});
   }
-  async changes(sessionId: string, selectedPath?: string): Promise<RepositoryChanges> {
-    const engine=this.get(sessionId);
-    return readRepositoryChanges(managedRepositoryReader(this.runtime.endpoint,engine.ready),selectedPath);
+  async changes(sessionId: string, selectedPath?: string, rootId?:string): Promise<RepositoryChanges> {
+    if(!rootId){const engine=this.get(sessionId);return readRepositoryChanges(managedRepositoryReader(this.runtime.endpoint,engine.ready),selectedPath);}
+    const root=(this.record(sessionId).workingDirectories||[]).find(item=>item.id===rootId);if(!root)throw new HttpError(404,'Working folder not found.');
+    if(this.record(sessionId).status!=='stopped'){const engine=this.get(sessionId);return readRepositoryChanges(managedRepositoryReader(this.runtime.endpoint,{...engine.ready,workdir:root.path}),selectedPath,root.baseCommit);}
+    const capture=this.store.get<{id:string;roots:WorkingDirectoryCapture[]}>('session-working-directory-captures',sessionId)?.roots.find(item=>item.id===rootId);
+    if(!capture)throw new HttpError(409,'This folder has no confirmed retained snapshot.');
+    const target=path.join(this.workspaceDataDir,'working-directory-inspection',sessionId,rootId,capture.commit);
+    await this.directoryManager.importCapture(capture,target);
+    return readRepositoryChanges(async args=>{try{const r=await exec('git',['--no-optional-locks','--no-pager','--literal-pathspecs','-c','core.hooksPath=/dev/null','-C',target,...args]);return {code:0,stdout:r.stdout,stderr:r.stderr};}catch(error){const r=error as {code:number;stdout:string;stderr:string};return r;}},selectedPath,root.baseCommit);
+  }
+  private publicRoot(root:WorkingDirectorySnapshot,status:WorkingDirectoryMount['status'],capture?:WorkingDirectoryCapture):WorkingDirectoryMount{return {id:root.id,name:root.name,path:root.containerPath,kind:root.kind,baseCommit:root.baseCommit,sourceCommit:root.sourceCommit,status,...(capture?{capture:{commit:capture.commit,bundleArtifactId:capture.bundleArtifact.id,diffArtifactId:capture.diffArtifact.id}}:{})};}
+  private async docker(args:string[]):Promise<string>{const i=dockerInvocation(this.runtime.endpoint,args);return (await exec(i.command,i.args,{env:i.env,timeout:120_000,maxBuffer:16*1024*1024})).stdout;}
+  private async provisionWorkingDirectories(sessionId:string,engine:EnvmuxSession,relaunch=false):Promise<void>{
+    const mounts=this.record(sessionId).workingDirectories;if(!mounts?.length||!relaunch)return;
+    const snapshots=await this.directoryManager.sourceSnapshots(sessionId);
+    const captures=this.store.get<{id:string;roots:WorkingDirectoryCapture[]}>('session-working-directory-captures',sessionId)?.roots||[];
+    for(const root of snapshots){
+      let source=root.path;const captured=captures.find(item=>item.id===root.id);
+      if(captured){source=path.join(this.workspaceDataDir,'working-directory-restore',sessionId,root.id,captured.commit);await this.directoryManager.importCapture(captured,source);}
+      await this.docker(['exec','--user','0',engine.ready.instance,'mkdir','-p','--',root.containerPath]);
+      await this.docker(['cp',`${source}/.`,`${engine.ready.instance}:${root.containerPath}`]);
+    }
+    this.store.set('session-working-directory-provision',{id:sessionId,complete:true});
+    this.patch(sessionId,{workingDirectories:snapshots.map(root=>this.publicRoot(root,'ready'))});
+  }
+  async workingDirectorySources(identity:string,project:Project):Promise<WorkingDirectorySource[]>{const roots=await this.directoryManager.prepare({identity,sources:project.workingDirectories||[]});return roots.map(({path:_,...source})=>source);}
+  async captureWorkingDirectories(sessionId:string):Promise<WorkingDirectoryCapture[]>{
+    if(!this.record(sessionId).workingDirectories?.length)return [];
+    if(this.store.list<Chat>('chats').some(chat=>chat.sessionId===sessionId&&['running','waiting'].includes(chat.status)))throw new HttpError(409,'Wait for or interrupt the active agent before capturing working folders.');
+    const existing=this.directoryCaptures.get(sessionId);if(existing)return existing;
+    if(this.record(sessionId).status==='stopped'){
+      const roots=this.store.get<{id:string;roots:WorkingDirectoryCapture[]}>('session-working-directory-captures',sessionId)?.roots||[],expected=this.record(sessionId).workingDirectories!;
+      if(roots.length!==expected.length||expected.some(root=>!roots.some(capture=>capture.id===root.id&&capture.name===root.name&&capture.baseCommit===root.baseCommit)))throw new HttpError(409,'Not every additional working folder has a confirmed retained snapshot. Inspect the retained environment before accepting this attempt.');
+      return roots;
+    }
+    const operation=(async()=>{
+      const engine=this.live.get(sessionId);if(!engine)throw new HttpError(409,'Reconnect the environment before capturing its folders.');
+      const snapshots=await this.directoryManager.sourceSnapshots(sessionId),exports:string[]=[];
+      await this.docker(['pause',engine.ready.instance]);
+      try{for(const root of snapshots){const destination=path.join(this.workspaceDataDir,'working-directory-exports',sessionId,randomUUID());await mkdir(destination,{recursive:true,mode:0o700});await this.docker(['cp',`${engine.ready.instance}:${root.containerPath}/.`,destination]);exports.push(destination);}}
+      finally{await this.docker(['unpause',engine.ready.instance]);}
+      const worker=this.store.list<{id:string;sessionId?:string;goal?:{id:string};task?:{id:string}}>('factory-workers').find(record=>record.sessionId===sessionId);
+      const controller=this.store.list<{id:string;sessionId?:string;goalId?:string}>('factory-controller-runs').find(record=>record.sessionId===sessionId);
+      const context=worker?{goalId:worker.goal?.id,taskId:worker.task?.id,attemptId:worker.id}:controller?{goalId:controller.goalId}:{};
+      const roots:WorkingDirectoryCapture[]=[];for(let i=0;i<snapshots.length;i++){const capture=await this.directoryManager.captureFromPath(snapshots[i]!,exports[i]!,context);roots.push(capture);for(const manifest of [capture.bundleArtifact,capture.diffArtifact])this.store.set('artifacts',manifest);}
+      this.store.set('session-working-directory-captures',{id:sessionId,roots});
+      this.patch(sessionId,{workingDirectories:snapshots.map(root=>this.publicRoot(root,'captured',roots.find(item=>item.id===root.id)))});return roots;
+    })().catch(error=>{this.patch(sessionId,{workingDirectories:this.record(sessionId).workingDirectories?.map(root=>({...root,status:'failed',error:error.message}))});throw error;}).finally(()=>this.directoryCaptures.delete(sessionId));
+    this.directoryCaptures.set(sessionId,operation);return operation;
   }
   output(sessionId: string): string {return this.store.events<{text:string}>('session-output',sessionId).map(e=>e.value.text).join('\n');}
   close(): void {for(const controller of this.streams.values())controller.abort();}

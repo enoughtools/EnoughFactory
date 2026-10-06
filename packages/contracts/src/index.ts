@@ -4,10 +4,18 @@ export type RuntimeKind = "codex" | "antigravity" | "claude";
 export type ApprovalMode = "approve-all" | "rules" | "manual";
 export type AutonomyMode = "manual" | "assisted" | "autonomous";
 export interface PolicyRule { id: string; tool?: string; commandPattern?: string; decision: "allow" | "deny" | "ask"; }
+export interface WorkingDirectory { id: string; name: string; path: string; }
+export interface WorkingDirectoryMount {
+  id: string; name: string; path: string; kind: "git" | "folder"; baseCommit: string; sourceCommit?: string;
+  status: "preparing" | "ready" | "captured" | "failed"; error?: string;
+  capture?: { commit: string; bundleArtifactId: string; diffArtifactId: string };
+}
 export interface Project {
   id: string; name: string; path: string; deviceId: string; createdAt: string;
   runtime: RuntimeKind; approvalMode: ApprovalMode; rules: PolicyRule[];
   internal?: boolean; sourceProjectId?: string;
+  /** Additional roots are writable isolated snapshots; only the primary repository auto-integrates. */
+  workingDirectories?: WorkingDirectory[];
   /** Reversible catalog removal. Repository files and retained history are unchanged. */
   archivedAt?: string;
 }
@@ -19,6 +27,7 @@ export interface Session {
   id: string; projectId: string; deviceId: string; name: string; status: SessionStatus;
   phase?: string; error?: string; createdAt: string; updatedAt: string; branch?: string;
   services: Service[]; containerId?: string; enginePid?: number;
+  workingDirectories?: WorkingDirectoryMount[];
   /** Reversible catalog removal; execution and evidence records remain available by identity. */
   archivedAt?: string;
 }
@@ -82,7 +91,7 @@ export interface TaskCheck {
 export interface AttemptInspection {
   attempt: Attempt; phase?: AttemptPhase; cancellation?: "none" | "requested" | "acknowledged";
   contract?: { title: string; description: string; kind?: TaskKind; acceptanceCriteria?: string[]; expectedOutputs?: string[]; estimatedMinutes?: number; writePaths?: string[]; resources?: TaskResources; dependsOn: string[]; checks: string[]; planRevision: number };
-  workspace?: { id: string; provider: "git" | "artifactfs"; baseCommit: string; sessionId?: string; deviceId?: string };
+  workspace?: { id: string; provider: "git" | "artifactfs"; baseCommit: string; sessionId?: string; deviceId?: string; workingDirectories?: WorkingDirectoryMount[] };
   candidate?: { id: string; commit: string; baseCommit: string; branch?: string; tree?: string; deviceId?: string };
   result?: { status: string; text: string; error?: string; waitReason?: string; wakeCondition?: string };
   checks?: TaskCheck[];

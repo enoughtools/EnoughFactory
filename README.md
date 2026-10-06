@@ -38,6 +38,8 @@ Use **Workbench** or the logo to return to all projects and goals. Projects in t
 
 A goal’s **Activity** tab shows its planner, diagnosis and evaluator conversations, recorded instructions, tool activity and preparation output, including before the first tasks exist. **Settings** shows the desktop and connected device-service versions.
 
+Add supporting repositories or folders in **Project settings → Working folders**, or when creating a project. Each task receives its own writable snapshots under `/workspaces/<name>` alongside the primary repository at `/work`. Running workspaces retain their recorded inputs when project settings change. Changes in supporting folders are captured and exportable; only the primary repository integrates automatically. See [working folders and retained changes](docs/task-workspace.md#working-folders).
+
 The desktop reconnects to compatible device services independently of the window. Bundled service updates wait for an atomic idle check covering agent turns, factory operations, environment startup and transfers; the private container engine stays running. Older services without that idle guard remain connected until an explicit handoff.
 
 For live interface development, run `pnpm dev`, then `pnpm --filter @enoughfactory/desktop dev` in another terminal. This starts the device service on port 4317 and Vite on port 4318. See [installation and first use](docs/install.md) for browser connections, startup service installation and removal.

@@ -6,7 +6,7 @@ import { FactoryCoordinator } from "./coordinator.js";
 import { readPlan } from "./protocol.js";
 import type {
   AttemptDetail, CandidateRef, EvaluationRecord, EvaluationResponse, ExecutionResult, FactoryRuntimePort,
-  FactoryStore, FactoryWorkspacePort, PlanResponse,
+  FactoryStore, FactoryWorkspacePort, PlanRecord, PlanResponse,
 } from "./types.js";
 
 /** Reads cannot mutate committed records and a failed transaction cannot leave half a transition. */
@@ -55,8 +55,9 @@ const completeEvaluation: EvaluationResponse = {
 
 function harness(devices: Device[] = [device]) {
   const store = new MemoryStore();
-  const calls = { planner: 0, evaluator: 0, diagnosis: 0, execute: 0, reconcile: 0, cancel: 0, prepare: 0, capture: 0, check: 0, integrate: 0, integrationFences: 0, reconcileIntegration: 0 };
+  const calls = { planner: 0, evaluator: 0, diagnosis: 0, execute: 0, reconcile: 0, cancel: 0, prepare: 0, capture: 0, check: 0, goalCheck: 0, integrate: 0, integrationFences: 0, reconcileIntegration: 0 };
   const executionPrompts: string[] = [];
+  const evaluationPrompts: string[] = [], candidateCommands: string[][] = [], integrationCommands: string[][] = [], goalCommands: string[][] = [];
   let planning: () => Promise<PlanResponse> = async () => plan;
   let evaluating: () => Promise<EvaluationResponse> = async () => completeEvaluation;
   let executing: () => Promise<ExecutionResult> = async () => ({ status: "succeeded", text: "Implementation complete" });
@@ -66,10 +67,14 @@ function harness(devices: Device[] = [device]) {
   let beforeCheck: () => Promise<void> = async () => {};
   let reconcilingIntegration: FactoryWorkspacePort["reconcileIntegration"];
   let inspecting: FactoryWorkspacePort["inspect"] = async () => ({ head: "integrated-head", branch: "main", status: "", artifacts: [{ name: "Release", sha256: "release-hash" }] });
+  let checkingGoal = async (current: Project, commands: string[]) => {
+    const repository = await inspecting(current);
+    return { repository, checks: commands.map(command => ({ command, passed: true, output: "Goal verified", exitCode: 0, candidateCommit: repository.head, checkedCommit: repository.head })) };
+  };
   const runtime: FactoryRuntimePort = {
     async complete(input) {
       if (input.role === "planner") { calls.planner++; return { text: JSON.stringify(await planning()) }; }
-      if (input.role === "evaluator") { calls.evaluator++; return { text: JSON.stringify(await evaluating()) }; }
+      if (input.role === "evaluator") { calls.evaluator++; evaluationPrompts.push(input.prompt); return { text: JSON.stringify(await evaluating()) }; }
       calls.diagnosis++;
       return { text: JSON.stringify({ action: "retry", reason: "The expected route was missing", instructions: "Add the missing route and verify the response" }) };
     },
@@ -83,6 +88,7 @@ function harness(devices: Device[] = [device]) {
     async capture() { calls.capture++; return candidate; },
     async check(_project, current, commands) {
       calls.check++;
+      candidateCommands.push([...commands]);
       await beforeCheck();
       return commands.map(command => ({ command, passed: true, output: "verified", exitCode: 0, candidateCommit: current.commit }));
     },
@@ -91,11 +97,13 @@ function harness(devices: Device[] = [device]) {
       calls.integrationFences++;
       if (!input.isCurrent()) throw new Error("Integration authority has been revoked");
       calls.integrate++;
+      integrationCommands.push([...input.checks]);
       await afterIntegrationWrite();
       return { commit: "integrated-head", previousHead: "initial-head", candidateCommit: current.commit,
         checks: input.checks.map(command => ({ command, passed: true, output: "Combined result verified", exitCode: 0, candidateCommit: current.commit, checkedCommit: "integrated-head" })) };
     },
     async inspect(current) { return inspecting(current); },
+    async checkGoal(current, commands) { calls.goalCheck++; goalCommands.push([...commands]); return checkingGoal(current, commands); },
     async reconcileIntegration(current, retainedCandidate) {
       calls.reconcileIntegration++;
       return reconcilingIntegration?.(current, retainedCandidate);
@@ -106,7 +114,7 @@ function harness(devices: Device[] = [device]) {
   const coordinator = new FactoryCoordinator(options);
   const goal = () => coordinator.create({ projectId: project.id, objective: "Build the feature and publish its release", criteria, autonomy: "autonomous", approvalMode: "approve-all", concurrency: 1 });
   return {
-    store, calls, coordinator, goal, executionPrompts, workspaces, recover: () => new FactoryCoordinator(options),
+    store, calls, coordinator, goal, executionPrompts, evaluationPrompts, candidateCommands, integrationCommands, goalCommands, workspaces, recover: () => new FactoryCoordinator(options),
     planning(fn: typeof planning) { planning = fn; },
     evaluating(fn: typeof evaluating) { evaluating = fn; },
     executing(fn: typeof executing) { executing = fn; },
@@ -116,6 +124,7 @@ function harness(devices: Device[] = [device]) {
     beforeCheck(fn: typeof beforeCheck) { beforeCheck = fn; },
     reconcileIntegration(fn: NonNullable<typeof reconcilingIntegration>) { reconcilingIntegration = fn; },
     inspect(fn: typeof inspecting) { inspecting = fn; },
+    goalChecking(fn: typeof checkingGoal) { checkingGoal = fn; },
   };
 }
 
@@ -152,7 +161,7 @@ function retainedAttempt(factory: ReturnType<typeof harness>, goal: Goal, retain
 
 test("fail-fast verification retains the actual failed command without diagnosing unrun checks as omitted", async () => {
   const factory = harness();
-  factory.planning(async () => ({ ...plan, checks: ["npm run verify", "npm run release"] }));
+  factory.planning(async () => ({ ...plan, checks: [], tasks: plan.tasks.map(task => ({ ...task, checks: ["npm run verify", "npm run release"] })) }));
   const stderr = "Error: regression route /health returned 503";
   factory.workspaces.check = async (_project, candidate) => {
     factory.calls.check++;
@@ -539,6 +548,81 @@ test("completion records evidence for every explicit criterion after all work is
   assert.equal(evidence.length, 1);
   assert.deepEqual(evidence[0]!.evaluation.criteria, completeEvaluation.criteria);
   assert.equal(evidence[0]!.head, "integrated-head");
+});
+
+test("bounded tasks integrate with their own checks before whole-goal checks run on the complete repository", async () => {
+  const factory = harness();
+  factory.planning(async () => ({ ...plan, checks: ["npm run check-product"], tasks: [
+    { key: "api", title: "Implement API", description: "Deliver the API contract", dependsOn: [], checks: ["npm run check-api"] },
+    { key: "web", title: "Implement UI", description: "Use the delivered API", dependsOn: ["api"], checks: ["npm run check-web"] },
+  ] }));
+  const goal = factory.goal();
+  await factory.coordinator.tick(); await factory.coordinator.waitForIdle();
+  assert.equal(factory.store.get<PlanRecord>("factory-plans", goal.id)!.checkScope, "goal");
+  await factory.coordinator.tick(); await factory.coordinator.waitForIdle();
+  assert.equal(factory.store.list<FactoryTask>("tasks").filter(task => task.status === "completed").length, 1);
+  assert.deepEqual(factory.candidateCommands, [["npm run check-api"]]);
+  assert.equal(factory.calls.goalCheck, 0, "a partly implemented product is checked against the bounded task contract");
+  await factory.coordinator.tick(); await factory.coordinator.waitForIdle();
+  assert.deepEqual(factory.candidateCommands, [["npm run check-api"], ["npm run check-web"]]);
+  assert.deepEqual(factory.integrationCommands, factory.candidateCommands);
+  assert.equal(factory.calls.goalCheck, 0);
+  const contracts = factory.store.list<AttemptDetail>("factory-attempt-details").map(detail => detail.contract!.checks);
+  assert.deepEqual(contracts, factory.candidateCommands);
+  await factory.coordinator.tick(); await factory.coordinator.waitForIdle();
+  assert.deepEqual(factory.goalCommands, [["npm run check-product"]]);
+  assert.equal(factory.calls.evaluator, 1);
+  assert.equal(factory.store.get<Goal>("goals", goal.id)!.status, "completed");
+});
+
+test("whole-goal check receipts are reused only for the same revision, commands and exact repository state", async () => {
+  const factory = harness();
+  const repository = { head: "integrated-head", branch: "main", status: "", fingerprint: "content-one", diff: "" };
+  factory.inspect(async () => ({ ...repository }));
+  factory.evaluating(async () => ({ ...completeEvaluation, complete: false, waitReason: "Waiting for deployment", wakeCondition: "deployment-ready" }));
+  const goal = await finishTask(factory);
+  async function evaluateAgain() {
+    factory.coordinator.notifyCondition("deployment-ready", goal.id);
+    await factory.coordinator.tick(); await factory.coordinator.waitForIdle();
+    assert.equal(factory.store.get<Goal>("goals", goal.id)!.status, "waiting");
+  }
+  await evaluateAgain();
+  assert.equal(factory.calls.goalCheck, 1);
+  await evaluateAgain();
+  assert.equal(factory.calls.goalCheck, 1, "unchanged evaluation does not repeat the same verification");
+  const changes = [
+    () => { repository.fingerprint = "content-two"; },
+    () => { repository.status = " M app.ts"; },
+    () => { repository.diff = "Changed application content"; },
+    () => { repository.head = "new-integrated-head"; },
+    () => { const current = factory.store.get<PlanRecord>("factory-plans", goal.id)!; factory.store.set("factory-plans", { ...current, checks: ["npm run changed-product-check"] }); },
+    () => { const current = factory.store.get<Goal>("goals", goal.id)!; factory.store.set("goals", { ...current, revision: current.revision + 1 }); },
+  ];
+  for (const [index, change] of changes.entries()) {
+    change(); await evaluateAgain();
+    assert.equal(factory.calls.goalCheck, index + 2, "changed receipt inputs require fresh exact-state evidence");
+  }
+  assert.equal(factory.calls.evaluator, 8);
+  assert.equal(factory.calls.check, 1, "accepted task checks are not repeated during goal evaluation");
+  assert.equal(factory.calls.integrate, 1);
+});
+
+test("failed whole-goal checks retain repair evidence and prevent a model's complete=true from completing the goal", async () => {
+  const factory = harness();
+  const failureOutput = "Product scenario failed: the integrated API and UI disagree";
+  factory.goalChecking(async (_project, commands) => ({
+    repository: { head: "integrated-head", branch: "main", status: "" },
+    checks: commands.map(command => ({ command, passed: false, output: failureOutput, exitCode: 1, candidateCommit: "integrated-head", checkedCommit: "integrated-head" })),
+  }));
+  const goal = await finishTask(factory);
+  await factory.coordinator.tick(); await factory.coordinator.waitForIdle();
+  assert.equal(factory.calls.goalCheck, 1);
+  assert.equal(factory.calls.evaluator, 1, "the evaluator receives the failure to choose proportionate repair work");
+  assert.ok(factory.evaluationPrompts[0]!.includes(failureOutput));
+  assert.notEqual(factory.store.get<Goal>("goals", goal.id)!.status, "completed", "green task checks and a positive model response cannot overrule the failing product scenario");
+  assert.equal(factory.store.list<FactoryTask>("tasks")[0]!.status, "completed", "a whole-goal failure retains the accepted bounded task");
+  assert.equal(factory.calls.diagnosis, 0);
+  assert.equal(factory.calls.integrate, 1);
 });
 
 test("dirty content changing during evaluation invalidates completion even when HEAD and status stay the same", async () => {

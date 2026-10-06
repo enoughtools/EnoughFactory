@@ -1,0 +1,33 @@
+.project-folders-dialog[data-slot="dialog-content"] { max-width: 680px; max-height: 85dvh; overflow-y: auto; }
+.project-folders-dialog > .session-tabs { overflow-x: auto; overflow-y: hidden; flex-shrink: 0; }
+.working-directories { min-width: 0; }
+.working-directories .working-directories-primary { padding: 10px 12px; border: 1px solid var(--factory-line); background: var(--factory-paper); margin-bottom: 16px; }
+.working-directories .working-directories-primary > div { display: flex; align-items: center; gap: 7px; margin-bottom: 5px; color: var(--factory-secondary); font-size: 10px; }
+.working-directories .working-directories-primary strong { font-weight: 500; }
+.working-directories .working-directories-primary > code { display: block; color: var(--factory-ink); font-size: 11px; overflow-wrap: anywhere; }
+.working-directories .working-directories-heading { margin-bottom: 7px; gap: 8px; }
+.working-directories .working-directories-heading h3 { margin: 0; font-size: 12px; font-weight: 500; line-height: 1.4; }
+.working-directories .working-directories-heading > [data-slot="button"] { flex-shrink: 0; }
+.working-directories > .field-hint { margin: 0; line-height: 1.6; }
+.working-directories .working-directories-rows { display: flex; flex-direction: column; gap: 10px; margin-top: 12px; }
+.working-directories .working-directories-rows:empty { margin-top: 0; }
+.working-directories .working-directory-row { border: 1px solid var(--factory-line); padding: 10px 12px 12px; min-width: 0; }
+.working-directories .working-directory-row-header { display: flex; align-items: center; justify-content: space-between; margin: -2px -3px 8px 0; }
+.working-directories .working-directory-row-header > span { display: flex; align-items: center; gap: 6px; color: var(--factory-secondary); font-size: 10px; }
+.working-directories .working-directory-row-header > [data-slot="button"] { width: 26px; height: 26px; min-height: 26px; padding: 0; }
+.working-directories .working-directory-fields { display: grid; grid-template-columns: minmax(0, 1fr) minmax(110px, .6fr); gap: 10px; }
+.working-directories .working-directory-fields .form-field { gap: 5px; }
+.working-directories .working-directory-fields label { font-size: 10px; }
+.working-directories .working-directory-fields input { min-width: 0; min-height: 36px; padding: 8px 10px; font-size: 11px; }
+.working-directories .working-directory-path .path-input { gap: 5px; }
+.working-directories .working-directory-path [data-slot="button"] { width: 34px; height: 36px; min-height: 36px; padding: 0; }
+.working-directories .working-directory-mount { display: flex; justify-content: space-between; align-items: baseline; flex-wrap: wrap; gap: 4px 10px; margin-top: 9px; color: var(--factory-muted); font-size: 9px; }
+.working-directories .working-directory-mount code { overflow-wrap: anywhere; color: var(--factory-secondary); font-size: 10px; }
+.working-directories .working-directories-error { margin-top: 10px; }
+.working-directories > .working-directories-future { margin-top: 10px; }
+
+@media (max-width: 640px) {
+  .working-directories .working-directory-fields { grid-template-columns: minmax(0, 1fr); }
+  .working-directories .working-directories-heading { align-items: flex-start; }
+  .working-directories .working-directories-heading h3 { max-width: 180px; }
+}

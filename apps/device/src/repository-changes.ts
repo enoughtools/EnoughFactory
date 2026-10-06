@@ -37,7 +37,7 @@ function filesFromStatus(output: string): RepositoryChangeFile[] {
 }
 
 /** Git status/diff only: never refresh the index, stage, commit or alter permissions. */
-export async function readRepositoryChanges(run: RepositoryReader, selectedPath?: string): Promise<RepositoryChanges> {
+export async function readRepositoryChanges(run: RepositoryReader, selectedPath?: string, baseline?:string): Promise<RepositoryChanges> {
   if (selectedPath !== undefined && (!selectedPath || selectedPath.length > 4096 || /[\0\\]/.test(selectedPath) || selectedPath.startsWith('/') || selectedPath.split('/').some(part => part === '..' || part === '.git'))) {
     throw new HttpError(400, 'Choose a relative changed-file path.');
   }
@@ -48,12 +48,18 @@ export async function readRepositoryChanges(run: RepositoryReader, selectedPath?
     return result.stdout;
   };
   const status = await checked(['status', '--porcelain=v1', '-z', '--untracked-files=all']);
-  const files = filesFromStatus(status);
+  let files = filesFromStatus(status);
+  if(baseline){
+    if(!/^[a-f0-9]{40,64}$/.test(baseline))throw new HttpError(409,'The folder snapshot has no valid baseline.');
+    const fields=(await checked(['diff','--no-ext-diff','--no-textconv','--name-status','-z',baseline,'--'])).split('\0'),committed:RepositoryChangeFile[]=[];
+    for(let i=0;i<fields.length-1;i++){const state=fields[i]!,first=fields[++i]!;if(!state)continue;const renamed=/^[RC]/.test(state);committed.push({path:renamed?fields[++i]!:first,indexStatus:state[0]!,workingTreeStatus:' ',...(renamed?{originalPath:first}:{})});}
+    files=[...new Map([...committed,...files].map(file=>[file.path,file])).values()];
+  }
   const file = selectedPath === undefined ? undefined : files.find(item => item.path === selectedPath);
   if (selectedPath !== undefined && !file) throw new HttpError(404, 'This file no longer has uncommitted changes.');
   const [head, branch] = await Promise.all([checked(['rev-parse', '--verify', 'HEAD']), checked(['branch', '--show-current'])]);
   const untracked = file?.indexStatus === '?' && file.workingTreeStatus === '?';
-  const result = await run(['diff', '--no-ext-diff', '--no-textconv', '--color=never', ...(untracked ? ['--no-index', '--', '/dev/null', selectedPath!] : ['HEAD', '--', ...(selectedPath === undefined ? [] : [selectedPath])])]);
+  const result = await run(['diff', '--no-ext-diff', '--no-textconv', '--color=never', ...(untracked ? ['--no-index', '--', '/dev/null', selectedPath!] : [baseline||'HEAD', '--', ...(selectedPath === undefined ? [] : [selectedPath])])]);
   if ((result.code !== 0 && !(untracked && result.code === 1)) || result.stderr.trim()) throw new HttpError(422, (result.stderr || result.stdout || 'The file diff could not be read.').slice(0, 2048));
   return { branch: branch.trim(), head: head.trim(), files, path: selectedPath,
     status: files.map(file => `${file.indexStatus}${file.workingTreeStatus} ${file.path}`).join('\n'),

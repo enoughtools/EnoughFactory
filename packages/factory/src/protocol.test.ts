@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { FactoryDecisionError } from "./errors.js";
-import { readPlan, readTasks, validateDependencies } from "./protocol.js";
+import { readCheckCommands, readEvaluation, readPlan, readTasks, validateDependencies } from "./protocol.js";
 
 const task = { key: "implementation", title: "Implement feature", description: "Deliver the requested behavior", dependsOn: [], checks: [] };
 
@@ -62,4 +62,34 @@ test("dependency validation accepts a DAG and completed predecessors but rejects
     { ...task, key: "second", dependsOn: ["first"] },
     { ...task, key: "third", dependsOn: ["second"] },
   ])), /dependency cycle/);
+});
+
+test("prose checks require corrected shell commands in plans, tasks and evaluation additions", () => {
+  const prose = "Run scripts/check-foundation.sh to validate foundation behavior.";
+  const correction = (error: unknown): boolean => error instanceof FactoryDecisionError && /actual shell commands/.test(error.message) && error.message.includes("sh scripts/check-foundation.sh");
+  assert.throws(() => readTasks([{ ...task, checks: [prose] }]), correction);
+  assert.throws(() => readPlan(JSON.stringify({ summary: "Deliver work", criteria: ["Verified"], tasks: [task], checks: [prose] })), correction);
+  assert.throws(() => readEvaluation(JSON.stringify({ complete: false, summary: "More work", criteria: [], additionalTasks: [{ ...task, checks: [prose] }] })), correction);
+  for (const instruction of ["run scripts/check-foundation.sh to validate the result", "Please execute npm test and then verify the behavior", "Run the test suite", "Ensure that all checks pass"]) {
+    assert.throws(() => readCheckCommands([instruction]), correction);
+  }
+});
+
+test("check commands reject Markdown wrappers and NUL bytes", () => {
+  for (const command of ["```sh\nsh scripts/check-foundation.sh\n```", "~~~bash\npnpm test\n~~~", "- sh scripts/check-foundation.sh", "1. pnpm test", "printf 'bad\u0000argument'"]) {
+    assert.throws(() => readCheckCommands([command]), FactoryDecisionError);
+  }
+});
+
+test("check commands retain arbitrary executables, scripts, compound shell logic and quoted explanatory content", () => {
+  const commands = [
+    "sh scripts/check-foundation.sh", "scripts/check-foundation.sh", "custom-verifier --strict", "Run --full",
+    "run suite --message 'to validate the result'", "printf '%s\\n' 'Run scripts/check-foundation.sh to validate the result'",
+    "CHECK_MODE=full ./verify && echo success", "if [ -f package.json ]; then pnpm test; else ./verify; fi",
+    "sh -c 'echo \"Ensure that the result is present\"'", "printf '%s' '```'",
+    "cat <<'MESSAGE'\nRun scripts/check-foundation.sh to validate the result\nMESSAGE",
+  ];
+  assert.deepEqual(readCheckCommands(commands), commands);
+  assert.deepEqual(readTasks([{ ...task, checks: commands }])[0]!.checks, commands);
+  assert.deepEqual(readPlan(JSON.stringify({ summary: "Deliver work", criteria: ["Verified"], tasks: [], checks: commands })).checks, commands);
 });
