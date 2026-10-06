@@ -2,14 +2,14 @@ import type { ChangeEvent } from "react";
 import { lazy, Suspense, useEffect, useRef, useState } from 'react';
 import type { FactoryState, RepositoryChanges, Session, WorkingDirectoryMount } from '@enoughfactory/contracts';
 import { ResizableHandle, ResizablePanel, ResizablePanelGroup } from '@enoughtools/ui-react';
-import { Activity, ArrowLeft, ArrowRight, ArrowUpRight, Box, GitBranch, Globe, LoaderCircle, MessageSquare, Play, RotateCcw, Square, TerminalSquare } from 'lucide-react';
+import { Activity, ArrowLeft, ArrowRight, ArrowUpRight, Box, GitBranch, Globe, MessageSquare, Play, RotateCcw, Square, TerminalSquare } from 'lucide-react';
 import type { DeviceClient } from './api';
 import { useResource } from './hooks';
 import { ChatPane } from './ChatPane';
 import { RuntimePanel } from './RuntimePanel';
 import { RemoveEnvironmentAction } from './WorkspaceRemoval';
 import { WorkingDirectoryMounts } from './WorkingDirectoryMounts';
-import { Button, EmptyState, Input, Loading, PageHeader, Panel, Status } from './ui';
+import { Button, EmptyState, Input, Loading, PageHeader, Panel, Status, Spinner } from './ui';
 import './repository-changes.css';
 
 type Run = (action: () => Promise<unknown>) => Promise<void>;
@@ -132,7 +132,7 @@ export function SessionWorkspace({ client, session, state, run, modalOpen, initi
     </>} />
     {session.deviceId === state.device.id && state.diagnostics.containerRuntime && state.diagnostics.containerRuntime.state !== 'ready' && <RuntimePanel state={state} client={client} run={run} compact />}
     {session.error && <div className="error-banner">{session.error}</div>}
-    {session.status === 'starting' && <div className="notice"><LoaderCircle className="loading-spinner" size={15} aria-hidden="true" /><strong>Starting environment</strong><span>{session.phase || 'Preparing image and starting services…'}</span></div>}
+    {session.status === 'starting' && <div className="notice"><Spinner className="factory-spinner" style={{ width: 15, height: 15 }} aria-hidden="true" /><strong>Starting environment</strong><span>{session.phase || 'Preparing image and starting services…'}</span></div>}
     {device?.online === false && <div className="connection-banner">{device.name} is offline. Showing its last reported environment state.</div>}
     <div className="session-tabs" role="tablist" aria-label="Session workspace">{tabs.map(item => <button
       key={item.id}

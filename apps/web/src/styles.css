@@ -370,7 +370,7 @@ button.project-card { width: 100%; }
 .modal-form > label { display: flex; flex-direction: column; gap: 7px; font-size: 11px; font-weight: 500; }
 .modal-form .header-actions { justify-content: flex-end; margin-top: 4px; }
 .connection-banner, .error-banner, .notice { display: flex; align-items: flex-start; gap: 10px; padding: 12px 15px; border: 1px solid var(--factory-line); background: var(--factory-paper); color: var(--factory-secondary); font-size: 11px; line-height: 1.7; margin-bottom: 20px; }
-.connection-banner svg, .error-banner svg, .notice svg { width: 16px; height: 16px; margin-top: 2px; }
+.connection-banner > svg, .error-banner > svg, .notice > svg { width: 16px; height: 16px; margin-top: 2px; }
 .connection-banner { background: var(--factory-warn-soft); border-color: var(--factory-warn); color: var(--factory-warn); }
 .error-banner { background: var(--factory-danger-soft); border-color: var(--factory-danger); color: var(--factory-danger); }
 .notice p, .error-banner p, .connection-banner p { margin: 0; }
@@ -427,7 +427,7 @@ button.project-card { width: 100%; }
 .runtime-panel { min-width: 0; }
 .runtime-overview { display: flex; align-items: flex-start; gap: 16px; padding-bottom: 20px; }
 .runtime-overview > svg, .runtime-overview > .runtime-icon { display: grid; place-items: center; flex: 0 0 39px; width: 39px; height: 39px; border: 1px solid var(--factory-line); background: var(--factory-accent-soft); padding: 9px; color: var(--factory-accent); stroke-width: 1.4; }
-.runtime-overview > .runtime-icon svg { width: 20px; height: 20px; }
+.runtime-overview > .runtime-icon > svg { width: 20px; height: 20px; }
 .runtime-overview > div:not(.runtime-icon):not(.runtime-actions) { flex: 1; min-width: 0; }
 .runtime-overview h3, .runtime-heading { margin: 0; color: var(--factory-ink); font-size: 13px; font-weight: 500; }
 .runtime-heading > div { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; margin-bottom: 7px; }
@@ -435,7 +435,6 @@ button.project-card { width: 100%; }
 .runtime-description { margin: 0; max-width: 650px; color: var(--factory-secondary); font-size: 11px; line-height: 1.75; }
 .runtime-overview .header-actions, .runtime-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 7px; margin-left: auto; flex-shrink: 0; }
 .runtime-phase { display: flex; align-items: center; gap: 8px; margin-top: 9px; font-size: 10px; color: var(--factory-accent); line-height: 1.7; }
-.runtime-phase .loading-spinner { width: 12px; height: 12px; }
 .runtime-resources { display: grid; grid-template-columns: repeat(auto-fit,minmax(140px,1fr)); border: 1px solid var(--factory-line); background: var(--factory-paper); margin: 0 0 20px; }
 .runtime-resources > div { padding: 14px 17px; border-right: 1px solid var(--factory-line); }
 .runtime-resources > div:last-child { border-right: 0; }
@@ -459,7 +458,6 @@ button.project-card { width: 100%; }
 .runtime-resource-form .header-actions, .runtime-resource-form > [data-slot="button"] { grid-column: 1 / -1; justify-self: start; }
 .runtime-resource-form .field-hint { grid-column: 1 / -1; }
 .runtime-operation { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; color: var(--factory-secondary); font-size: 10px; line-height: 1.7; margin: 13px 0 0; }
-.runtime-operation .loading-spinner { width: 12px; height: 12px; }
 .runtime-panel .state-preparing { color: var(--factory-warn); }
 .runtime-panel .badge-status.state-error { color: var(--factory-danger); }
 .runtime-compact > .panel > .panel-body { padding: 17px 20px; }
@@ -478,16 +476,15 @@ button.project-card { width: 100%; }
 .main-shell > .connection-banner, .main-shell > .error-banner { margin: 0; border-width: 0 0 1px; padding-left: 36px; padding-right: 36px; align-items: center; }
 .main-shell > .error-banner > span, .main-shell > .connection-banner > span { flex: 1; }
 .error-banner > button:not([data-slot="button"]) { display: grid; place-items: center; width: 25px; height: 25px; padding: 0; border: 0; color: var(--factory-danger); background: transparent; }
-.loading-spinner { display: inline-block; flex-shrink: 0; color: var(--factory-accent); animation: factory-spin 800ms linear infinite; }
+.factory-spinner { color: var(--factory-accent); }
 .keyboard-hint { color: var(--factory-muted); border: 1px solid var(--factory-line); padding: 1px 5px; font-size: 10px; line-height: 1.6; background: var(--factory-surface); font-family: var(--font-sans); }
 [data-slot="button"] { display: inline-flex; align-items: center; justify-content: center; gap: 7px; min-height: 36px; padding: 8px 13px; border-radius: 0; font-family: var(--font-sans); font-size: 12px; line-height: 1.45; font-weight: 500; box-shadow: none; }
-[data-slot="button"] svg { width: 14px; height: 14px; stroke-width: 1.7; }
+[data-slot="button"] > svg { width: 14px; height: 14px; stroke-width: 1.7; }
 [data-slot="dialog-content"] { padding: 26px; border: 1px solid var(--factory-ink); max-width: 510px; gap: 20px; box-shadow: 6px 6px 0 var(--color-accent-soft); background: var(--factory-surface); }
 [data-slot="dialog-content"] h2 { font-family: var(--font-sans); font-size: 18px; font-weight: 600; letter-spacing: -.3px; line-height: 1.3; }
 [data-slot="dialog-content"] [data-slot="dialog-footer"] { padding-top: 5px; gap: 8px; }
 [data-slot="dialog-close"] { width: 30px; height: 30px; }
 [data-slot="resizable-handle"] { background: var(--factory-line); }
-@keyframes factory-spin { to { transform: rotate(360deg); } }
 
 @media (min-width: 1600px) {
 }
@@ -612,7 +609,6 @@ button.project-card { width: 100%; }
 }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
-  .loading-spinner { animation: none !important; }
 }
 
 /* Controls introduced alongside the connected factory. */

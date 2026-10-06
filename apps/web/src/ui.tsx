@@ -1,6 +1,6 @@
 import type { ReactNode } from 'react';
-import { Button, Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle, Input } from '@enoughtools/ui-react';
-import { ArrowUpRight, LoaderCircle, X } from 'lucide-react';
+import { Button, Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle, Input, Spinner } from '@enoughtools/ui-react';
+import { ArrowUpRight, X } from 'lucide-react';
 
 export function EmptyState({ icon, title, children, action }: { icon: ReactNode; title: string; children: ReactNode; action?: ReactNode }) {
   return <div className="empty-state"><div className="empty-illustration" aria-hidden="true">{icon}</div><h2 className="empty-title">{title}</h2><div className="empty-description">{children}</div>{action}</div>;
@@ -15,7 +15,7 @@ export function Status({ state, label }: { state: string; label?: string }) {
   return <span className={`badge-status state-${state}`}><span className={`status-dot state-${state}`} />{label ?? state.replaceAll('_', ' ')}</span>;
 }
 export function Loading({ children = 'Connecting to your workspace…' }: { children?: ReactNode }) {
-  return <div className="empty-state" role="status"><LoaderCircle className="loading-spinner" size={24} /><div className="empty-description">{children}</div></div>;
+  return <div className="empty-state" role="status"><Spinner className="factory-spinner" style={{ width: 24, height: 24 }} aria-hidden="true" /><div className="empty-description">{children}</div></div>;
 }
 export function Modal({ open, onClose, title, description, children, className }: { open: boolean; onClose: () => void; title: string; description: string; children: ReactNode; className?: string }) {
   return <Dialog open={open} onOpenChange={(value: boolean) => !value && onClose()}><DialogContent className={className}><DialogHeader><DialogTitle>{title}</DialogTitle><DialogDescription>{description}</DialogDescription></DialogHeader>{children}</DialogContent></Dialog>;
@@ -23,4 +23,4 @@ export function Modal({ open, onClose, title, description, children, className }
 export function Field({ label, hint, children }: { label: string; hint?: string; children: ReactNode }) {
   return <label className="form-field"><span>{label}</span>{children}{hint && <span className="field-hint">{hint}</span>}</label>;
 }
-export { Button, Input, ArrowUpRight, X };
+export { Button, Input, Spinner, ArrowUpRight, X };

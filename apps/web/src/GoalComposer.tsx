@@ -1,11 +1,11 @@
 import { useEffect, useState } from 'react';
 import type { ApprovalMode, AutonomyMode, FactoryState, RuntimeKind, Session } from '@enoughfactory/contracts';
-import { FileText, LoaderCircle, MessageSquare, Plus, Send, Target, Upload } from 'lucide-react';
+import { FileText, MessageSquare, Plus, Send, Target, Upload } from 'lucide-react';
 import type { DeviceClient } from './api';
 import { ChatPane } from './ChatPane';
 import { clearGoalDraft, goalObjective, parseGoalProposal, readGoalDraft, saveGoalDraft, type GoalDraft } from './goal-draft';
 import { policies } from './SettingsPage';
-import { Button, Field, Input, Status } from './ui';
+import { Button, Field, Input, Status, Spinner } from './ui';
 import './goal-composer.css';
 
 type Run = (action: () => Promise<unknown>) => Promise<void>;
@@ -99,9 +99,9 @@ function ProjectDraft({ state, client, run, projectId, busy, onSubmit, creationE
       <header><strong><MessageSquare size={15} />Goal assistant</strong>{chat && <Button type="button" size="sm" variant="ghost" disabled={chat.status === 'running' || chat.status === 'waiting'} onClick={() => void assistantRun(() => client.post(`/api/chats/${chat.id}/messages`, { text: assistantPrompt(draft) }))}><Send size={13} />Send current draft</Button>}</header>
       {!!sessions.length && <details className="goal-execution-options"><summary>Assistant workspace</summary><Field label="Workspace"><select value={session?.id ?? ''} disabled={starting} onChange={event => update({ sessionId: event.target.value || undefined, chatId: undefined })}><option value="">Create an isolated workspace</option>{sessions.map(item => <option key={item.id} value={item.id}>{item.name} · {item.status}</option>)}</select></Field></details>}
       {assistantError && <div className="error-banner" role="alert">{assistantError}</div>}
-      {!session ? <div className="draft-assistant-start"><p>Use an agent to explore the project, refine the spec and propose completion criteria.</p><Button type="button" variant="outline" disabled={starting || !ownerOnline} onClick={() => void startEnvironment()}>{starting ? <LoaderCircle className="loading-spinner" size={15} /> : <Plus size={15} />}{starting ? 'Preparing assistant…' : 'Start goal assistant'}</Button>{!ownerOnline && <p className="field-hint">The project’s device is offline.</p>}</div>
+      {!session ? <div className="draft-assistant-start"><p>Use an agent to explore the project, refine the spec and propose completion criteria.</p><Button type="button" variant="outline" disabled={starting || !ownerOnline} onClick={() => void startEnvironment()}>{starting ? <Spinner className="factory-spinner" style={{ width: 15, height: 15 }} aria-hidden="true" /> : <Plus size={15} />}{starting ? 'Preparing assistant…' : 'Start goal assistant'}</Button>{!ownerOnline && <p className="field-hint">The project’s device is offline.</p>}</div>
         : session.status === 'ready' ? <ChatPane key={session.id} state={state} client={client} session={session} run={assistantRun} initialChatId={draft.chatId} drafting={{ prompt: assistantPrompt(draft), onChatCreated: id => update({ chatId: id }), onUseMessage: useProposal }} />
-        : <div className="draft-assistant-start"><Status state={session.status} /><p>{session.error ?? session.phase ?? (session.status === 'starting' ? 'Preparing the assistant workspace…' : 'Resume the assistant to continue.')}</p>{session.status === 'starting' ? <LoaderCircle className="loading-spinner" size={24} /> : ['stopped', 'failed'].includes(session.status) && <Button type="button" variant="outline" disabled={!ownerOnline} onClick={() => void assistantRun(() => client.post(`/api/sessions/${session.id}/restart`))}>Resume assistant</Button>}</div>}
+        : <div className="draft-assistant-start"><Status state={session.status} /><p>{session.error ?? session.phase ?? (session.status === 'starting' ? 'Preparing the assistant workspace…' : 'Resume the assistant to continue.')}</p>{session.status === 'starting' ? <Spinner className="factory-spinner" style={{ width: 24, height: 24 }} aria-hidden="true" /> : ['stopped', 'failed'].includes(session.status) && <Button type="button" variant="outline" disabled={!ownerOnline} onClick={() => void assistantRun(() => client.post(`/api/sessions/${session.id}/restart`))}>Resume assistant</Button>}</div>}
     </section>
   </div>;
 }

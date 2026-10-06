@@ -3,7 +3,7 @@ import type { Device } from '@enoughfactory/contracts';
 import { ArrowRight, Link2, RefreshCw, Wifi } from 'lucide-react';
 import type { Connection } from './api';
 import { browserPeerClient, pairedBrowserDevices, peerChanges } from './browserPeers';
-import { Button, Field, Status } from './ui';
+import { Button, Field, Spinner, Status } from './ui';
 
 const DEVICE_SERVICE_UPDATE_REQUIRED = '[DEVICE_SERVICE_UPDATE_REQUIRED]';
 
@@ -24,7 +24,7 @@ export function DesktopServiceRecovery({ error, onConnect }: { error: string | n
     catch (cause) { setRecoveryError(deviceConnectionError(cause instanceof Error ? cause.message : String(cause))); }
     finally { setBusy(false); }
   }
-  return <section className="modal-form" aria-label="Update device service" aria-busy={busy}><div className="notice"><RefreshCw size={18} /><div><strong>Update device service</strong><p className="field-hint">Restart with this installation’s current service version. Existing environments and work records are retained.</p></div></div>{recoveryError && <div className="error-banner" role="alert">{recoveryError}</div>}<div className="header-actions"><Button disabled={busy} onClick={() => void update()}><RefreshCw size={15} className={busy ? 'loading-spinner' : undefined} />{busy ? 'Updating device service…' : 'Update device service'}</Button></div></section>;
+  return <section className="modal-form" aria-label="Update device service" aria-busy={busy}><div className="notice"><RefreshCw size={18} /><div><strong>Update device service</strong><p className="field-hint">Restart with this installation’s current service version. Existing environments and work records are retained.</p></div></div>{recoveryError && <div className="error-banner" role="alert">{recoveryError}</div>}<div className="header-actions"><Button disabled={busy} onClick={() => void update()}>{busy ? <Spinner className="factory-spinner" style={{ width: 15, height: 15 }} aria-hidden="true" /> : <RefreshCw size={15} />}{busy ? 'Updating device service…' : 'Update device service'}</Button></div></section>;
 }
 
 export function BrowserConnection({ connection, onConnect }: { connection: Connection; onConnect: (connection: Connection) => void }) {

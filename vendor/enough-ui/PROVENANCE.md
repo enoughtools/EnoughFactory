@@ -1,1 +1,3 @@
 EnoughUI @enoughtools/ui-react 0.4.0, vendored distribution from https://github.com/enoughtools/enough-ui at revision 2c0a5f41ceb589b19224dd3f06f5345a14b2a0cd. MIT; upstream notices preserved. Source and generated output remain upstream-owned.
+
+Circular spinner patch from EnoughUI revision be0d171ee9ca0dcb79836bc81f5d412979bb586b (React/Astro source version 0.5.0). The rebuilt Spinner and shared variant modules are copied exactly; the shared spinner CSS is included in both stylesheets, and the universal square-corner reset is removed from the full stylesheet. All other 0.4.0 distribution assets and notices remain pinned to the base revision.

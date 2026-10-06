@@ -1,9 +1,9 @@
 import { useEffect, useState } from 'react';
 import type { Project, Session } from '@enoughfactory/contracts';
-import { Archive, ArrowLeft, Box, Folder, LoaderCircle, RotateCcw, Square, Trash2 } from 'lucide-react';
+import { Archive, ArrowLeft, Box, Folder, RotateCcw, Square, Trash2 } from 'lucide-react';
 import type { DeviceClient } from './api';
 import { relativeTime, useResource } from './hooks';
-import { Button, EmptyState, Loading, Modal, Panel } from './ui';
+import { Button, EmptyState, Loading, Modal, Panel, Spinner } from './ui';
 import './workspace-removal.css';
 
 type Run = (action: () => Promise<unknown>) => Promise<void>;
@@ -50,11 +50,11 @@ export function RemoveEnvironmentAction({ session, client, run, onRemoved, onOpe
         <div className="header-actions">
           <Button variant="outline" disabled={!!busy} onClick={() => changeOpen(false)}>Cancel</Button>
           {canStop && <Button variant="outline" disabled={!!busy || disabled} onClick={() => void act('stop')}>
-            {busy === 'stop' ? <LoaderCircle className="loading-spinner" size={15} /> : <Square size={13} />}
+            {busy === 'stop' ? <Spinner className="factory-spinner" style={{ width: 15, height: 15 }} aria-hidden="true" /> : <Square size={13} />}
             {busy === 'stop' ? 'Stopping…' : 'Stop environment'}
           </Button>}
           <Button disabled={!stopped || !!busy || disabled} onClick={() => void act('remove')}>
-            {busy === 'remove' ? <LoaderCircle className="loading-spinner" size={15} /> : <Trash2 size={15} />}
+            {busy === 'remove' ? <Spinner className="factory-spinner" style={{ width: 15, height: 15 }} aria-hidden="true" /> : <Trash2 size={15} />}
             {busy === 'remove' ? 'Removing…' : 'Remove environment'}
           </Button>
         </div>
@@ -90,7 +90,7 @@ export function RemoveProjectAction({ project, client, run, onRemoved }: {
         {error && <div className="error-banner" role="alert">{error}</div>}
         <div className="header-actions">
           <Button variant="outline" disabled={busy} onClick={() => setOpen(false)}>Cancel</Button>
-          <Button disabled={busy} onClick={() => void remove()}>{busy ? <LoaderCircle className="loading-spinner" size={15} /> : <Trash2 size={15} />}{busy ? 'Removing…' : 'Remove project'}</Button>
+          <Button disabled={busy} onClick={() => void remove()}>{busy ? <Spinner className="factory-spinner" style={{ width: 15, height: 15 }} aria-hidden="true" /> : <Trash2 size={15} />}{busy ? 'Removing…' : 'Remove project'}</Button>
         </div>
       </div>
     </Modal>
@@ -149,7 +149,7 @@ export function RemovedEnvironmentNotice({ sessionId, client, run, onRestored, o
       {(error || session.error || projectError) && <div className="error-banner" role="alert">{error ?? session.error ?? projectError}</div>}
       <div className="header-actions">{onBack && <Button variant="ghost" size="sm" disabled={busy} onClick={onBack}><ArrowLeft size={14} />Workbench</Button>}
       {session.data && !projectLoading && !projectError && <Button variant="outline" size="sm" disabled={busy} onClick={() => void restore()}>
-        {busy ? <LoaderCircle className="loading-spinner" size={14} /> : <RotateCcw size={14} />}
+        {busy ? <Spinner className="factory-spinner" style={{ width: 14, height: 14 }} aria-hidden="true" /> : <RotateCcw size={14} />}
         {busy ? 'Restoring…' : restorableProject?.archivedAt ? 'Restore project' : session.data.archivedAt ? 'Restore environment' : 'Refresh workspace'}
       </Button>}</div>
     </>}
@@ -187,7 +187,7 @@ export function RemovedItemsPanel({ client, run }: { client: DeviceClient; run: 
         <div className="removed-item-info"><strong>{item.name}</strong><span>{item.kind === 'projects' ? 'Project' : 'Environment'} · {item.detail}</span></div>
         {item.archivedAt && <span className="removed-item-time">{relativeTime(item.archivedAt)}</span>}
         <Button variant="outline" size="sm" disabled={!!busy} onClick={() => void restore(item.kind, item.id)}>
-          {busy === `${item.kind}:${item.id}` ? <LoaderCircle className="loading-spinner" size={14} /> : <RotateCcw size={14} />}
+          {busy === `${item.kind}:${item.id}` ? <Spinner className="factory-spinner" style={{ width: 14, height: 14 }} aria-hidden="true" /> : <RotateCcw size={14} />}
           {busy === `${item.kind}:${item.id}` ? 'Restoring…' : 'Restore'}
         </Button>
       </article>)}

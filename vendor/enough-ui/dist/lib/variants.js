@@ -200,7 +200,7 @@ export const paginationLinkVariants = cva("relative inline-flex h-11 min-w-11 cu
         size: "icon",
     },
 });
-export const spinnerVariants = cva("inline-flex shrink-0 items-center justify-center text-[var(--color-ink)] shadow-none", {
+export const spinnerVariants = cva("inline-flex shrink-0 items-center justify-center shadow-none", {
     variants: {
         size: {
             sm: "size-5",
