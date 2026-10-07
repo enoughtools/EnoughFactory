@@ -264,7 +264,11 @@ export class SessionController {
       const context=worker?{goalId:worker.goal?.id,taskId:worker.task?.id,attemptId:worker.id}:controller?{goalId:controller.goalId}:{};
       const roots:WorkingDirectoryCapture[]=[];for(let i=0;i<snapshots.length;i++){const capture=await this.directoryManager.captureFromPath(snapshots[i]!,exports[i]!,context);roots.push(capture);for(const manifest of [capture.bundleArtifact,capture.diffArtifact])this.store.set('artifacts',manifest);}
       this.store.set('session-working-directory-captures',{id:sessionId,roots});
-      this.patch(sessionId,{workingDirectories:snapshots.map(root=>this.publicRoot(root,'captured',roots.find(item=>item.id===root.id)))});return roots;
+      this.patch(sessionId,{workingDirectories:snapshots.map(root=>this.publicRoot(root,'captured',roots.find(item=>item.id===root.id)))});
+      // Immutable artifacts and their capture journal now own recovery. Remove
+      // only this invocation's staging copies, never prior or uncertain exports.
+      for(const destination of exports)await rm(destination,{recursive:true,force:true});
+      return roots;
     })().catch(error=>{this.patch(sessionId,{workingDirectories:this.record(sessionId).workingDirectories?.map(root=>({...root,status:'failed',error:error.message}))});throw error;}).finally(()=>this.directoryCaptures.delete(sessionId));
     this.directoryCaptures.set(sessionId,operation);return operation;
   }

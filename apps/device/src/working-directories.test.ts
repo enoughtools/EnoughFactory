@@ -1,10 +1,12 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { cp, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { cp, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { EnvmuxSession, type EnvmuxReady, type EnvmuxState } from '@enoughfactory/envmux';
 import type { Project } from '@enoughfactory/contracts';
+import type { ArtifactManifest, WorkingDirectoryCapture, WorkingDirectorySnapshot } from '@enoughfactory/workspaces';
 import { Store } from './store.ts';
 import { SessionController } from './sessions.ts';
 import { factoryAttemptWorkingDirectorySources } from './factory.ts';
@@ -96,4 +98,78 @@ test('repair snapshots retain prior roots and include newly configured verificat
   const tooMany = { ...project, workingDirectories: Array.from({ length: 7 }, (_, index) => ({ id: `new-${index}`, name: `new-${index}`, path: verification })) };
   await assert.rejects(factoryAttemptWorkingDirectorySources(dataDir, sessions, 'over-capacity-attempt', tooMany, captures), /at most eight/);
   await assert.rejects(readFile(path.join(workspaceData, 'working-directories', 'over-capacity-attempt', 'snapshots.json')), /ENOENT/, 'Capacity failure cannot publish a truncated snapshot');
+});
+
+test('working-folder export cleanup waits for every retained artifact and journal', async t => {
+  for (const failure of [undefined, 'copy', 'capture', 'artifact', 'journal'] as const) await t.test(failure || 'success', async t => {
+    const root = await mkdtemp(path.join(tmpdir(), 'enough-session-export-cleanup-'));
+    const owned = path.join(root, 'owned'), sessionId = 'session-export-fixture';
+    const exportParent = path.join(owned, 'working-directory-exports', sessionId);
+    const priorExport = path.join(exportParent, '11111111-1111-4111-8111-111111111111');
+    const authoredRoot = path.join(root, 'authored'), sourceMetadata = path.join(owned, 'working-directories', sessionId);
+    const artifactRoot = path.join(owned, 'artifacts');
+    for (const directory of [priorExport, authoredRoot, sourceMetadata, artifactRoot]) await mkdir(directory, { recursive: true });
+    await writeFile(path.join(priorExport, 'retained.txt'), 'uncertain prior export');
+    await writeFile(path.join(authoredRoot, 'source.txt'), 'authored input');
+    await writeFile(path.join(sourceMetadata, 'snapshots.json'), 'source metadata');
+    const createdAt = new Date().toISOString();
+    const manifest = (id: string): ArtifactManifest => ({ id, name: id, mime: 'application/octet-stream', sha256: 'a'.repeat(64), size: 1, deviceId: 'fixture', createdAt });
+    const snapshots: WorkingDirectorySnapshot[] = ['one', 'two'].map(id => ({ id, name: id, kind: 'folder', containerPath: `/workspaces/${id}`, baseCommit: 'b'.repeat(40), sourceArtifact: manifest(`source-${id}`), path: path.join(sourceMetadata, id) }));
+    const records = new Map<string, { id: string; [key: string]: unknown }>();
+    const exports: string[] = [], artifactFiles: string[] = [];
+    let registrations = 0, paused = false;
+    const store = {
+      get: (bucket: string, id: string) => records.get(`${bucket}:${id}`),
+      list: (bucket: string) => [...records.entries()].filter(([key]) => key.startsWith(`${bucket}:`)).map(([, record]) => record),
+      set: (bucket: string, value: { id: string; [key: string]: unknown }) => {
+        if (bucket === 'artifacts' && ++registrations === 3 && failure === 'artifact') throw new Error('artifact registration unavailable');
+        if (bucket === 'session-working-directory-captures') {
+          assert.equal(registrations, 4);
+          assert(exports.every(destination => existsSync(destination)), 'All staging copies remain until the complete capture journal is stored');
+          if (failure === 'journal') throw new Error('capture journal unavailable');
+        }
+        records.set(`${bucket}:${value.id}`, value);
+      },
+    } as unknown as Store;
+    store.set('sessions', { id: sessionId, projectId: 'project', deviceId: 'fixture', name: 'fixture', status: 'ready', createdAt, updatedAt: createdAt, services: [], workingDirectories: snapshots.map(snapshot => ({ id: snapshot.id, name: snapshot.name, path: snapshot.containerPath, kind: snapshot.kind, baseCommit: snapshot.baseCommit, status: 'ready' })) });
+    store.set('chats', { id: 'chat-fixture', sessionId, status: 'completed', messages: ['retained conversation'] });
+    const endpoint = { host: 'unix:///tmp/unused-export-cleanup.sock', cliPath: '/tmp/unused-docker', configDirectory: path.join(root, 'config') };
+    const controller = new SessionController(store, 'fixture', () => {}, () => {}, { endpoint, ensureReady: async () => assert.fail('Export cleanup must not start a runtime'), bridgeHostAddress: () => undefined }, owned);
+    t.after(async () => { controller.close(); await rm(root, { recursive: true, force: true }); });
+    (controller as unknown as { live: Map<string, unknown> }).live.set(sessionId, { ready: { instance: 'fixture-container' } });
+    (controller as unknown as { docker(args: string[]): Promise<string> }).docker = async args => {
+      if (args[0] === 'pause' || args[0] === 'unpause') { paused = args[0] === 'pause'; return ''; }
+      assert.equal(args[0], 'cp'); assert.equal(paused, true);
+      const destination = args[2]!; exports.push(destination);
+      await writeFile(path.join(destination, 'output.txt'), 'retained output');
+      if (failure === 'copy' && exports.length === 2) throw new Error('copy unavailable');
+      return '';
+    };
+    controller.directoryManager.sourceSnapshots = async () => snapshots;
+    controller.directoryManager.captureFromPath = async (snapshot, exported): Promise<WorkingDirectoryCapture> => {
+      assert(exports.every(destination => existsSync(destination)), 'No root export may be removed while any capture is pending');
+      assert.equal(await readFile(path.join(exported, 'output.txt'), 'utf8'), 'retained output');
+      if (failure === 'capture' && snapshot.id === 'two') throw new Error('capture unavailable');
+      const bundleArtifact = manifest(`bundle-${snapshot.id}`), diffArtifact = manifest(`diff-${snapshot.id}`);
+      for (const artifact of [bundleArtifact, diffArtifact]) { const file = path.join(artifactRoot, artifact.id); await writeFile(file, 'immutable retained bytes'); artifactFiles.push(file); }
+      return { id: snapshot.id, name: snapshot.name, kind: snapshot.kind, containerPath: snapshot.containerPath, baseCommit: snapshot.baseCommit, commit: 'c'.repeat(40), bundleArtifact, diffArtifact };
+    };
+    if (failure) {
+      await assert.rejects(controller.captureWorkingDirectories(sessionId), /unavailable/);
+      assert(exports.every(destination => existsSync(destination)), 'Any export, capture, artifact or journal failure preserves all copied roots');
+      assert.equal(store.get('session-working-directory-captures', sessionId), undefined);
+    } else {
+      const captures = await controller.captureWorkingDirectories(sessionId);
+      assert.equal(captures.length, 2);
+      assert.deepEqual(await readdir(exportParent), [path.basename(priorExport)], 'Only UUID exports created by this invocation are removed');
+      assert.deepEqual(store.get('session-working-directory-captures', sessionId), { id: sessionId, roots: captures });
+      assert(captures.every(capture => [capture.bundleArtifact, capture.diffArtifact].every(artifact => store.get('artifacts', artifact.id))));
+    }
+    assert.equal(paused, false);
+    assert.equal(await readFile(path.join(priorExport, 'retained.txt'), 'utf8'), 'uncertain prior export');
+    assert.equal(await readFile(path.join(authoredRoot, 'source.txt'), 'utf8'), 'authored input');
+    assert.equal(await readFile(path.join(sourceMetadata, 'snapshots.json'), 'utf8'), 'source metadata');
+    assert.equal(store.get<{ messages: string[] }>('chats', 'chat-fixture')?.messages[0], 'retained conversation');
+    for (const file of artifactFiles) assert.equal(await readFile(file, 'utf8'), 'immutable retained bytes');
+  });
 });

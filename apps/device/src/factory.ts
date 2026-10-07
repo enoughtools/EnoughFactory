@@ -19,6 +19,7 @@ import { exec, HttpError, now } from './util.ts';
 import { inspectAttempt, inspectGoal, inspectTask, taskControlReason, taskDispatchBlocker } from './task-inspection.ts';
 import { factoryChatBinding } from './factory-chat.ts';
 import { controllerError } from './factory-controller-error.ts';
+import { releaseControllerInputs } from './factory-controller-inputs.ts';
 import { prepareControllerContext } from './controller-context.ts';
 import { assertCurrentWorkerAssignment, assertWorkerContext, disposeWorkerContext, prepareWorkerContext, type WorkerEvidenceContext } from './worker-context.ts';
 import { developmentToolchainChoice, parseDevelopmentToolchain, prepareDevelopmentToolchain, type FrozenDevelopmentToolchain } from './development-toolchain.ts';
@@ -527,23 +528,29 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
       await app.ensureRuntimeReady();
       const developmentToolchain=await resolveToolchain(project,signal);
       const operation = randomUUID();
-      const workspace = await workspaces.create({ projectPath: project.path, goalId: goal.id, taskId: `control-${role}`, attemptId: operation,developmentToolchain:developmentToolchain==='default'?undefined:developmentToolchain });
-      await configureHandoff(workspace);
-      const context = await prepareControllerContext({ operation, goalId: goal.id, role, project, store: app.store,
-        workspaces, directoryManager: app.sessions.directoryManager, dataDir: app.dataDir });
-      const owned = internalProject(project, workspace, `${goal.title} · ${role}`);
-      const session = await app.sessions.create(owned, sessionName(operation), { workingDirectorySources: context.workingDirectorySources,developmentToolchain });
-      const record: ControllerRun = { id: operation, goalId: goal.id, role, sessionId: session.id, status: 'starting', updatedAt: now() };
-      app.store.set('factory-controller-runs', record);
+      app.store.set('factory-controller-inputs', { id: operation, goalId: goal.id, role, status: 'preparing', updatedAt: now() });
+      let sessionId: string | undefined;
+      let record: ControllerRun | undefined;
       let chatId: string | undefined;
       let controllerFailure: unknown;
       const cancel = () => {
         if (chatId) void chats.interrupt(chatId).catch(() => {});
-        else void app.sessions.stop(session.id).catch(() => {});
+        else if (sessionId) void app.sessions.stop(sessionId).catch(() => {});
       };
       signal?.addEventListener('abort', cancel, { once: true });
       try {
         if (signal?.aborted) throw new Error('The controller decision was revoked.');
+        const workspace = await workspaces.create({ projectPath: project.path, goalId: goal.id, taskId: `control-${role}`, attemptId: operation,developmentToolchain:developmentToolchain==='default'?undefined:developmentToolchain });
+        await configureHandoff(workspace);
+        const context = await prepareControllerContext({ operation, goalId: goal.id, role, project, store: app.store,
+          workspaces, directoryManager: app.sessions.directoryManager, dataDir: app.dataDir });
+        if (signal?.aborted) throw new Error('The controller decision was revoked.');
+        const owned = internalProject(project, workspace, `${goal.title} · ${role}`);
+        const session = await app.sessions.create(owned, sessionName(operation), { workingDirectorySources: context.workingDirectorySources,developmentToolchain });
+        sessionId = session.id;
+        record = { id: operation, goalId: goal.id, role, sessionId, status: 'starting', updatedAt: now() };
+        app.store.set('factory-controller-runs', record);
+        app.store.set('factory-controller-inputs', { id: operation, goalId: goal.id, role, sessionId, status: 'prepared', updatedAt: now() });
         await app.sessions.waitReady(session.id);
         if (signal?.aborted) throw new Error('The controller decision was revoked.');
         const chat = chats.create({ sessionId: session.id, runtime: goal.runtime, approvalMode: goal.approvalMode, title: `${goal.title} · ${role}` });
@@ -556,19 +563,16 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
         return { text: result.text, chatId: chat.id, spend: spend(result) };
       } catch (error) {
         controllerFailure = error;
-        app.store.set('factory-controller-runs', { ...record, chatId, status: signal?.aborted ? 'interrupted' : 'failed', error: (error as Error).message, updatedAt: now() });
+        if (record) app.store.set('factory-controller-runs', { ...record, chatId, status: signal?.aborted ? 'interrupted' : 'failed', error: (error as Error).message, updatedAt: now() });
         throw error;
       } finally {
         signal?.removeEventListener('abort', cancel);
         try {
-          const current = app.sessions.record(session.id);
-          if (app.sessions.needsTermination(session.id)) {
-            if (current.status !== 'stopping') await app.sessions.stop(session.id);
-            await app.sessions.waitStopped(session.id);
-          }
+          await releaseControllerInputs({ operation, sessionId, dataDir: app.dataDir, store: app.store,
+            sessions: app.sessions, directoryManager: app.sessions.directoryManager, artifacts: workspaces.artifacts });
         } catch (error) {
           // Cleanup cannot turn a known preparation failure into an unknown provider outcome.
-          app.store.set('factory-controller-cleanup', { id: operation, sessionId: session.id, error: (error as Error).message, updatedAt: now() });
+          app.store.set('factory-controller-cleanup', { id: operation, sessionId, error: (error as Error).message, updatedAt: now() });
           if (controllerFailure === undefined) throw error;
         }
       }
