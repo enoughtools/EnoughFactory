@@ -13,7 +13,9 @@ const paths = `export PATH=/opt/enoughfactory/node/bin:/root/.local/bin:$PATH; e
 export async function availability(containerId: string, options: RuntimeOptions = {}): Promise<RuntimeCapability[]> {
   const query = `${paths}
 for runtime in codex claude agy; do
-  if command -v "$runtime" >/dev/null 2>&1; then printf '%s\\t' "$runtime"; "$runtime" --version 2>/dev/null | head -1; else printf '%s\\t\\n' "$runtime"; fi
+  runtime_version=''
+  if command -v "$runtime" >/dev/null 2>&1; then runtime_version=$("$runtime" --version 2>/dev/null | head -1); fi
+  printf '%s\\t%s\\n' "$runtime" "$runtime_version"
 done
 if [ -x /opt/enoughfactory/antigravity/bin/python ]; then printf 'sdk\\t'; /opt/enoughfactory/antigravity/bin/python -c 'import importlib.metadata; print(importlib.metadata.version("google-antigravity"))'; else printf 'sdk\\t\\n'; fi`;
   const output = await containerCommand(containerId, ["sh", "-c", query], { ...options, timeout: 30_000 });
@@ -43,6 +45,19 @@ if [ ! -x /opt/enoughfactory/antigravity/bin/python ]; then python3 -m venv /opt
 /opt/enoughfactory/antigravity/bin/python -m pip install --disable-pip-version-check --quiet 'google-antigravity==${RUNTIME_PINS.antigravitySdk}'
 `;
   return `${common}
+node_stage=''
+npm_cache=''
+cleanup_provisioning() {
+  cleanup_status=$?
+  trap - EXIT
+  if [ -n "$node_stage" ]; then rm -rf -- "$node_stage" || cleanup_status=1; fi
+  if [ -n "$npm_cache" ]; then rm -rf -- "$npm_cache" || cleanup_status=1; fi
+  exit "$cleanup_status"
+}
+trap cleanup_provisioning EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 if [ ! -x /opt/enoughfactory/node/bin/node ]; then
   if ! command -v curl >/dev/null 2>&1 || ! command -v xz >/dev/null 2>&1; then
     if ! command -v apt-get >/dev/null 2>&1; then echo 'Node provisioning needs curl, xz and glibc.' >&2; exit 1; fi
@@ -50,16 +65,20 @@ if [ ! -x /opt/enoughfactory/node/bin/node ]; then
   fi
   case "$(uname -m)" in x86_64) architecture=x64;; aarch64|arm64) architecture=arm64;; *) echo 'Unsupported Linux runtime architecture.' >&2; exit 1;; esac
   filename="node-v${RUNTIME_PINS.node}-linux-$architecture.tar.xz"
-  stage=$(mktemp -d)
-  trap 'rm -rf "$stage"' EXIT
-  curl -fLsS "https://nodejs.org/dist/v${RUNTIME_PINS.node}/$filename" -o "$stage/$filename"
-  curl -fLsS "https://nodejs.org/dist/v${RUNTIME_PINS.node}/SHASUMS256.txt" -o "$stage/SHASUMS256.txt"
-  (cd "$stage"; awk -v file="$filename" '$2 == file' SHASUMS256.txt | sha256sum -c -)
+  node_stage=$(mktemp -d)
+  curl -fLsS "https://nodejs.org/dist/v${RUNTIME_PINS.node}/$filename" -o "$node_stage/$filename"
+  curl -fLsS "https://nodejs.org/dist/v${RUNTIME_PINS.node}/SHASUMS256.txt" -o "$node_stage/SHASUMS256.txt"
+  (cd "$node_stage"; awk -v file="$filename" '$2 == file' SHASUMS256.txt | sha256sum -c -)
   mkdir -p /opt/enoughfactory/node
-  tar -xJf "$stage/$filename" --strip-components=1 -C /opt/enoughfactory/node
+  tar -xJf "$node_stage/$filename" --strip-components=1 -C /opt/enoughfactory/node
 fi
-npm install --global --prefix /opt/enoughfactory/node --no-audit --no-fund '${runtime === "codex" ? `@openai/codex@${RUNTIME_PINS.codex}` : `@anthropic-ai/claude-code@${RUNTIME_PINS.claude}`}'
+npm_cache=$(mktemp -d "\${TMPDIR:-/tmp}/enoughfactory-npm.XXXXXXXX")
+npm install --global --prefix /opt/enoughfactory/node --cache "$npm_cache" --no-audit --no-fund '${runtime === "codex" ? `@openai/codex@${RUNTIME_PINS.codex}` : `@anthropic-ai/claude-code@${RUNTIME_PINS.claude}`}'
 `;
+}
+
+function hasPinnedVersion(capability: RuntimeCapability, desired: string): boolean {
+  return !!capability.version && new RegExp(`(?:^|\\s)${desired.replaceAll(".", "\\.")}(?=$|\\s|\\()`).test(capability.version);
 }
 
 export async function writePrivateFile(containerId: string, path: string, content: string | Buffer, options: RuntimeOptions = {}): Promise<void> {
@@ -86,15 +105,16 @@ export async function copyMinimalAuth(containerId: string, runtime: RuntimeKind,
 export async function provisionRuntime(containerId: string, runtime: RuntimeKind, provision: ProvisionOptions = {}, options: RuntimeOptions = {}): Promise<RuntimeCapability> {
   const before = (await availability(containerId, options)).find((entry) => entry.kind === runtime)!;
   const desired = runtime === "codex" ? RUNTIME_PINS.codex : runtime === "claude" ? RUNTIME_PINS.claude : RUNTIME_PINS.antigravitySdk;
-  if (!before.available || !before.version?.includes(desired) || runtime === "antigravity" && !before.interactiveApprovals) {
+  if (!before.available || !hasPinnedVersion(before, desired) || runtime === "antigravity" && !before.interactiveApprovals) {
     await containerCommand(containerId, ["sh", "-s"], { ...options, input: installScript(runtime), timeout: 300_000 });
   }
   if (runtime === "antigravity") {
     const script = await readFile(resolve(options.runtimeAssetsDir ?? assetsDirectory, "antigravity_bridge.py"));
     await writePrivateFile(containerId, "/opt/enoughfactory/agents/antigravity_bridge.py", script, options);
   }
-  if (provision.copyHostAuth) await copyMinimalAuth(containerId, runtime, provision, options);
   const result = (await availability(containerId, options)).find((entry) => entry.kind === runtime)!;
   if (!result.available) throw new AgentError(`The ${runtime} runtime was not installed successfully.`, "RUNTIME_MISSING");
+  if (!hasPinnedVersion(result, desired) || runtime === "antigravity" && !result.interactiveApprovals) throw new AgentError(`The ${runtime} runtime did not report the required version ${desired}.`, "RUNTIME_VERSION_MISMATCH");
+  if (provision.copyHostAuth) await copyMinimalAuth(containerId, runtime, provision, options);
   return result;
 }
