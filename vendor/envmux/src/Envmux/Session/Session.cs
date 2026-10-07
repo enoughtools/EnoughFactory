@@ -44,6 +44,9 @@ internal sealed class Session : IAsyncDisposable
     private IBackend? _backend;
     private PortalListener? _portal;
 
+    /// <summary>The instance adopted at startup, so restart cannot adopt a later replacement.</summary>
+    private Instance? _retainedInstance;
+
     /// <summary>The session's SOCKS port, once claimed.</summary>
     private Socks.SocksListener? _socks;
 
@@ -509,6 +512,9 @@ internal sealed class Session : IAsyncDisposable
         }
 
         Phase = "starting the instance";
+
+        _retainedInstance = existing ?? await backend.Instances.GetAsync(Plan.InstanceName, ct).ConfigureAwait(false)
+            ?? throw new SessionException("the created session instance could not be confirmed; inspect its retained work before retrying");
 
         if (existing is not { IsRunning: true })
         {
@@ -1231,24 +1237,43 @@ internal sealed class Session : IAsyncDisposable
     {
         Log.Info("restarting from .envmux.json as it is now");
 
+        var next = Plan;
         try
         {
             var reloaded = SessionConfig.Load(Plan.Directory);
-            Plan = SessionPlan.Resolve(reloaded, Plan.Directory, Plan.Session) with { ManagedGoldenImage = Plan.ManagedGoldenImage };
+            next = SessionRestart.Resolve(Plan, reloaded);
         }
         catch (ConfigException e)
         {
             Log.Error($"config is broken, keeping the one we started with: {e.Message}");
         }
 
-        await ClearTasksAsync(stop: true).ConfigureAwait(false);
-
-        // Services can have been added to the file since the session started.
-        await StartServicesAsync(Backend, ct).ConfigureAwait(false);
-
+        IsReady = false;
+        FailedWith = null;
+        Phase = "checking the retained instance";
         Announce();
+        try
+        {
+            Address = await SessionRestart.EnsureInstanceAsync(Backend, next,
+                _retainedInstance ?? throw new SessionException("the original session instance was not confirmed; inspect its retained work before restarting"), ct).ConfigureAwait(false);
+            Plan = next;
+            await ClearTasksAsync(stop: true).ConfigureAwait(false);
 
-        _ = StartTasksAsync(ct);
+            // Services can have been added to the file since the session started.
+            await StartServicesAsync(Backend, ct).ConfigureAwait(false);
+
+            IsReady = true;
+            Phase = "";
+            Announce();
+            _ = StartTasksAsync(ct);
+        }
+        catch (Exception e)
+        {
+            FailedWith = e.Message;
+            Phase = "restart failed; retained work is available for recovery";
+            Announce();
+            throw;
+        }
     }
 
     /// <summary>

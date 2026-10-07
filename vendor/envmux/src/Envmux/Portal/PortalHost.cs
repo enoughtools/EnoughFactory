@@ -1070,13 +1070,20 @@ internal sealed class PortalHost(Session.Session session, RoomFeed room) : IDisp
         return Task.CompletedTask;
     }
 
-    /// <summary>Recreate the container from the config as it is on disk now.</summary>
-    private Task RestartAsync(HttpContext context)
+    /// <summary>Reload tasks after the retained instance is ready; never recreate its source.</summary>
+    private async Task RestartAsync(HttpContext context)
     {
         session.Log.Info("portal: restart");
-        Detach(session.RestartAsync(), "restarting the session");
-        context.Response.StatusCode = StatusCodes.Status202Accepted;
-        return Task.CompletedTask;
+        try
+        {
+            await session.RestartAsync(CancellationToken.None).ConfigureAwait(false);
+            context.Response.StatusCode = StatusCodes.Status204NoContent;
+        }
+        catch (Exception e) when (e is SessionException or Backends.BackendException or IncusException or IOException)
+        {
+            session.Log.Error($"could not restart the session: {e.Message}");
+            await ProblemAsync(context, StatusCodes.Status409Conflict, e.Message).ConfigureAwait(false);
+        }
     }
 
     /// <summary>

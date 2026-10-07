@@ -200,7 +200,7 @@ internal sealed class DockerBackend : IBackend
 
         public async Task<IReadOnlyList<Instance>> ListAsync(CancellationToken ct = default) =>
             [.. (await engine.ContainersAsync(Ours, all: true, ct).ConfigureAwait(false))
-                .Select(c => AsInstance(c.Names.Count > 0 ? c.Names[0].TrimStart('/') : c.Id, c.State == "running", c.Labels))];
+                .Select(c => AsInstance(c.Names.Count > 0 ? c.Names[0].TrimStart('/') : c.Id, c.Id, c.State == "running", c.Labels))];
 
         /// <exception cref="BackendException">A container by that name exists and is not envmux's.</exception>
         public async Task<Instance?> GetAsync(string name, CancellationToken ct = default)
@@ -225,7 +225,7 @@ internal sealed class DockerBackend : IBackend
                     $"{name} was created with another managed golden image. Name a new session to use the prepared toolchain; the existing work is retained.");
             }
 
-            return AsInstance(name, container.Running, container.Labels);
+            return AsInstance(name, container.Id, container.Running, container.Labels);
         }
 
         public async Task CreateAsync(InstancesPost spec, Action<string>? report = null, CancellationToken ct = default)
@@ -322,10 +322,11 @@ internal sealed class DockerBackend : IBackend
             Task.CompletedTask;
 
         /// <summary>A container as the session reads an instance: its state, and the config it was made with.</summary>
-        private static Instance AsInstance(string name, bool running, IReadOnlyDictionary<string, string> labels) =>
+        private static Instance AsInstance(string name, string id, bool running, IReadOnlyDictionary<string, string> labels) =>
             new()
             {
                 Name = name,
+                BackendId = id,
                 Status = running ? "Running" : "Stopped",
                 StatusCode = running ? IncusStatus.Running : IncusStatus.Stopped,
                 Config = DockerSpec.SpecOf(labels)?.Config ?? new Dictionary<string, string>(),

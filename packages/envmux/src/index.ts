@@ -59,6 +59,12 @@ export interface StartOptions {
 function message(error: unknown): string { return error instanceof Error ? error.message : String(error); }
 function boundedText(text: string, added: string): string { return (text + added).slice(-32_768); }
 
+export class EnvmuxHttpError extends Error {
+  constructor(readonly status: number, detail: string) {
+    super(`Envmux ${status}: ${detail}`); this.name = 'EnvmuxHttpError';
+  }
+}
+
 async function command(program: string, args: string[], cwd?: string, env: NodeJS.ProcessEnv = process.env): Promise<{ code: number; stdout: string; stderr: string }> {
   return await new Promise((accept, reject) => {
     const child = spawn(program, args, { cwd, env, stdio: ['ignore', 'pipe', 'pipe'] });
@@ -109,7 +115,16 @@ export class EnvmuxSession {
     this.ready = options.ready; this.name = options.ready.session; this.id = options.ready.instance;
     this.projectPath = options.projectPath; this.process = options.process;
     this.pid = options.pid ?? options.process?.pid;
-    this.ended = options.ended ?? Promise.resolve(0);
+    if (options.ended) this.ended = options.ended;
+    else if (!options.process) this.ended = Promise.resolve(0);
+    else {
+      const child = options.process;
+      this.ended = new Promise<number>(accept => {
+        if (child.exitCode !== null) accept(child.exitCode);
+        else if (child.signalCode !== null) accept(1);
+        else child.once('exit', code => accept(code ?? 1));
+      });
+    }
   }
 
   private redact(text: string): string {
@@ -135,7 +150,7 @@ export class EnvmuxSession {
     const response = await fetch(new URL(path, this.ready.endpoint), { ...init, headers });
     if (!response.ok) {
       const detail = (await response.text()).slice(0, 2_048);
-      throw new Error(`Envmux ${response.status}: ${this.redact(detail || response.statusText)}`);
+      throw new EnvmuxHttpError(response.status, this.redact(detail || response.statusText));
     }
     return response;
   }
@@ -160,7 +175,14 @@ export class EnvmuxSession {
   }
   async restart(): Promise<void> { await this.request('/api/restart', { method: 'POST' }); }
   async stop(): Promise<void> {
-    await this.request('/api/stop', { method: 'POST' });
+    try { await this.request('/api/stop', { method: 'POST' }); }
+    catch (error) {
+      // A restarted portal can reject its original token. Only our still-live child
+      // has an owned shutdown channel; a saved PID never authorizes signaling.
+      if (!(error instanceof EnvmuxHttpError) || error.status !== 401 || !this.process
+        || this.process.exitCode !== null || this.process.signalCode !== null || !this.process.pid) throw error;
+      if (!this.process.kill('SIGINT')) throw error;
+    }
     if (this.process) {
       let timer: ReturnType<typeof setTimeout> | undefined;
       try { const code=await Promise.race([this.ended, new Promise<never>((_, reject) => {

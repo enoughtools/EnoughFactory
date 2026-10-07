@@ -100,6 +100,12 @@ methods the `k` key and `/task restart` reach. A task restarted from a browser
 tab and one restarted from the window are the same act, and both show up in
 both places a moment later.
 
+Restarting the session reloads its task and service configuration while keeping
+the current portal credentials. If the retained instance stopped with its host,
+restart starts that same instance before reporting success; it never creates a
+replacement for missing work. Changes to portal authentication, the source
+branch or work directory require stopping the session and starting it again.
+
 Clicking a task's name opens **its output**, followed from the beginning: the
 backlog envmux has kept and then every line as it arrives. Read-only in the
 strong sense — there is no pty on the other end and nothing to type into. This

@@ -61,7 +61,10 @@ export class MacRuntime {
       }
       return { ...base, phase: 'ready', message: 'EnoughFactory’s private container engine is ready', version: info.ServerVersion };
     } catch { /* A stopped daemon's forwarded socket may still exist. */ }
-    if (this.starting || this.phase?.phase === 'stopping') return { ...base, ...(this.phase ?? { phase: 'starting', message: 'Checking EnoughFactory’s private container runtime' }) };
+    // An external VM stop can leave the last progress phase as ready. Once a
+    // start is in flight, only the live Docker probe above can establish ready.
+    if (this.starting) return { ...base, phase: 'starting', message: this.phase?.phase === 'starting' ? this.phase.message : 'Checking EnoughFactory’s private container runtime' };
+    if (this.phase?.phase === 'stopping') return { ...base, ...this.phase };
     if (!existsSync(join(this.home, 'factory/lima.yaml'))) return { ...base, phase: 'stopped', message: 'EnoughFactory’s private container engine has not been started' };
     let vm: { name: string; status: string } | undefined;
     try {

@@ -99,6 +99,7 @@ internal static class Program
 
         Sessions use the local Linux Docker engine by default. Incus is optional.
         Press b for the session browser: its localhost reaches the instance.
+        Session restart retains its instance and credentials; authentication changes need stop/start.
         With no .envmux.json, envmux offers to write one.
         Managed supervisors may select a prepared immutable base with
         ENVMUX_MANAGED_GOLDEN_IMAGE when ENVMUX_MANAGED_DOCKER=1.
