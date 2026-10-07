@@ -27,6 +27,8 @@ import { assertCurrentWorkerAssignment, assertWorkerContext, disposeWorkerContex
 import { developmentToolchainChoice, parseDevelopmentToolchain, prepareDevelopmentToolchain, type FrozenDevelopmentToolchain } from './development-toolchain.ts';
 import { retainManualContinuation, type ManualContinuationInput } from './manual-continuation-retention.ts';
 import { HostDiskAdmission, HostDiskHeadroomError, PREPARATION_HEADROOM_BYTES, preparationArtifactBytes } from './host-disk-admission.ts';
+import { TerminalSessionCleanup } from './terminal-session-cleanup.ts';
+import { importFactoryEnvironmentArchives } from './factory-archive-imports.ts';
 
 interface WorkerRecord {
   id: string; coordinatorId: string; goal: Goal; task: FactoryTask; attempt: Attempt; project: Project;
@@ -141,6 +143,8 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
   });
   const jobs = new Map<string, { phase: 'preparing' | 'executing' | 'capturing'; done: Promise<void> }>();
   const captureJobs = new Map<string, Promise<CandidateRef>>();
+  const activeControllerOperations = new Set<string>();
+  let terminalCleanup:TerminalSessionCleanup|undefined;
   const verifiedArtifacts = new Map<string, { path: string; size: number; mtime: number; ctime: number }>();
   const local = (deviceId?: string) => !deviceId || deviceId === app.device.id;
   const worker = (id: string): WorkerRecord => {
@@ -250,10 +254,9 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
       directoryManager: app.sessions.directoryManager, artifacts: workspaces.artifacts, workspaces,
       retireContainer: async (sessionId,assertCurrent) => {
         const conversations=app.store.list<import('@enoughfactory/contracts').Chat>('chats').filter(chat=>chat.sessionId===sessionId);
-        if(!conversations.length||conversations.some(chat=>chat.runtime!=='codex'))return;
         if(conversations.some(chat=>chats.isRunning(chat.id)))throw new HttpError(409,'Wait for the worker conversations to finish before retiring its container.');
         const releaseDisk=hostDisk.reserve(`retire:${sessionId}`);
-        try{await chats.manager.withIdleContainer(app.sessions.record(sessionId).containerId!,()=>app.sessions.retireWorkerContainer(sessionId,app.dataDir,assertCurrent,()=>hostDisk.assert()));}
+        try{await chats.manager.withIdleContainer(app.sessions.retirementContainerName(sessionId),()=>app.sessions.retireWorkerContainer(sessionId,app.dataDir,assertCurrent,()=>hostDisk.assert()));}
         finally{releaseDisk();}
       },
       disposeWorkspace: async () => {
@@ -310,7 +313,7 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
     const referenceContext=record.referenceContext||(record.coordinatorId===app.device.id?await prepareWorkerContext({goal:record.goal,task:record.task,attempt:record.attempt,project,store:app.store,workspaces,directoryManager:app.sessions.directoryManager,dataDir:app.dataDir,reservedNames:workingDirectorySources.map(root=>root.name),assertCurrent}):undefined);
     assertCurrent();
     if(referenceContext){assertWorkerContext(referenceContext,record);patchWorker(record.id,{referenceContext});}
-    const owned = internalProject(project, workspace, record.task.title);
+    const owned = internalProject({...project,runtime:record.goal.runtime}, workspace, record.task.title);
     const state = workspace.providerState;
     hostDisk.assert();
     const session = await app.sessions.create(owned, name,{workingDirectorySources,referenceContext:referenceContext?.source,assertCurrent,developmentToolchain,...(state && typeof state.bindSource === 'string' && typeof state.stateVolume === 'string'
@@ -373,6 +376,7 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
     try {
     if (!record.sessionId) throw new Error('The prepared attempt has no container session.');
     if (worker(record.id).status === 'canceled') return;
+    if(app.sessions.archivedEnvironment(record.sessionId))await app.sessions.restart(record.sessionId);
     await app.sessions.waitReady(record.sessionId);
     if (worker(record.id).status === 'canceled') return;
     assertExecutionAssignment(record);
@@ -448,6 +452,10 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
     if (!['succeeded', 'failed'].includes(record.status) || !record.workspace || !record.sessionId) throw new Error('Capture requires a confirmed ended execution and workspace.');
     const existing = captureJobs.get(id); if (existing) return existing;
     const operation = app.withRuntimeOperation(async () => {
+      if(app.sessions.archivedEnvironment(record.sessionId!)){
+        await app.sessions.restart(record.sessionId!);
+        await app.sessions.waitReady(record.sessionId!);
+      }
       const session = app.sessions.record(record.sessionId!);
       let commit = app.store.get<{ id: string; commit: string }>('factory-capture-input', id)?.commit;
       if (session.status !== 'stopped') {
@@ -643,11 +651,11 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
       const developmentToolchain=await resolveToolchain(project,signal);
       hostDisk.assert();
       const operation = randomUUID();
+      activeControllerOperations.add(operation);
       app.store.set('factory-controller-inputs', { id: operation, goalId: goal.id, role, status: 'preparing', updatedAt: now() });
       let sessionId: string | undefined;
       let record: ControllerRun | undefined;
       let chatId: string | undefined;
-      let controllerFailure: unknown;
       const cancel = () => {
         if (chatId) void chats.interrupt(chatId).catch(() => {});
         else if (sessionId) void app.sessions.stop(sessionId).catch(() => {});
@@ -661,7 +669,7 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
           workspaces, directoryManager: app.sessions.directoryManager, dataDir: app.dataDir });
         if (signal?.aborted) throw new Error('The controller decision was revoked.');
         hostDisk.assert();
-        const owned = internalProject(project, workspace, `${goal.title} · ${role}`);
+        const owned = internalProject({...project,runtime:goal.runtime}, workspace, `${goal.title} · ${role}`);
         const session = await app.sessions.create(owned, sessionName(operation), { workingDirectorySources: context.workingDirectorySources,developmentToolchain });
         sessionId = session.id;
         record = { id: operation, goalId: goal.id, role, sessionId, status: 'starting', updatedAt: now() };
@@ -679,18 +687,20 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
         app.store.set('factory-controller-runs', { ...record, chatId: chat.id, status: 'completed', updatedAt: now(), result: result.text });
         return { text: result.text, chatId: chat.id, spend: spend(result) };
       } catch (error) {
-        controllerFailure = error;
         if (record) app.store.set('factory-controller-runs', { ...record, chatId, status: signal?.aborted ? 'interrupted' : 'failed', error: (error as Error).message, updatedAt: now() });
         throw error;
       } finally {
         signal?.removeEventListener('abort', cancel);
         try {
           await releaseControllerInputs({ operation, sessionId, dataDir: app.dataDir, store: app.store,
-            sessions: app.sessions, directoryManager: app.sessions.directoryManager, artifacts: workspaces.artifacts });
+            sessions: app.sessions, directoryManager: app.sessions.directoryManager, artifacts: workspaces.artifacts,
+            retireContainer:async(sid,assertCurrent)=>app.sessions.withRetirementLease(sid,()=>chats.manager.withIdleContainer(app.sessions.retirementContainerName(sid),()=>app.sessions.retireEphemeralEnvironment(sid,app.dataDir,{assertCurrent,assertSpace:()=>hostDisk.assert(),runtimeKinds:[goal.runtime]})))});
         } catch (error) {
-          // Cleanup cannot turn a known preparation failure into an unknown provider outcome.
+          // Cleanup is retried durably; it cannot change an already recorded provider outcome.
           app.store.set('factory-controller-cleanup', { id: operation, sessionId, error: (error as Error).message, updatedAt: now() });
-          if (controllerFailure === undefined) throw error;
+        } finally {
+          activeControllerOperations.delete(operation);
+          if(sessionId)terminalCleanup?.request(sessionId);
         }
       }
       }).catch(error => { throw controllerError(error, { providerInvoked, runtimeReady: app.diagnostics.containerRuntime?.state === 'ready' }); }).finally(() => releaseDisk());
@@ -830,6 +840,7 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
         chatIsRunning: chatId => chats.isRunning(chatId),
         workerJobsBusy: attemptId => jobs.has(attemptId) || captureJobs.has(attemptId),
         async captureGitCommit(context) {
+          if(app.sessions.archivedEnvironment(context.sessionId)){await app.sessions.restart(context.sessionId);await app.sessions.waitReady(context.sessionId);}
           const session = app.sessions.record(context.sessionId);
           if (session.status !== 'ready') throw new HttpError(409, 'Reconnect the retained environment before preserving its completed manual repair.');
           const engine = app.sessions.get(session.id);
@@ -1052,6 +1063,31 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
   });
   app.serviceHandoffHooks.push(()=>coordinator.stop());
   app.closers.unshift(() => coordinator.stop());
+  let archiveImportJob:Promise<void>|undefined;
+  const importArchives=()=>{
+    if(archiveImportJob)return archiveImportJob;
+    const job=app.withRuntimeOperation(()=>importFactoryEnvironmentArchives({dataDir:app.dataDir,store:app.store,sessions:app.sessions,endpoint:app.runtime.endpoint,assertCurrent:()=>app.assertServiceAvailable()}))
+      .then(()=>{}).catch(error=>{app.store.set('session-archive-imports',{id:'startup',status:'deferred',reason:(error as Error).message,updatedAt:now()});})
+      .finally(()=>{if(archiveImportJob===job)archiveImportJob=undefined;});
+    archiveImportJob=job;return job;
+  };
+  await importArchives();
+  terminalCleanup=new TerminalSessionCleanup({store:app.store,sessions:app.sessions,
+    runtimeReady:()=>app.diagnostics.containerRuntime?.state==='ready',eligible:session=>['stopped','failed','unknown'].includes(session.status),
+    identity:session=>app.sessions.retirementIdentityKey(session.id),
+    busy:sessionId=>app.store.list<WorkerRecord>(journal).some(record=>record.sessionId===sessionId&&(jobs.has(record.id)||jobs.has(`capture-${record.id}`)||captureJobs.has(record.id)))
+      ||app.store.list<ControllerRun>('factory-controller-runs').some(run=>run.sessionId===sessionId&&activeControllerOperations.has(run.id)),
+    retire:async(sessionId,assertCurrent)=>app.withRuntimeOperation(()=>app.sessions.withRetirementLease(sessionId,()=>chats.manager.withIdleContainer(app.sessions.retirementContainerName(sessionId),()=>{
+      const runtimeKinds=[...new Set(app.store.list<import('@enoughfactory/contracts').Chat>('chats').filter(chat=>chat.sessionId===sessionId).map(chat=>chat.runtime))];
+      return app.sessions.retireEphemeralEnvironment(sessionId,app.dataDir,{assertCurrent,assertSpace:()=>hostDisk.assert(),runtimeKinds});
+    }))),
+  });
+  const requestCleanup=(sessionId:string)=>terminalCleanup?.request(sessionId);
+  app.sessions.afterTerminal.push(requestCleanup);
+  const cleanupRuntimeReady=(topic:string,data:unknown)=>{if(topic==='runtime'&&(data as ContainerRuntimeStatus).state==='ready')void importArchives().then(()=>terminalCleanup?.reconcile());};
+  app.listeners.add(cleanupRuntimeReady);
+  app.closers.unshift(async()=>{coordinator.stop();app.listeners.delete(cleanupRuntimeReady);const index=app.sessions.afterTerminal.indexOf(requestCleanup);if(index>=0)app.sessions.afterTerminal.splice(index,1);await archiveImportJob;await terminalCleanup?.close();});
+  terminalCleanup.start();
   await coordinator.start();
   return { coordinator, workspaces, runtime, workspacePort };
 }

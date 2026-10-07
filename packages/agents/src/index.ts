@@ -9,6 +9,7 @@ export * from "./types.ts";
 export { ApprovalRouter, matchPolicyRule } from "./policy.ts";
 export { CODEX_PROTOCOL_VERSION, codexApprovalResponse } from "./codex.ts";
 export type { CodexPayloadRelease } from "./provision.ts";
+export { prepareAgentToolchain, verifyPreparedAgentToolchain, type PreparedAgentToolchain, type AgentToolchainOptions } from "./toolchain-image.ts";
 
 interface LiveTurn { containerId: string; controller: AbortController; process?: ContainerProcess; router: ApprovalRouter; codex?: CodexTurn; }
 export interface AgentManagerOptions extends RuntimeOptions {

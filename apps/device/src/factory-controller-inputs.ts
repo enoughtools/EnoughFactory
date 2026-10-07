@@ -11,6 +11,7 @@ export async function releaseControllerInputs(input: {
   operation: string; sessionId?: string; dataDir: string; store: FactoryStore;
   sessions: Pick<SessionController, 'record' | 'owns' | 'stop' | 'waitStopped' | 'needsTermination' | 'assertCanArchive'>;
   directoryManager: WorkingDirectoryManager; artifacts: ArtifactStore;
+  retireContainer?: (sessionId:string,assertCurrent:()=>void)=>Promise<void>;
 }): Promise<void> {
   if (!/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(input.operation)) throw new Error('Invalid controller input ownership.');
   const projectId = `workspace-${input.operation}`;
@@ -28,6 +29,9 @@ export async function releaseControllerInputs(input: {
     }
     if (input.sessions.record(sessionId).status !== 'stopped' || input.sessions.needsTermination(sessionId)) throw new Error('Controller termination is unconfirmed; inputs are retained.');
     input.sessions.assertCanArchive(sessionId);
+    await input.retireContainer?.(sessionId,()=>{
+      if(input.sessions.record(sessionId).projectId!==projectId||input.sessions.record(sessionId).status!=='stopped'||!input.sessions.owns(sessionId))throw new Error('Controller environment ownership changed before preservation.');
+    });
   }
 
   const workspaceData = path.join(input.dataDir, 'workspace-data');

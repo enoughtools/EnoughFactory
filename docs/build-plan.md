@@ -135,6 +135,8 @@ Keep control, streams and bulk transfer in separate bounded application queues. 
 
 Chats remain device-local. Replicate only the catalog metadata needed to find them; do not build transcript synchronization. Existing authorized work continues through a connection loss according to its execution policy. Cancellation remains requested until the owning service acknowledges it.
 
+Execution environments are ephemeral. Known work in progress keeps its owned environment alive. Once an attempt or controller is terminal, preserve its source changes, chat history in SQLite, and useful artifacts, then remove its container and exclusively owned volumes. Completed source already accepted by the coordinator does not need a retained execution environment. Failed, superseded and stopped orphan attempts need a durable file capture rather than indefinite container retention; preserving those files does not invent a known execution outcome. Restart and retry use fresh environments with retained work restored. Tool installations and caches are reproducible payloads, shared through immutable image layers where possible, rather than history to archive per attempt.
+
 Verify this layer with one bounded connectivity exercise: direct connection, relay connection, sleep/network-change reconnect, terminal streaming beside an artifact transfer, and UI closure while work continues. Do not turn that exercise into a new networking platform.
 
 ## Layer 4 Coordinated work and repository handoffs

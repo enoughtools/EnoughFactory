@@ -10,6 +10,7 @@ import { containerCommand, quote, type SpawnProcess } from "./process.ts";
 export interface RuntimeOptions { dockerEndpoint?: DockerRuntimeEndpoint; spawnProcess?: SpawnProcess; runtimeAssetsDir?: string; signal?: AbortSignal; }
 const assetsDirectory = fileURLToPath(new URL("../../../runtime/agents/", import.meta.url));
 const paths = `export PATH=/opt/enoughfactory/node/bin:/root/.local/bin:$PATH; export HOME=/root;`;
+export const AGENT_RUNTIME_PATHS = paths;
 export async function availability(containerId: string, options: RuntimeOptions = {}): Promise<RuntimeCapability[]> {
   const query = `${paths}
 for runtime in codex claude agy; do
@@ -27,7 +28,7 @@ if [ -x /opt/enoughfactory/antigravity/bin/python ]; then printf 'sdk\\t'; /opt/
   ];
 }
 
-function installScript(runtime: RuntimeKind): string {
+export function runtimeInstallScript(runtime: RuntimeKind): string {
   const common = `set -eu
 ${paths}
 if ! command -v setsid >/dev/null 2>&1; then
@@ -125,6 +126,13 @@ function json(filename, limit = 65536) {
 }
 let native;
 try {
+  const imageReceiptPath = '/opt/enoughfactory/agents/image-toolchain.json';
+  ancestors(imageReceiptPath);
+  if (stat(imageReceiptPath)) {
+    const image = json(imageReceiptPath, 4096);
+    if (image.schemaVersion === 1 && image.runtime === 'codex' && image.nodeVersion === '${RUNTIME_PINS.node}' && image.providerVersion === '${RUNTIME_PINS.codex}' && /^sha256:[a-f0-9]{64}$/.test(image.baseImage) && /^[a-f0-9]{64}$/.test(image.recipeSha256)) defer('Codex is shared by this environment’s immutable toolchain image.');
+    defer('The image toolchain receipt has changed; its inherited files were retained.');
+  }
   ancestors(receiptPath);
   if (!stat(receiptPath)) defer('This Codex installation has no app ownership receipt.');
   const receipt = json(receiptPath, 4096);
@@ -208,7 +216,7 @@ export async function provisionRuntime(containerId: string, runtime: RuntimeKind
   const before = (await availability(containerId, options)).find((entry) => entry.kind === runtime)!;
   const desired = runtime === "codex" ? RUNTIME_PINS.codex : runtime === "claude" ? RUNTIME_PINS.claude : RUNTIME_PINS.antigravitySdk;
   if (!before.available || !hasPinnedVersion(before, desired) || runtime === "antigravity" && !before.interactiveApprovals) {
-    await containerCommand(containerId, ["sh", "-s"], { ...options, input: installScript(runtime), timeout: 300_000 });
+    await containerCommand(containerId, ["sh", "-s"], { ...options, input: runtimeInstallScript(runtime), timeout: 300_000 });
   }
   if (runtime === "antigravity") {
     const script = await readFile(resolve(options.runtimeAssetsDir ?? assetsDirectory, "antigravity_bridge.py"));

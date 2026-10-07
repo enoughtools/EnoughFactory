@@ -26,6 +26,7 @@ Read `docs/build-plan.md` before product implementation. It records the agreed s
 - Device-local chats may be unavailable while their device is offline. Do not build unnecessary transcript replication.
 - Keep goal/task/attempt records durable at the selected coordinator. Preserve task identity, distinguish unknown execution status from failure, and reconcile effects before retrying.
 - Use Git/ArtifactFS for workspaces and source; keep transactional coordination and evidence manifests separate.
+- Environments are ephemeral execution resources. Keep known work in progress alive; retain completed, superseded and failed work as durable source snapshots, SQLite chat history and useful artifacts, then retire the container and its exclusively owned volumes. Do not keep stopped containers as a history store. Preserve uncertain execution outcomes honestly while saving their files, and recreate environments from retained state when work continues.
 
 ## Verification and progress
 

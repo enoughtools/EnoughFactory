@@ -72,6 +72,18 @@ test("idle owned Codex payload release preserves provider state, Node/npm and ot
   });
 });
 
+test("image-owned Codex tools survive terminal cleanup and can serve another turn", async () => {
+  const f = await fixture();
+  try {
+    await writeFile(path.join(f.agents, "image-toolchain.json"), JSON.stringify({ schemaVersion: 1, runtime: "codex", nodeVersion: RUNTIME_PINS.node, providerVersion: RUNTIME_PINS.codex, baseImage: `sha256:${"a".repeat(64)}`, recipeSha256: "b".repeat(64) }));
+    const result = await releaseCodexPayload("fixture-container", f.options);
+    assert.equal(result.status, "deferred");
+    assert.match(result.reason!, /immutable toolchain image/);
+    await f.payloadPresent(); await f.preserved();
+    assert.equal((await provisionRuntime("fixture-container", "codex", {}, f.options)).version, `codex-cli ${RUNTIME_PINS.codex}`);
+  } finally { await f.close(); }
+});
+
 test("unreceipted, changed or redirected payloads are retained before any deletion", async t => {
   const cases = {
     unreceipted: async (f: Awaited<ReturnType<typeof fixture>>) => rm(f.receipt),

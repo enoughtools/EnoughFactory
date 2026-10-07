@@ -251,8 +251,9 @@ export class DeviceApp {
       if(method==='DELETE'&&!action)return {ok:true,session:this.removals.archiveSession(sid)};
       if(method==='POST'&&action==='archive')return {ok:true,session:this.removals.archiveSession(sid)};
       if(method==='POST'&&action==='restore')return this.removals.restoreSession(sid);
-      if(method==='POST')this.sessions.assertWorkAvailable(sid);
+      if(method==='POST'&&action!=='restart')this.sessions.assertWorkAvailable(sid);
       if(method==='GET'&&!action)return this.sessions.record(sid);
+      if(method==='GET'&&action==='environment-archive')return {retirement:this.sessions.archivedEnvironment(sid),history:this.store.events('session-environment-history',sid),cleanup:this.store.get('session-environment-cleanup',sid),restoration:this.store.get('session-environment-restore',sid)};
       if(method==='GET'&&action==='state')return this.sessions.get(sid).state();
       if(method==='GET'&&action==='changes')return this.sessions.changes(sid,url.searchParams.get('path')??undefined,url.searchParams.get('root')??undefined);
       if(method==='GET'&&action==='working-directories')return this.sessions.record(sid).workingDirectories||[];
