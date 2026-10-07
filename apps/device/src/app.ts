@@ -297,7 +297,7 @@ export class DeviceApp {
     try {
       let body:Record<string,unknown>={};if(['POST','PATCH','PUT'].includes(req.method||'')){const chunks:Buffer[]=[];let size=0;for await(const chunk of req){size+=chunk.length;if(size>8*1024*1024)throw new HttpError(413,'Request too large.');chunks.push(Buffer.from(chunk));}if(size){try {body=JSON.parse(Buffer.concat(chunks).toString());}catch {throw new HttpError(400,'Request must contain valid JSON.');}if(!body||typeof body!=='object'||Array.isArray(body))throw new HttpError(400,'Request must be an object.');}}
       const result=await this.dispatch({method:req.method||'GET',url,body});res.writeHead(200,{'Content-Type':'application/json','Cache-Control':'no-store'});res.end(JSON.stringify(result));
-    }catch(error){const e=error as Error;res.writeHead(error instanceof HttpError?error.status:500,{'Content-Type':'application/json'});res.end(JSON.stringify({error:e.message,code:error instanceof HttpError?error.code:undefined}));}
+    }catch(error){const e=error as Error;res.writeHead(error instanceof HttpError?error.status:500,{'Content-Type':'application/json'});res.end(JSON.stringify({error:e.message,code:error instanceof HttpError?error.code:undefined,details:error instanceof HttpError?error.details:undefined}));}
   }
   private static(url:URL,res:ServerResponse):void{
     const root=process.env.ENOUGHFACTORY_WEB_PATH||path.resolve(process.env.ENOUGHFACTORY_REPO||process.cwd(),'apps/web/dist');

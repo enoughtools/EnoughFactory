@@ -291,14 +291,19 @@ export class FactoryCoordinator {
     this.changed(); await Promise.allSettled(attempts.map(attempt => this.acknowledgeCancel(attempt)));
   }
 
-  async retireAttempt(attemptId: string, options: { preserveController?: boolean } = {}): Promise<void> {
+  async retireAttempt(attemptId: string, options: { preserveController?: boolean; expectedGoalRevision?: number; repairInstructions?: string } = {}): Promise<void> {
     const attempt = this.attempt(attemptId), task = this.task(attempt.taskId), goal = this.goal(task.goalId);
     if (terminalGoals.has(goal.status) || task.status === "completed") throw new Error("Integrated or terminal work cannot be retired as a live attempt.");
-    if (!this.isCurrent(attempt)) throw new FactoryOperationError("stale", "This attempt no longer owns its task's execution authority.");
+    if (!this.isCurrent(attempt) || (options.expectedGoalRevision !== undefined && goal.revision !== options.expectedGoalRevision)) throw new FactoryOperationError("stale", "This attempt no longer owns its task's execution authority.");
     if (attempt.status === "failed") await this.retainFailedWork(attempt);
-    if (!this.isCurrent(attempt)) throw new FactoryOperationError("stale", "This attempt changed while its partial work was being retained.");
+    if (!this.isCurrent(attempt) || (options.expectedGoalRevision !== undefined && this.goal(goal.id).revision !== options.expectedGoalRevision)) throw new FactoryOperationError("stale", "This attempt changed while its partial work was being retained.");
     this.options.store.transaction(() => {
       this.revoke(attempt); this.writeTask(task.id, { status: "queued", currentAttemptId: undefined });
+      if (options.repairInstructions !== undefined) {
+        const repairInstructions = options.repairInstructions.trim();
+        this.options.store.set(TABLE.taskDetails, { ...this.taskDetail(task.id), repairInstructions: repairInstructions || undefined });
+        this.decision(goal.id, "task-retry-instructions", repairInstructions ? "The user supplied repair instructions for the next isolated task attempt." : "The user cleared repair instructions for the next isolated task attempt.", { taskId: task.id, previousAttemptId: attempt.id, repairInstructions });
+      }
       this.decision(goal.id, "attempt-retired", "Attempt authority was retired explicitly. A new isolated attempt may now be placed; external effects still require reconciliation.", { attemptId });
       this.writeGoal(goal.id, { nextAction: "Place a replacement for the explicitly retired attempt" });
       const control = this.control(goal.id);

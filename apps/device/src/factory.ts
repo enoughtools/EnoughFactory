@@ -20,6 +20,7 @@ import { factoryChatBinding } from './factory-chat.ts';
 import { controllerError } from './factory-controller-error.ts';
 import { prepareControllerContext } from './controller-context.ts';
 import { developmentToolchainChoice, parseDevelopmentToolchain, prepareDevelopmentToolchain, type FrozenDevelopmentToolchain } from './development-toolchain.ts';
+import { retainManualContinuation, type ManualContinuationInput } from './manual-continuation-retention.ts';
 
 interface WorkerRecord {
   id: string; coordinatorId: string; goal: Goal; task: FactoryTask; attempt: Attempt; project: Project;
@@ -595,10 +596,73 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
       const attempt = app.store.get<Attempt>('attempts', attemptInspectionRoute[1]); if (!attempt) throw new HttpError(404, 'Attempt not found.');
       return inspectAttempt(app.store, attempt);
     }
+    const continuationRoute = route.match(/^\/api\/tasks\/([^/]+)\/retain-continuation$/);
+    if (method === 'POST' && continuationRoute) {
+      const task = app.store.get<FactoryTask>('tasks', continuationRoute[1]);
+      if (!task) throw new HttpError(404, 'Task not found.');
+      const turn = body.turn;
+      if (!turn || typeof turn !== 'object' || Array.isArray(turn)) throw new HttpError(400, 'Identify the exact completed manual turn.');
+      const input: ManualContinuationInput = {
+        goalId: task.goalId, taskId: task.id, goalRevision: body.expectedGoalRevision as number,
+        attemptId: body.expectedAttemptId as string, oldCandidateId: body.expectedCandidateId as string,
+        chatId: body.chatId as string, turn: turn as ManualContinuationInput['turn'],
+      };
+      return app.withRuntimeOperation(() => retainManualContinuation(input, {
+        store: app.store, deviceId: app.device.id,
+        readChatEvents(chatId) {
+          const events: ReturnType<ChatController['events']> = [];
+          let cursor = 0;
+          for (;;) {
+            const batch = chats.events(chatId, cursor);
+            if (!batch.length) return events;
+            events.push(...batch);
+            const latest = batch[batch.length - 1]!.seq;
+            if (latest <= cursor) throw new Error('Conversation event cursor did not advance.');
+            cursor = latest;
+          }
+        },
+        chatIsRunning: chatId => chats.isRunning(chatId),
+        workerJobsBusy: attemptId => jobs.has(attemptId) || captureJobs.has(attemptId),
+        async captureGitCommit(context) {
+          const session = app.sessions.record(context.sessionId);
+          if (session.status !== 'ready') throw new HttpError(409, 'Reconnect the retained environment before preserving its completed manual repair.');
+          const engine = app.sessions.get(session.id);
+          const containerGit = async (...args: string[]) => {
+            const invocation = dockerInvocation(app.runtime.endpoint, ['exec', engine.ready.instance, 'git', '-c', 'safe.directory=*', '-c', 'core.hooksPath=/dev/null', '-C', engine.ready.workdir, ...args]);
+            return (await exec(invocation.command, invocation.args, { env: invocation.env, maxBuffer: 16 * 1024 * 1024 })).stdout.trim();
+          };
+          await containerGit('add', '--all');
+          if (await containerGit('diff', '--cached', '--name-only')) await containerGit('-c', 'user.name=EnoughFactory', '-c', 'user.email=factory@enoughtools.com', 'commit', '-m', `Preserve completed manual repair for EnoughFactory attempt ${context.attempt.id}`);
+          return containerGit('rev-parse', 'HEAD');
+        },
+        captureExtras: context => app.sessions.captureWorkingDirectories(context.sessionId),
+        async validateGitCommit(context, commit) {
+          // An artifact-write retry must not stop an environment containing newer terminal edits.
+          if (app.sessions.record(context.sessionId).status === 'stopped') return;
+          const engine = app.sessions.get(context.sessionId);
+          const containerGit = async (...args: string[]) => {
+            const invocation = dockerInvocation(app.runtime.endpoint, ['exec', engine.ready.instance, 'git', '-c', 'safe.directory=*', '-c', 'core.hooksPath=/dev/null', '-C', engine.ready.workdir, ...args]);
+            return (await exec(invocation.command, invocation.args, { env: invocation.env, maxBuffer: 16 * 1024 * 1024 })).stdout.trim();
+          };
+          if (await containerGit('rev-parse', 'HEAD') !== commit || await containerGit('status', '--porcelain')) throw new HttpError(409, 'The retained environment has newer source changes than this repair capture. It has been left running; preserve and inspect those edits before retrying this retention.', 'MANUAL_CONTINUATION_SOURCE_CHANGED');
+        },
+        async stopSession(context) {
+          if (app.sessions.record(context.sessionId).status !== 'stopped') await app.sessions.stop(context.sessionId);
+          await app.sessions.waitStopped(context.sessionId);
+        },
+        async capture(context, captureInput) {
+          const candidate = await workspaces.capture({ workspaceId: context.workspace.id, ...captureInput });
+          rememberArtifacts(...candidateArtifacts(candidate));
+          return candidateRef(candidate);
+        },
+        onChange: () => app.changed(),
+      }));
+    }
     const taskRoute = route.match(/^\/api\/tasks\/([^/]+)\/(run|retry)$/);
     if (method === 'POST' && taskRoute) {
       if (body.expectedGoalRevision !== undefined && (!Number.isInteger(body.expectedGoalRevision) || Number(body.expectedGoalRevision) < 1)) throw new HttpError(400, 'Expected goal revision must be a positive integer.');
       if (body.expectedAttemptId !== undefined && body.expectedAttemptId !== null && typeof body.expectedAttemptId !== 'string') throw new HttpError(400, 'Expected attempt identity must be text or null.');
+      if (body.repairInstructions !== undefined && (typeof body.repairInstructions !== 'string' || body.repairInstructions.length > 8000)) throw new HttpError(400, 'Repair instructions must be text of at most 8,000 characters.');
       const currentState = (expectedRevision: unknown) => {
         const task = app.store.get<FactoryTask>('tasks', taskRoute[1]); if (!task) throw new HttpError(404, 'Task not found.');
         const goal = app.store.get<Goal>('goals', task.goalId); if (!goal) throw new HttpError(404, 'Goal not found.');
@@ -622,7 +686,7 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
         if (task.status !== 'failed' || (task.currentAttemptId && attempt?.status !== 'failed') || (body.expectedAttemptId !== undefined && body.expectedAttemptId !== (task.currentAttemptId ?? null))) throw new HttpError(409, 'This failed attempt has changed. Refresh its current state before retrying.');
         eligible({ ...task, status: 'queued', currentAttemptId: undefined }, goal);
         if (task.currentAttemptId) {
-          try { await coordinator.retireAttempt(task.currentAttemptId, { preserveController: true }); }
+          try { await coordinator.retireAttempt(task.currentAttemptId, { preserveController: true, expectedGoalRevision: goal.revision, ...(typeof body.repairInstructions === 'string' ? { repairInstructions: body.repairInstructions } : {}) }); }
           catch (error) { if (error instanceof FactoryOperationError && error.kind === 'stale') throw new HttpError(409, error.message); throw error; }
           const after = currentState(goal.revision);
           if (after.task.status !== 'queued' || after.task.currentAttemptId) throw new HttpError(409, 'Coordination advanced while cancellation was acknowledged. Refresh the current attempt.');
@@ -632,7 +696,15 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
           app.store.set('tasks', { ...task, status: 'queued', updatedAt: now() });
         }
         const detail = app.store.get<TaskDetail>('factory-task-details', task.id);
-        if (detail?.waitingFor) app.store.set('factory-task-details', { ...detail, waitingFor: undefined, waitReason: undefined });
+        const repairInstructions = !task.currentAttemptId && typeof body.repairInstructions === 'string' ? body.repairInstructions.trim() : detail?.repairInstructions;
+        app.store.transaction(() => {
+          app.store.set<TaskDetail>('factory-task-details', { ...(detail ?? { id: task.id, key: task.id, checks: [], planRevision: goal.revision, selected: true, failureSignatures: [] }), waitingFor: undefined, waitReason: undefined, repairInstructions: repairInstructions || undefined });
+          if (!task.currentAttemptId && body.repairInstructions !== undefined) app.store.set<Decision>('decisions', {
+            id: randomUUID(), goalId: goal.id, at: now(), kind: 'task-retry-instructions',
+            text: repairInstructions ? 'The user supplied repair instructions for the next isolated task attempt.' : 'The user cleared repair instructions for the next isolated task attempt.',
+            data: { taskId: task.id, previousAttemptId: task.currentAttemptId, repairInstructions },
+          });
+        });
       }
       coordinator.selectTasks(task.goalId, [task.id], { additive: true, preserveController: dispatchControl.stage === 'diagnose' || dispatchControl.stage === 'plan' }); return { ok: true };
     }

@@ -92,7 +92,7 @@ export class CodexTurn {
     else if (method === "turn/completed") {
       const turn = params.turn ?? {};
       if (this.turnId && turn.id !== this.turnId) return;
-      if (turn.status === "failed") { this.fail(new AgentError(turn.error?.message ?? "Codex turn failed.", "AGENT_TURN_FAILED")); return; }
+      if (turn.status === "failed") { this.fail(new AgentError(turn.error?.message ?? "Codex turn failed.", "AGENT_TURN_FAILED", true)); return; }
       if (turn.status === "interrupted") { this.fail(new AgentError("Agent turn interrupted.", "INTERRUPTED")); return; }
       this.finished = true;
       this.resolveTurn({ threadId: this.threadId, text: [...(this.finalMessages.size ? this.finalMessages : this.messages).values()].filter(Boolean).join("\n\n"), usage: this.usage, stopReason: turn.status });

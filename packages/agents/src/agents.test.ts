@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { ApprovalRouter, matchPolicyRule } from "./policy.ts";
-import { codexApprovalResponse } from "./codex.ts";
+import { codexApprovalResponse, CodexTurn, type RpcMessage } from "./codex.ts";
 import type { AgentEvent, TurnInput } from "./types.ts";
 import { ContainerProcess, containerCommand } from "./process.ts";
 import { spawn } from "node:child_process";
@@ -80,9 +80,53 @@ test("a preparation failure records that the task provider never started", async
   const events: AgentEvent[] = [];
   await assert.rejects(manager.runTurn(input, { onEvent: event => { events.push(event); }, onApproval: async () => true }), error => {
     assert.equal((error as Error & { agentStarted?: boolean }).agentStarted, false);
+    assert.equal((error as Error & { executionEnded?: boolean }).executionEnded, true);
     return true;
   });
   assert.equal(starts, 1, "Only the preparation query may launch; never a task provider or replacement");
   assert.equal(events.at(-1)?.data?.phase, "preparation");
   assert.equal(events.at(-1)?.data?.agentStarted, false);
+});
+
+test('only a terminal Codex provider response proves a failed turn ended', async () => {
+  for (const terminalResponse of [true, false]) {
+    let receive!: (line: string) => void, close!: (value: { code: number }) => void;
+    const process = {
+      lines(callback: (line: string) => void) { receive = callback; },
+      exit: new Promise<{ code: number }>(resolve => { close = resolve; }), errorText: () => 'Transport closed',
+      write(message: RpcMessage) {
+        if (message.id === undefined) return;
+        const result = message.method === 'thread/start' ? { thread: { id: 'thread' } } : message.method === 'turn/start' ? { turn: { id: 'turn' } } : {};
+        queueMicrotask(() => {
+          receive(JSON.stringify({ id: message.id, result }));
+          if (message.method === 'turn/start') {
+            if (terminalResponse) receive(JSON.stringify({ method: 'turn/completed', params: { threadId: 'thread', turn: { id: 'turn', status: 'failed', error: { message: 'Task failed' } } } }));
+            else close({ code: 1 });
+          }
+        });
+      },
+    } as unknown as ContainerProcess;
+    const callbacks = { onEvent: () => {}, onApproval: async () => true };
+    const controller = new AbortController(), router = new ApprovalRouter(input, callbacks, controller.signal);
+    await assert.rejects(new CodexTurn(input, callbacks, process, router, controller.signal).run(), error => {
+      assert.equal((error as { executionEnded?: boolean }).executionEnded, terminalResponse);
+      assert.equal((error as { code?: string }).code, terminalResponse ? 'AGENT_TURN_FAILED' : 'RUNTIME_DISCONNECTED');
+      return true;
+    });
+  }
+});
+
+test('a nonzero CLI transport exit cannot masquerade as confirmed provider completion', async () => {
+  const spawnProcess = (() => {
+    const child = new EventEmitter() as EventEmitter & { stdout: PassThrough; stderr: PassThrough; stdin: PassThrough; kill: () => boolean };
+    child.stdout = new PassThrough(); child.stderr = new PassThrough(); child.stdin = new PassThrough(); child.kill = () => true;
+    queueMicrotask(() => { child.stderr.write('Docker transport disconnected'); child.emit('close', 1); });
+    return child;
+  }) as unknown as typeof spawn;
+  const manager = new AgentManager({ autoProvision: false, dockerEndpoint: { cliPath: '/managed/docker', host: 'unix:///managed/docker.sock', configDirectory: '/managed/config' }, spawnProcess });
+  await assert.rejects(manager.runTurn({ ...input, cwd: '/work', codexTransport: 'exec' }, { onEvent: () => {}, onApproval: async () => true }), error => {
+    assert.equal((error as { agentStarted?: boolean }).agentStarted, true);
+    assert.equal((error as { executionEnded?: boolean }).executionEnded, false);
+    return true;
+  });
 });

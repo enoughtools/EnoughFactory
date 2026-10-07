@@ -5,7 +5,8 @@ import path from 'node:path';
 import test, { type TestContext } from 'node:test';
 import type { Attempt, Chat, FactoryTask, Goal, Project, Session } from '@enoughfactory/contracts';
 import type { AttemptDetail, ControlRecord, WorkspaceRef } from '@enoughfactory/factory';
-import type { TurnInput, TurnResult } from '@enoughfactory/agents';
+import type { TurnCallbacks, TurnInput, TurnResult } from '@enoughfactory/agents';
+import type { AddressInfo } from 'node:net';
 import { DeviceApp } from './app.ts';
 import { ChatController } from './chats.ts';
 import { initializeFactory } from './factory.ts';
@@ -140,6 +141,65 @@ test('a manual Continue turn preserves factory binding and passes the immutable 
   assert.ok(!received!.systemInstructions!.includes('Later description'));
   assert.equal(fixture.app.store.get<CompletionReceipt>('chat-results', state.chat.id)!.attemptId, state.attempt.id);
   assert.equal(chats.get(state.chat.id).attemptId, state.attempt.id);
+});
+
+test('ended and stale factory conversations reject new provider turns without losing their transcript or receipts', async t => {
+  const fixture = await harness(t), chats = new ChatController(fixture.app);
+  t.mock.method(chats.manager, 'runTurn', async () => assert.fail('Ended or stale factory source cannot start another provider turn'));
+  await new Promise<void>(resolve => fixture.app.server.listen(0, '127.0.0.1', resolve));
+  const origin = `http://127.0.0.1:${(fixture.app.server.address() as AddressInfo).port}`;
+  for (const change of ['ended', 'checking', 'replaced', 'revision', 'new-chat'] as const) {
+    const state = fixture.seed(change === 'ended' || change === 'checking' ? 'succeeded' : 'running');
+    if (change === 'ended') {
+      fixture.app.store.set('tasks', { ...state.task, status: 'failed' });
+      fixture.app.store.set('attempts', { ...state.attempt, status: 'failed' });
+    } else if (change === 'checking') fixture.app.store.set('tasks', { ...state.task, status: 'review' });
+    else if (change === 'replaced') fixture.app.store.set('tasks', { ...state.task, currentAttemptId: 'replacement' });
+    else if (change === 'revision') fixture.app.store.set('goals', { ...state.goal, revision: 3 });
+    const chatId = change === 'new-chat' ? 'other-chat' : state.chat.id;
+    if (change === 'new-chat') fixture.app.store.set('chats', { ...state.chat, id: chatId });
+    fixture.app.store.set('chat-results', { ...state.completion, id: chatId });
+    const before = fixture.app.store.get('chat-results', chatId), events = chats.events(chatId);
+    const response = await fetch(`${origin}/api/chats/${chatId}/messages`, {
+      method: 'POST', headers: { authorization: `Bearer ${fixture.app.token}`, 'content-type': 'application/json' }, body: JSON.stringify({ text: 'Repair this failure' }),
+    });
+    assert.equal(response.status, 409, change);
+    const error = await response.json() as { code: string; details: { goalId: string; taskId: string; attemptId: string } };
+    assert.equal(error.code, 'FACTORY_TASK_RETRY_REQUIRED');
+    assert.equal(error.details.goalId, state.goal.id); assert.equal(error.details.taskId, state.task.id); assert.equal(error.details.attemptId, state.attempt.id);
+    assert.deepEqual(fixture.app.store.get('chat-results', chatId), before);
+    assert.deepEqual(chats.events(chatId), events);
+  }
+});
+
+test('ordinary chats and answers to an already pending factory question retain their existing flow', async t => {
+  const fixture = await harness(t), chats = new ChatController(fixture.app);
+  const engine = { ready: { instance: 'fake-container', workdir: '/workspace/existing' } } as ReturnType<DeviceApp['sessions']['get']>;
+  t.mock.method(fixture.app.sessions, 'get', () => engine);
+  let state = fixture.seed('running');
+  fixture.app.store.delete('factory-workers', state.attempt.id);
+  t.mock.method(chats.manager, 'runTurn', async (input: TurnInput) => ({ threadId: 'normal-thread', text: input.prompt }));
+  const normal = await chats.run(state.chat.id, 'Ordinary conversation');
+  assert.equal(normal.text, 'Ordinary conversation');
+  assert.equal(fixture.app.store.get<CompletionReceipt>('chat-results', state.chat.id)!.attemptId, undefined);
+
+  state = fixture.seed('running');
+  let questionEntered!: () => void;
+  const entered = new Promise<void>(resolve => { questionEntered = resolve; });
+  t.mock.method(chats.manager, 'runTurn', async (_input: TurnInput, callbacks: TurnCallbacks) => {
+    const pending = callbacks.onQuestion!({ id: 'question', chatId: state.chat.id, questions: [{ id: 'choice' }] }, new AbortController().signal);
+    questionEntered();
+    assert.deepEqual(await pending, { choice: { answers: ['Use the existing design'] } });
+    return { threadId: state.chat.threadId, text: 'Continued after the answer', stopReason: 'completed' };
+  });
+  const turn = chats.run(state.chat.id, 'Ask a question', { attemptId: state.attempt.id, autonomous: false });
+  await entered;
+  // The original live turn may still ask for input while its task has changed; answering is not a new turn.
+  fixture.app.store.set('goals', { ...state.goal, revision: 3 });
+  await fixture.app.dispatch({ method: 'POST', url: new URL(`http://local/api/chats/${state.chat.id}/messages`), body: { text: 'Use the existing design' } });
+  await turn;
+  assert.equal(chats.get(state.chat.id).status, 'idle');
+  assert.equal(fixture.app.store.get<CompletionReceipt>('chat-results', state.chat.id)!.attemptId, state.attempt.id);
 });
 
 test('stale authority and mismatched legacy receipts remain unknown instead of authorizing execution or success', async t => {

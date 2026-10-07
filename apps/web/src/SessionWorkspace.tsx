@@ -106,7 +106,7 @@ function Preview({ client, session, hidden }: { client: DeviceClient; session: S
   return <div className="preview-pane"><form className="preview-toolbar" onSubmit={event => { event.preventDefault(); void navigate(); }}><Globe size={16} />{desktop && target && <><Button type="button" variant="ghost" size="icon" aria-label="Previous preview page" onClick={() => void window.enoughFactory?.previewNavigation?.('back')}><ArrowLeft size={14} /></Button><Button type="button" variant="ghost" size="icon" aria-label="Next preview page" onClick={() => void window.enoughFactory?.previewNavigation?.('forward')}><ArrowRight size={14} /></Button></>}<Input aria-label="Preview address" value={address} onChange={(event: ChangeEvent<HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement>) => setAddress(event.target.value)} placeholder="http://localhost:3000" /><Button variant="outline" size="sm" disabled={loading || session.status !== 'ready'} type="submit">{loading ? 'Opening…' : 'Open'}</Button>{target && <Button type="button" variant="ghost" size="icon" aria-label="Open preview in a separate window" onClick={() => { if (desktop) void window.enoughFactory?.openPreview?.({ sessionId: session.id, url: address }); else window.open(target, '_blank', 'noopener,noreferrer'); }}><ArrowUpRight size={16} /></Button>}</form>{error && <div className="error-banner">{error}</div>}<div className="preview-viewport" ref={viewport}>{target ? !desktop && <iframe title={`${session.name} preview`} src={target} className="preview-frame" referrerPolicy="no-referrer" /> : <EmptyState icon={<Globe size={32} />} title="Open a preview">Enter the URL of a service running in this environment.</EmptyState>}</div><p className="preview-hint">If this site blocks embedding, open it in a separate window.</p></div>;
 }
 
-export function SessionWorkspace({ client, session, state, run, modalOpen, initialChatId, compact, initialTab, onRemoved }: { client: DeviceClient; session: Session; state: FactoryState; run: Run; modalOpen: boolean; initialChatId?: string; compact?: boolean; initialTab?: SessionTab; onRemoved?: () => void }) {
+export function SessionWorkspace({ client, session, state, run, modalOpen, initialChatId, compact, initialTab, onRemoved, onOpenTask }: { client: DeviceClient; session: Session; state: FactoryState; run: Run; modalOpen: boolean; initialChatId?: string; compact?: boolean; initialTab?: SessionTab; onRemoved?: () => void; onOpenTask?: (taskId: string) => void }) {
   const [tab, setTab] = useState<SessionTab>(initialChatId ? 'agent' : initialTab ?? 'overview');
   const [outputTask, setOutputTask] = useState('stdout');
   const [removalOpen, setRemovalOpen] = useState(false);
@@ -173,7 +173,7 @@ export function SessionWorkspace({ client, session, state, run, modalOpen, initi
           <Output client={client} session={session} task={outputTask} />
         </ResizablePanel>
       </ResizablePanelGroup>}
-      {tab === 'agent' && <ChatPane client={client} session={session} state={state} run={run} initialChatId={initialChatId} />}
+      {tab === 'agent' && <ChatPane client={client} session={session} state={state} run={run} initialChatId={initialChatId} onOpenTask={onOpenTask} />}
       {tab === 'terminal' && <Suspense fallback={<Loading>Opening terminal…</Loading>}><TerminalPane client={client} session={session} /></Suspense>}
       {tab === 'preview' && <Preview client={client} session={session} hidden={modalOpen || removalOpen} />}
       {tab === 'changes' && <Changes client={client} session={session} state={state} run={run} />}

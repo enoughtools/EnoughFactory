@@ -1,9 +1,35 @@
 import type { Attempt, Chat, FactoryTask, Goal } from '@enoughfactory/contracts';
 import type { AttemptDetail, FactoryStore } from '@enoughfactory/factory';
+import { HttpError } from './util.ts';
 
 interface ChatWorker {
   id: string; coordinatorId: string; chatId?: string; sessionId?: string;
   status: string; goal: Goal; task: FactoryTask; attempt: Attempt;
+}
+
+/** A new provider turn cannot modify an ended candidate or bypass its task by opening another chat. */
+export function assertFactoryChatCanStartTurn(store: FactoryStore, chat: Chat, deviceId: string, requestedAttemptId?: string): ReturnType<typeof factoryChatBinding> {
+  const workers = store.list<ChatWorker>('factory-workers');
+  const worker = workers.find(record => record.chatId === chat.id) ?? workers.find(record => record.sessionId === chat.sessionId);
+  if (!worker && !chat.attemptId) return undefined;
+  const attemptId = worker?.id ?? chat.attemptId!;
+  const attempt = store.get<Attempt>('attempts', attemptId);
+  const task = store.get<FactoryTask>('tasks', worker?.task.id ?? attempt?.taskId ?? '');
+  const detail = store.get<AttemptDetail>('factory-attempt-details', attemptId);
+  const binding = factoryChatBinding(store, chat, deviceId);
+  const localAuthority = !worker || worker.coordinatorId === deviceId;
+  const ended = !!worker && !['prepared', 'running', 'unknown'].includes(worker.status) ||
+    !!attempt && ['failed', 'succeeded', 'retired'].includes(attempt.status) ||
+    !!task && ['review', 'completed', 'failed', 'canceled'].includes(task.status);
+  const stale = !binding || (requestedAttemptId !== undefined && requestedAttemptId !== binding.attemptId) ||
+    (localAuthority && (!detail || detail.cancellation !== 'none' || !!detail.candidate || !!detail.integration));
+  if (!ended && !stale) return binding;
+  throw new HttpError(409,
+    'This factory attempt has ended or changed. Open its task and choose Retry task with instructions to continue in a new attempt. Its existing changes and checks remain preserved.',
+    'FACTORY_TASK_RETRY_REQUIRED', {
+      goalId: task?.goalId ?? worker?.goal.id ?? detail?.goalId ?? '', taskId: task?.id ?? worker?.task.id ?? attempt?.taskId ?? '',
+      attemptId, taskStatus: task?.status ?? worker?.task.status ?? 'unknown', reason: ended ? 'attempt-ended' : 'authority-changed',
+    });
 }
 
 /** Recover conversation ownership from the worker journal, never from a prompt or a title. */

@@ -8,4 +8,4 @@ export function equalSecret(a: string, b: string): boolean {
   const left = Buffer.from(a), right = Buffer.from(b);
   return left.length === right.length && timingSafeEqual(left, right);
 }
-export class HttpError extends Error { constructor(readonly status: number, message: string, readonly code?: string) { super(message); } }
+export class HttpError extends Error { constructor(readonly status: number, message: string, readonly code?: string, readonly details?: Record<string, unknown>) { super(message); } }

@@ -40,6 +40,18 @@ export function initialConnection(): Connection {
 }
 export function storeConnection(connection: Connection) { try { localStorage.setItem(CONNECTION_KEY, JSON.stringify(connection)); } catch { /* A browser may disable preferences; the active connection can still work. */ } }
 
+export class DeviceRequestError extends Error {
+  readonly code?: string;
+  readonly details?: unknown;
+  constructor(readonly status: number, body: unknown) {
+    const error = body && typeof body === 'object' && !Array.isArray(body) ? body as { error?: unknown; code?: unknown; details?: unknown } : undefined;
+    super(deviceErrorMessage(error?.error ?? body, `The device returned ${status}.`));
+    this.name = 'DeviceRequestError';
+    this.code = typeof error?.code === 'string' ? error.code : undefined;
+    this.details = error?.details;
+  }
+}
+
 export class DeviceClient {
   constructor(readonly connection: Connection) {}
   url(path: string) { return `${this.connection.url.replace(/\/$/, '')}${path}`; }
@@ -49,7 +61,7 @@ export class DeviceClient {
       if (!this.connection.deviceId) throw new Error('Choose a paired device.');
       const peers = await browserPeerClient();
       const response = await peers.request(this.connection.deviceId, { method: options.method ?? 'GET', path, ...(options.body ? { body: JSON.parse(String(options.body)) } : {}) }, 30_000, lane);
-      if (response.status < 200 || response.status >= 300) throw new Error(deviceErrorMessage((response.body as { error?: string })?.error, `The device returned ${response.status}.`));
+      if (response.status < 200 || response.status >= 300) throw new DeviceRequestError(response.status, response.body);
       if (path === '/api/state') {
         const state = response.body as FactoryState;
         const owner = peers.devices().find(device => device.id === this.connection.deviceId);
@@ -64,9 +76,9 @@ export class DeviceClient {
     if (response.headers.get('content-type')?.includes('text/html')) throw new Error(WEB_PAGE_MESSAGE);
     if (!response.ok) {
       const body = await response.text();
-      let message: unknown = body;
-      try { message = (JSON.parse(body) as { error?: string }).error ?? body; } catch { /* Plain engine errors are useful too. */ }
-      throw new Error(deviceErrorMessage(message, `The device returned ${response.status}.`));
+      let error: unknown = body;
+      try { error = JSON.parse(body); } catch { /* Plain engine errors are useful too. */ }
+      throw new DeviceRequestError(response.status, error);
     }
     if (response.status === 204) return undefined as T;
     if (response.headers.get('content-type')?.includes('json')) return response.json() as Promise<T>;

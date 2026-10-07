@@ -54,7 +54,7 @@ function requireOnline(app:DeviceApp,deviceId:string):void {
   if(!device?.online)throw new HttpError(409,`${device?.name||'The owning device'} is offline. Its chats and live tools will return when it reconnects.`,'DEVICE_OFFLINE');
 }
 function rpcBody(response: RpcResponse): unknown {
-  if(response.status>=400){const body=object(response.body);throw new HttpError(response.status,typeof body.error==='string'?body.error:'The remote operation failed.',typeof body.code==='string'?body.code:undefined);}
+  if(response.status>=400){const body=object(response.body);throw new HttpError(response.status,typeof body.error==='string'?body.error:'The remote operation failed.',typeof body.code==='string'?body.code:undefined,body.details&&typeof body.details==='object'&&!Array.isArray(body.details)?body.details as Record<string,unknown>:undefined);}
   return response.body;
 }
 function parsePackets(stream:PeerStream,accept:(packet:Packet)=>void):()=>void {
@@ -185,7 +185,7 @@ export async function initializeNetwork(app: DeviceApp): Promise<{
       if(rpc.method==='POST'&&url.pathname.endsWith('/browser-preview'))return {v:1,id:rpc.id,status:200,body:await createPreview(call)};
       const deviceId=owner(call);if(deviceId&&deviceId!==app.device.id){requireOnline(app,deviceId);const response=await peers.request(deviceId,{method:rpc.method,path:rpc.path,body:rpc.body});return {...response,id:rpc.id};}
       return {v:1,id:rpc.id,status:200,body:await app.dispatch(call)};
-    }catch(error){return {v:1,id:rpc.id,status:error instanceof HttpError?error.status:500,body:{error:(error as Error).message,code:error instanceof HttpError?error.code:undefined}};}
+    }catch(error){return {v:1,id:rpc.id,status:error instanceof HttpError?error.status:500,body:{error:(error as Error).message,code:error instanceof HttpError?error.code:undefined,details:error instanceof HttpError?error.details:undefined}};}
   };
   peers=await PeerManager.create({dataDir:app.dataDir,name:app.settings.deviceName,signalingUrl:app.settings.signalingUrl,
     iceServers:iceServers(app.settings),relayFallback:true,onRequest:request,

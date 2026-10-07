@@ -5,13 +5,15 @@ import { ArrowRight, ArrowUpRight, Clock3, Download, FileText, History, ListChec
 import type { DeviceClient } from './api';
 import { downloadArtifact } from './artifacts';
 import { relativeTime } from './hooks';
-import { Button, Status } from './ui';
+import { Button, Field, Modal, Status } from './ui';
 import { taskGraphLayout } from './task-graph-layout';
 import { WorkingDirectoryMounts } from './WorkingDirectoryMounts';
 import './task-inspector.css';
 
 type InspectorTab = 'overview' | 'contract' | 'evidence' | 'activity';
 type Run = (action: () => Promise<unknown>) => Promise<void>;
+interface RetryDraft { taskId: string; goalRevision: number; attemptId: string | null; instructions: string; originalInstructions: string }
+const retryInstructionsLimit = 8_000;
 export interface TaskInspectorProps {
   inspection: TaskInspection;
   state: FactoryState;
@@ -163,7 +165,10 @@ function ArtifactList({ artifacts, goal, client, run }: { artifacts: Artifact[];
 export function TaskInspector({ inspection, state, goal, selectedAttemptId, dispatchAllowed, cancellationReason, onSelectAttempt, onSelectTask, client, run, openSession, onOpenChat, onOpenGoalActivity }: TaskInspectorProps) {
   const [tab, setTab] = useState<InspectorTab>('overview');
   const [busy, setBusy] = useState<string | null>(null);
-  useEffect(() => { setTab('overview'); }, [inspection.task.id]);
+  const [retryOpen, setRetryOpen] = useState(false);
+  const [retryDraft, setRetryDraft] = useState<RetryDraft | null>(null);
+  const [retryError, setRetryError] = useState<string | null>(null);
+  useEffect(() => { setTab('overview'); setRetryOpen(false); setRetryDraft(null); setRetryError(null); }, [inspection.task.id]);
   const { task } = inspection;
   const criticalMinutes = useMemo(() => {
     const tasks = state.tasks.filter(item => item.goalId === goal.id).map(item => item.id === task.id ? task : item);
@@ -182,12 +187,37 @@ export function TaskInspector({ inspection, state, goal, selectedAttemptId, disp
   const terminal = ['completed', 'canceled', 'failed'].includes(goal.status);
   const canRun = (!task.currentAttemptId || !historical) && dispatchAllowed && !terminal && ['ready', 'queued'].includes(inspection.state) && inspection.dependencies.every(value => value.status === 'completed');
   const canRetry = !historical && dispatchAllowed && !terminal && task.status === 'failed' && inspection.state === 'failed' && (!attempt || attempt.status === 'failed');
+  const retryChanged = !canRetry || !retryDraft || retryDraft.taskId !== task.id || retryDraft.goalRevision !== goal.revision || retryDraft.attemptId !== (task.currentAttemptId ?? null);
   const canRetire = !terminal && task.status !== 'completed' && attempt && attempt.id === task.currentAttemptId && (['created', 'running', 'unknown', 'failed'].includes(attempt.status) || (task.status === 'review' && attempt.status === 'succeeded'));
   async function act(name: string, action: () => Promise<unknown>) { if (busy) return; setBusy(name); try { await run(action); } finally { setBusy(null); } }
+  function openRetry() {
+    setRetryDraft(current => current?.taskId === task.id && current.goalRevision === goal.revision && current.attemptId === (task.currentAttemptId ?? null) ? current : {
+      taskId: task.id, goalRevision: goal.revision, attemptId: task.currentAttemptId ?? null,
+      instructions: current?.taskId === task.id ? current.instructions : inspection.repairInstructions ?? '', originalInstructions: inspection.repairInstructions ?? '',
+    });
+    setRetryError(null); setRetryOpen(true);
+  }
+  async function retry() {
+    if (busy || !retryDraft || retryChanged || retryDraft.instructions.length > retryInstructionsLimit) return;
+    const draft = retryDraft, instructions = draft.instructions.trim();
+    setRetryError(null);
+    await act('retry', async () => {
+      try {
+        await client.post(`/api/tasks/${encodeURIComponent(draft.taskId)}/retry`, {
+          expectedGoalRevision: draft.goalRevision, expectedAttemptId: draft.attemptId,
+          ...(instructions !== draft.originalInstructions.trim() ? { repairInstructions: instructions } : {}),
+        });
+        setRetryOpen(false); setRetryDraft(null);
+      } catch (cause) {
+        setRetryError(cause instanceof Error ? cause.message : 'The task could not be retried. Your instructions are kept here.');
+        throw cause;
+      }
+    });
+  }
   const selectAttempt = (id: string) => onSelectAttempt(id);
   return <section className="task-inspector" aria-label={`Inspect ${task.title}`} aria-busy={busy !== null}>
     <header className="ti-header"><div><p className="ti-eyebrow">{task.kind ?? 'Task'}{inspection.planRevision !== undefined ? ` · Plan ${inspection.planRevision}` : ''}</p><h2>{task.title}</h2><div className="ti-header-meta"><Status state={inspection.state} label={task.status === 'canceled' ? 'Canceled task' : undefined} /><span>{device?.name ?? 'Unassigned'}{device?.online === false ? ' · offline' : ''}</span>{attempt && <span>Attempt {attempt.generation}{historical ? ' · previous' : ''}</span>}</div></div>
-      <div className="ti-actions">{canRun && <Button size="sm" disabled={busy !== null} onClick={() => void act('run', () => client.post(`/api/tasks/${encodeURIComponent(task.id)}/run`, { expectedGoalRevision: goal.revision }))}><Play size={13} />{busy === 'run' ? 'Starting…' : 'Run task'}</Button>}{canRetry && <Button size="sm" variant="outline" disabled={busy !== null} onClick={() => void act('retry', () => client.post(`/api/tasks/${encodeURIComponent(task.id)}/retry`, { expectedGoalRevision: goal.revision, expectedAttemptId: task.currentAttemptId ?? null }))}><RotateCcw size={13} />{busy === 'retry' ? 'Retrying…' : 'Retry task'}</Button>}{sessionId && <Button size="sm" variant="ghost" onClick={() => openSession(sessionId)}><ArrowUpRight size={13} />Workspace</Button>}{chatId && chatSessionId && onOpenChat && <Button size="sm" variant="ghost" onClick={() => onOpenChat(chatSessionId, chatId)}><MessageSquare size={13} />Agent chat</Button>}</div>
+      <div className="ti-actions">{canRun && <Button size="sm" disabled={busy !== null} onClick={() => void act('run', () => client.post(`/api/tasks/${encodeURIComponent(task.id)}/run`, { expectedGoalRevision: goal.revision }))}><Play size={13} />{busy === 'run' ? 'Starting…' : 'Run task'}</Button>}{canRetry && <Button size="sm" variant="outline" disabled={busy !== null} onClick={openRetry}><RotateCcw size={13} />Retry task with instructions</Button>}{sessionId && <Button size="sm" variant="ghost" onClick={() => openSession(sessionId)}><ArrowUpRight size={13} />Workspace</Button>}{chatId && chatSessionId && onOpenChat && <Button size="sm" variant="ghost" onClick={() => onOpenChat(chatSessionId, chatId)}><MessageSquare size={13} />Agent chat</Button>}</div>
     </header>
     {(inspection.state === 'unknown' || attempt?.status === 'unknown' || item?.cancellation === 'requested') && <div className="ti-authority"><ShieldOff size={16} /><div><strong>{item?.cancellation === 'requested' ? 'Cancellation is awaiting acknowledgment' : 'Execution outcome is unknown'}</strong><p>The owning device has not confirmed termination or all effects. Retiring revokes this attempt’s EnoughFactory authority and permits replacement work. Direct external effects may still need reconciliation.</p></div></div>}
     {canRetire && attempt && <details className="ti-retire"><summary>Attempt authority</summary><div><p>{attempt.status === 'unknown' ? 'A lost connection does not prove this attempt failed. Retire only when you intend to permit a replacement.' : 'Retire this attempt to revoke integration authority and request cancellation from its owning device.'}</p><Button variant="outline" size="sm" disabled={busy !== null} onClick={() => void act('retire', () => client.post(`/api/attempts/${encodeURIComponent(attempt.id)}/retire`))}><ShieldOff size={13} />{busy === 'retire' ? 'Retiring…' : 'Retire attempt'}</Button></div></details>}
@@ -205,5 +235,16 @@ export function TaskInspector({ inspection, state, goal, selectedAttemptId, disp
       {tab === 'evidence' && <div className="ti-content">{attempts.length > 1 && <label className="ti-attempt-picker">Evidence for<select value={attempt?.id ?? ''} onChange={event => selectAttempt(event.target.value)}>{attempts.map(value => <option key={value.attempt.id} value={value.attempt.id}>Attempt {value.attempt.generation} · {value.attempt.status}</option>)}</select></label>}<AttemptEvidence item={item} configuredChecks={item?.contract?.checks ?? (attempt?.id === task.currentAttemptId ? inspection.checks : [])} detailsAvailable={inspection.detailsAvailable !== false} client={client} run={run} offline={device?.online === false} />{inspection.detailsAvailable !== false && <ArtifactList artifacts={inspection.artifacts} goal={goal} client={client} run={run} />}</div>}
       {tab === 'activity' && <div className="ti-content"><AttemptHistory attempts={attempts} selectedId={attempt?.id} state={state} onSelect={selectAttempt} />{item?.result?.status === 'waiting' && item.result.wakeCondition && attempt?.id === task.currentAttemptId && attempt?.status !== 'retired' && goal.status === 'waiting' && <div className="ti-wake"><p>Waiting for <strong>{item.result.wakeCondition}</strong>{item.result.waitReason ? `: ${item.result.waitReason}` : ''}</p><Button variant="outline" size="sm" disabled={busy !== null} onClick={() => void act('wake', () => client.post(`/api/goals/${encodeURIComponent(goal.id)}/wake`, { condition: item?.result?.wakeCondition }))}><Play size={13} />Condition satisfied · Resume</Button></div>}{device?.online === false && <p className="ti-muted">Live tools and device-local chats are unavailable while {device.name} is offline. Recorded task evidence remains here.</p>}</div>}
     </div>
+    <Modal open={retryOpen} onClose={() => { if (busy !== 'retry') setRetryOpen(false); }} title="Retry task with instructions" description="Start a fresh attempt using the current goal policy. The previous attempt, its chat and saved evidence remain available.">
+      <form className="modal-form" onSubmit={event => { event.preventDefault(); void retry(); }}>
+        <p><strong>{task.title}</strong></p>
+        <Field label="Instructions for the next attempt (optional)" hint={`Edit the existing instructions or add feedback. ${retryDraft?.instructions.length ?? 0} / ${retryInstructionsLimit.toLocaleString()} characters.`}>
+          <textarea autoFocus rows={7} maxLength={retryInstructionsLimit} value={retryDraft?.instructions ?? ''} disabled={busy === 'retry'} onChange={event => setRetryDraft(current => current ? { ...current, instructions: event.target.value } : current)} placeholder="Explain what to change or what the previous attempt missed…" />
+        </Field>
+        {retryChanged && <p className="error-banner" role="alert">The task or goal changed. Your instructions are kept here. Close this dialog and inspect the current attempt before retrying.</p>}
+        {retryError && <p className="error-banner" role="alert">{retryError}</p>}
+        <div className="header-actions"><Button type="button" variant="ghost" disabled={busy === 'retry'} onClick={() => setRetryOpen(false)}>Cancel</Button><Button type="submit" disabled={busy !== null || retryChanged || !retryDraft || retryDraft.instructions.length > retryInstructionsLimit}><RotateCcw size={14} />{busy === 'retry' ? 'Retrying…' : 'Retry task'}</Button></div>
+      </form>
+    </Modal>
   </section>;
 }

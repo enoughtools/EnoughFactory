@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import type { Artifact, Attempt, AttemptInspection, ControllerRun, FactoryTask, Goal, GoalInspection, Project, TaskInspection } from '@enoughfactory/contracts';
-import type { AttemptDetail, ControlRecord, PlanRecord, TaskDetail } from '@enoughfactory/factory';
+import type { AttemptDetail, ControlRecord, FactoryRuntimePort, FactoryWorkspacePort, PlanRecord, TaskDetail } from '@enoughfactory/factory';
 import { DeviceApp } from './app.ts';
 import type { ChatController } from './chats.ts';
 import { initializeFactory } from './factory.ts';
@@ -335,6 +335,23 @@ test('stale inspector commands preserve newer attempts, pause and replanning con
     assert.equal(app.store.get<FactoryTask>('tasks', task.id)!.currentAttemptId, undefined);
     seed({}, { status: 'failed' }); assert.equal(await post(retry, { ...expected, expectedAttemptId: null }), 200);
 
+    // Feedback must be validated before retirement, and omission must preserve an existing repair request.
+    seed({}, { status: 'failed', currentAttemptId: first.id });
+    const beforeInvalidFeedback = snapshot(), canceledBeforeInvalidFeedback = cancellations;
+    for (const repairInstructions of [42, 'x'.repeat(8001)]) assert.equal(await post(retry, { ...expected, expectedAttemptId: first.id, repairInstructions }), 400);
+    assert.deepEqual(snapshot(), beforeInvalidFeedback); assert.equal(cancellations, canceledBeforeInvalidFeedback);
+    assert.equal(await post(retry, { ...expected, expectedAttemptId: first.id, repairInstructions: '  Repair the existing archive workflow and preserve its data.\n  ' }), 200);
+    assert.equal(app.store.get<TaskDetail>('factory-task-details', task.id)!.repairInstructions, 'Repair the existing archive workflow and preserve its data.');
+    assert.equal(app.store.list<{ kind: string }>('decisions').filter(item => item.kind === 'task-retry-instructions').length, 1);
+    seed({}, { status: 'failed' });
+    app.store.set('factory-task-details', { ...app.store.get<TaskDetail>('factory-task-details', task.id)!, repairInstructions: 'Keep the existing request' });
+    assert.equal(await post(retry, { ...expected, expectedAttemptId: null }), 200);
+    assert.equal(app.store.get<TaskDetail>('factory-task-details', task.id)!.repairInstructions, 'Keep the existing request');
+    seed({}, { status: 'failed' });
+    app.store.set('factory-task-details', { ...app.store.get<TaskDetail>('factory-task-details', task.id)!, repairInstructions: 'Clear this request' });
+    assert.equal(await post(retry, { ...expected, expectedAttemptId: null, repairInstructions: '' }), 200);
+    assert.equal(app.store.get<TaskDetail>('factory-task-details', task.id)!.repairInstructions, undefined);
+
     // The owner acknowledgement is asynchronous: newer coordinator state must win.
     for (const transition of ['steer', 'replacement', 'write-conflict'] as const) {
       seed({ concurrency: 4 }, { status: 'failed', currentAttemptId: first.id, writePaths: ['src/shared/ui/'] });
@@ -342,7 +359,7 @@ test('stale inspector commands preserve newer attempts, pause and replanning con
       const acknowledgment = new Promise<void>(resolve => { acknowledge = resolve; });
       const cancelEntered = new Promise<void>(resolve => { entered = resolve; });
       cancelHook = async () => { entered(); await acknowledgment; };
-      const pending = post(retry, { ...expected, expectedAttemptId: first.id });
+      const pending = post(retry, { ...expected, expectedAttemptId: first.id, repairInstructions: 'The original authorized repair request' });
       try {
         await cancelEntered;
         if (transition === 'steer') await factory.coordinator.steer(goal.id, { context: 'Revise the goal before continuing' });
@@ -357,7 +374,31 @@ test('stale inspector commands preserve newer attempts, pause and replanning con
         assert.deepEqual(app.store.get('tasks', task.id), taskBefore);
         if (transition === 'replacement') assert.equal(app.store.get<Attempt>('attempts', second.id)!.status, 'running');
         if (transition === 'write-conflict') assert.equal(app.store.get<TaskDetail>('factory-task-details', task.id)!.selected, false, 'A newly occupied write footprint cannot be authorized after cancellation acknowledgment');
+        assert.equal(app.store.get<TaskDetail>('factory-task-details', task.id)!.repairInstructions, 'The original authorized repair request', 'Feedback was accepted atomically with retirement under the original authority; the stale response must not write it again');
       } finally { acknowledge(); cancelHook = async () => {}; await pending; }
     }
+
+    // A formal retry produces a new generation with current policy and retained repair input, without adopting old checks.
+    seed({ approvalMode: 'manual' }, { status: 'failed', currentAttemptId: first.id });
+    const source = { id: 'unchecked-repair', commit: 'repair-commit', baseCommit: 'base' };
+    const project: Project = { id: goal.projectId, name: 'Product', path: '/unused', deviceId: app.device.id, runtime: 'codex', approvalMode: 'rules', rules: [{ id: 'rule', tool: 'read', decision: 'allow' }], createdAt: at };
+    app.store.set('projects', project);
+    app.store.set('factory-task-details', { ...app.store.get<TaskDetail>('factory-task-details', task.id)!, lastCandidate: source });
+    let preparation: Parameters<FactoryWorkspacePort['prepare']>[0] | undefined, execution: Parameters<FactoryRuntimePort['execute']>[0] | undefined;
+    t.mock.method(factory.workspacePort, 'prepare', async (input: Parameters<FactoryWorkspacePort['prepare']>[0]) => { preparation = input; return { id: 'new-workspace', path: '/isolated', provider: 'git', baseCommit: 'base' }; });
+    t.mock.method(factory.runtime, 'execute', async (input: Parameters<FactoryRuntimePort['execute']>[0]) => { execution = input; return { status: 'unknown', text: '', error: 'No provider launched in this authority test' }; });
+    cancelHook = async () => {
+      assert.equal(app.store.get<TaskDetail>('factory-task-details', task.id)!.repairInstructions, 'Keep the manual repair and fix the archive failure', 'Cancellation acknowledgement may trigger dispatch immediately, so feedback must already be durable');
+      assert.equal(app.store.get<FactoryTask>('tasks', task.id)!.status, 'queued');
+    };
+    assert.equal(await post(retry, { ...expected, expectedAttemptId: first.id, repairInstructions: 'Keep the manual repair and fix the archive failure' }), 200);
+    await factory.coordinator.tick(); await factory.coordinator.waitForIdle();
+    assert.ok(execution); assert.ok(preparation);
+    assert.notEqual(execution.attempt.id, first.id); assert.equal(execution.attempt.generation, 3);
+    assert.equal(execution.goal.approvalMode, 'manual'); assert.deepEqual(execution.project.rules, project.rules);
+    assert.deepEqual(preparation.previousCandidate, source);
+    assert.match(execution.prompt, /Keep the manual repair and fix the archive failure/);
+    assert.equal(app.store.get<Attempt>('attempts', first.id)!.status, 'retired');
+    assert.equal(app.store.get<AttemptDetail>('factory-attempt-details', execution.attempt.id)!.checks, undefined);
   } finally { await app.close(); }
 });

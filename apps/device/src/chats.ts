@@ -3,7 +3,7 @@ import type { Chat, ChatEvent, Approval, ApprovalMode, Project, RuntimeKind } fr
 import type { DeviceApp } from './app.ts';
 import { HttpError, id, now } from './util.ts';
 import path from 'node:path';
-import { factoryChatBinding } from './factory-chat.ts';
+import { assertFactoryChatCanStartTurn } from './factory-chat.ts';
 
 interface PendingApproval { resolve:(decision:boolean)=>void; signal?:AbortSignal; }
 interface Question {id:string;chatId:string;questions:unknown;resolve:(answers:Record<string,{answers:string[]}>)=>void;}
@@ -25,9 +25,8 @@ export class ChatController {
         if(method==='GET'&&!action)return chat;
         if(method==='GET'&&(action==='messages'||action==='events'))return this.events(chat.id,Number(url.searchParams.get('cursor')||0));
         if(method==='POST'&&action==='messages'){
-          app.assertRuntimeCanRun();
           const pending=[...this.questions.values()].find(q=>q.chatId===chat.id);
-          if(pending){const text=String(body.text||'');this.event(chat.id,{kind:'message',role:'user',text});const answers=questionAnswers(pending.questions,text);pending.resolve(answers);this.questions.delete(pending.id);this.patch(chat.id,{status:'running'});return {ok:true};}
+          if(pending){app.assertRuntimeCanRun();const text=String(body.text||'');this.event(chat.id,{kind:'message',role:'user',text});const answers=questionAnswers(pending.questions,text);pending.resolve(answers);this.questions.delete(pending.id);this.patch(chat.id,{status:'running'});return {ok:true};}
           void this.run(chat.id,String(body.text||'')).catch(()=>{});return {ok:true};
         }
         if(method==='POST'&&action==='interrupt'){await this.interrupt(chat.id);return {ok:true};}
@@ -67,10 +66,10 @@ export class ChatController {
   events(chatId:string,cursor=0):ChatEvent[]{return this.app.store.events<ChatEvent>('chat',chatId,cursor).map(e=>({...e.value,seq:e.seq}));}
   private patch(chatId:string,fields:Partial<Chat>):void{this.app.store.set('chats',{...this.get(chatId),...fields,updatedAt:now()});this.app.changed();}
   run(chatId:string,prompt:string,options:RunOptions={}):Promise<TurnResult>{
-    this.app.assertRuntimeCanRun();
     const chat=this.get(chatId);if(!prompt.trim())throw new HttpError(400,'Write a message.');if(this.running.has(chatId))throw new HttpError(409,'This agent is already working.');
+    const binding=assertFactoryChatCanStartTurn(this.app.store,chat,this.app.device.id,options.attemptId);
+    this.app.assertRuntimeCanRun();
     this.app.sessions.assertCanStartWork(chat.sessionId);
-    const binding=factoryChatBinding(this.app.store,chat,this.app.device.id);
     if(binding && !options.attemptId)options={...options,attemptId:binding.attemptId,systemInstructions:binding.instructions,autonomous:true};
     const engine=this.app.sessions.get(chat.sessionId),session=this.app.sessions.record(chat.sessionId),project=this.app.store.get<Project>('projects',session.projectId);
     if(session.workingDirectories?.length)options={...options,systemInstructions:[options.systemInstructions,
@@ -101,7 +100,7 @@ export class ChatController {
         return new Promise<Record<string,{answers:string[]}>>((resolve,reject)=>{this.questions.set(request.id,{...request,resolve});signal.addEventListener('abort',()=>{this.questions.delete(request.id);reject(new Error('Question canceled.'));},{once:true});});
       }
       }).finally(()=>signal.removeEventListener('abort',abort));
-    }).then(result=>{this.app.store.set('chat-results',{id:chatId,result,attemptId:options.attemptId,completedAt:now()});this.patch(chatId,{status:'idle',threadId:result.threadId||chat.threadId});return result;}).catch(error=>{const current=this.get(chatId);this.app.store.set('chat-turn-failures',{id:chatId,attemptId:options.attemptId,error:error.message,code:error.code,agentStarted:error.agentStarted,completedAt:now()});this.patch(chatId,{status:current.status==='interrupted'?'interrupted':'failed',error:error.message});throw error;}).finally(()=>this.running.delete(chatId));
+    }).then(result=>{this.app.store.set('chat-results',{id:chatId,result,attemptId:options.attemptId,completedAt:now()});this.patch(chatId,{status:'idle',threadId:result.threadId||chat.threadId});return result;}).catch(error=>{const current=this.get(chatId);this.app.store.set('chat-turn-failures',{id:chatId,attemptId:options.attemptId,error:error.message,code:error.code,agentStarted:error.agentStarted,executionEnded:error.executionEnded===true,completedAt:now()});this.patch(chatId,{status:current.status==='interrupted'?'interrupted':'failed',error:error.message});throw error;}).finally(()=>this.running.delete(chatId));
     this.running.set(chatId,job);return job;
   }
   async interrupt(chatId:string):Promise<void>{await this.manager.interrupt(chatId);this.patch(chatId,{status:'interrupted'});}
