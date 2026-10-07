@@ -9,6 +9,7 @@ import { delimiter, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { connectExistingService, probeDeviceConnection, type DeviceConnection } from './service-connection.ts';
 import { finishIdleServiceHandoff, prepareServiceUpdate, type ServiceUpdateStatus } from './service-update.ts';
+import { createDesktopQuitController } from './desktop-lifetime.ts';
 
 type Connection = DeviceConnection;
 interface PreviewOptions { sessionId: string; url: string; bounds?: Rectangle }
@@ -360,6 +361,7 @@ app.on('login', (event, contents, _details, authentication, respond) => {
 });
 
 function createWindow(): void {
+  if (stoppingDesktop) return;
   if (mainWindow && !mainWindow.isDestroyed()) { mainWindow.show(); mainWindow.focus(); return; }
   mainWindow = new BrowserWindow({
     width: 1440, height: 960, minWidth: 980, minHeight: 650,
@@ -458,15 +460,17 @@ else {
   }).catch(error => { dialog.showErrorBox('EnoughFactory could not open', error instanceof Error ? error.message : String(error)); app.quit(); });
   app.on('activate', createWindow);
   app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });
-  let quitting = false;
-  app.on('before-quit', event => {
-    if (quitting) return;
-    event.preventDefault();
-    quitting = true;
-    stoppingDesktop = true;
-    if (updateTimer) { clearTimeout(updateTimer); updateTimer = undefined; }
-    // Once an idle handoff is accepted, finish launching its independent daemon
-    // before this process exits. Staging or waiting never keeps the desktop open.
-    void (async () => { if (handoffJob) await handoffJob.catch(() => {}); await closePreview(); })().finally(() => app.quit());
+  const desktopQuit = createDesktopQuitController({
+    prepareQuit: () => {
+      stoppingDesktop = true;
+      if (updateTimer) { clearTimeout(updateTimer); updateTimer = undefined; }
+      return handoffJob;
+    },
+    closePreview,
+    quit: () => app.quit(),
+    // GUI-only exit: the detached device service owns all work and the VM.
+    exit: () => app.exit(0),
   });
+  app.on('before-quit', desktopQuit.beforeQuit);
+  app.once('quit', desktopQuit.dispose);
 }
