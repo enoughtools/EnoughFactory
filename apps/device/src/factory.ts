@@ -1073,7 +1073,7 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
   };
   await importArchives();
   terminalCleanup=new TerminalSessionCleanup({store:app.store,sessions:app.sessions,
-    runtimeReady:()=>app.diagnostics.containerRuntime?.state==='ready',eligible:session=>['stopped','failed','unknown'].includes(session.status),
+    runtimeReady:()=>app.diagnostics.containerRuntime?.state==='ready',eligible:session=>['stopped','failed','unknown'].includes(session.status)&&!app.sessions.archivedEnvironment(session.id),
     identity:session=>app.sessions.retirementIdentityKey(session.id),
     busy:sessionId=>app.store.list<WorkerRecord>(journal).some(record=>record.sessionId===sessionId&&(jobs.has(record.id)||jobs.has(`capture-${record.id}`)||captureJobs.has(record.id)))
       ||app.store.list<ControllerRun>('factory-controller-runs').some(run=>run.sessionId===sessionId&&activeControllerOperations.has(run.id)),
