@@ -26,6 +26,7 @@ export class SessionController {
   private stopJobs = new Map<string,Promise<void>>();
   private generations = new Map<string,number>();
   private runtimeWaits = new Set<string>();
+  private stoppedInputReleases = new Set<string>();
   readonly beforeStop: Array<(sessionId:string)=>Promise<void>> = [];
   readonly afterCaptureBeforeStop: Array<(sessionId:string)=>Promise<void>> = [];
   directoryManager: WorkingDirectoryManager;
@@ -42,6 +43,14 @@ export class SessionController {
     const record=this.record(sessionId);
     if(!['stopped','failed'].includes(record.status)||this.live.has(sessionId)||this.starts.has(sessionId)||this.launchJobs.has(sessionId)||this.stopJobs.has(sessionId)||this.stopping.has(sessionId)||this.needsTermination(sessionId))throw new HttpError(409,'Stop this environment and confirm its work has returned before removing it.','ENVIRONMENT_IN_USE');
   }
+  /** A stopped session cannot restart while its reconstructible host inputs are released. */
+  async withStoppedInputs<T>(sessionId:string, operation:()=>Promise<T>):Promise<T> {
+    if(this.stoppedInputReleases.has(sessionId))throw new HttpError(409,'This environment is releasing retained input copies.','ENVIRONMENT_BUSY');
+    this.assertCanArchive(sessionId);
+    if(!this.owns(sessionId)||this.record(sessionId).status!=='stopped')throw new HttpError(409,'Confirm the owned environment has stopped before releasing its input copies.','ENVIRONMENT_IN_USE');
+    this.stoppedInputReleases.add(sessionId);
+    try{return await operation();}finally{this.stoppedInputReleases.delete(sessionId);}
+  }
   assertActiveProject(project:Project|undefined):void {
     if(!project)throw new HttpError(404,'The source project is no longer available.');
     const visited=new Set<string>();let current:Project|undefined=project;
@@ -51,6 +60,7 @@ export class SessionController {
     }
   }
   assertWorkAvailable(sessionId:string):Session {
+    if(this.stoppedInputReleases.has(sessionId))throw new HttpError(409,'Wait for retained input copies to finish releasing before restarting this environment.','ENVIRONMENT_BUSY');
     const record=this.record(sessionId);if(record.archivedAt)throw new HttpError(409,'Restore this environment before starting work.','ENVIRONMENT_REMOVED');
     const project=this.store.get<Project>('projects',record.projectId);if(project)this.assertActiveProject(project);
     return record;

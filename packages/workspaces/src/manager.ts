@@ -1,11 +1,13 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, writeFile, copyFile, rm, access, readdir } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, writeFile, copyFile, rm, access, readdir } from "node:fs/promises";
 import { join, resolve, dirname, isAbsolute } from "node:path";
 import { ArtifactStore, writeAtomic } from "./artifacts.ts";
 import { candidateDevelopmentToolchain, dockerCheckExecutor, frozenDevelopmentToolchain, sameDevelopmentRecipe } from "./checks.ts";
 import { git, run, safeId } from "./process.ts";
 import { WorkingDirectoryManager, workingDirectoryEmptyDirectories } from "./working-directories.ts";
 import type { ArtifactManifest, Candidate, CheckContext, CheckExecutor, CheckReport, DevelopmentToolchain, IntegrationResult, ManagedWorkspaceProvider, WorkingDirectoryCapture, WorkspaceProvider, WorkspaceRecord } from "./types.ts";
+
+const sourceExports = new Map<string, Promise<ArtifactManifest>>();
 
 export interface WorkspaceManagerOptions {
   dataDir: string;
@@ -148,25 +150,64 @@ export class WorkspaceManager {
 
   async exportSource(input: { projectPath: string; reference?: string }): Promise<ArtifactManifest> {
     const commit = await git(input.projectPath, "rev-parse", "--verify", `${input.reference ?? "HEAD"}^{commit}`);
-    const id = randomUUID();
-    const ref = `refs/enoughfactory/source/${id}`;
+    const objectFormat = await git(input.projectPath, "rev-parse", "--show-object-format");
+    if (!/^[a-f0-9]{40,64}$/.test(commit) || !["sha1", "sha256"].includes(objectFormat)) throw new Error("Source repository has an unsupported object identity");
+    const key = `${this.root}\0${objectFormat}\0${commit}`;
+    const pending = sourceExports.get(key);
+    if (pending) return pending;
+    const ref = `refs/enoughfactory/source/${commit}`;
     const directory = join(this.root, "source");
-    await mkdir(directory, { recursive: true });
-    const path = join(directory, `${id}.bundle`);
+    const indexPath = join(directory, `${objectFormat}-${commit}.json`);
+    const operation = (async () => {
+      let retained: ArtifactManifest | undefined;
+      try { retained = JSON.parse(await readFile(indexPath, "utf8")) as ArtifactManifest; }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+      if (retained) {
+        if (retained.metadata?.commit !== commit || retained.metadata?.ref !== ref || retained.metadata?.objectFormat !== objectFormat) throw new Error("Retained source export has a different immutable identity");
+        const artifact = await this.artifacts.get(retained.id);
+        if (JSON.stringify(artifact) !== JSON.stringify(retained)) throw new Error("Retained source export manifest changed");
+        const path = await this.artifacts.path(artifact);
+        if (await git(input.projectPath, "bundle", "list-heads", path) !== `${commit} ${ref}`) throw new Error("Retained source bundle does not advertise its exact commit");
+        return artifact;
+      }
+      await mkdir(directory, { recursive: true });
+      const temporary = await mkdtemp(join(directory, "export-"));
+      const repository = join(temporary, "repository.git");
+      const path = join(temporary, "source.bundle");
+      // A private object view avoids touching project refs, hooks or configuration. The
+      // canonical index also keeps exports stable if Git later repacks the source objects.
+      const env = { PATH: process.env.PATH, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null", GIT_NO_REPLACE_OBJECTS: "1", LC_ALL: "C" };
+      const isolatedGit = async (...args: string[]) => {
+        const result = await run("git", args, { env, inheritEnv: false });
+        if (result.exitCode !== 0) throw new Error(`Git source export failed: ${result.stderr.trim() || result.stdout.trim()}`);
+        return result.stdout.trim();
+      };
+      try {
+        await isolatedGit("-c", "init.templateDir=", "init", "--bare", "--quiet", `--object-format=${objectFormat}`, repository);
+        const objects = resolve(input.projectPath, await git(input.projectPath, "rev-parse", "--git-path", "objects"));
+        await writeFile(join(repository, "objects", "info", "alternates"), `${JSON.stringify(objects)}\n`);
+        await isolatedGit("-C", repository, "-c", "core.hooksPath=/dev/null", "update-ref", ref, commit);
+        await isolatedGit("-C", repository, "-c", "core.hooksPath=/dev/null", "-c", "pack.threads=1", "bundle", "create", path, ref);
+        const artifact = await this.artifacts.putFile(path, { name: `source-${commit}.bundle`, mime: "application/x-git-bundle", metadata: { commit, ref, objectFormat } });
+        await writeAtomic(indexPath, artifact);
+        return artifact;
+      } finally { await rm(temporary, { recursive: true, force: true }); }
+    })();
+    sourceExports.set(key, operation);
     try {
-      await git(input.projectPath, "update-ref", ref, commit);
-      await git(input.projectPath, "bundle", "create", path, ref);
-      return await this.artifacts.putFile(path, { name: `source-${commit}.bundle`, mime: "application/x-git-bundle", metadata: { commit, ref } });
-    } finally { await git(input.projectPath, "update-ref", "-d", ref).catch(() => undefined); await rm(path, { force: true }); }
+      return await operation;
+    } finally { if (sourceExports.get(key) === operation) sourceExports.delete(key); }
   }
 
   async importSource(input: { artifact: ArtifactManifest; targetPath: string; branch?: string }): Promise<string> {
     const commit = String(input.artifact.metadata?.commit ?? "");
-    if (!/^[a-f0-9]{40,64}$/.test(commit)) throw new Error("Source bundle manifest has no exact commit");
+    if (!/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(commit)) throw new Error("Source bundle manifest has no exact commit");
+    const objectFormat = input.artifact.metadata?.objectFormat === undefined ? (commit.length === 40 ? "sha1" : "sha256") : input.artifact.metadata.objectFormat;
+    if ((objectFormat !== "sha1" && objectFormat !== "sha256") || commit.length !== (objectFormat === "sha1" ? 40 : 64)) throw new Error("Source bundle object format does not match its exact commit");
     const bundlePath = await this.artifacts.path(input.artifact);
     await mkdir(dirname(input.targetPath), { recursive: true });
     if (await exists(input.targetPath)) throw new Error("Source transfer target already exists");
-    const initialized = await run("git", ["init", "--quiet", input.targetPath]);
+    const initialized = await run("git", ["init", "--quiet", `--object-format=${objectFormat}`, input.targetPath]);
     if (initialized.exitCode !== 0) throw new Error(`Could not create workspace: ${initialized.stderr}`);
     try {
       const ref = String(input.artifact.metadata?.ref ?? "");

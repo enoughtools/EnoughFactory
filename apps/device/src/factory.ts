@@ -20,6 +20,7 @@ import { inspectAttempt, inspectGoal, inspectTask, taskControlReason, taskDispat
 import { factoryChatBinding } from './factory-chat.ts';
 import { controllerError } from './factory-controller-error.ts';
 import { releaseControllerInputs } from './factory-controller-inputs.ts';
+import { releaseCoordinatorWorkerInputs, releaseGoalCheckInputs, releaseWorkerInputs } from './factory-worker-inputs.ts';
 import { releaseFactoryCodexPayload } from './factory-codex-cleanup.ts';
 import { controllerCandidates, prepareControllerContext } from './controller-context.ts';
 import { assertCurrentWorkerAssignment, assertWorkerContext, disposeWorkerContext, prepareWorkerContext, workerCandidates, type WorkerEvidenceContext } from './worker-context.ts';
@@ -243,6 +244,22 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
     return { ...record, ...(sessionId ? { sessionId } : {}) };
   }
   function candidateRef(candidate: Candidate): CandidateRef { return { ...candidate }; }
+  async function releaseLocalWorker(id: string): Promise<void> {
+    if (jobs.has(id) || jobs.has(`capture-${id}`) || captureJobs.has(id)) throw new HttpError(409, 'Wait for the worker and its source capture to finish before releasing inputs.');
+    await releaseWorkerInputs({ attemptId: id, dataDir: app.dataDir, store: app.store, sessions: app.sessions,
+      directoryManager: app.sessions.directoryManager, artifacts: workspaces.artifacts, workspaces,
+      disposeWorkspace: async () => {
+        try { await workspaces.dispose(id); }
+        catch(error) {
+          if((error as NodeJS.ErrnoException).code!=='ENOENT')throw error;
+          // A peer can retry release after losing its acknowledgment. Missing
+          // workspace metadata alone is not proof that its directory was released.
+          try{await lstat(path.join(app.dataDir,'workspace-data','workspaces',id));}
+          catch(missing){if((missing as NodeJS.ErrnoException).code==='ENOENT')return;throw missing;}
+          throw error;
+        }
+      } });
+  }
   async function sourceRootsForAttempt(attemptId:string,project:Project,previous?:CandidateRef):Promise<WorkingDirectorySource[]>{
     return factoryAttemptWorkingDirectorySources(app.dataDir,app.sessions,attemptId,project,previous?.workingDirectories as WorkingDirectoryCapture[]|undefined);
   }
@@ -574,14 +591,19 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
       const repository=await workspacePort.inspect(project),operation=randomUUID();
       if(repository.status.trim())throw new Error('Goal checks require a clean primary working tree so they can verify the integrated commit. Commit or preserve the remaining primary edits before evaluating.');
       const workspace=await workspaces.create({projectPath:project.path,goalId:goal.id,taskId:'goal-check',attemptId:operation,baseCommit:repository.head,developmentToolchain:developmentToolchain==='default'?undefined:developmentToolchain});
+      let candidate:Candidate|undefined,report:CheckReport|undefined;
       try{
         const roots=await app.sessions.directoryManager.prepare({identity:operation,sources:project.workingDirectories||[]});
         const workingDirectories:WorkingDirectoryCapture[]=[];for(const root of roots)workingDirectories.push(await app.sessions.directoryManager.captureFromPath(root,root.path));
-        const candidate=await workspaces.capture({workspaceId:workspace.id,reference:workspace.branch,workingDirectories});
+        candidate=await workspaces.capture({workspaceId:workspace.id,reference:workspace.branch,workingDirectories});
         rememberArtifacts(...candidateArtifacts(candidate));
-        const report=await workspaces.verify({candidateId:candidate.id,commands});rememberArtifacts(report.logArtifact);
+        report=await workspaces.verify({candidateId:candidate.id,commands});rememberArtifacts(report.logArtifact);
         return {repository,checks:checkResults(report,candidate.commit)};
-      }finally{await workspaces.dispose(workspace.id);}
+      }finally{
+        await workspaces.dispose(workspace.id);
+        if(candidate&&report)try{await releaseGoalCheckInputs({operation,candidate,report,dataDir:app.dataDir,store:app.store,directoryManager:app.sessions.directoryManager,artifacts:workspaces.artifacts,workspaces});}
+        catch(error){app.store.set('factory-worker-cleanup',{id:operation,error:(error as Error).message,updatedAt:now()});}
+      }
       });
     },
     async reconcileIntegration(project, candidate) {
@@ -591,8 +613,13 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
         checks: result.report ? checkResults(result.report, candidate.commit) : [] };
     },
     async release(workspace) {
-      if (local(workspace.deviceId)) await workspaces.dispose(workspace.id);
-      else await rpc(workspace.deviceId!, 'POST', `/api/factory/worker/${workspace.id}/release`);
+      try {
+        if (local(workspace.deviceId)) await releaseLocalWorker(workspace.id);
+        else {
+          await rpc(workspace.deviceId!, 'POST', `/api/factory/worker/${workspace.id}/release`);
+          await releaseCoordinatorWorkerInputs({attemptId:workspace.id,dataDir:app.dataDir,store:app.store,directoryManager:app.sessions.directoryManager,artifacts:workspaces.artifacts,workspaces});
+        }
+      } catch(error) { app.store.set('factory-worker-cleanup',{id:workspace.id,error:(error as Error).message,updatedAt:now()}); throw error; }
     },
   };
   const runtime: FactoryRuntimePort = {
@@ -996,7 +1023,7 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
       return { ok: true };
     }
     if (method === 'POST' && action === 'release') {
-      if (record.workspace) await workspaces.dispose(record.workspace.id); return { ok: true };
+      await releaseLocalWorker(record.id); return { ok: true };
     }
     return undefined;
   });
