@@ -7,6 +7,7 @@ import { EnvmuxSession, type EnvmuxReady, type EnvmuxState } from '@enoughfactor
 import type { Project } from '@enoughfactory/contracts';
 import { Store } from './store.ts';
 import { SessionController } from './sessions.ts';
+import { factoryAttemptWorkingDirectorySources } from './factory.ts';
 
 test('extra snapshots become ready before use, failed export retains the environment, and restart restores retained edits', async t => {
   const root=await mkdtemp(path.join(tmpdir(),'enough-device-working-roots-')),owned=path.join(root,'owned'),container=path.join(root,'fake-container'),source=path.join(root,'source');
@@ -54,4 +55,45 @@ test('extra snapshots become ready before use, failed export retains the environ
   assert.equal(await readFile(path.join(source,'input.txt'),'utf8'),'original input\n');await assert.rejects(readFile(path.join(source,'output.txt')),/ENOENT/);
   await controller.stop(session.id);store.delete('session-working-directory-captures',session.id);
   await assert.rejects(controller.captureWorkingDirectories(session.id),/Not every additional working folder/);
+});
+
+test('repair snapshots retain prior roots and include newly configured verification inputs without truncation', async t => {
+  const root = await mkdtemp(path.join(tmpdir(), 'enough-repair-working-roots-'));
+  const dataDir = path.join(root, 'owned'), workspaceData = path.join(dataDir, 'workspace-data');
+  const source = path.join(root, 'support'), reference = path.join(root, 'reference'), verification = path.join(root, 'verification-inputs');
+  for (const directory of [source, reference, verification]) await mkdir(directory);
+  await writeFile(path.join(source, 'input.txt'), 'original support\n');
+  await writeFile(path.join(reference, 'reference.txt'), 'retained reference\n');
+  await writeFile(path.join(verification, 'native-contract.json'), '{"requires":"real native evidence"}\n');
+  const store = new Store(path.join(root, 'store'));
+  const endpoint = { host: 'unix:///tmp/unused-repair.sock', cliPath: '/tmp/unused-docker', configDirectory: path.join(root, 'config') };
+  const sessions = new SessionController(store, 'fixture', () => {}, () => {}, { endpoint, ensureReady: async () => assert.fail('Snapshot preparation must not start a runtime'), bridgeHostAddress: () => undefined }, workspaceData);
+  t.after(async () => { sessions.close(); store.close(); await rm(root, { recursive: true, force: true }); });
+  const original = [{ id: 'support', name: 'support', path: source }, { id: 'reference', name: 'reference', path: reference }];
+  const prior = await sessions.directoryManager.prepare({ identity: 'original-attempt', sources: original });
+  await writeFile(path.join(prior[0]!.path, 'input.txt'), 'retained authored repair\n');
+  const captures = await Promise.all(prior.map(snapshot => sessions.directoryManager.captureFromPath(snapshot, snapshot.path)));
+  await writeFile(path.join(source, 'input.txt'), 'new project contents must not replace retained work\n');
+  const project: Project = { id: 'project', name: 'Fixture', path: root, deviceId: 'fixture', createdAt: new Date().toISOString(), runtime: 'codex', approvalMode: 'approve-all', rules: [], workingDirectories: [
+    { id: 'support', name: 'renamed-support', path: source },
+    { id: 'independent-verification-inputs', name: 'verification-inputs', path: verification },
+  ] };
+  const sources = await factoryAttemptWorkingDirectorySources(dataDir, sessions, 'repair-attempt', project, captures);
+  assert.deepEqual(sources.map(({ id, name, containerPath }) => ({ id, name, containerPath })), [
+    { id: 'support', name: 'support', containerPath: '/workspaces/support' },
+    { id: 'reference', name: 'reference', containerPath: '/workspaces/reference' },
+    { id: 'independent-verification-inputs', name: 'verification-inputs', containerPath: '/workspaces/verification-inputs' },
+  ]);
+  const snapshots = await sessions.directoryManager.prepare({ identity: 'repair-attempt' });
+  assert.equal(await readFile(path.join(snapshots[0]!.path, 'input.txt'), 'utf8'), 'retained authored repair\n');
+  assert.equal(await readFile(path.join(snapshots[2]!.path, 'native-contract.json'), 'utf8'), '{"requires":"real native evidence"}\n');
+  assert.equal(await readFile(path.join(source, 'input.txt'), 'utf8'), 'new project contents must not replace retained work\n');
+  assert(sources.every(source => !('path' in source)), 'Worker transfer contains immutable source envelopes, never coordinator filesystem paths');
+
+  const collision = { ...project, workingDirectories: [{ id: 'new-support', name: 'SUPPORT', path: verification }] };
+  await assert.rejects(factoryAttemptWorkingDirectorySources(dataDir, sessions, 'collision-attempt', collision, captures), /identifiers and names must be unique/);
+  await assert.rejects(readFile(path.join(workspaceData, 'working-directories', 'collision-attempt', 'snapshots.json')), /ENOENT/, 'Collision cannot publish a truncated snapshot');
+  const tooMany = { ...project, workingDirectories: Array.from({ length: 7 }, (_, index) => ({ id: `new-${index}`, name: `new-${index}`, path: verification })) };
+  await assert.rejects(factoryAttemptWorkingDirectorySources(dataDir, sessions, 'over-capacity-attempt', tooMany, captures), /at most eight/);
+  await assert.rejects(readFile(path.join(workspaceData, 'working-directories', 'over-capacity-attempt', 'snapshots.json')), /ENOENT/, 'Capacity failure cannot publish a truncated snapshot');
 });

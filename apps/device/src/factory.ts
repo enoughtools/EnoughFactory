@@ -14,6 +14,7 @@ import type { TurnResult } from '@enoughfactory/agents';
 import { dockerInvocation, SWIFT_TOOLCHAIN, validatePreparedToolchain } from '@enoughfactory/runtime';
 import type { DeviceApp, ApiCall } from './app.ts';
 import type { ChatController } from './chats.ts';
+import type { SessionController } from './sessions.ts';
 import { exec, HttpError, now } from './util.ts';
 import { inspectAttempt, inspectGoal, inspectTask, taskControlReason, taskDispatchBlocker } from './task-inspection.ts';
 import { factoryChatBinding } from './factory-chat.ts';
@@ -43,6 +44,23 @@ export function factoryExecutionIsUncertain(error: { agentStarted?: boolean; exe
   // facts need the legacy fallback; an unacknowledged task request may have real effects.
   if (typeof error.agentStarted === 'boolean' || typeof error.executionEnded === 'boolean') return error.agentStarted !== false && error.executionEnded !== true;
   return ['RUNTIME_DISCONNECTED', 'PROTOCOL_TIMEOUT', 'PROTOCOL_ERROR', 'RUNTIME_TIMEOUT', 'CONTAINER_UNAVAILABLE'].includes(error.code ?? '');
+}
+export async function factoryAttemptWorkingDirectorySources(dataDir: string, sessions: Pick<SessionController, 'directoryManager' | 'workingDirectorySources'>, attemptId: string, project: Project, prior?: readonly WorkingDirectoryCapture[]): Promise<WorkingDirectorySource[]> {
+  if (!prior?.length) return sessions.workingDirectorySources(attemptId, project);
+  // Retain authored repair inputs by identity, including previously selected roots.
+  // Current configuration contributes only new identities; it cannot silently replace
+  // retained contents/names or remove a root that the previous candidate still needs.
+  const sources = [];
+  const retainedIds = new Set(prior.map(root => root.id));
+  for (const root of prior) {
+    const target = path.join(dataDir, 'workspace-data', 'working-directory-repair', attemptId, root.id);
+    await sessions.directoryManager.importCapture(root, target);
+    sources.push({ id: root.id, name: root.name, path: target });
+  }
+  sources.push(...(project.workingDirectories ?? []).filter(root => !retainedIds.has(root.id)));
+  // The existing snapshot manager validates the entire union (names/IDs, paths and
+  // the eight-root limit) before export, rather than truncating or renaming inputs.
+  return sessions.workingDirectorySources(attemptId, { ...project, workingDirectories: sources });
 }
 
 /** The service owns execution and the supervisor; no open window is required. */
@@ -172,10 +190,7 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
   }
   function candidateRef(candidate: Candidate): CandidateRef { return { ...candidate }; }
   async function sourceRootsForAttempt(attemptId:string,project:Project,previous?:CandidateRef):Promise<WorkingDirectorySource[]>{
-    const prior=previous?.workingDirectories as WorkingDirectoryCapture[]|undefined;
-    if(!prior?.length)return app.sessions.workingDirectorySources(attemptId,project);
-    const sources=[];for(const root of prior){const target=path.join(app.dataDir,'workspace-data','working-directory-repair',attemptId,root.id);await app.sessions.directoryManager.importCapture(root,target);sources.push({id:root.id,name:root.name,path:target});}
-    return app.sessions.workingDirectorySources(attemptId,{...project,workingDirectories:sources});
+    return factoryAttemptWorkingDirectorySources(app.dataDir,app.sessions,attemptId,project,previous?.workingDirectories as WorkingDirectoryCapture[]|undefined);
   }
   async function prepareLocal(record: WorkerRecord, project = record.project, previousCandidate?: CandidateRef): Promise<void> {
     return app.withRuntimeOperation(async signal=>{
