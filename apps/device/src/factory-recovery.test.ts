@@ -1,15 +1,18 @@
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test, { type TestContext } from 'node:test';
 import type { Attempt, Chat, FactoryTask, Goal, Project, Session } from '@enoughfactory/contracts';
-import type { AttemptDetail, ControlRecord, WorkspaceRef } from '@enoughfactory/factory';
+import type { AttemptDetail, ControlRecord, PlanRecord, WorkspaceRef } from '@enoughfactory/factory';
+import { WorkspaceManager, type ArtifactManifest, type Candidate, type CheckReport } from '@enoughfactory/workspaces';
 import type { TurnCallbacks, TurnInput, TurnResult } from '@enoughfactory/agents';
 import type { AddressInfo } from 'node:net';
 import { DeviceApp } from './app.ts';
 import { ChatController } from './chats.ts';
 import { factoryExecutionIsUncertain, initializeFactory } from './factory.ts';
+import { exec } from './util.ts';
 
 interface WorkerReceipt {
   id: string; coordinatorId: string; goal: Goal; task: FactoryTask; attempt: Attempt; project: Project;
@@ -74,6 +77,58 @@ async function harness(t: TestContext) {
   }
   return { app, factory, seed, setLive(value: boolean) { live = value; } };
 }
+
+test('final snapshot candidates and check artifacts retain the real goal owner through coordinator evaluation', async t => {
+  const fixture = await harness(t), state = fixture.seed('succeeded');
+  const repository = state.worker.project.path;
+  await mkdir(repository);
+  await exec('git', ['-C', repository, 'init', '-q']);
+  await writeFile(path.join(repository, 'README.md'), 'Integrated fixture source\n');
+  await exec('git', ['-C', repository, 'add', 'README.md']);
+  await exec('git', ['-C', repository, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-qm', 'Integrated fixture']);
+  const commit = (await exec('git', ['-C', repository, 'rev-parse', 'HEAD'])).stdout.trim();
+  fixture.app.store.set('tasks', { ...state.task, status: 'completed' });
+  fixture.app.store.set('attempts', { ...state.attempt, status: 'succeeded' });
+  fixture.app.store.set<ControlRecord>('factory-control', { id: state.goal.id, stage: 'evaluate', spent: 0, startedAt: state.goal.createdAt, steering: [] });
+  fixture.app.store.set<PlanRecord>('factory-plans', { id: state.goal.id, goalId: state.goal.id, revision: state.goal.revision, summary: 'Verify the integrated fixture', checks: ['fixture/final-check'], checkScope: 'goal', taskKeys: {}, createdAt: state.goal.createdAt });
+  t.mock.method(fixture.app, 'ensureRuntimeReady', async () => fixture.app.runtime.endpoint);
+  t.mock.method(fixture.factory.runtime, 'complete', async () => ({ text: JSON.stringify({ complete: true, summary: 'Fixture verified', criteria: [{ criterion: state.goal.criteria[0], satisfied: true, evidence: ['fixture/final-check'] }] }) }));
+  // Keep the production capture, verifier, report writer and artifact catalog. Only
+  // command execution is inert, so no container or provider is started by this test.
+  const verifier = new WorkspaceManager({ dataDir: path.join(fixture.app.dataDir, 'workspace-data'), deviceId: fixture.app.device.id, checkExecutor: async context => ({ command: context.command, exitCode: 0, stdout: 'Fixture verified', stderr: '', startedAt: state.goal.createdAt, endedAt: state.goal.createdAt }) });
+  let candidate: Candidate | undefined, report: CheckReport | undefined;
+  t.mock.method(fixture.factory.workspaces, 'verify', async (input: Parameters<WorkspaceManager['verify']>[0]) => {
+    candidate = await verifier.candidate(input.candidateId);
+    report = await verifier.verify(input);
+    return report;
+  });
+
+  await fixture.factory.coordinator.start();
+  await fixture.factory.coordinator.waitForIdle();
+  fixture.factory.coordinator.stop();
+  const evaluated = fixture.app.store.get<Goal>('goals', state.goal.id)!;
+  assert.equal(evaluated.status, 'completed', evaluated.error);
+  assert.ok(candidate && report, 'final verification must capture and check the integrated source');
+  assert.equal(candidate.goalId, state.goal.id);
+  assert.equal(candidate.taskId, 'goal-check');
+  assert.equal(candidate.workspaceId, candidate.attemptId);
+  assert.notEqual(candidate.attemptId, state.goal.id, 'the unique check operation remains separate from goal ownership');
+  assert.equal(candidate.commit, commit);
+  assert.equal(report.candidateId, candidate.id);
+  assert.equal(report.commit, commit);
+  assert.equal(report.status, 'passed');
+  for (const artifact of [candidate.bundleArtifact, candidate.diffArtifact, report.logArtifact]) {
+    assert.equal(artifact.goalId, state.goal.id);
+    assert.equal(artifact.attemptId, candidate.attemptId);
+    assert.deepEqual(fixture.app.store.get<ArtifactManifest>('artifacts', artifact.id), JSON.parse(JSON.stringify(artifact)), 'goal-owned artifacts remain discoverable in the catalog');
+  }
+  const savedReport = JSON.parse(await readFile(path.join(fixture.app.dataDir, 'workspace-data', 'reports', `${report.id}.json`), 'utf8')) as CheckReport;
+  assert.deepEqual(savedReport, JSON.parse(JSON.stringify(report)), 'the durable report retains the same goal-owned manifest');
+  const observations = JSON.parse((await verifier.artifacts.read(report.logArtifact)).toString());
+  assert.equal(observations.actualHead, commit);
+  assert.equal(observations.dirty, '');
+  assert.equal((await exec('git', ['-C', repository, 'status', '--porcelain'])).stdout, '');
+});
 
 test('unknown and running factory workers observe a live conversation without repeating execution', async t => {
   const fixture = await harness(t);

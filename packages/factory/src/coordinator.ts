@@ -701,7 +701,7 @@ export class FactoryCoordinator {
         if (!goalChecks) {
           if (!this.options.workspaces.checkGoal) throw new Error("This workspace provider cannot verify the final goal snapshot. Configure goal verification before accepting completion.");
           this.writeGoal(goal.id, { nextAction: "Verify the integrated goal result" }); this.changed();
-          const report = await this.options.workspaces.checkGoal(project, commands);
+          const report = await this.options.workspaces.checkGoal(project, commands, goal);
           if (!this.operationCurrent(goal.id, operation)) return;
           if (report.checks.every(check => check.passed) && commands.some(command => !report.checks.some(check => check.command === command))) throw new Error("Goal verification omitted a configured executable check.");
           goalChecks = { id: this.goalCheckReceiptId(goal, report.repository, commands), goalId: goal.id, revision: goal.revision, at: this.now(), repository: report.repository, commands, checks: report.checks };

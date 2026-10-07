@@ -429,11 +429,11 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
       hash.update(JSON.stringify({profile,...(profile==='default'?{}:{recipeSha256:SWIFT_TOOLCHAIN.recipeSha256}),developmentToolchain}));
       return { head, branch, status, summary, diff, fingerprint: hash.digest('hex'),developmentToolchain };
     },
-    async checkGoal(project,commands){
+    async checkGoal(project,commands,goal){
       const developmentToolchain=await app.withRuntimeOperation(async signal=>{await app.ensureRuntimeReady();return resolveToolchain(project,signal);});
       const repository=await workspacePort.inspect(project),operation=randomUUID();
       if(repository.status.trim())throw new Error('Goal checks require a clean primary working tree so they can verify the integrated commit. Commit or preserve the remaining primary edits before evaluating.');
-      const workspace=await workspaces.create({projectPath:project.path,goalId:operation,taskId:'goal-check',attemptId:operation,baseCommit:repository.head,developmentToolchain:developmentToolchain==='default'?undefined:developmentToolchain});
+      const workspace=await workspaces.create({projectPath:project.path,goalId:goal.id,taskId:'goal-check',attemptId:operation,baseCommit:repository.head,developmentToolchain:developmentToolchain==='default'?undefined:developmentToolchain});
       try{
         const roots=await app.sessions.directoryManager.prepare({identity:operation,sources:project.workingDirectories||[]});
         const workingDirectories:WorkingDirectoryCapture[]=[];for(const root of roots)workingDirectories.push(await app.sessions.directoryManager.captureFromPath(root,root.path));

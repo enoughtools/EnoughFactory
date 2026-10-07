@@ -38,7 +38,7 @@ export interface FactoryWorkspacePort {
   capture(workspace: WorkspaceRef, input: { goal: Goal; task: FactoryTask; attempt: Attempt }): Promise<CandidateRef>;
   check(project: Project, candidate: CandidateRef, commands: string[]): Promise<CheckResult[]>;
   /** Check an isolated exact final repository snapshot after task dependencies integrate. */
-  checkGoal?(project: Project, commands: string[]): Promise<{ repository: RepositoryEvidence; checks: CheckResult[] }>;
+  checkGoal?(project: Project, commands: string[], goal: Goal): Promise<{ repository: RepositoryEvidence; checks: CheckResult[] }>;
   /** Recheck the combined result when HEAD changed. Fence immediately before writing. */
   integrate(project: Project, candidate: CandidateRef, input: { checks: string[]; isCurrent: () => boolean }): Promise<IntegrationResult>;
   inspect(project: Project): Promise<RepositoryEvidence>;
