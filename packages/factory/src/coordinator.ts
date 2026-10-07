@@ -5,7 +5,7 @@ import type {
   EvaluationRecord, ExecutionResult, GoalCheckRecord, PlanRecord, PlannedTask, RepositoryEvidence, TaskDetail,
 } from "./types.js";
 import { readCheckCommands, readEvaluation, readJsonObject, readPlan, readTasks, validateDependencies } from "./protocol.js";
-import { FactoryOperationError, FactoryDecisionError, FactoryControllerError } from "./errors.js";
+import { FactoryOperationError, FactoryDecisionError, FactoryControllerError, FactoryCapacityError } from "./errors.js";
 import { activeExecutionTasks, descendants, placementConstraint, sortReadyTasks, taskSchedulingBlocker } from "./scheduler.js";
 import { ControllerEvidence, controllerPrompt } from "./controller-evidence.js";
 
@@ -82,6 +82,7 @@ export class FactoryCoordinator {
           this.decision(goal.id, "controller-recovered", "An interrupted controller decision will be recomputed from current records.");
         }
         for (const attempt of this.attempts(goal.id).filter(item => this.isCurrent(item) && (activeAttempts.has(item.status) || (item.status === "succeeded" && this.task(item.taskId).status === "review")))) {
+          if (this.attemptDetail(attempt.id).capacityWait) continue;
           this.options.store.set(TABLE.attempts, { ...attempt, status: "unknown" as const });
           this.decision(goal.id, "attempt-recovered", "Execution status is unknown after service recovery; reconcile with its owner before continuing.", { attemptId: attempt.id });
         }
@@ -121,11 +122,18 @@ export class FactoryCoordinator {
         if (goal.coordinatorId !== this.options.deviceId || terminalGoals.has(goal.status)) continue;
         for (const attempt of this.attempts(goal.id)) {
           if (activeAttempts.has(attempt.status) && !this.busyAttempts.has(attempt.id) && !this.reconciling.has(attempt.id) && (!this.enabled || Date.now() - (this.lastObservation.get(attempt.id) ?? 0) >= 10_000)) {
+            if (this.attemptDetail(attempt.id).capacityWait) {
+              if (["paused", "waiting", "draft"].includes(this.goal(goal.id).status) || this.checkBudget(this.goal(goal.id)) || !this.admit(goal.id)) continue;
+              this.busyAttempts.add(attempt.id);
+              this.track(this.execute(attempt).finally(() => this.busyAttempts.delete(attempt.id)));
+              continue;
+            }
             this.lastObservation.set(attempt.id, Date.now());
             this.reconciling.add(attempt.id);
             this.track(this.reconcileAttempt(attempt).finally(() => this.reconciling.delete(attempt.id)));
           }
         }
+        this.recoverCompletedWork(goal);
         if (goal.status === "paused") continue;
         if (this.busyGoals.has(goal.id)) {
           const control = this.control(goal.id);
@@ -140,7 +148,8 @@ export class FactoryCoordinator {
           current = this.goal(goal.id); control = this.control(goal.id);
         }
         if (current.status === "waiting") {
-          if (control.waitingFor === "device-online" && this.hasAvailableDevice(current)) this.wake(current.id, "A worker device is available.");
+          if (control.waitingFor === "host-disk-space" && this.options.admission && !this.options.admission(current)) this.wake(current.id, "Host disk space is available; continuing work.");
+          else if (control.waitingFor === "device-online" && this.hasAvailableDevice(current)) this.wake(current.id, "A worker device is available.");
           else if (control.wakeAt && Date.parse(control.wakeAt) <= Date.parse(this.now())) this.wake(current.id, "The configured wait has elapsed.");
           else continue;
           current = this.goal(goal.id); control = this.control(goal.id);
@@ -148,6 +157,7 @@ export class FactoryCoordinator {
         if (current.status === "draft" && !control.manualAction && !this.tasks(current.id).some(task => this.taskDetail(task.id).selected)) continue;
         if (this.checkBudget(current)) continue;
         if (!this.options.project(current.projectId)) { this.wait(current.id, "The goal's project is unavailable.", "project-available"); continue; }
+        if (!this.admit(current.id)) continue;
         if (control.waitingFor && (control.stage === "diagnose" || (control.stage === "plan" && control.replanTaskIds?.length))) {
           this.dispatch(current, false); continue;
         }
@@ -391,14 +401,19 @@ export class FactoryCoordinator {
     } catch (error) { this.operationFailed(goal.id, operation, error); }
   }
 
-  private dispatch(goal: Goal, manageController = true): void {
-    const tasks = this.tasks(goal.id).filter(task => task.status !== "canceled");
-    for (const task of tasks.filter(task => task.status === "review")) {
+  private recoverCompletedWork(goal: Goal): void {
+    for (const task of this.tasks(goal.id).filter(task => task.status === "review")) {
       if (!task.currentAttemptId || this.busyAttempts.has(task.currentAttemptId) || this.reconciling.has(task.currentAttemptId)) continue;
       const attempt = this.attempt(task.currentAttemptId);
+      if (goal.status === "paused" && this.attemptDetail(attempt.id).candidate) continue;
       this.busyAttempts.add(attempt.id);
       this.track(this.processResult(attempt, this.attemptDetail(attempt.id).result ?? { status: "succeeded", text: "Recovered retained candidate." }).finally(() => this.busyAttempts.delete(attempt.id)));
     }
+  }
+
+  private dispatch(goal: Goal, manageController = true): void {
+    if (!this.admit(goal.id)) return;
+    const tasks = this.tasks(goal.id).filter(task => task.status !== "canceled");
     const failed = tasks.find(task => task.status === "failed" && !this.taskDetail(task.id).waitingFor);
     if (failed && manageController) {
       if (goal.autonomy === "autonomous" || this.taskDetail(failed.id).selected) {
@@ -418,6 +433,9 @@ export class FactoryCoordinator {
     const stableKeys = new Map(tasks.map(task => [task.id, this.taskDetail(task.id).key]));
     for (const task of sortReadyTasks(tasks, stableKeys)) {
       if (capacity === 0) break;
+      // The previous execution can synchronously acquire a setup reservation.
+      // Recheck before allocating the next attempt against the same host space.
+      if (!this.admit(goal.id)) break;
       const detail = this.taskDetail(task.id);
       if (goal.autonomy !== "autonomous" && !detail.selected) continue;
       if (this.control(goal.id).replanTaskIds?.includes(task.id)) continue;
@@ -457,10 +475,12 @@ export class FactoryCoordinator {
     let executing = false;
     const task = this.task(attempt.taskId), goal = this.goal(task.goalId), project = this.project(goal);
     try {
-      const workspace = await this.options.workspaces.prepare({ goal, task, attempt, project, previousCandidate: this.taskDetail(task.id).lastCandidate });
+      const retained = this.attemptDetail(attempt.id);
+      const workspace = retained.capacityWait === "executing" && retained.workspace ? retained.workspace
+        : await this.options.workspaces.prepare({ goal, task, attempt, project, previousCandidate: this.taskDetail(task.id).lastCandidate });
       if (!this.isCurrent(attempt)) return;
       this.options.store.transaction(() => {
-        this.options.store.set(TABLE.attemptDetails, { ...this.attemptDetail(attempt.id), workspace, phase: "executing" as const });
+        this.options.store.set(TABLE.attemptDetails, { ...this.attemptDetail(attempt.id), workspace, phase: "executing" as const, capacityWait: undefined });
         this.writeAttempt(attempt.id, { status: "running", baseCommit: workspace.baseCommit, ...(workspace.sessionId ? { sessionId: workspace.sessionId } : {}) });
       });
       executing = true;
@@ -469,7 +489,8 @@ export class FactoryCoordinator {
       await this.processResult(attempt, result);
     } catch (error) {
       if (!this.isCurrent(attempt)) return;
-      if (executing) this.markUnknown(attempt, error);
+      if (error instanceof FactoryCapacityError) this.deferExecution(attempt, error.message, executing ? "executing" : "preparing");
+      else if (executing) this.markUnknown(attempt, error);
       else this.failAttempt(attempt, error);
     }
     this.changed();
@@ -478,6 +499,9 @@ export class FactoryCoordinator {
   private async processResult(attemptInput: Attempt, result: ExecutionResult): Promise<void> {
     if (!this.isCurrent(attemptInput)) return;
     const attempt = this.attempt(attemptInput.id), task = this.task(attempt.taskId), goal = this.goal(task.goalId), project = this.project(goal);
+    if (result.status === "waiting" && result.agentStarted === false && result.wakeCondition === "host-disk-space") {
+      this.deferExecution(attempt, result.waitReason || "Waiting for host disk space before provider setup.", "executing"); return;
+    }
     this.options.store.transaction(() => {
       const saved = this.attemptDetail(attempt.id);
       if (!saved.usageAccounted) this.recordSpend(goal.id, result.spend);
@@ -547,7 +571,10 @@ export class FactoryCoordinator {
       if (this.options.workspaces.release) await this.options.workspaces.release(detail.workspace).catch(() => undefined);
     } catch (error) {
       if (this.isCurrent(attempt)) {
-        if (this.goal(goal.id).status === "paused") {
+        if (error instanceof FactoryCapacityError) {
+          this.writeTask(task.id, { status: "review" });
+          this.capacityWait(goal.id, error.message);
+        } else if (this.goal(goal.id).status === "paused") {
           this.writeTask(task.id, { status: "review" });
           this.writeGoal(goal.id, { nextAction: "Candidate retained; integration waits for resume" });
         } else if (["capturing", "integrating"].includes(this.attemptDetail(attempt.id).phase) && !(error instanceof FactoryOperationError)) this.markUnknown(attempt, error);
@@ -872,7 +899,7 @@ export class FactoryCoordinator {
       const previous = control.controllerFailures;
       const count = (previous?.revision === operation.revision && previous.kind === operation.kind ? previous.count : 0) + 1;
       const delay = error instanceof FactoryControllerError && error.recovery === "retry" ? controllerRetryDelays[count - 1] : undefined;
-      const condition = delay !== undefined ? "controller-retry" : error instanceof FactoryControllerError && error.recovery !== "retry" ? error.recovery : "controller-retry-required";
+      const condition = delay !== undefined ? "controller-retry" : error instanceof FactoryCapacityError ? error.condition : error instanceof FactoryControllerError && error.recovery !== "retry" ? error.recovery : "controller-retry-required";
       const reason = delay !== undefined ? `${this.error(error)} Retry ${count}/${controllerRetryDelays.length} is scheduled after preparation backoff.` : this.error(error);
       this.options.store.set(TABLE.control, { ...this.control(goalId), operation: undefined,
         controllerFailures: { revision: operation.revision, kind: operation.kind, count },
@@ -973,6 +1000,8 @@ export class FactoryCoordinator {
   }
   private wait(goalId: string, reason: string, condition: string, wakeAt?: string): void {
     if (terminalGoals.has(this.goal(goalId).status) || this.goal(goalId).status === "paused") return;
+    const current = this.control(goalId);
+    if (this.goal(goalId).status === "waiting" && current.waitingFor === condition && current.waitReason === reason && current.wakeAt === wakeAt) return;
     this.options.store.transaction(() => {
       this.options.store.set(TABLE.control, { ...this.control(goalId), waitingFor: condition, waitReason: reason, wakeAt, operation: undefined });
       this.writeGoal(goalId, { status: "waiting", error: reason, nextAction: reason });
@@ -981,12 +1010,38 @@ export class FactoryCoordinator {
   }
   private wake(goalId: string, reason: string): void {
     const goal = this.goal(goalId), control = this.control(goalId);
-    const stage = control.controllerFailures && ["plan", "diagnose", "evaluate"].includes(control.stage) ? control.stage : this.nextStage(goalId);
+    const stage = control.waitingFor === "host-disk-space" || control.controllerFailures && ["plan", "diagnose", "evaluate"].includes(control.stage) ? control.stage : this.nextStage(goalId);
     this.options.store.transaction(() => {
       this.options.store.set(TABLE.control, { ...this.control(goalId), stage, waitingFor: undefined, waitReason: undefined, wakeAt: undefined });
       this.writeGoal(goalId, { status: stage === "plan" ? "planning" : "running", error: undefined, nextAction: reason });
       this.decision(goal.id, "woken", reason);
     });
+  }
+
+  private admit(goalId: string): boolean {
+    const blocker = this.options.admission?.(this.goal(goalId));
+    if (!blocker) return true;
+    // A localized repair may already have a live controller. Capacity admission
+    // must not revoke its authority or pretend that its provider turn ended.
+    this.capacityWait(goalId, blocker.reason);
+    return false;
+  }
+
+  private deferExecution(attempt: Attempt, reason: string, phase: "preparing" | "executing"): void {
+    const task = this.task(attempt.taskId);
+    this.options.store.transaction(() => {
+      this.options.store.set(TABLE.attemptDetails, { ...this.attemptDetail(attempt.id), capacityWait: phase, phase: "preparing" as const });
+      this.writeAttempt(attempt.id, { status: "created", error: reason });
+      this.writeTask(task.id, { status: "running" });
+      this.capacityWait(task.goalId, reason);
+    });
+    this.changed();
+  }
+
+  private capacityWait(goalId: string, reason: string): void {
+    if (this.busyGoals.has(goalId) || this.control(goalId).operation) {
+      if (this.goal(goalId).nextAction !== reason) { this.writeGoal(goalId, { nextAction: reason }); this.changed(); }
+    } else this.wait(goalId, reason, "host-disk-space");
   }
   private context(goal: Goal, evidence?: ControllerEvidence): string {
     const control = this.control(goal.id);

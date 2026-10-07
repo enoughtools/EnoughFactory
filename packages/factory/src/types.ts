@@ -50,6 +50,8 @@ export interface ExecutionResult {
   status: "succeeded" | "failed" | "waiting" | "unknown";
   text: string; chatId?: string; sessionId?: string; spend?: number;
   error?: string; waitReason?: string; wakeCondition?: string;
+  /** Only an owning adapter may positively report that no provider execution began. */
+  agentStarted?: false;
 }
 export interface FactoryRuntimePort {
   complete(input: { goal: Goal; role: "planner" | "evaluator" | "diagnosis"; prompt: string; project: Project; signal?: AbortSignal }): Promise<{ text: string; chatId?: string; spend?: number }>;
@@ -93,6 +95,7 @@ export interface AttemptDetail {
   integration?: IntegrationResult; cancellation: "none" | "requested" | "acknowledged";
   usageAccounted?: boolean; accountedSpend?: number;
   phase: "preparing" | "executing" | "capturing" | "checking" | "integrating" | "done";
+  capacityWait?: "preparing" | "executing";
 }
 export interface CriterionEvidence { criterion: string; satisfied: boolean; evidence: string[]; }
 export interface EvaluationResponse {
@@ -135,5 +138,7 @@ export interface ConfigureGoalInput {
 export interface CoordinatorOptions {
   store: FactoryStore; runtime: FactoryRuntimePort; workspaces: FactoryWorkspacePort;
   deviceId: string; devices: () => Device[]; project: (id: string) => Project | undefined;
+  /** Fresh owning-host capacity check before allocating new controller or worker work. */
+  admission?: (goal: Goal) => { reason: string; condition: string } | undefined;
   onChange?: () => void; now?: () => Date;
 }

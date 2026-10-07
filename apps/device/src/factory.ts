@@ -4,9 +4,9 @@ import { mkdir, readFile, writeFile, lstat, readlink, open } from 'node:fs/promi
 import path from 'node:path';
 import type { Attempt, FactoryTask, Goal, Project, Decision, ControllerRun, ContainerRuntimeStatus, DevelopmentToolchain, DevelopmentToolchainId } from '@enoughfactory/contracts';
 import {
-  FactoryCoordinator, FactoryOperationError, type FactoryWorkspacePort, type FactoryRuntimePort, type WorkspaceRef,
+  FactoryCoordinator, FactoryOperationError, FactoryCapacityError, type FactoryWorkspacePort, type FactoryRuntimePort, type WorkspaceRef,
   type CandidateRef, type ExecutionResult, type CheckResult, type CreateGoalInput,
-  type RepositoryEvidence, type EvaluationRecord, type ControlRecord, type TaskDetail, type AttemptDetail,
+  type RepositoryEvidence, type EvaluationRecord, type ControlRecord, type TaskDetail, type AttemptDetail, type FactoryStore,
 } from '@enoughfactory/factory';
 import { WorkspaceManager, ArtifactFsWorkspaceProvider, dockerCheckExecutor, appleCheckExecutor, isAppleCheckCommand, appleCheckArtifacts, fingerprintWorkingDirectories, type WorkingDirectorySource, type WorkingDirectoryCapture, type ArtifactManifest, type Candidate, type CheckReport, type WorkspaceRecord } from '@enoughfactory/workspaces';
 import type { PeerManager } from '@enoughfactory/peers';
@@ -21,10 +21,11 @@ import { factoryChatBinding } from './factory-chat.ts';
 import { controllerError } from './factory-controller-error.ts';
 import { releaseControllerInputs } from './factory-controller-inputs.ts';
 import { releaseFactoryCodexPayload } from './factory-codex-cleanup.ts';
-import { prepareControllerContext } from './controller-context.ts';
-import { assertCurrentWorkerAssignment, assertWorkerContext, disposeWorkerContext, prepareWorkerContext, type WorkerEvidenceContext } from './worker-context.ts';
+import { controllerCandidates, prepareControllerContext } from './controller-context.ts';
+import { assertCurrentWorkerAssignment, assertWorkerContext, disposeWorkerContext, prepareWorkerContext, workerCandidates, type WorkerEvidenceContext } from './worker-context.ts';
 import { developmentToolchainChoice, parseDevelopmentToolchain, prepareDevelopmentToolchain, type FrozenDevelopmentToolchain } from './development-toolchain.ts';
 import { retainManualContinuation, type ManualContinuationInput } from './manual-continuation-retention.ts';
+import { HostDiskAdmission, HostDiskHeadroomError, PREPARATION_HEADROOM_BYTES, preparationArtifactBytes } from './host-disk-admission.ts';
 
 interface WorkerRecord {
   id: string; coordinatorId: string; goal: Goal; task: FactoryTask; attempt: Attempt; project: Project;
@@ -35,12 +36,21 @@ interface WorkerRecord {
   workingDirectorySources?: WorkingDirectorySource[];
   referenceContext?: WorkerEvidenceContext;
   developmentToolchain?: FrozenDevelopmentToolchain;
+  capacityWait?: string;
+  preparationIdentity?: string;
 }
 interface ReceivedArtifact { id: string; peerId: string; manifest: ArtifactManifest; path: string; }
 interface GoalOptions { id: string; workspaceProvider: 'git' | 'artifactfs'; }
 const journal = 'factory-workers';
 const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
 function candidateArtifacts(candidate:Candidate):ArtifactManifest[]{return [candidate.bundleArtifact,candidate.diffArtifact,...(candidate.workingDirectories||[]).flatMap(root=>[root.bundleArtifact,root.diffArtifact])];}
+function preparationArtifacts(candidates: CandidateRef[]): ArtifactManifest[] {
+  return candidates.flatMap(value => {
+    const candidate = value as unknown as Partial<Candidate>;
+    return [candidate.bundleArtifact, ...(candidate.workingDirectories || []).map(root => root.bundleArtifact)]
+      .filter((artifact): artifact is ArtifactManifest => !!artifact);
+  });
+}
 function publicWorkerProject(project:Project):Project{return {...project,path:'',workingDirectories:project.workingDirectories?.map(root=>({...root,path:''}))};}
 function assertCapturedRoots(roots:WorkingDirectoryCapture[],expected:Array<{id:string;name:string;baseCommit:string}>):void{if(roots.length!==expected.length||expected.some(source=>!roots.some(root=>root.id===source.id&&root.name===source.name&&root.baseCommit===source.baseCommit)))throw new Error('Every prepared working folder must have an exact retained capture before this attempt can be accepted.');}
 export function factoryExecutionIsUncertain(error: { agentStarted?: boolean; executionEnded?: boolean; code?: string }): boolean {
@@ -48,6 +58,15 @@ export function factoryExecutionIsUncertain(error: { agentStarted?: boolean; exe
   // facts need the legacy fallback; an unacknowledged task request may have real effects.
   if (typeof error.agentStarted === 'boolean' || typeof error.executionEnded === 'boolean') return error.agentStarted !== false && error.executionEnded !== true;
   return ['RUNTIME_DISCONNECTED', 'PROTOCOL_TIMEOUT', 'PROTOCOL_ERROR', 'RUNTIME_TIMEOUT', 'CONTAINER_UNAVAILABLE'].includes(error.code ?? '');
+}
+/** A retry observes the original transfer, including its exact bundle ref and config. */
+export async function factoryAttemptTransferSource(store: FactoryStore, attemptId: string,
+  exportSource: () => Promise<ArtifactManifest>, config: () => Promise<string | undefined>): Promise<{ source: ArtifactManifest; config?: string }> {
+  const frozen = store.get<{ id: string; source: ArtifactManifest; config?: string }>('factory-worker-source', attemptId);
+  if (frozen) return frozen;
+  const record = { id: attemptId, source: await exportSource(), config: await config() };
+  store.set('factory-worker-source', record);
+  return record;
 }
 export async function factoryAttemptWorkingDirectorySources(dataDir: string, sessions: Pick<SessionController, 'directoryManager' | 'workingDirectorySources'>, attemptId: string, project: Project, prior?: readonly WorkingDirectoryCapture[]): Promise<WorkingDirectorySource[]> {
   if (!prior?.length) return sessions.workingDirectorySources(attemptId, project);
@@ -69,6 +88,29 @@ export async function factoryAttemptWorkingDirectorySources(dataDir: string, ses
 
 /** The service owns execution and the supervisor; no open window is required. */
 export async function initializeFactory(app: DeviceApp, chats: ChatController, network?: { peers: PeerManager }) {
+  const hostDisk = new HostDiskAdmission(() => [app.dataDir, ...(app.diagnostics.containerRuntime?.dataDirectory ? [app.diagnostics.containerRuntime.dataDirectory] : [])], () => app.device.name);
+  function reserveDisk(identity: string, bytes = 0): () => void {
+    try { return hostDisk.reserve(identity, bytes); }
+    catch (error) { if (error instanceof HostDiskHeadroomError) throw new FactoryCapacityError(error.message, { cause: error }); throw error; }
+  }
+  async function withCheckCapacity<T>(operation: () => Promise<T>, candidate?: CandidateRef): Promise<T> {
+    const release = reserveDisk(`check:${randomUUID()}`, preparationArtifactBytes(preparationArtifacts(candidate ? [candidate] : [])));
+    try { return await operation(); } finally { release(); }
+  }
+  function workerPreparationBytes(goal: Goal, task: FactoryTask, attempt: Pick<Attempt, 'id'>, previousCandidate?: CandidateRef): number {
+    const references = workerCandidates(app.store, goal, task, attempt).selected.map(item => item.candidate);
+    return preparationArtifactBytes(preparationArtifacts([...references, ...(previousCandidate ? [previousCandidate] : [])]));
+  }
+  function admission(goal: Goal) {
+    const stage = app.store.get<ControlRecord>('factory-control', goal.id)?.stage;
+    const role = stage === 'plan' ? 'planner' : stage === 'evaluate' ? 'evaluator' : stage === 'diagnose' ? 'diagnosis' : undefined;
+    // Before an attempt exists, use current task contracts rather than an older
+    // attempt's frozen assignment. Larger ready tasks conservatively set the floor.
+    const bytes = role ? preparationArtifactBytes(preparationArtifacts(controllerCandidates(app.store, goal.id, role).map(item => item.candidate)))
+      : Math.max(0, ...app.store.list<FactoryTask>('tasks').filter(task => task.goalId === goal.id && ['queued', 'ready'].includes(task.status))
+        .map(task => workerPreparationBytes(goal, task, { id: '' }, app.store.get<TaskDetail>('factory-task-details', task.id)?.lastCandidate)));
+    return hostDisk.blocker(PREPARATION_HEADROOM_BYTES + bytes * 2);
+  }
   app.sessions.afterCaptureBeforeStop.push(sessionId => releaseFactoryCodexPayload({ store: app.store, sessions: app.sessions, chats, manager: chats.manager }, sessionId));
   for (const run of app.store.list<ControllerRun>('factory-controller-runs')) {
     if (run.status === 'starting' || run.status === 'running') app.store.set('factory-controller-runs', { ...run, status: 'interrupted', error: 'The device service restarted before this decision completed. Its conversation and environment remain inspectable.', updatedAt: now() });
@@ -86,7 +128,7 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
       await app.ensureRuntimeReady();
       await app.runtime.prepareWorkspace(context.path);
       for (const root of context.workingDirectories || []) await app.runtime.prepareWorkspace(root.path);
-      return checkExecutor(check);
+      return await checkExecutor(check);
     }), { release: checkExecutor.release }),
     artifactFs: new ArtifactFsWorkspaceProvider({
       rootDirectory: path.join(app.dataDir, 'workspace-data'),
@@ -114,6 +156,11 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
     const running = Promise.resolve().then(operation).catch(error => {
       const record = worker(id);
       if (record.status === 'canceled') return;
+      if (error instanceof HostDiskHeadroomError && (phase === 'preparing' || phase === 'executing')) {
+        patchWorker(id, { status: phase === 'executing' ? 'prepared' : 'preparing', capacityWait: error.message, error: undefined,
+          result: { status: 'waiting', text: '', agentStarted: false, waitReason: error.message, wakeCondition: 'host-disk-space', sessionId: record.sessionId, chatId: record.chatId } });
+        return;
+      }
       const uncertain = factoryExecutionIsUncertain(error);
       const result: ExecutionResult = { status: uncertain ? 'unknown' : 'failed', text: '', error: error.message, sessionId: record.sessionId, chatId: record.chatId };
       patchWorker(id, { status: uncertain ? 'unknown' : 'failed', error: error.message, result });
@@ -123,6 +170,7 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
   async function rpc<T>(peerId: string, method: string, route: string, body?: unknown): Promise<T> {
     if (!network) throw new Error('Device networking is not configured.');
     const response = await network.peers.request(peerId, { method, path: route, body }, 60_000);
+    if (response.status >= 400 && (response.body as { code?: string })?.code === 'HOST_DISK_HEADROOM') throw new FactoryCapacityError((response.body as { error?: string })?.error || 'The worker is waiting for host disk space.');
     if (response.status >= 400) throw new Error((response.body as { error?: string })?.error || `Worker request failed (${response.status}).`);
     return response.body as T;
   }
@@ -207,10 +255,14 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
     };
     try {
     assertCurrent();
+    hostDisk.assert();
     await app.ensureRuntimeReady();
     assertCurrent();
+    // Docker readiness does not prove either host or guest storage is writable.
+    hostDisk.assert();
     const developmentToolchain=await resolveToolchain(project,signal,record.developmentToolchain);
     assertCurrent();
+    hostDisk.assert();
     patchWorker(record.id,{developmentToolchain});
     const name = sessionName(record.id);
     const config = await projectConfig(project);
@@ -225,14 +277,17 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
     }
     assertCurrent();
     await configureHandoff(workspace);
+    hostDisk.assert();
     const workingDirectorySources=record.workingDirectorySources||await sourceRootsForAttempt(record.id,project,previousCandidate);
     assertCurrent();
     patchWorker(record.id,{workingDirectorySources});
+    hostDisk.assert();
     const referenceContext=record.referenceContext||(record.coordinatorId===app.device.id?await prepareWorkerContext({goal:record.goal,task:record.task,attempt:record.attempt,project,store:app.store,workspaces,directoryManager:app.sessions.directoryManager,dataDir:app.dataDir,reservedNames:workingDirectorySources.map(root=>root.name),assertCurrent}):undefined);
     assertCurrent();
     if(referenceContext){assertWorkerContext(referenceContext,record);patchWorker(record.id,{referenceContext});}
     const owned = internalProject(project, workspace, record.task.title);
     const state = workspace.providerState;
+    hostDisk.assert();
     const session = await app.sessions.create(owned, name,{workingDirectorySources,referenceContext:referenceContext?.source,assertCurrent,developmentToolchain,...(state && typeof state.bindSource === 'string' && typeof state.stateVolume === 'string'
       ? { workspace: { bindSource: state.bindSource, stateVolume: state.stateVolume } } : {})});
     patchWorker(record.id, { workspace: ref(workspace, session.id), sessionId: session.id });
@@ -257,6 +312,7 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
     if (previous) {
       if (previous.coordinatorId !== input.coordinatorId || previous.attempt.generation !== input.attempt.generation
         || previous.goal.id !== input.goal.id || previous.goal.revision !== input.goal.revision || previous.task.id !== input.task.id
+        || previous.preparationIdentity && input.preparationIdentity && previous.preparationIdentity !== input.preparationIdentity
         || input.coordinatorId!==app.device.id&&previous.referenceContext?.source.sourceArtifact.sha256 !== input.referenceContext?.source.sourceArtifact.sha256)
         throw new HttpError(409, 'Attempt identity is already bound to a different assignment.');
       return previous;
@@ -282,15 +338,20 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
     const execution = { ...current, goal, project };
     assertExecutionAssignment(execution);
     // No await separates the final authority check and execution ownership.
-    patchWorker(record.id, { goal, project });
+    patchWorker(record.id, { goal, project, capacityWait: undefined, result: undefined });
     track(record.id, 'executing', () => executeLocal(execution, prompt));
   }
   async function executeLocal(record: WorkerRecord, prompt: string): Promise<void> {
+    // Provisioning happens inside chats.run. Its real completion boundary is the
+    // turn promise, so retain conservative capacity ownership through that turn.
+    const releaseDisk = hostDisk.reserve(`provider:${record.id}`);
+    try {
     if (!record.sessionId) throw new Error('The prepared attempt has no container session.');
     if (worker(record.id).status === 'canceled') return;
     await app.sessions.waitReady(record.sessionId);
     if (worker(record.id).status === 'canceled') return;
     assertExecutionAssignment(record);
+    hostDisk.assert();
     const ownedProject = app.store.get<Project>('projects', app.sessions.record(record.sessionId).projectId);
     if (ownedProject) app.store.set('projects', { ...ownedProject, rules: record.project.rules, runtime: record.goal.runtime, approvalMode: record.goal.approvalMode });
     const chat = record.chatId ? chats.get(record.chatId) : chats.create({ sessionId: record.sessionId,
@@ -304,10 +365,12 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
       systemInstructions: `You are implementing an assigned EnoughFactory task toward this goal:\n${record.goal.objective}\n\nYou have full permissions inside this container. Enough owns the configured ${record.goal.approvalMode} policy. Make routine implementation decisions and execute the task completely. Do not stop at a plan or ask for permission already granted. Keep verification proportionate. Preserve changes and describe concrete evidence and any remaining work. The factory will independently capture, check, integrate and evaluate your result.\n\n${validationInstructions()}\n\n${toolchainInstructions(app.sessions.record(record.sessionId).developmentToolchain)}\n\n${record.referenceContext?.instructions??''}` });
     if (worker(record.id).status === 'canceled') return;
     patchWorker(record.id, { status: 'succeeded', result: { status: 'succeeded', text: result.text, sessionId: record.sessionId, chatId: chat.id, spend: spend(result) } });
+    } finally { releaseDisk(); }
   }
   async function reconcileLocal(id: string): Promise<WorkerRecord> {
     const record = worker(id);
     if (jobs.has(id)) return record;
+    if (record.capacityWait) return record;
     if ((record.status === 'running' || record.status === 'unknown') && record.chatId) {
       if (chats.isRunning(record.chatId)) {
         if (record.status === 'unknown') patchWorker(id, { status: 'running', error: undefined, result: undefined });
@@ -347,6 +410,7 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
   async function waitWorker(peerId: string | undefined, attemptId: string, until: 'prepared' | 'finished'): Promise<WorkerRecord> {
     for (;;) {
       const record = local(peerId) ? await reconcileLocal(attemptId) : await rpc<WorkerRecord>(peerId!, 'GET', `/api/factory/worker/${attemptId}`);
+      if (record.capacityWait && !jobs.has(attemptId)) return record;
       if (record.status === 'failed' || record.status === 'canceled' || record.status === 'unknown') return record;
       if (until === 'prepared' && ['prepared', 'running', 'succeeded'].includes(record.status)) return record;
       if (until === 'finished' && record.status === 'succeeded') return record;
@@ -403,19 +467,22 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
       goal={...goal,revision:app.store.get<AttemptDetail>('factory-attempt-details',attempt.id)?.assignmentGoalRevision??goal.revision};
       const assertCurrent=()=>assertCurrentWorkerAssignment(app.store,{goal,task,attempt});
       assertCurrent();
+      const releaseDisk=reserveDisk(`attempt:${attempt.id}`,workerPreparationBytes(goal,task,attempt,previousCandidate));
+      try {
       const toolchainProfile=await developmentToolchainChoice(project);
       assertCurrent();
       project={...project,developmentToolchain:toolchainProfile};
       if (local(attempt.deviceId)) {
         const record = beginWorker({ id: attempt.id, coordinatorId: app.device.id, goal, task, attempt, project });
-        if (record.status === 'preparing') track(record.id, 'preparing', () => prepareLocal(record, project, previousCandidate));
+        if (record.status === 'preparing') { patchWorker(record.id, { capacityWait: undefined, result: undefined }); track(record.id, 'preparing', () => prepareLocal(record, project, previousCandidate)); }
       } else {
         if(toolchainProfile!=='default'){
           const health=await rpc<{deviceId:string;capabilities?:{developmentToolchains?:Array<{id:string;recipeSha256:string}>}}>(attempt.deviceId,'GET','/api/health');
           if(health.deviceId!==attempt.deviceId||!health.capabilities?.developmentToolchains?.some(profile=>profile.id===toolchainProfile&&profile.recipeSha256===SWIFT_TOOLCHAIN.recipeSha256))throw new Error('Update the selected worker device to the same fixed Swift toolchain recipe before dispatching this task.');
         }
         if(project.workingDirectories?.length||(previousCandidate?.workingDirectories as unknown[]|undefined)?.length){const health=await rpc<{deviceId:string;capabilities?:{workingDirectories?:boolean}}>(attempt.deviceId,'GET','/api/health');if(health.deviceId!==attempt.deviceId||health.capabilities?.workingDirectories!==true)throw new Error('Update the selected worker device before using additional working folders.');}
-        const source = await workspaces.exportSource({ projectPath: project.path }); rememberArtifacts(source);
+        const {source,config}=await factoryAttemptTransferSource(app.store,attempt.id,()=>workspaces.exportSource({projectPath:project.path}),()=>projectConfig(project));
+        rememberArtifacts(source);
         await sendArtifact(attempt.deviceId, source);
         const workingDirectorySources=await sourceRootsForAttempt(attempt.id,project,previousCandidate);
         const referenceContext=await prepareWorkerContext({goal,task,attempt,project,store:app.store,workspaces,directoryManager:app.sessions.directoryManager,dataDir:app.dataDir,reservedNames:workingDirectorySources.map(root=>root.name),assertCurrent});
@@ -426,7 +493,6 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
           const prior = await workspaces.candidate(previousCandidate.id);
           for(const artifact of candidateArtifacts(prior))await sendArtifact(attempt.deviceId,artifact);
         }
-        const config=await projectConfig(project);
         assertCurrent();
         await rpc(attempt.deviceId, 'POST', '/api/factory/worker/prepare', { goal, task, attempt,
           project: publicWorkerProject(project), source, workingDirectorySources, referenceContext, config, previousCandidate,
@@ -435,6 +501,7 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
       }
       const record = await waitWorker(attempt.deviceId, attempt.id, 'prepared');
       assertCurrent();
+      if (record.capacityWait) throw new FactoryCapacityError(record.capacityWait);
       if (!record.workspace || !['prepared', 'running', 'succeeded'].includes(record.status)) throw new Error(record.error || 'Worker preparation did not complete.');
       if(toolchainProfile!=='default')validatePreparedToolchain(record.workspace.developmentToolchain);
       else if(record.workspace.developmentToolchain)throw new Error('The worker did not honor the selected default development environment.');
@@ -444,6 +511,7 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
       const mounts=record.workspace.workingDirectories as import('@enoughfactory/contracts').WorkingDirectoryMount[]|undefined;
       if(sources.length&&(!mounts||mounts.length!==sources.length||sources.some(source=>!mounts.some(root=>root.id===source.id&&root.name===source.name&&root.path===source.containerPath&&root.baseCommit===source.baseCommit&&root.kind===source.kind))))throw new Error('The worker did not confirm the exact additional working folder snapshots. No task execution was authorized.');
       return record.workspace;
+      } finally { releaseDisk(); }
     },
     async capture(workspace, { attempt }) {
       if (local(workspace.deviceId)) return captureLocal(attempt.id);
@@ -463,10 +531,13 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
       }
     },
     async check(_project, candidate, commands) {
+      return withCheckCapacity(async () => {
       const report = await workspaces.verify({ candidateId: candidate.id, commands }); rememberArtifacts(report.logArtifact);
       return checkResults(report, candidate.commit);
+      }, candidate);
     },
     async integrate(project, candidate, input) {
+      return withCheckCapacity(async () => {
       const result = await workspaces.integrate({ candidateId: candidate.id, projectPath: project.path, commands: input.checks, isCurrent: input.isCurrent });
       if (result.report) rememberArtifacts(result.report.logArtifact);
       if (result.status !== 'integrated' || !result.commit) {
@@ -475,6 +546,7 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
       }
       return { commit: result.commit, previousHead: result.previousCommit, candidateCommit: candidate.commit,
         checks: result.report ? checkResults(result.report, candidate.commit) : [] };
+      }, candidate);
     },
     async inspect(project): Promise<RepositoryEvidence> {
       const [head, branch, status, summary, diff] = await Promise.all([
@@ -497,6 +569,7 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
       return { head, branch, status, summary, diff, fingerprint: hash.digest('hex'),developmentToolchain };
     },
     async checkGoal(project,commands,goal){
+      return withCheckCapacity(async () => {
       const developmentToolchain=await app.withRuntimeOperation(async signal=>{await app.ensureRuntimeReady();return resolveToolchain(project,signal);});
       const repository=await workspacePort.inspect(project),operation=randomUUID();
       if(repository.status.trim())throw new Error('Goal checks require a clean primary working tree so they can verify the integrated commit. Commit or preserve the remaining primary edits before evaluating.');
@@ -509,6 +582,7 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
         const report=await workspaces.verify({candidateId:candidate.id,commands});rememberArtifacts(report.logArtifact);
         return {repository,checks:checkResults(report,candidate.commit)};
       }finally{await workspaces.dispose(workspace.id);}
+      });
     },
     async reconcileIntegration(project, candidate) {
       const result = await workspaces.reconcileIntegration({ candidateId: candidate.id, projectPath: project.path });
@@ -524,11 +598,15 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
   const runtime: FactoryRuntimePort = {
     async complete({ goal, role, prompt, project, signal }) {
       let providerInvoked = false;
+      let releaseDisk=()=>{};
       return app.withRuntimeOperation(async runtimeSignal=>{
+      releaseDisk=hostDisk.reserve(`controller:${goal.id}:${role}`,preparationArtifactBytes(preparationArtifacts(controllerCandidates(app.store,goal.id,role).map(item=>item.candidate))));
       signal=signal?AbortSignal.any([signal,runtimeSignal]):runtimeSignal;
       if (signal?.aborted) throw new Error('The controller decision was revoked.');
       await app.ensureRuntimeReady();
+      hostDisk.assert();
       const developmentToolchain=await resolveToolchain(project,signal);
+      hostDisk.assert();
       const operation = randomUUID();
       app.store.set('factory-controller-inputs', { id: operation, goalId: goal.id, role, status: 'preparing', updatedAt: now() });
       let sessionId: string | undefined;
@@ -547,6 +625,7 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
         const context = await prepareControllerContext({ operation, goalId: goal.id, role, project, store: app.store,
           workspaces, directoryManager: app.sessions.directoryManager, dataDir: app.dataDir });
         if (signal?.aborted) throw new Error('The controller decision was revoked.');
+        hostDisk.assert();
         const owned = internalProject(project, workspace, `${goal.title} · ${role}`);
         const session = await app.sessions.create(owned, sessionName(operation), { workingDirectorySources: context.workingDirectorySources,developmentToolchain });
         sessionId = session.id;
@@ -554,6 +633,7 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
         app.store.set('factory-controller-runs', record);
         app.store.set('factory-controller-inputs', { id: operation, goalId: goal.id, role, sessionId, status: 'prepared', updatedAt: now() });
         await app.sessions.waitReady(session.id);
+        hostDisk.assert();
         if (signal?.aborted) throw new Error('The controller decision was revoked.');
         const chat = chats.create({ sessionId: session.id, runtime: goal.runtime, approvalMode: goal.approvalMode, title: `${goal.title} · ${role}` });
         chatId = chat.id;
@@ -578,7 +658,7 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
           if (controllerFailure === undefined) throw error;
         }
       }
-      }).catch(error => { throw controllerError(error, { providerInvoked, runtimeReady: app.diagnostics.containerRuntime?.state === 'ready' }); });
+      }).catch(error => { throw controllerError(error, { providerInvoked, runtimeReady: app.diagnostics.containerRuntime?.state === 'ready' }); }).finally(() => releaseDisk());
     },
     async execute({ attempt, goal, project, prompt, assignmentGoalRevision }) {
       const currentProject = app.store.get<Project>('projects', project.id) || project;
@@ -617,7 +697,7 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
     patchWorker(id, { cancellationAcknowledged: true, result: { status: 'failed', text: '', error: 'Cancellation acknowledged by the owning service.', sessionId: record.sessionId, chatId: record.chatId } });
   }
   const coordinator = new FactoryCoordinator({ store: app.store, runtime, workspaces: workspacePort,
-    deviceId: app.device.id, devices: () => app.devices, project: id => app.store.get<Project>('projects', id), onChange: () => app.changed() });
+    deviceId: app.device.id, devices: () => app.devices, project: id => app.store.get<Project>('projects', id), admission, onChange: () => app.changed() });
   const runtimeReady = (topic: string, data: unknown) => {
     if (topic !== 'runtime' || (data as ContainerRuntimeStatus).state !== 'ready') return;
     try { app.assertRuntimeCanRun(); } catch { return; }
@@ -852,24 +932,36 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
         if(recipe?.id!==SWIFT_TOOLCHAIN.id||recipe.recipeSha256!==SWIFT_TOOLCHAIN.recipeSha256)throw new HttpError(409,'The coordinator and worker must agree on the exact fixed Swift toolchain recipe.');
       }else if(body.toolchainRecipe!==undefined)throw new HttpError(400,'A toolchain recipe must match the selected development toolchain.');
       for (const value of [attempt.id, task.id, goal.id]) if (typeof value !== 'string' || !/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,79}$/.test(value)) throw new HttpError(400, 'Invalid factory identity.');
-      const source = body.source as ArtifactManifest; await importReceived(peerId, source);
+      const source = body.source as ArtifactManifest;
       const workingDirectorySources=body.workingDirectorySources as WorkingDirectorySource[]|undefined;
       if(project.workingDirectories?.length&&!workingDirectorySources?.length)throw new HttpError(409,'The coordinator did not transfer the configured additional working folders.');
-      for(const root of workingDirectorySources||[])await importReceived(peerId,root.sourceArtifact);
       const previousCandidate = body.previousCandidate as CandidateRef | undefined;
       const referenceContext=body.referenceContext as WorkerEvidenceContext|undefined;
-      if(referenceContext){assertWorkerContext(referenceContext,{goal,task,attempt});await importReceived(peerId,referenceContext.source.sourceArtifact);}
-      if (previousCandidate) await acceptRemoteCandidate(peerId, previousCandidate);
-      app.assertRuntimeCanRun();
-      const record = beginWorker({ id: attempt.id, coordinatorId: peerId, goal, task, attempt, project, workingDirectorySources,referenceContext });
+      if(referenceContext)assertWorkerContext(referenceContext,{goal,task,attempt});
+      const preparationIdentity=createHash('sha256').update(JSON.stringify({source:source?.sha256,roots:workingDirectorySources?.map(root=>[root.id,root.name,root.sourceArtifact.sha256]),reference:referenceContext?.source.sourceArtifact.sha256,previous:previousCandidate?.id,config:body.config})).digest('hex');
+      const existing=app.store.get<WorkerRecord>(journal,attempt.id);
+      // Claim identity synchronously, before the first artifact import can yield.
+      const record=beginWorker({id:attempt.id,coordinatorId:peerId,goal,task,attempt,project,workingDirectorySources,referenceContext,preparationIdentity});
+      if(existing&&(existing.status!=='preparing'||!existing.capacityWait))return record;
+      let releaseDisk:()=>void;
+      try { releaseDisk=hostDisk.reserve(`remote-attempt:${attempt.id}`,preparationArtifactBytes([source,...(workingDirectorySources||[]).map(root=>root.sourceArtifact),...(referenceContext?[referenceContext.source.sourceArtifact]:[]),...preparationArtifacts(previousCandidate?[previousCandidate]:[])])); }
+      catch(error){if(error instanceof HostDiskHeadroomError){patchWorker(record.id,{capacityWait:error.message,result:{status:'waiting',text:'',agentStarted:false,waitReason:error.message,wakeCondition:'host-disk-space'}});return worker(record.id);}throw error;}
+      patchWorker(record.id,{capacityWait:undefined,result:undefined});
       app.store.set<GoalOptions>('factory-options', { id: goal.id, workspaceProvider: body.workspaceProvider === 'artifactfs' ? 'artifactfs' : 'git' });
-      if (record.status === 'preparing') track(record.id, 'preparing', async () => {
+      track(record.id, 'preparing', async () => {
+        try {
+        hostDisk.assert();
+        await importReceived(peerId, source);
+        for(const root of workingDirectorySources||[])await importReceived(peerId,root.sourceArtifact);
+        if(referenceContext)await importReceived(peerId,referenceContext.source.sourceArtifact);
+        if(previousCandidate)await acceptRemoteCandidate(peerId,previousCandidate);
         const sourcePath = path.join(app.dataDir, 'worker-source', record.id);
         await mkdir(path.dirname(sourcePath), { recursive: true });
         try { await git(sourcePath, 'rev-parse', 'HEAD'); }
         catch { await workspaces.importSource({ artifact: source, targetPath: sourcePath }); }
         if (typeof body.config === 'string') await writeFile(path.join(sourcePath, '.envmux.json'), body.config, { mode: 0o600 });
         await prepareLocal(record, { ...project, path: sourcePath, deviceId: app.device.id }, previousCandidate);
+        } finally { releaseDisk(); }
       });
       return worker(record.id);
     }

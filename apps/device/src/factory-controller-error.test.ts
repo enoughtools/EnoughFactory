@@ -24,6 +24,7 @@ test('controller recovery requires both known preparation and a transient failur
     { code: 'RUNTIME_TIMEOUT', message: 'Container command timed out', agentStarted: false, recovery: 'retry' },
     { code: 'RUNTIME_TIMEOUT', message: 'Provider acknowledgement timed out', agentStarted: true, recovery: 'controller-retry-required' },
     { code: 'RUNTIME_PAUSED', message: 'Start the runtime to continue', recovery: 'runtime-available' },
+    { code: 'HOST_DISK_HEADROOM', message: 'Free disk space on this device to continue', agentStarted: false, recovery: 'host-disk-space' },
     { code: 'RUNTIME_MISSING', message: 'Provider runtime is not installed', agentStarted: false, recovery: 'runtime-configured' },
     { code: 'AUTHENTICATION_REQUIRED', message: 'Sign in to continue', recovery: 'credentials-changed' },
     { code: 'QUOTA_EXCEEDED', message: 'Provider quota exceeded', recovery: 'provider-available' },

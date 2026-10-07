@@ -7,7 +7,8 @@ export function controllerError(error: unknown, context: { providerInvoked: bool
   const metadata = failure as Error & { code?: string; agentStarted?: boolean };
   const code = metadata.code;
   let recovery: FactoryControllerError['recovery'] = 'controller-retry-required';
-  if (code === 'RUNTIME_PAUSED') recovery = 'runtime-available';
+  if (code === 'HOST_DISK_HEADROOM') recovery = 'host-disk-space';
+  else if (code === 'RUNTIME_PAUSED') recovery = 'runtime-available';
   else if (['MANAGED_RUNTIME_UNCONFIGURED', 'RUNTIME_MISSING', 'UNSUPPORTED_APPROVAL_MODE'].includes(code || '')) recovery = 'runtime-configured';
   else if (['AUTHENTICATION_REQUIRED', 'UNAUTHENTICATED', 'INVALID_CREDENTIAL'].includes(code || '')) recovery = 'credentials-changed';
   else if (['RATE_LIMITED', 'QUOTA_EXCEEDED'].includes(code || '')) recovery = 'provider-available';

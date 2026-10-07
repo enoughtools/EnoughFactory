@@ -30,7 +30,7 @@ export function assertCurrentWorkerAssignment(store: FactoryStore, input: { goal
 }
 
 /** Current goal guidance and unresolved retained work supplement dependency evidence. */
-export function workerCandidates(store: FactoryStore, goal: Goal, task: FactoryTask, attempt: Attempt): { selected: SelectedCandidate[]; omitted: number } {
+export function workerCandidates(store: FactoryStore, goal: Goal, task: FactoryTask, attempt: Pick<Attempt, 'id'>): { selected: SelectedCandidate[]; omitted: number } {
   const detail = store.get<AttemptDetail>('factory-attempt-details', attempt.id);
   const assignment = detail?.contract ?? task;
   const taskDetail = store.get<TaskDetail>('factory-task-details', task.id);
