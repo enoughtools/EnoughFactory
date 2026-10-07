@@ -78,7 +78,7 @@ ${runtime === "codex" ? `case "$(uname -m)" in
   *) echo 'Unsupported Linux Codex architecture; expected x86_64, aarch64 or arm64.' >&2; exit 1;;
 esac` : ""}
 npm_cache=$(mktemp -d "\${TMPDIR:-/tmp}/enoughfactory-npm.XXXXXXXX")
-npm install --global --prefix /opt/enoughfactory/node --cache "$npm_cache" --no-audit --no-fund '${runtime === "codex" ? `@openai/codex@${RUNTIME_PINS.codex}` : `@anthropic-ai/claude-code@${RUNTIME_PINS.claude}`}'${runtime === "codex" ? ' "$native_package"' : ""}
+npm install --global --prefix /opt/enoughfactory/node --cache "$npm_cache" --no-audit --no-fund${runtime === "codex" ? " --omit=optional" : ""} '${runtime === "codex" ? `@openai/codex@${RUNTIME_PINS.codex}` : `@anthropic-ai/claude-code@${RUNTIME_PINS.claude}`}'${runtime === "codex" ? ' "$native_package"' : ""}
 `;
 }
 

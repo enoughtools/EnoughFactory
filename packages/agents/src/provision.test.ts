@@ -120,6 +120,7 @@ test("Codex requires the pinned native package on every supported architecture w
         const runtime = await provisionRuntime("fixture-container", "codex", {}, context.options);
         assert.equal(runtime.version, `codex-cli ${RUNTIME_PINS.codex}`);
         const args = await context.npmArguments();
+        assert.ok(args.includes("--omit=optional"), "Only the explicitly required native package should be installed");
         assert.deepEqual(args.filter(arg => arg.startsWith("@openai/")), [
           `@openai/codex@${RUNTIME_PINS.codex}`,
           `@openai/codex-linux-${platform}@npm:@openai/codex@${RUNTIME_PINS.codex}-linux-${platform}`,
