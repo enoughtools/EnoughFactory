@@ -432,6 +432,42 @@ test("restart preserves failed repair history and recovers only the current succ
   } finally { recovered.stop(); }
 });
 
+test("restart preserves the original completion time of a successful candidate awaiting resume", async () => {
+  let time = "2026-10-05T01:00:00.000Z";
+  const factory = harness([device], () => new Date(time));
+  const goal = await planGoal(factory);
+  factory.executing(async () => {
+    time = "2026-10-05T01:05:00.000Z";
+    factory.coordinator.pause(goal.id);
+    return { status: "succeeded", text: "Implementation complete before service restart" };
+  });
+  await factory.coordinator.tick();
+  await factory.coordinator.waitForIdle();
+  const original = factory.store.list<Attempt>("attempts")[0]!;
+  const originalDetail = factory.store.get<AttemptDetail>("factory-attempt-details", original.id)!;
+  assert.equal(original.endedAt, time, "a fresh result records its actual completion time");
+  assert.equal(original.status, "succeeded");
+  assert.equal(factory.store.list<FactoryTask>("tasks")[0]!.status, "review");
+  assert.ok(originalDetail.candidate);
+  factory.coordinator.stop();
+  time = "2026-10-05T02:00:00.000Z";
+  const recovered = factory.recover();
+  try {
+    await recovered.start();
+    await recovered.waitForIdle();
+    assert.deepEqual(factory.store.get<Attempt>("attempts", original.id), original);
+    const recoveredDetail = factory.store.get<AttemptDetail>("factory-attempt-details", original.id)!;
+    assert.deepEqual(recoveredDetail.candidate, originalDetail.candidate);
+    assert.deepEqual(recoveredDetail.checks, originalDetail.checks);
+    assert.deepEqual(recoveredDetail.workspace, originalDetail.workspace);
+    assert.equal(factory.store.get<Goal>("goals", goal.id)!.status, "paused");
+    assert.equal(factory.calls.execute, 1);
+    assert.equal(factory.calls.capture, 1);
+    assert.equal(factory.calls.check, 0);
+    assert.equal(factory.calls.integrate, 0);
+  } finally { recovered.stop(); }
+});
+
 test("a lost integration acknowledgement stays unknown until recovery confirms the original commit", async () => {
   const factory = harness();
   factory.afterIntegrationWrite(async () => { throw new Error("Connection closed after the repository write"); });

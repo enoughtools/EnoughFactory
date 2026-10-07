@@ -489,7 +489,7 @@ export class FactoryCoordinator {
       if (!this.isCurrent(attempt)) return;
       this.failAttempt(attempt, result.error || result.text || "The runtime reported failure."); return;
     }
-    this.writeAttempt(attempt.id, { status: "succeeded", endedAt: this.now() });
+    this.writeAttempt(attempt.id, { status: "succeeded", endedAt: attempt.endedAt ?? this.now() });
     this.writeTask(task.id, { status: "review" });
     const detail = this.attemptDetail(attempt.id);
     if (!detail.workspace) { this.markUnknown(attempt, "The recovered execution has no retained workspace reference."); return; }
