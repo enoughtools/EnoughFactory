@@ -58,6 +58,7 @@ function harness(devices: Device[] = [device], now?: () => Date) {
   const store = new MemoryStore();
   const calls = { planner: 0, evaluator: 0, diagnosis: 0, execute: 0, reconcile: 0, cancel: 0, prepare: 0, capture: 0, check: 0, goalCheck: 0, integrate: 0, integrationFences: 0, reconcileIntegration: 0 };
   const executionPrompts: string[] = [];
+  const planningPrompts: string[] = [];
   const evaluationPrompts: string[] = [], candidateCommands: string[][] = [], integrationCommands: string[][] = [], goalCommands: string[][] = [];
   let planning: () => Promise<PlanResponse> = async () => plan;
   let evaluating: () => Promise<EvaluationResponse> = async () => completeEvaluation;
@@ -76,7 +77,7 @@ function harness(devices: Device[] = [device], now?: () => Date) {
   };
   const runtime: FactoryRuntimePort = {
     async complete(input) {
-      if (input.role === "planner") { calls.planner++; return { text: JSON.stringify(await planning()) }; }
+      if (input.role === "planner") { calls.planner++; planningPrompts.push(input.prompt); return { text: JSON.stringify(await planning()) }; }
       if (input.role === "evaluator") { calls.evaluator++; evaluationPrompts.push(input.prompt); return { text: JSON.stringify(await evaluating()) }; }
       calls.diagnosis++;
       diagnosisPrompts.push(input.prompt);
@@ -119,7 +120,7 @@ function harness(devices: Device[] = [device], now?: () => Date) {
   const coordinator = new FactoryCoordinator(options);
   const goal = () => coordinator.create({ projectId: project.id, objective: "Build the feature and publish its release", criteria, autonomy: "autonomous", approvalMode: "approve-all", concurrency: 1 });
   return {
-    store, calls, coordinator, goal, executionPrompts, evaluationPrompts, diagnosisPrompts, candidateCommands, integrationCommands, goalCommands, workspaces, recover: () => new FactoryCoordinator(options),
+    store, calls, coordinator, goal, planningPrompts, executionPrompts, evaluationPrompts, diagnosisPrompts, candidateCommands, integrationCommands, goalCommands, workspaces, recover: () => new FactoryCoordinator(options),
     planning(fn: typeof planning) { planning = fn; },
     evaluating(fn: typeof evaluating) { evaluating = fn; },
     executing(fn: typeof executing) { executing = fn; },
@@ -154,6 +155,93 @@ async function finishTask(factory: ReturnType<typeof harness>): Promise<Goal> {
   assert.equal(factory.store.list<FactoryTask>("tasks")[0]!.status, "completed");
   return goal;
 }
+
+test("controllers retain every contract and exact evidence identity without embedding a large accepted history", async () => {
+  const factory = harness(), created = factory.goal();
+  const originalCriteria = Array.from({ length: 9 }, (_, index) => `Original completion criterion ${index}: deliver the actual native behavior`);
+  const goal = { ...created, criteria: originalCriteria, revision: 13 };
+  factory.store.set("goals", goal);
+  const output = `Check began\n${'\u0000\\"\n'.repeat(30_000)}\nFINAL FAILURE: concrete native launch error`;
+  const accepted: FactoryTask[] = [];
+  for (let index = 0; index < 38; index++) {
+    const task: FactoryTask = { id: `accepted-${index}`, goalId: goal.id, title: `Accepted task ${index}`, description: `Full accepted contract ${index}`,
+      kind: "feature", acceptanceCriteria: [`Behavior ${index} must work`], expectedOutputs: [`deliverable-${index}`], writePaths: [`Packages/Feature${index}`],
+      dependsOn: index ? [`accepted-${index - 1}`] : [], status: "completed", currentAttemptId: `accepted-attempt-${index}`, createdAt: device.lastSeen, updatedAt: device.lastSeen };
+    accepted.push(task);
+    factory.store.set("tasks", task);
+    factory.store.set<TaskDetail>("factory-task-details", { id: task.id, key: `accepted-key-${index}`, checks: [`check-feature-${index}`], planRevision: 12, selected: false, failureSignatures: [] });
+    factory.store.set<Attempt>("attempts", { id: task.currentAttemptId!, taskId: task.id, generation: 1, deviceId: device.id, status: "succeeded", startedAt: device.lastSeen });
+    const checks = [{ command: `check-feature-${index}`, passed: true, output, exitCode: 0, candidateCommit: `accepted-source-${index}`, checkedCommit: `accepted-merge-${index}` }];
+    factory.store.set<AttemptDetail>("factory-attempt-details", { id: task.currentAttemptId!, goalId: goal.id, goalRevision: 12, cancellation: "none", phase: "done",
+      contract: { title: task.title, description: task.description, kind: task.kind, acceptanceCriteria: task.acceptanceCriteria, expectedOutputs: task.expectedOutputs,
+        dependsOn: task.dependsOn, checks: checks.map(check => check.command), planRevision: 12 },
+      candidate: { id: `accepted-candidate-${index}`, commit: `accepted-source-${index}`, baseCommit: `accepted-base-${index}`,
+        bundleArtifact: { id: `bundle-${index}`, sha256: `bundle-sha-${index}`, metadata: { hugeInventory: output } }, ignoredProviderState: output },
+      result: { status: "succeeded", text: output }, checks,
+      integration: { commit: `accepted-merge-${index}`, previousHead: `accepted-base-${index}`, candidateCommit: `accepted-source-${index}`, checks } });
+  }
+  const retainedTask: FactoryTask = { id: "current-repair", goalId: goal.id, title: "Current integration", description: "Wire the remaining actual application",
+    acceptanceCriteria: ["Current wiring contract"], expectedOutputs: ["Native fixture launch"], dependsOn: [accepted[37]!.id], status: "failed", createdAt: device.lastSeen, updatedAt: device.lastSeen };
+  factory.store.set("tasks", retainedTask);
+  factory.store.set<TaskDetail>("factory-task-details", { id: retainedTask.id, key: "current-integration", checks: ["check-current"], planRevision: 12,
+    lastError: output, lastCandidate: { id: "newest-retained-candidate", commit: "newest-retained-commit", baseCommit: "latest-base" }, selected: false, failureSignatures: [] });
+  factory.store.set<PlanRecord>("factory-plans", { id: goal.id, goalId: goal.id, revision: 12, summary: "Current whole-goal contract", checks: ["prior-whole-goal-check"], checkScope: "goal",
+    taskKeys: Object.fromEntries([...accepted.map((task, index) => [`accepted-key-${index}`, task.id]), ["current-integration", retainedTask.id]]), createdAt: device.lastSeen });
+  factory.store.set<ControlRecord>("factory-control", { ...factory.store.get<ControlRecord>("factory-control", goal.id)!, stage: "plan",
+    steering: ["Preserve all nine criteria and accepted work"], replanInstructions: "Use the newest retained candidate and finish actual wiring", replanReason: `Legacy diagnostic reason embedded a complete log: ${output}` });
+  factory.planning(async () => ({ summary: "Continue exact retained integration", criteria: originalCriteria, checks: ["check-whole-goal"], tasks: [{
+    key: "current-integration", title: retainedTask.title, description: retainedTask.description, acceptanceCriteria: retainedTask.acceptanceCriteria,
+    expectedOutputs: retainedTask.expectedOutputs, dependsOn: ["accepted-key-37"], checks: ["check-current"],
+  }] }));
+  const durableBefore = factory.store.get<AttemptDetail>("factory-attempt-details", "accepted-attempt-37")!;
+  await factory.coordinator.tick(); await factory.coordinator.waitForIdle();
+  assert.equal(factory.calls.planner, 1, "large evidence must reach the provider rather than fail its input schema");
+  const planningPrompt = factory.planningPrompts[0]!;
+  for (const task of accepted) {
+    const index = Number(task.id.split("-")[1]);
+    for (const expected of [task.description, task.acceptanceCriteria![0]!, task.expectedOutputs![0]!, `accepted-key-${index}`, `check-feature-${index}`, `accepted-source-${index}`, `accepted-merge-${index}`, `accepted-candidate-${index}`, `bundle-sha-${index}`]) assert.ok(planningPrompt.includes(expected), expected);
+  }
+  for (const value of [...originalCriteria, "newest-retained-candidate", "newest-retained-commit", "Use the newest retained candidate and finish actual wiring", "Preserve all nine criteria and accepted work", "prior-whole-goal-check"]) assert.ok(planningPrompt.includes(value), value);
+
+  const replacement = factory.store.get<FactoryTask>("tasks", retainedTask.id)!;
+  const failedAttempt: Attempt = { id: "current-failed-attempt", taskId: replacement.id, generation: 2, deviceId: device.id, status: "failed", error: output, startedAt: device.lastSeen };
+  factory.store.set("attempts", failedAttempt);
+  factory.store.set("tasks", { ...replacement, status: "failed", currentAttemptId: failedAttempt.id });
+  factory.store.set<AttemptDetail>("factory-attempt-details", { id: failedAttempt.id, goalId: goal.id, goalRevision: goal.revision, cancellation: "none", phase: "done",
+    candidate: { id: "newest-retained-candidate", commit: "newest-retained-commit", baseCommit: "latest-base" }, result: { status: "failed", text: output },
+    checks: [{ command: "check-current", passed: false, output, exitCode: 1, candidateCommit: "newest-retained-commit" }] });
+  factory.store.set<ControlRecord>("factory-control", { ...factory.store.get<ControlRecord>("factory-control", goal.id)!, stage: "diagnose", diagnosisTaskId: replacement.id });
+  factory.diagnosing(async () => ({ action: "wait", reason: "Need native evidence", instructions: "Preserve current candidate" }));
+  await factory.coordinator.tick(); await factory.coordinator.waitForIdle();
+  assert.equal(factory.calls.diagnosis, 1);
+  assert.ok(factory.diagnosisPrompts[0]!.includes("FINAL FAILURE: concrete native launch error"), "repair retains the actual failure tail");
+  assert.ok(factory.diagnosisPrompts[0]!.includes("newest-retained-commit"));
+
+  factory.store.set("tasks", { ...factory.store.get<FactoryTask>("tasks", replacement.id)!, status: "canceled" });
+  const repository = { head: "final-primary", branch: "main", status: "", fingerprint: "exact-tree", diff: output };
+  factory.inspect(async () => repository);
+  factory.goalChecking(async (_project, commands) => ({ repository, checks: commands.map(command => ({ command, passed: false, output, exitCode: 1, candidateCommit: repository.head, checkedCommit: repository.head })) }));
+  factory.evaluating(async () => ({ complete: false, summary: "Repair actual launch failure", criteria: originalCriteria.map(criterion => ({ criterion, satisfied: false, evidence: [] })) }));
+  factory.coordinator.requestEvaluation(goal.id);
+  await factory.coordinator.tick(); await factory.coordinator.waitForIdle();
+  assert.equal(factory.calls.evaluator, 1);
+  const evaluationPrompt = factory.evaluationPrompts[0]!;
+  assert.ok(evaluationPrompt.includes("FINAL FAILURE: concrete native launch error"));
+  assert.ok(evaluationPrompt.includes("factory-goal-checks/"));
+  assert.ok(evaluationPrompt.includes('"passed":false'));
+  for (const task of accepted) assert.ok(evaluationPrompt.includes(task.acceptanceCriteria![0]!), task.id);
+  for (const prompt of [planningPrompt, factory.diagnosisPrompts[0]!, evaluationPrompt]) {
+    assert.ok(prompt.length < 768 * 1024, `actual serialized controller prompt is ${prompt.length} characters`);
+    for (const criterion of originalCriteria) assert.ok(prompt.includes(criterion));
+    assert.ok(prompt.includes("characters omitted"));
+    assert.ok(prompt.includes("sha256"));
+  }
+  assert.deepEqual(factory.store.get<AttemptDetail>("factory-attempt-details", "accepted-attempt-37"), durableBefore, "summarization never changes retained evidence");
+  const receipt = factory.store.list<import("./types.js").GoalCheckRecord>("factory-goal-checks")[0]!;
+  assert.equal(receipt.checks[0]!.output, output, "the whole-goal receipt preserves the full failure");
+  assert.ok(factory.store.get<ControlRecord>("factory-control", goal.id)!.replanReason!.length < 100_000, "future replans do not re-embed the full check log");
+  assert.deepEqual(factory.store.get<Goal>("goals", goal.id)!.criteria, originalCriteria);
+});
 
 function retainedAttempt(factory: ReturnType<typeof harness>, goal: Goal, retained: Pick<AttemptDetail, "phase"> & Partial<Pick<AttemptDetail, "workspace" | "candidate" | "result">>): Attempt {
   const task = factory.store.list<FactoryTask>("tasks")[0]!;

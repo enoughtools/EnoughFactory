@@ -7,6 +7,7 @@ import type {
 import { readCheckCommands, readEvaluation, readJsonObject, readPlan, readTasks, validateDependencies } from "./protocol.js";
 import { FactoryOperationError, FactoryDecisionError, FactoryControllerError } from "./errors.js";
 import { activeExecutionTasks, descendants, placementConstraint, sortReadyTasks, taskSchedulingBlocker } from "./scheduler.js";
+import { ControllerEvidence, controllerPrompt } from "./controller-evidence.js";
 
 const TABLE = {
   goals: "goals", tasks: "tasks", attempts: "attempts", decisions: "decisions",
@@ -342,23 +343,36 @@ export class FactoryCoordinator {
     const completed = this.tasks(goal.id).filter(task => task.status === "completed");
     const scope = this.control(goal.id).replanTaskIds;
     const preserved = scope ? this.tasks(goal.id).filter(task => !scope.includes(task.id) && task.status !== "canceled") : completed;
-    const prompt = [
-      "You are the EnoughFactory planner. Build the entire objective, preserving all explicit requirements. Make routine implementation decisions yourself.",
-      "Return one JSON object: {summary,criteria:string[],checks:string[],tasks:[{key,title,description,kind:'feature'|'unit'|'architecture'|'test',acceptanceCriteria:string[],expectedOutputs:string[],dependsOn:string[],checks:string[],estimatedMinutes?:number,writePaths?:string[],resources?:{cpus?:number,memoryGiB?:number},deviceId?:string}]}. Stable task keys must be unique, dependencies acyclic, checks focused and executable inside the isolated runtime.",
-      "Choose task kinds by outcome: feature delivers observable product behavior; unit implements a bounded component or change; architecture resolves a structural decision and preserves its rationale and handoff; test supplies focused verification for an identified uncertainty. Give each task concrete acceptance criteria and expected deliverables. Do not invent extra architecture/test tasks or mandatory reviews when the work does not need them.",
-      "Every ordinary checks entry is a shell command, never an instruction or explanation. A structured validation profile explicitly advertised by the runtime is also a valid check; preserve its exact prefix and JSON rather than wrapping it in a shell command. For example use 'sh scripts/check-foundation.sh', not 'Run scripts/check-foundation.sh to validate the foundation'. Task checks verify only outputs available when that task and its actual prerequisites finish. An architecture or interface task should verify its deliverables without requiring the future application, packages or tests to exist. Plan-level checks are final whole-goal checks, run once on the integrated result after all tasks finish; do not copy them into every task or require expensive full-product verification at every layer. Empty task checks are acceptable when concrete deliverable evidence is the appropriate verification.",
-      "Maximize useful parallel work: establish shared interfaces/contracts in small prerequisite tasks, then give independent implementations disjoint ownership. DependsOn is for actual required outputs, not preferred chronology or artificial phases. Avoid making every task depend on a broad setup task. Declare repository-relative writePaths (files, directories or globs) for likely writes, estimatedMinutes for effort and resources for meaningful CPU/memory needs. Estimates guide scheduling; do not invent precision. Keep verification proportionate; do not require human approval or ceremonies unless the goal's actual policy requires them.",
-      "Do not claim implementation or completion. A task may include configured release/deployment actions. Recorded goal completion criteria are authoritative: return their exact text unchanged, including criteria added through user steering. Derive explicit observable goal criteria only when none are recorded. Put implementation-specific requirements in task acceptanceCriteria; routine replanning must not add paraphrased or duplicate goal criteria.",
-      this.context(goal),
-      `Devices: ${JSON.stringify(this.options.devices())}`,
-      `Already integrated work: ${JSON.stringify(completed.map(task => ({ key: this.taskDetail(task.id).key, title: task.title, description: task.description, attempt: this.options.store.get(TABLE.attemptDetails, task.currentAttemptId ?? "") })))}`,
-      `Retained unfinished work: ${JSON.stringify(this.tasks(goal.id).filter(task => task.status !== "completed" && (!scope || scope.includes(task.id))).map(task => ({ key: this.taskDetail(task.id).key, title: task.title, description: task.description, failure: this.taskDetail(task.id).lastError, candidate: this.taskDetail(task.id).lastCandidate, priorRepairGuidance: { planRevision: this.taskDetail(task.id).planRevision, instructions: this.taskDetail(task.id).repairInstructions } })))}`,
-      "Prior repair guidance belongs to its recorded plan revision. Carry applicable requirements into the new task contracts, resolving obsolete instructions against the current diagnosis and latest retained candidate. Do not replace already accepted implementations merely because an older handoff reported them missing.",
-      ...(scope ? [`This is a localized repair. Replace only the affected work above. Preserve these unrelated tasks exactly; their keys may be dependencies but must not be repeated: ${JSON.stringify(preserved.map(task => ({ key: this.taskDetail(task.id).key, title: task.title, status: task.status, dependsOn: task.dependsOn.map(id => this.taskDetail(id).key) })))}`] : []),
-      "Do not repeat completed tasks. Their keys may be referenced as dependencies.",
-      "Reuse a retained unfinished task's stable key when continuing the same work. Its isolated candidate can seed a replacement workspace; use a new key when the task's purpose changes.",
-    ].join("\n\n");
     try {
+      const prompt = controllerPrompt(evidence => {
+        // Prioritize current failures before allocating excerpts to historical accepted work.
+        const retained = this.tasks(goal.id).filter(task => task.status !== "completed" && (!scope || scope.includes(task.id))).map(task => {
+          const detail = this.taskDetail(task.id);
+          return { ...evidence.task(task, detail), failure: evidence.text(detail.lastError, `${TABLE.taskDetails}/${task.id}.lastError`, 8192),
+            candidate: evidence.candidate(detail.lastCandidate), priorRepairGuidance: { planRevision: detail.planRevision, instructions: detail.repairInstructions } };
+        });
+        const context = this.context(goal, evidence);
+        const integrated = completed.map(task => ({ ...evidence.task(task, this.taskDetail(task.id)),
+          attempt: evidence.attempt(this.options.store.get<Attempt>(TABLE.attempts, task.currentAttemptId ?? ""),
+            this.options.store.get<AttemptDetail>(TABLE.attemptDetails, task.currentAttemptId ?? "")) }));
+        return [
+          "You are the EnoughFactory planner. Build the entire objective, preserving all explicit requirements. Make routine implementation decisions yourself.",
+          "Return one JSON object: {summary,criteria:string[],checks:string[],tasks:[{key,title,description,kind:'feature'|'unit'|'architecture'|'test',acceptanceCriteria:string[],expectedOutputs:string[],dependsOn:string[],checks:string[],estimatedMinutes?:number,writePaths?:string[],resources?:{cpus?:number,memoryGiB?:number},deviceId?:string}]}. Stable task keys must be unique, dependencies acyclic, checks focused and executable inside the isolated runtime.",
+          "Choose task kinds by outcome: feature delivers observable product behavior; unit implements a bounded component or change; architecture resolves a structural decision and preserves its rationale and handoff; test supplies focused verification for an identified uncertainty. Give each task concrete acceptance criteria and expected deliverables. Do not invent extra architecture/test tasks or mandatory reviews when the work does not need them.",
+          "Every ordinary checks entry is a shell command, never an instruction or explanation. A structured validation profile explicitly advertised by the runtime is also a valid check; preserve its exact prefix and JSON rather than wrapping it in a shell command. For example use 'sh scripts/check-foundation.sh', not 'Run scripts/check-foundation.sh to validate the foundation'. Task checks verify only outputs available when that task and its actual prerequisites finish. An architecture or interface task should verify its deliverables without requiring the future application, packages or tests to exist. Plan-level checks are final whole-goal checks, run once on the integrated result after all tasks finish; do not copy them into every task or require expensive full-product verification at every layer. Empty task checks are acceptable when concrete deliverable evidence is the appropriate verification.",
+          "Maximize useful parallel work: establish shared interfaces/contracts in small prerequisite tasks, then give independent implementations disjoint ownership. DependsOn is for actual required outputs, not preferred chronology or artificial phases. Avoid making every task depend on a broad setup task. Declare repository-relative writePaths (files, directories or globs) for likely writes, estimatedMinutes for effort and resources for meaningful CPU/memory needs. Estimates guide scheduling; do not invent precision. Keep verification proportionate; do not require human approval or ceremonies unless the goal's actual policy requires them.",
+          "Do not claim implementation or completion. A task may include configured release/deployment actions. Recorded goal completion criteria are authoritative: return their exact text unchanged, including criteria added through user steering. Derive explicit observable goal criteria only when none are recorded. Put implementation-specific requirements in task acceptanceCriteria; routine replanning must not add paraphrased or duplicate goal criteria.",
+          context,
+          `Devices: ${JSON.stringify(this.options.devices())}`,
+          `Current whole-goal check contract: ${JSON.stringify({ revision: this.planRecord(goal.id)?.revision, checks: this.planRecord(goal.id)?.checks ?? [] })}`,
+          `Already integrated work: ${JSON.stringify(integrated)}`,
+          `Retained unfinished work: ${JSON.stringify(retained)}`,
+          "Prior repair guidance belongs to its recorded plan revision. Carry applicable requirements into the new task contracts, resolving obsolete instructions against the current diagnosis and latest retained candidate. Do not replace already accepted implementations merely because an older handoff reported them missing.",
+          ...(scope ? [`This is a localized repair. Replace only the affected work above. Preserve these unrelated tasks exactly; their keys may be dependencies but must not be repeated: ${JSON.stringify(preserved.map(task => ({ key: this.taskDetail(task.id).key, title: task.title, status: task.status, dependsOn: task.dependsOn.map(id => this.taskDetail(id).key) })))}`] : []),
+          "Do not repeat completed tasks. Their keys may be referenced as dependencies.",
+          "Reuse a retained unfinished task's stable key when continuing the same work. Its isolated candidate can seed a replacement workspace; use a new key when the task's purpose changes.",
+        ];
+      });
       const response = await this.options.runtime.complete({ goal, role: "planner", prompt, project, signal: this.operationControllers.get(goal.id)?.signal });
       if (!this.operationCurrent(goal.id, operation)) return;
       this.recordSpend(goal.id, response.spend);
@@ -627,13 +641,13 @@ export class FactoryCoordinator {
       if (!diagnosisCurrent()) return;
       const detail = this.taskDetail(taskId);
       const repeated = detail.failureSignatures.length >= 3 && new Set(detail.failureSignatures.slice(-3)).size === 1;
-      const prompt = [
+      const prompt = controllerPrompt(evidence => [
         "You are the EnoughFactory repair supervisor. Decide the next concrete action after a confirmed failure. Return JSON {action:'retry'|'replan'|'wait',reason:string,instructions?:string,waitReason?:string,wakeCondition?:string}.",
         "Retry must change the implementation approach or address the observed failure. Replan changes task decomposition or dependencies. Wait only for an identified external condition; do not ask for human permission already granted by project policy.",
         "If a configured check is prose rather than an executable command, or requires future task outputs unrelated to this task's contract, replan to correct the verification scope. Do not make a worker fabricate missing future application layers or repeat unchanged invalid commands. Retain useful candidate work and keep checks proportionate to the task's actual deliverables.",
         repeated ? "Three equivalent failures occurred. Choose a changed decomposition or external wait rather than repeating the same attempt." : "Make a proportionate repair decision and continue.",
-        this.context(goal), `Failed task: ${JSON.stringify(task)}`, `Failure: ${detail.lastError}`, `Retained work: ${JSON.stringify(detail.lastCandidate)}`, `Attempt evidence: ${JSON.stringify(attempt ? this.attemptDetail(attempt.id) : {})}`,
-      ].join("\n\n");
+        this.context(goal, evidence), `Failed task: ${JSON.stringify(evidence.task(task, detail))}`, `Failure: ${JSON.stringify(evidence.text(detail.lastError, `${TABLE.taskDetails}/${task.id}.lastError`, 8192))}`, `Retained work: ${JSON.stringify(evidence.candidate(detail.lastCandidate))}`, `Attempt evidence: ${JSON.stringify(evidence.attempt(attempt, attempt ? this.attemptDetail(attempt.id) : undefined))}`,
+      ]);
       const response = await this.options.runtime.complete({ goal, role: "diagnosis", prompt, project: this.project(goal), signal: this.operationControllers.get(goal.id)?.signal });
       if (!diagnosisCurrent()) return;
       this.recordSpend(goal.id, response.spend);
@@ -718,16 +732,18 @@ export class FactoryCoordinator {
         }
       }
       const goalChecksPassed = !goalChecks || goalChecks.checks.every(check => check.passed);
-      const evidence = this.tasks(goal.id).filter(task => task.status === "completed").map(task => ({ task, attempt: task.currentAttemptId ? this.attemptDetail(task.currentAttemptId) : undefined }));
-      const prompt = [
+      const prompt = controllerPrompt(evidence => [
         "You are the EnoughFactory completion evaluator. Audit the entire original objective against the actual repository and retained execution evidence. A worker's final response, green unrelated tests or partial implementation do not prove completion.",
         "Inspect/run only meaningful checks needed for uncertain criteria. Return JSON {complete:boolean,summary:string,criteria:[{criterion:string,satisfied:boolean,evidence:string[]}],additionalTasks?:[{key,title,description,kind:'feature'|'unit'|'architecture'|'test',acceptanceCriteria:string[],expectedOutputs:string[],dependsOn:string[],checks:string[]}],waitReason?:string,wakeCondition?:string}. Use task kinds for concrete delivery outcomes, not mandatory role ceremonies.",
         "Use each criterion's exact original text. Every satisfied criterion requires concrete current-state evidence such as files, runtime outcomes, exact commit check records or published URLs. If something remains, add actionable tasks. Never weaken the objective to declare completion. No mandatory human gate applies to autonomous plus approve-all.",
         "Also inspect the accepted tasks' acceptance criteria and expected deliverables. Integration records prove accepted source, not that every requested behavior or deliverable exists. Add concrete follow-up work for any unmet contract that matters to the original objective.",
         "Configured whole-goal checks have already run against the exact integrated snapshot. Do not repeat them merely to restate the evidence. A failed configured check prevents completion: use its concrete command/output to propose focused repair tasks. Checks on a future repaired snapshot will run once after that work integrates. Every additional task check must be an executable shell command scoped to outputs available at that task's completion, never prose or an unrelated whole-product gate.",
-        `Whole-goal check evidence: ${JSON.stringify(goalChecks ?? { commands: [], checks: [] })}`,
-        this.context(goal), `Repository snapshot: ${JSON.stringify(repository)}`, `Integrated work and check records: ${JSON.stringify(evidence)}`,
-      ].join("\n\n");
+        `Whole-goal check evidence: ${JSON.stringify(evidence.goalChecks(goalChecks))}`,
+        this.context(goal, evidence), `Repository snapshot: ${JSON.stringify(evidence.repository(repository, `goal/${goal.id}/repository/${repository.head}`))}`,
+        `Integrated work and check records: ${JSON.stringify(this.tasks(goal.id).filter(task => task.status === "completed").map(task => ({
+          ...evidence.task(task, this.taskDetail(task.id)), attempt: evidence.attempt(this.options.store.get<Attempt>(TABLE.attempts, task.currentAttemptId ?? ""), task.currentAttemptId ? this.attemptDetail(task.currentAttemptId) : undefined),
+        })))}`,
+      ]);
       const response = await this.options.runtime.complete({ goal, role: "evaluator", prompt, project, signal: this.operationControllers.get(goal.id)?.signal });
       if (!this.operationCurrent(goal.id, operation)) return;
       this.recordSpend(goal.id, response.spend);
@@ -771,7 +787,8 @@ export class FactoryCoordinator {
         });
       } else {
         this.decision(goal.id, "evaluation-incomplete", evaluation.summary || "Completion lacked evidence for all criteria.", { evaluationId: record.id, required });
-        await this.replan(goal.id, `Completion remains unproven. ${evaluation.summary}\nUnsatisfied criteria: ${required.filter(criterion => !evaluation.criteria.some(item => item.criterion === criterion && item.satisfied && item.evidence.length)).join("; ")}\n${goalChecksPassed ? "" : `Failed goal checks:\n${goalChecks!.checks.filter(check => !check.passed).map(check => `${check.command}\n${check.output}`).join("\n")}`}`);
+        const failedChecks = goalChecksPassed ? "" : `Failed goal checks (all receipt outcomes retained for exact record indexes):\n${JSON.stringify(new ControllerEvidence().goalChecks(goalChecks))}`;
+        await this.replan(goal.id, `Completion remains unproven. ${evaluation.summary}\nUnsatisfied criteria: ${required.filter(criterion => !evaluation.criteria.some(item => item.criterion === criterion && item.satisfied && item.evidence.length)).join("; ")}\n${failedChecks}`);
       }
       this.changed();
     } catch (error) { this.operationFailed(goal.id, operation, error); }
@@ -971,9 +988,12 @@ export class FactoryCoordinator {
       this.decision(goal.id, "woken", reason);
     });
   }
-  private context(goal: Goal): string {
+  private context(goal: Goal, evidence?: ControllerEvidence): string {
     const control = this.control(goal.id);
-    return `Original objective:\n${goal.objective}\n\nRequired completion criteria:\n${goal.criteria.map(value => `- ${value}`).join("\n")}\n\nAutonomy: ${goal.autonomy}; approvals: ${goal.approvalMode}.\n\nSteering context:\n${control.steering.join("\n")}\n\nReplanning reason:\n${control.replanReason ?? "Initial plan"}${control.replanInstructions ? `\n\nCurrent diagnosis handoff:\n${control.replanInstructions}` : ""}`;
+    // Older services embedded complete failed check logs here. Keep requirements/steering/handoff exact,
+    // while treating the diagnostic reason like the other retained failure text.
+    const reason = control.replanReason && evidence ? evidence.text(control.replanReason, `${TABLE.control}/${goal.id}.replanReason`, 8192) : undefined;
+    return `Original objective:\n${goal.objective}\n\nRequired completion criteria:\n${goal.criteria.map(value => `- ${value}`).join("\n")}\n\nAutonomy: ${goal.autonomy}; approvals: ${goal.approvalMode}.\n\nSteering context:\n${control.steering.join("\n")}\n\nReplanning reason:\n${reason?.omittedCharacters ? JSON.stringify(reason) : control.replanReason ?? "Initial plan"}${control.replanInstructions ? `\n\nCurrent diagnosis handoff:\n${control.replanInstructions}` : ""}`;
   }
   private executionPrompt(goal: Goal, task: FactoryTask): string {
     const detail = this.executionTaskDetail(task);
