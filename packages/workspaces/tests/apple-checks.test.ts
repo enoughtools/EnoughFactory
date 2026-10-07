@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { ArtifactStore } from "../src/artifacts.ts";
 import {
-  APPLE_PRODUCT_INVENTORY_SOURCE, appleCheckArtifacts, appleCheckExecutor, appleEnvironment,
+  APPLE_PRODUCT_INVENTORY_SOURCE, appleCheckArtifacts, appleCheckExecutor, appleEnvironment, appleManifestCompilerSource,
   appleSandboxProfile, appleToolArguments, isAppleCheckCommand, parseAppleCheckCommand, runNativeGroup,
 } from "../src/apple-checks.ts";
 import type { Candidate } from "../src/types.ts";
@@ -26,6 +26,9 @@ test("Apple validation accepts a narrow data contract and rejects shell/path/opt
   assert.throws(() => parseAppleCheckCommand(`${prefix}swift build; touch /outside`));
   const environment = appleEnvironment("/owned/scratch", "/Applications/Xcode.app/Contents/Developer");
   assert.equal(environment.HOME, "/owned/scratch/home");
+  assert.equal(environment.TMPDIR, "/owned/scratch/tmp/");
+  assert.equal(environment.TEMP, "/owned/scratch/tmp");
+  assert.equal(environment.TMP, "/owned/scratch/tmp");
   assert.equal(environment.SSH_AUTH_SOCK, undefined);
   assert.equal(environment.DYLD_INSERT_LIBRARIES, undefined);
   const policy = appleSandboxProfile({ sources: ["/owned/check"], scratch: "/owned/scratch", developerDirectory: "/Applications/Xcode.app/Contents/Developer" });
@@ -36,7 +39,64 @@ test("Apple validation accepts a narrow data contract and rejects shell/path/opt
   const args = appleToolArguments({ tool: "xcodebuild", project: "Mail.xcodeproj", scheme: "Mail", platform: "ios-simulator", configuration: "Debug" }, "/owned/check", "/owned/scratch");
   assert.ok(args.includes("iphonesimulator"));
   assert.ok(args.includes("CODE_SIGNING_ALLOWED=NO"));
+  assert.ok(args.includes("-IDEPackageSupportDisableManifestSandbox=YES"));
+  assert.ok(args.includes("OTHER_SWIFT_FLAGS=$(inherited) -disable-sandbox"));
+  assert.ok(args.includes("-packageCachePath"));
+  assert.ok(!args.some(arg => arg.startsWith("SWIFT_EXEC=")));
   assert.ok(!args.includes("test"));
+  for (const action of ["build", "test"] as const) {
+    const swiftArgs = appleToolArguments({ tool: "swift", package: ".", action }, "/owned/check", "/owned/scratch");
+    const compilerOption = swiftArgs.indexOf("-Xswiftc");
+    assert.ok(compilerOption >= 0);
+    assert.equal(swiftArgs[compilerOption + 1], "-disable-sandbox");
+  }
+});
+
+test("manifest compiler restores private paths when Xcode strips the environment and preserves literal arguments", async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "enough-apple-manifest-")));
+  try {
+    const scratch = join(root, "private '$(printf injected)"), developer = join(root, "trusted developer 'directory");
+    await mkdir(join(scratch, "tools"), { recursive: true });
+    const compiler = join(developer, "Toolchains", "XcodeDefault.xctoolchain", "usr", "bin", "swiftc");
+    await mkdir(dirname(compiler), { recursive: true });
+    await writeFile(compiler, '#!/bin/sh\nprintf "%s\\n" "$HOME" "$TMPDIR" "$TEMP" "$TMP" "$CCHROOT" "$@"\n', { mode: 0o500 });
+    const wrapper = join(scratch, "tools", "swiftc-manifest");
+    await writeFile(wrapper, appleManifestCompilerSource(scratch, developer), { mode: 0o500 });
+    const args = ["source 'literal.swift", "$(printf changed)", "-o", "output with spaces.o"];
+    const output = await runNativeGroup(wrapper, args, { cwd: scratch, env: { SWIFT_EXEC_MANIFEST: wrapper }, timeoutMs: 5_000 });
+    assert.equal(output.exitCode, 0, output.stderr);
+    assert.equal(output.stdout, [join(scratch, "home"), `${join(scratch, "tmp")}/`, join(scratch, "tmp"), join(scratch, "tmp"), join(scratch, "cache"), ...args, ""].join("\n"));
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("Apple temp compatibility allows directory metadata but denies global temp data and writes", { skip: process.platform !== "darwin" }, async () => {
+  const scratch = await realpath(await mkdtemp(join(tmpdir(), "enough-apple-private-tmp-")));
+  const outside = await realpath(await mkdtemp("/private/tmp/enough-apple-denied-tmp-"));
+  try {
+    await mkdir(join(scratch, "home")); await mkdir(join(scratch, "tmp"));
+    await mkdir(join(scratch, "tools")); await writeFile(join(scratch, "tools", "swiftc-manifest"), "trusted launcher");
+    await writeFile(join(outside, "sentinel"), "owned private test bytes");
+    const developerDirectory = "/Applications/Xcode.app/Contents/Developer";
+    const policy = appleSandboxProfile({ sources: [], scratch, developerDirectory, validatorExecutable: await realpath(process.execPath) });
+    const script = String.raw`
+      const fs = require("node:fs");
+      if (!fs.statSync("/tmp").isDirectory() || !fs.statSync("/private/tmp").isDirectory()) throw new Error("Missing temp metadata");
+      for (const operation of [() => fs.readdirSync("/private/tmp"), () => fs.readFileSync(process.argv[1] + "/sentinel"), () => fs.writeFileSync(process.argv[1] + "/forbidden", "denied")]) {
+        try { operation(); throw new Error("Global temporary access was allowed"); }
+        catch (error) { if (error.code !== "EPERM" && error.code !== "EACCES") throw error; }
+      }
+      for (const key of ["TMPDIR", "TMP", "TEMP"]) fs.writeFileSync(process.env[key] + "/allowed-" + key, "private");
+      for (const operation of [() => fs.writeFileSync(process.argv[2], "changed"), () => fs.unlinkSync(process.argv[2]), () => fs.renameSync(process.argv[2], process.argv[2] + "-moved")]) {
+        try { operation(); throw new Error("Trusted compiler launcher was writable"); }
+        catch (error) { if (error.code !== "EPERM" && error.code !== "EACCES") throw error; }
+      }
+      process.stdout.write("private-temp-verified");
+    `;
+    const output = await runNativeGroup("/usr/bin/sandbox-exec", ["-p", policy, await realpath(process.execPath), "--jitless", "-e", script, outside, join(scratch, "tools", "swiftc-manifest")], { cwd: scratch, env: appleEnvironment(scratch, developerDirectory), timeoutMs: 5_000 });
+    assert.equal(output.exitCode, 0, output.stderr);
+    assert.equal(output.stdout, "private-temp-verified");
+    assert.equal(await readFile(join(scratch, "tools", "swiftc-manifest"), "utf8"), "trusted launcher");
+  } finally { await rm(scratch, { recursive: true, force: true }); await rm(outside, { recursive: true, force: true }); }
 });
 
 test("Apple product inventory refuses escaping symlinks and preserves confined framework links", async () => {

@@ -124,6 +124,14 @@ export function appleCheckExecutor(options: AppleCheckOptions): CheckExecutor & 
     try {
       for (const name of ["home", "tmp", "cache", "modules", "build", "config", "security", "packages"]) await mkdir(join(scratch, name), { mode: 0o700 });
       const environment = appleEnvironment(scratch, developerDirectory);
+      if (profile.tool === "xcodebuild") {
+        // Xcode's embedded SwiftPM forwards only SWIFT_EXEC(_MANIFEST) to its
+        // manifest compiler. Restore our fixed private environment before the
+        // Swift driver creates temporary files, without changing the app compiler.
+        await mkdir(join(scratch, "tools"), { mode: 0o700 });
+        environment.SWIFT_EXEC_MANIFEST = join(scratch, "tools", "swiftc-manifest");
+        await writeFile(environment.SWIFT_EXEC_MANIFEST, appleManifestCompilerSource(scratch, developerDirectory), { mode: 0o500, flag: "wx" });
+      }
       const policy = appleSandboxProfile({ sources: [source, ...additional], scratch, developerDirectory, validatorExecutable: await realpath(process.execPath) });
       await verifyBoundary({ execute, policy, scratch, guard, environment, signal: context.signal });
       const args = appleToolArguments(profile, source, scratch);
@@ -156,17 +164,28 @@ async function privateDirectory(path: string, parent: string): Promise<string> {
 export function appleEnvironment(scratch: string, developerDirectory: string): NodeJS.ProcessEnv {
   return {
     PATH: "/usr/bin:/bin:/usr/sbin:/sbin", USER: "enoughfactory", LOGNAME: "enoughfactory", LANG: "en_US.UTF-8", LC_ALL: "en_US.UTF-8",
-    HOME: join(scratch, "home"), CFFIXED_USER_HOME: join(scratch, "home"), TMPDIR: `${join(scratch, "tmp")}/`,
-    XDG_CACHE_HOME: join(scratch, "cache"), CLANG_MODULE_CACHE_PATH: join(scratch, "modules"), SWIFT_MODULECACHE_PATH: join(scratch, "modules"),
+    HOME: join(scratch, "home"), CFFIXED_USER_HOME: join(scratch, "home"), TMPDIR: `${join(scratch, "tmp")}/`, TEMP: join(scratch, "tmp"), TMP: join(scratch, "tmp"),
+    XDG_CACHE_HOME: join(scratch, "cache"), CCHROOT: join(scratch, "cache"), CLANG_MODULE_CACHE_PATH: join(scratch, "modules"), SWIFT_MODULECACHE_PATH: join(scratch, "modules"),
     DEVELOPER_DIR: developerDirectory, MACOSX_DEPLOYMENT_TARGET: "14.0", GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null", GIT_TERMINAL_PROMPT: "0", CI: "1",
   };
 }
 
+/** The generated launcher is trusted service code and protected from build writes. */
+export function appleManifestCompilerSource(scratch: string, developerDirectory: string): string {
+  const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
+  const environment = appleEnvironment(scratch, developerDirectory);
+  const compiler = join(developerDirectory, "Toolchains", "XcodeDefault.xctoolchain", "usr", "bin", "swiftc");
+  return `#!/bin/sh\n${Object.entries(environment).map(([key, value]) => `export ${key}=${quote(value!)}`).join("\n")}\nexec ${quote(compiler)} "$@"\n`;
+}
+
 export function appleToolArguments(profile: AppleCheckProfile, source: string, scratch: string): string[] {
-  if (profile.tool === "swift") return ["swift", profile.action, "--triple", `${process.arch === "arm64" ? "arm64" : "x86_64"}-apple-macosx14.0`, "--package-path", join(source, profile.package), "--sdk", "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk", "--scratch-path", join(scratch, "build"), "--cache-path", join(scratch, "cache"), "--config-path", join(scratch, "config"), "--security-path", join(scratch, "security"), "--disable-sandbox", "--disable-netrc", "--disable-keychain", "--disable-automatic-resolution", "--skip-update", "--disable-dependency-cache", "--build-system", "native", "--jobs", "2"];
+  if (profile.tool === "swift") return ["swift", profile.action, "--triple", `${process.arch === "arm64" ? "arm64" : "x86_64"}-apple-macosx14.0`, "--package-path", join(source, profile.package), "--sdk", "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk", "--scratch-path", join(scratch, "build"), "--cache-path", join(scratch, "cache"), "--config-path", join(scratch, "config"), "--security-path", join(scratch, "security"), "--disable-sandbox", "-Xswiftc", "-disable-sandbox", "--disable-netrc", "--disable-keychain", "--disable-automatic-resolution", "--skip-update", "--disable-dependency-cache", "--build-system", "native", "--jobs", "2"];
   // Use the immutable JSON/log evidence: Xcode 27 traps while finalizing an explicit
   // -resultBundlePath inside this sandbox, despite successfully compiling the app.
-  return ["xcodebuild", profile.project.endsWith(".xcworkspace") ? "-workspace" : "-project", join(source, profile.project), "-scheme", profile.scheme, "-configuration", profile.configuration, "-sdk", profile.platform === "macos" ? "macosx" : "iphonesimulator", "-destination", profile.platform === "macos" ? "generic/platform=macOS" : "generic/platform=iOS Simulator", "-derivedDataPath", join(scratch, "build"), "-clonedSourcePackagesDirPath", join(scratch, "packages"), "-disableAutomaticPackageResolution", "-skipPackageUpdates", "-disablePackageRepositoryCache", "-parallelizeTargets", "-jobs", "2", "CODE_SIGNING_ALLOWED=NO", "CODE_SIGNING_REQUIRED=NO", "CODE_SIGN_IDENTITY=", "COMPILER_INDEX_STORE_ENABLE=NO", `OBJROOT=${join(scratch, "build", "Intermediates")}`, `SYMROOT=${join(scratch, "build", "Products")}`, `DSTROOT=${join(scratch, "build", "Install")}`, `SHARED_PRECOMPS_DIR=${join(scratch, "modules")}`, `MODULE_CACHE_DIR=${join(scratch, "modules")}`, "build"];
+  // The outer boundary has already passed its controls. A nested SwiftPM sandbox
+  // cannot be applied here, and compiler macro servers have the same restriction.
+  // Disable those inner layers while keeping the verified outer boundary inherited.
+  return ["xcodebuild", profile.project.endsWith(".xcworkspace") ? "-workspace" : "-project", join(source, profile.project), "-scheme", profile.scheme, "-configuration", profile.configuration, "-sdk", profile.platform === "macos" ? "macosx" : "iphonesimulator", "-destination", profile.platform === "macos" ? "generic/platform=macOS" : "generic/platform=iOS Simulator", "-derivedDataPath", join(scratch, "build"), "-clonedSourcePackagesDirPath", join(scratch, "packages"), "-packageCachePath", join(scratch, "cache"), "-packageAuthorizationProvider", "netrc", "-IDEPackageSupportDisableManifestSandbox=YES", "OTHER_SWIFT_FLAGS=$(inherited) -disable-sandbox", "-disableAutomaticPackageResolution", "-skipPackageUpdates", "-disablePackageRepositoryCache", "-parallelizeTargets", "-jobs", "2", "CODE_SIGNING_ALLOWED=NO", "CODE_SIGNING_REQUIRED=NO", "CODE_SIGN_IDENTITY=", "COMPILER_INDEX_STORE_ENABLE=NO", `OBJROOT=${join(scratch, "build", "Intermediates")}`, `SYMROOT=${join(scratch, "build", "Products")}`, `DSTROOT=${join(scratch, "build", "Install")}`, `SHARED_PRECOMPS_DIR=${join(scratch, "modules")}`, `MODULE_CACHE_DIR=${join(scratch, "modules")}`, "build"];
 }
 
 async function captureAppleProducts(input: {
@@ -270,10 +289,14 @@ export function appleSandboxProfile(input: { sources: string[]; scratch: string;
     ...input.validatorExecutable ? [`(allow process-exec file-map-executable file-read* (literal ${quoted(input.validatorExecutable)}))`] : [],
     `(allow file-read* ${readRoots.map(path => `(subpath ${quoted(path)})`).join(" ")})`,
     `(allow file-read-metadata ${[...ancestors].map(path => `(literal ${quoted(path)})`).join(" ")})`,
+    // Xcode's vendored SwiftPM checks the system temp directory even with a private
+    // TMPDIR. Permit only that type check; contents and global temp writes stay denied.
+    '(allow file-read-metadata (literal "/tmp") (literal "/private/tmp"))',
     `(allow file-read* (literal "/dev/null") (literal "/dev/random") (literal "/dev/urandom") (literal "/dev/zero") (literal "/dev/fd/0") (literal "/dev/fd/1") (literal "/dev/fd/2"))`,
     `(allow file-write* (subpath ${quoted(input.scratch)}))`,
     // Keep the scratch root itself anchored; untrusted children may change only its contents.
     `(deny file-write* (literal ${quoted(input.scratch)}))`,
+    `(deny file-write* (subpath ${quoted(join(input.scratch, "tools"))}))`,
     '(allow file-write-data (literal "/dev/null") (literal "/dev/fd/1") (literal "/dev/fd/2"))',
   ].join("\n");
 }
