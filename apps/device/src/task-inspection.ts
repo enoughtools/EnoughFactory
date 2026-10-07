@@ -1,4 +1,4 @@
-import type { Artifact, Attempt, AttemptInspection, ControllerRun, Device, FactoryTask, Goal, GoalInspection, Project, TaskCheck, TaskInspection, TaskOverview } from '@enoughfactory/contracts';
+import type { Artifact, Attempt, AttemptInspection, ControllerRun, Device, FactoryTask, Goal, GoalInspection, Project, TaskCheck, TaskInspection, TaskOverview, DevelopmentToolchain } from '@enoughfactory/contracts';
 import type { AttemptDetail, ControlRecord, FactoryStore, PlanRecord, TaskDetail } from '@enoughfactory/factory';
 import { activeExecutionTasks, taskSchedulingBlocker } from '@enoughfactory/factory';
 import type { WorkingDirectoryCapture } from '@enoughfactory/workspaces';
@@ -36,8 +36,8 @@ export function inspectAttempt(store: FactoryStore, attempt: Attempt): AttemptIn
   const captures=candidate?.workingDirectories as WorkingDirectoryCapture[]|undefined;
   const workingDirectories=captures?.map(root=>({id:root.id,name:root.name,path:root.containerPath,kind:root.kind,baseCommit:root.baseCommit,status:'captured' as const,capture:{commit:root.commit,bundleArtifactId:root.bundleArtifact.id,diffArtifactId:root.diffArtifact.id}}))||workspace?.workingDirectories as WorkingDirectoryMount[]|undefined;
   return { attempt, phase: detail?.phase, cancellation: detail?.cancellation, contract: detail?.contract,
-    ...(workspace ? { workspace: { id: workspace.id, provider: workspace.provider, baseCommit: workspace.baseCommit, sessionId: workspace.sessionId, deviceId: workspace.deviceId,workingDirectories } } : {}),
-    ...(candidate ? { candidate: { id: candidate.id, commit: candidate.commit, baseCommit: candidate.baseCommit, branch: candidate.branch, tree: candidate.tree, deviceId: candidate.deviceId } } : {}),
+    ...(workspace ? { workspace: { id: workspace.id, provider: workspace.provider, baseCommit: workspace.baseCommit, sessionId: workspace.sessionId, deviceId: workspace.deviceId,workingDirectories,developmentToolchain:workspace.developmentToolchain as DevelopmentToolchain|undefined } } : {}),
+    ...(candidate ? { candidate: { id: candidate.id, commit: candidate.commit, baseCommit: candidate.baseCommit, branch: candidate.branch, tree: candidate.tree, deviceId: candidate.deviceId,developmentToolchain:candidate.developmentToolchain as DevelopmentToolchain|undefined } } : {}),
     ...(result ? { result: { status: result.status, text: result.text, error: result.error, waitReason: result.waitReason, wakeCondition: result.wakeCondition } } : {}),
     ...(detail?.checks ? { checks: detail.checks.map(publicCheck) } : {}),
     ...(integration ? { integration: { commit: integration.commit, previousHead: integration.previousHead, candidateCommit: integration.candidateCommit, checks: integration.checks.map(publicCheck) } } : {}) };
@@ -47,7 +47,7 @@ function publicCheck(check: TaskCheck): TaskCheck {
   // Full logs remain immutable artifacts; keep inspection RPCs bounded for remote devices.
   const limit = 64 * 1024;
   return { command: check.command, passed: check.passed, output: check.output.slice(0, limit), exitCode: check.exitCode,
-    candidateCommit: check.candidateCommit, checkedCommit: check.checkedCommit,
+    candidateCommit: check.candidateCommit, checkedCommit: check.checkedCommit,developmentToolchain:check.developmentToolchain,
     ...(check.output.length > limit ? { outputTruncated: true } : {}) };
 }
 

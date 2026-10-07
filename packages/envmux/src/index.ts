@@ -26,7 +26,7 @@ export interface EnvmuxState {
 export interface EnvmuxReady {
   type: 'ready'; version: 1; endpoint: string; token: string; proxy?: string;
   project: string; session: string; instance: string; workdir: string; user: string; branch: string;
-  dockerHost: string;
+  dockerHost: string; goldenImage?: string;
 }
 export interface EnvmuxLifecycleEvent {
   type: string; version: number; phase?: string; error?: string; exitCode?: number;
@@ -48,6 +48,8 @@ export interface EngineOptions {
 }
 export interface StartOptions {
   projectPath: string; name: string; signal?: AbortSignal;
+  /** An immutable image already prepared on the owned engine for this launch. */
+  goldenImage?: string;
   workspace?: { bindSource: string; stateVolume: string };
   onEvent?: (event: EnvmuxLifecycleEvent) => void;
   onLog?: (line: string) => void;
@@ -196,7 +198,7 @@ export class EnvmuxEngine {
   private readonly prefix: string[];
   readonly dockerRuntime?: DockerRuntimeEndpoint;
   private readonly containerHostAddress?: string;
-  private capabilityCheck?: Promise<void>;
+  private capabilityCheck?: Promise<{ managedGoldenImage: boolean }>;
 
   constructor(options: EngineOptions = {}) {
     if (options.containerHostAddress && !isIP(options.containerHostAddress)) {
@@ -230,6 +232,7 @@ export class EnvmuxEngine {
   private environment(): NodeJS.ProcessEnv {
     const env = cleanDockerEnvironment();
     env.ENVMUX_MANAGED_DOCKER = '1';
+    env.ENVMUX_MANAGED_GOLDEN_IMAGE = '';
     env.ENVMUX_DOCKER_HOST = this.dockerRuntime?.host ?? '';
     env.DOCKER_HOST = this.dockerRuntime?.host ?? '';
     env.DOCKER_CONFIG = this.dockerRuntime?.configDirectory ?? '';
@@ -238,14 +241,15 @@ export class EnvmuxEngine {
     return env;
   }
 
-  private verifyEngineCapability(): Promise<void> {
+  private verifyEngineCapability(): Promise<{ managedGoldenImage: boolean }> {
     this.capabilityCheck ??= (async () => {
       const result = await command(this.program, [...this.prefix, '--factory-capabilities'], undefined, this.environment());
       if (result.code) throw new Error('This Envmux build does not support EnoughFactory managed runtime isolation; install the bundled engine');
-      const capabilities = JSON.parse(result.stdout) as { protocolVersion?: number; managedDocker?: boolean };
+      const capabilities = JSON.parse(result.stdout) as { protocolVersion?: number; managedDocker?: boolean; managedGoldenImage?: boolean };
       if (capabilities.protocolVersion !== 1 || capabilities.managedDocker !== true) {
         throw new Error('This Envmux build does not support EnoughFactory managed runtime isolation');
       }
+      return { managedGoldenImage: capabilities.managedGoldenImage === true };
     })();
     const check = this.capabilityCheck;
     return check.catch(error => {
@@ -304,7 +308,13 @@ export class EnvmuxEngine {
 
   async start(options: StartOptions): Promise<EnvmuxSession> {
     const runtime = this.requireRuntime();
-    await this.verifyEngineCapability();
+    if (options.goldenImage !== undefined && !/^sha256:[0-9a-f]{64}$/.test(options.goldenImage)) {
+      throw new Error('A managed golden image must be an immutable sha256 image ID');
+    }
+    const capabilities = await this.verifyEngineCapability();
+    if (options.goldenImage && !capabilities.managedGoldenImage) {
+      throw new Error('This Envmux build does not support managed golden images; install the bundled engine');
+    }
     if (options.signal?.aborted) throw new Error('Session startup was canceled');
     if (options.workspace) {
       const identity = /^\/var\/lib\/enoughfactory\/workspaces\/([A-Za-z0-9_-]{1,80})\/repo$/.exec(options.workspace.bindSource)?.[1];
@@ -315,6 +325,7 @@ export class EnvmuxEngine {
     const child = spawn(this.program, [...this.prefix, '-C', options.projectPath, options.name, '--headless', '--backend', 'docker'], {
       cwd: options.projectPath, stdio: ['ignore', 'pipe', 'pipe', 'pipe'],
       env: { ...this.environment(), ENVMUX_BOOTSTRAP_FD: '3',
+        ENVMUX_MANAGED_GOLDEN_IMAGE: options.goldenImage ?? '',
         ENVMUX_WORKSPACE_BIND: options.workspace?.bindSource ?? '',
         ENVMUX_ARTIFACT_STATE_VOLUME: options.workspace?.stateVolume ?? '',
       },
@@ -343,6 +354,9 @@ export class EnvmuxEngine {
           if (event.type === 'ready') {
             if ((event as EnvmuxReady).dockerHost !== runtime.host) {
               cancel(); fail(new Error('Envmux connected to a container runtime outside its managed endpoint')); return;
+            }
+            if (options.goldenImage && (event as EnvmuxReady).goldenImage !== options.goldenImage) {
+              cancel(); fail(new Error('Envmux did not confirm the requested managed golden image')); return;
             }
             const endpoint = new URL((event as EnvmuxReady).endpoint);
             if (endpoint.hostname !== '127.0.0.1' || endpoint.protocol !== 'http:' || !endpoint.port || endpoint.port === '0') {

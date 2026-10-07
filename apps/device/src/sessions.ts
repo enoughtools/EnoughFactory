@@ -8,11 +8,12 @@ import path from 'node:path';
 import { mkdir } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { managedRepositoryReader, readRepositoryChanges } from './repository-changes.ts';
+import { prepareDevelopmentToolchain, validateFrozenDevelopmentToolchain, type FrozenDevelopmentToolchain } from './development-toolchain.ts';
 
 interface WorkspaceBinding { bindSource:string; stateVolume:string; }
 interface PrivateSession { id: string; ready: EnvmuxReady; projectPath: string; pid?: number; workspace?:WorkspaceBinding; }
-interface LaunchRecord { id:string;projectPath:string;generation:number;dockerHost:string;workspace?:WorkspaceBinding; workingDirectorySources?:WorkingDirectorySource[]; }
-interface LaunchOptions { workspace?:WorkspaceBinding; workingDirectorySources?:WorkingDirectorySource[]; }
+interface LaunchRecord { id:string;projectPath:string;generation:number;dockerHost:string;workspace?:WorkspaceBinding; workingDirectorySources?:WorkingDirectorySource[]; developmentToolchain?:FrozenDevelopmentToolchain; }
+interface LaunchOptions { workspace?:WorkspaceBinding; workingDirectorySources?:WorkingDirectorySource[]; developmentToolchain?:FrozenDevelopmentToolchain; }
 interface RuntimeAccess { endpoint:DockerRuntimeEndpoint; ensureReady():Promise<DockerRuntimeEndpoint>; bridgeHostAddress():string|undefined; }
 class SessionGenerationChangedError extends HttpError {constructor(){super(409,'A newer environment connection replaced this request.');}}
 export class SessionController {
@@ -66,6 +67,11 @@ export class SessionController {
   }
   private async attach(saved:PrivateSession):Promise<EnvmuxSession>{
     if(saved.ready.dockerHost!==this.runtime.endpoint.host)throw new HttpError(409,'This environment belongs to a previous container engine. Create a new EnoughFactory environment.');
+    const toolchain=this.store.get<LaunchRecord>('session-launch',saved.id)?.developmentToolchain;
+    if(toolchain&&toolchain!=='default'){
+      const frozen=validateFrozenDevelopmentToolchain(toolchain);
+      if(frozen!=='default'&&saved.ready.goldenImage!==frozen.image)throw new HttpError(409,'This environment did not confirm its saved development toolchain. Its work is retained; inspect it before starting a replacement.');
+    }
     const generation=(this.generations.get(saved.id)||this.store.get<LaunchRecord>('session-launch',saved.id)?.generation||0)+1;this.generations.set(saved.id,generation);
     const current=()=>this.generations.get(saved.id)===generation;
     const engine=await this.engine.attach(saved);if(!current())throw new SessionGenerationChangedError();
@@ -84,10 +90,14 @@ export class SessionController {
   }
   private launch(record:Session,project:Project,options?:LaunchOptions):void{
     const generation=(this.generations.get(record.id)||this.store.get<LaunchRecord>('session-launch',record.id)?.generation||0)+1;this.generations.set(record.id,generation);
-    this.store.set<LaunchRecord>('session-launch',{id:record.id,projectPath:project.path,generation,dockerHost:this.runtime.endpoint.host,workspace:options?.workspace,workingDirectorySources:options?.workingDirectorySources});
+    this.store.set<LaunchRecord>('session-launch',{id:record.id,projectPath:project.path,generation,dockerHost:this.runtime.endpoint.host,workspace:options?.workspace,workingDirectorySources:options?.workingDirectorySources,developmentToolchain:options?.developmentToolchain});
     const current=()=>this.generations.get(record.id)===generation;
     const abort = new AbortController(); this.starts.set(record.id,abort);this.runtimeWaits.add(record.id);
     const job=(async()=>{await this.runtime.ensureReady();this.runtimeWaits.delete(record.id);if(abort.signal.aborted)throw new Error('Environment startup canceled.');
+      const developmentToolchain=await prepareDevelopmentToolchain(this.runtime.endpoint,project,{frozen:options?.developmentToolchain,signal:abort.signal,onProgress:phase=>{if(current())this.patch(record.id,{phase});}});
+      if(!current()||abort.signal.aborted)throw new Error('Environment startup canceled.');
+      this.store.set('session-launch',{...this.store.get<LaunchRecord>('session-launch',record.id)!,developmentToolchain});
+      this.patch(record.id,{developmentToolchain:developmentToolchain==='default'?undefined:developmentToolchain});
       if(options?.workingDirectorySources!==undefined?options.workingDirectorySources.length:project.workingDirectories?.length){
         this.patch(record.id,{phase:'Snapshotting additional working folders'});
         let roots=await this.directoryManager.sourceSnapshots(record.id);
@@ -100,7 +110,7 @@ export class SessionController {
       }
       if(abort.signal.aborted)throw new Error('Environment startup canceled.');
       if(current())this.patch(record.id,{phase:'Preparing environment',error:undefined});
-      return this.engine.start({projectPath:project.path,name:record.name,workspace:options?.workspace,signal:abort.signal,onEvent: e=>{
+      return this.engine.start({projectPath:project.path,name:record.name,workspace:options?.workspace,goldenImage:developmentToolchain==='default'?undefined:developmentToolchain.image,signal:abort.signal,onEvent: e=>{
       if(!current())return;
       if(e.type==='phase') this.patch(record.id,{phase:e.phase});
       if(e.type==='error') this.patch(record.id,{error:e.error});
@@ -171,7 +181,7 @@ export class SessionController {
     if(record.status!=='stopped'){if(!saved)throw new HttpError(409,'Reconnect or inspect the environment before restarting uncertain work.');await this.runtime.ensureReady();const engine=await this.attach(saved);await engine.restart();await this.update(sessionId,await engine.state());return;}
     if((launch?.dockerHost||saved?.ready.dockerHost)!==this.runtime.endpoint.host)throw new HttpError(409,'This session used a previous container engine. Create a new EnoughFactory environment from its returned Git branch.');
     const project=this.store.get<Project>('projects',record.projectId);if(!project)throw new HttpError(404,'The source project is no longer available.');
-    this.patch(sessionId,{status:'starting',phase:'Preparing EnoughFactory runtime',error:undefined,services:[]});this.launch(record,project,{workspace:launch?.workspace||saved?.workspace,workingDirectorySources:launch?.workingDirectorySources});
+    this.patch(sessionId,{status:'starting',phase:'Preparing EnoughFactory runtime',error:undefined,services:[]});this.launch(record,project,{workspace:launch?.workspace||saved?.workspace,workingDirectorySources:launch?.workingDirectorySources,developmentToolchain:launch?.developmentToolchain||record.developmentToolchain});
   }
   async changes(sessionId: string, selectedPath?: string, rootId?:string): Promise<RepositoryChanges> {
     if(!rootId){const engine=this.get(sessionId);return readRepositoryChanges(managedRepositoryReader(this.runtime.endpoint,engine.ready),selectedPath);}

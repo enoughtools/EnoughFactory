@@ -46,6 +46,7 @@ internal sealed class DockerBackend : IBackend
     public DockerBackend(IDockerEngine engine, DockerBackendConfig config)
     {
         _engine = engine;
+        ManagedGoldenImage = config.ManagedGoldenImage;
 
         var exec = new EngineExec(engine);
 
@@ -55,14 +56,17 @@ internal sealed class DockerBackend : IBackend
         Images = new DockerImagesSeam(new DockerImages(engine, config, exec));
     }
 
-    /// <summary>The engine this machine points at: <c>DOCKER_HOST</c>, the current context, or the default pipe.</summary>
+    /// <summary>The explicit managed engine, or ordinary Docker resolution when no supervisor owns it.</summary>
     public static DockerBackend Connect(DockerBackendConfig? config = null)
     {
-        config ??= new DockerBackendConfig();
+        config = (config ?? new DockerBackendConfig()).ResolveManaged(Environment.GetEnvironmentVariable);
         return new DockerBackend(DockerEngineClient.Connect(config.Endpoint), config);
     }
 
     public string Name => _engine.Endpoint;
+
+    /// <summary>The immutable manager-selected base, checked before creating or adopting a session.</summary>
+    public string? ManagedGoldenImage { get; }
 
     public BackendKind Kind => BackendKind.Docker;
 
@@ -213,6 +217,14 @@ internal sealed class DockerBackend : IBackend
                     "Rename or remove it, or name the session something else.");
             }
 
+            if (config.ManagedGoldenImage is { } golden &&
+                string.Equals(container.Labels.GetValueOrDefault(DockerSpec.Labels.Kind), DockerSpec.SessionKind, StringComparison.Ordinal) &&
+                !string.Equals(container.Labels.GetValueOrDefault(DockerImages.Labels.GoldenImage), golden, StringComparison.Ordinal))
+            {
+                throw new BackendException(
+                    $"{name} was created with another managed golden image. Name a new session to use the prepared toolchain; the existing work is retained.");
+            }
+
             return AsInstance(name, container.Running, container.Labels);
         }
 
@@ -246,6 +258,11 @@ internal sealed class DockerBackend : IBackend
 
             if (await engine.ImageAsync(image, ct).ConfigureAwait(false) is null)
             {
+                if (config.ManagedGoldenImage is not null && !DockerSpec.IsService(spec))
+                {
+                    throw new BackendException($"the prepared managed image {image} is unavailable; prepare it before starting the session");
+                }
+
                 report?.Invoke($"pulling {image}");
                 await engine.PullAsync(image, report, ct).ConfigureAwait(false);
             }
@@ -385,7 +402,7 @@ internal sealed class DockerBackend : IBackend
                     "which every session after this one starts from");
 
                 await images.BuildProjectAsync(
-                    plan.Project, plan.Directory, plan.Image, plan.Features, user, report, ct).ConfigureAwait(false);
+                    plan.Project, plan.Directory, plan.ImageFingerprintBase, plan.Features, user, report, ct).ConfigureAwait(false);
             }
 
             return new ImageChoice(

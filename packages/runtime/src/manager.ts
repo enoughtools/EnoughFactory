@@ -2,6 +2,7 @@ import { mkdir, readFile, writeFile, rename } from 'node:fs/promises';
 import { join, resolve, relative } from 'node:path';
 import { MacRuntime } from './mac.ts';
 import { LinuxRuntime } from './linux.ts';
+import { prepareToolchain, type ToolchainProfileId, type ToolchainPreparationOptions, type PreparedToolchain } from './swift.ts';
 import type { ContainerRuntimeStatus, DockerRuntimeEndpoint, RuntimeOptions, RuntimeProgress } from './types.ts';
 
 export interface ManagedRuntimeManagerOptions {
@@ -56,6 +57,9 @@ export class ManagedRuntimeManager {
     try { return await this.starting; } finally { this.starting = undefined; }
   }
   async ensureReady(): Promise<DockerRuntimeEndpoint> { return await this.start(); }
+  async ensureDevelopmentToolchain(id: ToolchainProfileId, options: ToolchainPreparationOptions = {}): Promise<PreparedToolchain> {
+    await this.ensureReady(); return await prepareToolchain(this.endpoint, id, options);
+  }
   async stop(): Promise<void> { if (this.starting) await this.starting.catch(() => {}); await this.load(); await this.backend.stop(); }
   async prepareWorkspace(path: string): Promise<void> {
     const inside = relative(this.dataDirectory, resolve(path));

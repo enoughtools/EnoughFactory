@@ -31,6 +31,15 @@ $ envmux feat-login      # named, when the session is a task
 Names are slugged the same way project names are, so `envmux feat/login` becomes
 `feat-login` everywhere.
 
+EnoughFactory's private supervisor checks `--factory-capabilities` before
+launching. With `ENVMUX_MANAGED_DOCKER=1`, it may set
+`ENVMUX_MANAGED_GOLDEN_IMAGE` to an immutable `sha256:` image ID already prepared
+on its owned engine. Readiness confirms that base ID. A missing image fails
+without pulling or building a replacement; a previous session made with another
+base is retained and requires a new session name. Feature caches are bound to the
+same exact base. Ordinary invocations ignore the image override, and child
+agents do not inherit it.
+
 Starting a session whose instance already exists **adopts** it, with everything
 still in it: dependencies installed, uncommitted work in place, latched tasks
 still running. Reusing a name returns you to your work.

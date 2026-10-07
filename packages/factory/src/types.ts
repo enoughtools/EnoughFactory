@@ -1,4 +1,4 @@
-import type { ApprovalMode, Attempt, AttemptInspection, AutonomyMode, Device, FactoryTask, Goal, Project, RuntimeKind, TaskKind } from "@enoughfactory/contracts";
+import type { ApprovalMode, Attempt, AttemptInspection, AutonomyMode, Device, FactoryTask, Goal, Project, RuntimeKind, TaskKind, DevelopmentToolchain } from "@enoughfactory/contracts";
 
 /** All writes inside a transaction must commit together, including decisions. */
 export interface FactoryStore {
@@ -22,10 +22,12 @@ export interface CandidateRef {
 export interface CheckResult {
   command: string; passed: boolean; output: string; exitCode?: number;
   candidateCommit: string; checkedCommit?: string;
+  developmentToolchain?: DevelopmentToolchain;
 }
 export interface RepositoryEvidence {
   head: string; branch: string; status: string; summary?: string; diff?: string;
   fingerprint?: string;
+  developmentToolchain?: DevelopmentToolchain;
   artifacts?: Array<{ name: string; sha256: string; path?: string }>;
 }
 export interface IntegrationResult {

@@ -38,6 +38,16 @@ internal sealed record SessionPlan
     /// </remarks>
     public required string Image { get; init; }
 
+    /// <summary>The immutable base selected by this launch's managed Docker backend.</summary>
+    /// <remarks>It belongs to the resolved plan, never the repository's configuration file.</remarks>
+    public string? ManagedGoldenImage { get; init; }
+
+    /// <summary>The configured image and the exact managed base, when one was selected.</summary>
+    /// <remarks>Distinct managed recipes need distinct feature-cache names, including concurrent launches.</remarks>
+    public string ImageFingerprintBase => ManagedGoldenImage is { } image
+        ? $"{Image}\nmanaged-golden-image={image}"
+        : Image;
+
     /// <summary>
     /// The toolchain layered onto the image, as dev container features.
     /// </summary>
@@ -55,7 +65,7 @@ internal sealed record SessionPlan
     /// change a feature and the next session looks for an image that does not
     /// exist yet, and builds it.
     /// </remarks>
-    public string ImageFingerprint => Incus.Features.Fingerprint(Image, Features);
+    public string ImageFingerprint => Incus.Features.Fingerprint(ImageFingerprintBase, Features);
 
     /// <summary>Whether this project has an image of its own to be copied from.</summary>
     public bool HasProjectImage => Features.Count > 0;

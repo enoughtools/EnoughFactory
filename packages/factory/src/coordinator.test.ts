@@ -7,7 +7,7 @@ import { FactoryControllerError } from "./errors.js";
 import { readPlan } from "./protocol.js";
 import type {
   AttemptDetail, CandidateRef, ControlRecord, EvaluationRecord, EvaluationResponse, ExecutionResult, FactoryRuntimePort,
-  FactoryStore, FactoryWorkspacePort, PlanRecord, PlanResponse,
+  FactoryStore, FactoryWorkspacePort, PlanRecord, PlanResponse, TaskDetail,
 } from "./types.js";
 
 /** Reads cannot mutate committed records and a failed transaction cannot leave half a transition. */
@@ -62,6 +62,8 @@ function harness(devices: Device[] = [device], now?: () => Date) {
   let planning: () => Promise<PlanResponse> = async () => plan;
   let evaluating: () => Promise<EvaluationResponse> = async () => completeEvaluation;
   let executing: () => Promise<ExecutionResult> = async () => ({ status: "succeeded", text: "Implementation complete" });
+  let diagnosing = async () => ({ action: "retry", reason: "The expected route was missing", instructions: "Add the missing route and verify the response" });
+  const diagnosisPrompts: string[] = [];
   let reconciling: FactoryRuntimePort["reconcile"] = async () => ({ status: "unknown" });
   let beforeIntegrationWrite: () => Promise<void> = async () => {};
   let afterIntegrationWrite: () => Promise<void> = async () => {};
@@ -77,16 +79,18 @@ function harness(devices: Device[] = [device], now?: () => Date) {
       if (input.role === "planner") { calls.planner++; return { text: JSON.stringify(await planning()) }; }
       if (input.role === "evaluator") { calls.evaluator++; evaluationPrompts.push(input.prompt); return { text: JSON.stringify(await evaluating()) }; }
       calls.diagnosis++;
-      return { text: JSON.stringify({ action: "retry", reason: "The expected route was missing", instructions: "Add the missing route and verify the response" }) };
+      diagnosisPrompts.push(input.prompt);
+      return { text: JSON.stringify(await diagnosing()) };
     },
     async execute(input) { calls.execute++; executionPrompts.push(input.prompt); return executing(); },
     async reconcile(attempt) { calls.reconcile++; return reconciling(attempt); },
     async cancel() { calls.cancel++; },
   };
   const candidate: CandidateRef = { id: "candidate", commit: "candidate-commit", baseCommit: "initial-head" };
+  let capturing: FactoryWorkspacePort["capture"] = async () => candidate;
   const workspaces: FactoryWorkspacePort = {
     async prepare({ attempt }) { calls.prepare++; return { id: attempt.id, path: `/workspace/${attempt.id}`, baseCommit: "initial-head", provider: "git" }; },
-    async capture() { calls.capture++; return candidate; },
+    async capture(workspace, input) { calls.capture++; return capturing(workspace, input); },
     async check(_project, current, commands) {
       calls.check++;
       candidateCommands.push([...commands]);
@@ -115,10 +119,12 @@ function harness(devices: Device[] = [device], now?: () => Date) {
   const coordinator = new FactoryCoordinator(options);
   const goal = () => coordinator.create({ projectId: project.id, objective: "Build the feature and publish its release", criteria, autonomy: "autonomous", approvalMode: "approve-all", concurrency: 1 });
   return {
-    store, calls, coordinator, goal, executionPrompts, evaluationPrompts, candidateCommands, integrationCommands, goalCommands, workspaces, recover: () => new FactoryCoordinator(options),
+    store, calls, coordinator, goal, executionPrompts, evaluationPrompts, diagnosisPrompts, candidateCommands, integrationCommands, goalCommands, workspaces, recover: () => new FactoryCoordinator(options),
     planning(fn: typeof planning) { planning = fn; },
     evaluating(fn: typeof evaluating) { evaluating = fn; },
     executing(fn: typeof executing) { executing = fn; },
+    diagnosing(fn: typeof diagnosing) { diagnosing = fn; },
+    capturing(fn: typeof capturing) { capturing = fn; },
     reconciling(fn: typeof reconciling) { reconciling = fn; },
     beforeIntegrationWrite(fn: typeof beforeIntegrationWrite) { beforeIntegrationWrite = fn; },
     afterIntegrationWrite(fn: typeof afterIntegrationWrite) { afterIntegrationWrite = fn; },
@@ -807,4 +813,90 @@ test("replanning preserves authoritative goal criteria and explicit steering wit
     await factory.coordinator.tick(); await factory.coordinator.waitForIdle();
     assert.deepEqual(factory.store.get<Goal>("goals", goal.id)!.criteria, steeredCriteria, "explicit user scope remains authoritative after steering triggers another plan");
   }
+});
+
+test("repair captures a confirmed failed attempt after storage recovery before preparing diagnosis", async () => {
+  const factory = harness();
+  let spaceAvailable = false;
+  const partial: CandidateRef = { id: "retained-failed-source", commit: "exact-partial-commit", baseCommit: "initial-head" };
+  let originalAttempt: Attempt | undefined;
+  factory.executing(async () => ({ status: "failed", text: "Failed to load workspace requirements" }));
+  factory.capturing(async (workspace, input) => {
+    if (originalAttempt) assert.equal(input.attempt.id, originalAttempt.id);
+    assert.equal(workspace.id, input.attempt.id, "capture uses the same preserved workspace");
+    if (!spaceAvailable) throw Object.assign(new Error("No space left on device"), { code: "ENOSPC" });
+    return partial;
+  });
+  const goal = await planGoal(factory);
+  await factory.coordinator.tick(); await factory.coordinator.waitForIdle();
+  originalAttempt = factory.store.list<Attempt>("attempts")[0]!;
+  const task = factory.store.list<FactoryTask>("tasks")[0]!;
+  const originalWorkspace = factory.store.get<AttemptDetail>("factory-attempt-details", originalAttempt.id)!.workspace;
+  assert.equal(originalAttempt.status, "failed");
+  assert.equal(factory.calls.capture, 1);
+  assert.equal(factory.store.get<AttemptDetail>("factory-attempt-details", originalAttempt.id)!.candidate, undefined);
+
+  await factory.coordinator.tick(); await factory.coordinator.waitForIdle();
+  await factory.coordinator.tick(); await factory.coordinator.waitForIdle();
+  const waiting = factory.store.get<ControlRecord>("factory-control", goal.id)!;
+  assert.equal(waiting.stage, "diagnose");
+  assert.equal(waiting.waitingFor, "controller-retry-required");
+  assert.match(waiting.waitReason!, /original environment is preserved.*storage or runtime problem/i);
+  assert.equal(factory.calls.capture, 2);
+  assert.equal(factory.calls.diagnosis, 0, "controller preparation must wait for failed source retention");
+  assert.equal(factory.store.get<FactoryTask>("tasks", task.id)!.currentAttemptId, originalAttempt.id);
+  assert.equal(factory.store.get<Attempt>("attempts", originalAttempt.id)!.status, "failed");
+
+  spaceAvailable = true;
+  factory.diagnosing(async () => {
+    const retained = factory.store.get<AttemptDetail>("factory-attempt-details", originalAttempt!.id)!;
+    assert.deepEqual(retained.candidate, partial, "exact source is durable before the controller context is constructed");
+    assert.deepEqual(retained.workspace, originalWorkspace);
+    assert.equal(retained.checks, undefined, "partial source is not evidence of passed checks");
+    assert.equal(factory.store.get<Attempt>("attempts", originalAttempt!.id)!.status, "failed");
+    if (factory.calls.diagnosis === 1) throw new FactoryControllerError("Diagnosis environment preparation was interrupted", "controller-retry-required");
+    return { action: "retry", reason: "Resume from the retained source", instructions: "Continue the original assigned contract" };
+  });
+  factory.coordinator.notifyCondition("controller-retry-required", goal.id);
+  await factory.coordinator.tick(); await factory.coordinator.waitForIdle();
+  assert.equal(factory.calls.capture, 3);
+  assert.deepEqual(factory.store.get<AttemptDetail>("factory-attempt-details", originalAttempt.id)!.candidate, partial);
+  assert.deepEqual(factory.store.get<TaskDetail>("factory-task-details", task.id)!.lastCandidate, partial);
+  assert.equal(factory.store.get<Attempt>("attempts", originalAttempt.id)!.candidate, partial.commit);
+  assert.match(factory.diagnosisPrompts[0]!, /exact-partial-commit/);
+  assert.equal(factory.calls.execute, 1, "retention never repeats the failed provider turn");
+  assert.equal(factory.calls.check, 0);
+  assert.equal(factory.calls.integrate, 0);
+
+  factory.coordinator.notifyCondition("controller-retry-required", goal.id);
+  await factory.coordinator.tick(); await factory.coordinator.waitForIdle();
+  assert.equal(factory.calls.capture, 3, "an already retained candidate is not captured again");
+  assert.equal(factory.calls.diagnosis, 2);
+  assert.equal(factory.calls.execute, 1);
+  const decisions = factory.store.list<Decision>("decisions").filter(decision => decision.kind === "partial-work-retained");
+  assert.equal(decisions.length, 1);
+  assert.deepEqual(decisions[0]!.data, { attemptId: originalAttempt.id, candidate: partial.commit });
+});
+
+test("explicit retry cannot retire confirmed failed work until its source is retained", async () => {
+  const factory = harness();
+  let spaceAvailable = false;
+  const partial: CandidateRef = { id: "saved-before-retirement", commit: "saved-failed-commit", baseCommit: "initial-head" };
+  factory.executing(async () => ({ status: "failed", text: "Preparation ran out of disk space" }));
+  factory.capturing(async () => {
+    if (!spaceAvailable) throw new Error("No space left on device");
+    return partial;
+  });
+  await planGoal(factory);
+  await factory.coordinator.tick(); await factory.coordinator.waitForIdle();
+  const attempt = factory.store.list<Attempt>("attempts")[0]!;
+  await assert.rejects(factory.coordinator.retireAttempt(attempt.id), /original environment is preserved/);
+  assert.equal(factory.store.get<Attempt>("attempts", attempt.id)!.status, "failed");
+  assert.equal(factory.store.get<FactoryTask>("tasks", attempt.taskId)!.currentAttemptId, attempt.id);
+  assert.equal(factory.calls.cancel, 0, "failed capture must not terminate the preserved environment");
+  spaceAvailable = true;
+  await factory.coordinator.retireAttempt(attempt.id);
+  assert.equal(factory.store.get<Attempt>("attempts", attempt.id)!.status, "retired");
+  assert.deepEqual(factory.store.get<AttemptDetail>("factory-attempt-details", attempt.id)!.candidate, partial);
+  assert.equal(factory.calls.execute, 1);
 });

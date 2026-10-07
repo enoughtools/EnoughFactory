@@ -397,6 +397,7 @@ internal sealed class Session : IAsyncDisposable
         try
         {
             _backend ??= BackendCatalog.Open(Plan.Backend, _host);
+            Plan = Plan with { ManagedGoldenImage = (_backend as DockerBackend)?.ManagedGoldenImage };
             await _backend.PreflightAsync().ConfigureAwait(false);
         }
         catch (BackendException e)
@@ -1233,7 +1234,7 @@ internal sealed class Session : IAsyncDisposable
         try
         {
             var reloaded = SessionConfig.Load(Plan.Directory);
-            Plan = SessionPlan.Resolve(reloaded, Plan.Directory, Plan.Session);
+            Plan = SessionPlan.Resolve(reloaded, Plan.Directory, Plan.Session) with { ManagedGoldenImage = Plan.ManagedGoldenImage };
         }
         catch (ConfigException e)
         {

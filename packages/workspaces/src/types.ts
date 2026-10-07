@@ -1,4 +1,7 @@
+import type { PreparedToolchain } from "@enoughfactory/runtime";
+
 export type WorkspaceProvider = "git" | "artifactfs";
+export type DevelopmentToolchain = PreparedToolchain;
 
 export interface ArtifactManifest {
   id: string;
@@ -62,6 +65,7 @@ export interface WorkspaceRecord {
   providerState?: Record<string, unknown>;
   fallbackReason?: string;
   repairConflicts?: string[];
+  developmentToolchain?: DevelopmentToolchain;
 }
 
 export interface Candidate {
@@ -79,6 +83,7 @@ export interface Candidate {
   createdAt: string;
   repairConflicts?: string[];
   workingDirectories?: WorkingDirectoryCapture[];
+  developmentToolchain?: DevelopmentToolchain;
 }
 
 export interface CommandResult {
@@ -89,6 +94,8 @@ export interface CommandResult {
   startedAt: string;
   endedAt: string;
   timedOut?: boolean;
+  /** Actual checker image, which can differ from the author device's architecture. */
+  developmentToolchain?: DevelopmentToolchain;
 }
 
 export interface CheckContext {
@@ -111,6 +118,8 @@ export interface CheckReport {
   candidateId: string;
   commit: string;
   baseCommit?: string;
+  developmentToolchain?: DevelopmentToolchain;
+  candidateDevelopmentToolchain?: DevelopmentToolchain;
   status: "passed" | "failed" | "not-configured" | "canceled";
   commands: CommandResult[];
   logArtifact: ArtifactManifest;

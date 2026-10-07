@@ -3,9 +3,10 @@ import assert from "node:assert/strict";
 import { mkdtemp, mkdir, writeFile, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { SWIFT_TOOLCHAIN } from "@enoughfactory/runtime";
 import { WorkspaceManager, WorkingDirectoryManager, ArtifactStore, dockerCheckExecutor } from "../src/index.ts";
 import { git, run } from "../src/process.ts";
-import type { CheckExecutor } from "../src/types.ts";
+import type { CheckExecutor, DevelopmentToolchain } from "../src/types.ts";
 
 const executor: CheckExecutor = async (context) => {
   const startedAt = new Date().toISOString();
@@ -147,6 +148,50 @@ test("checks use retained secondary snapshots, reject their changed trees or hea
     assert.equal(await readFile(join(source, "reference.txt"), "utf8"), "original source\n");
     assert.equal(await git(project, "status", "--porcelain"), "");
     for (const path of contexts.values()) await assert.rejects(readFile(join(path, "reference.txt")), /ENOENT/);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("candidate toolchains stay frozen across transfer and combined checks record their actual local image", async () => {
+  const { root, project, manager } = await fixture();
+  try {
+    const author: DevelopmentToolchain = { id: SWIFT_TOOLCHAIN.id, recipeSha256: SWIFT_TOOLCHAIN.recipeSha256, image: `sha256:${"1".repeat(64)}`, baseImage: SWIFT_TOOLCHAIN.baseImage, platform: "linux/arm64", swiftVersion: SWIFT_TOOLCHAIN.swiftVersion, nodeVersion: SWIFT_TOOLCHAIN.nodeVersion };
+    const selected = { ...author };
+    const plain = await manager.create({ projectPath: project, goalId: "goal", taskId: "plain", attemptId: "plain-toolchain" });
+    const swift = await manager.create({ projectPath: project, goalId: "goal", taskId: "swift", attemptId: "swift-toolchain", developmentToolchain: selected });
+    selected.image = `sha256:${"2".repeat(64)}`;
+    assert.deepEqual(swift.developmentToolchain, author);
+    await assert.rejects(manager.create({ projectPath: project, goalId: "goal", taskId: "swift", attemptId: swift.id, developmentToolchain: selected }), /frozen development toolchain/);
+    const plainCandidate = await manager.capture({ workspaceId: plain.id });
+    const swiftCandidate = await manager.capture({ workspaceId: swift.id });
+    assert.equal(plainCandidate.developmentToolchain, undefined);
+    assert.deepEqual(swiftCandidate.developmentToolchain, author);
+    assert.deepEqual(swiftCandidate.bundleArtifact.metadata?.developmentToolchain, author);
+    const checker: DevelopmentToolchain = { ...author, platform: "linux/amd64", image: `sha256:${"3".repeat(64)}` };
+    const seen: Array<DevelopmentToolchain | undefined> = [];
+    const check: CheckExecutor = async context => {
+      const frozen = context.candidate.developmentToolchain;
+      seen.push(frozen ? { ...frozen } : undefined);
+      return { command: context.command, exitCode: 0, stdout: "", stderr: "", developmentToolchain: frozen ? checker : undefined, startedAt: new Date().toISOString(), endedAt: new Date().toISOString() };
+    };
+    const local = new WorkspaceManager({ dataDir: join(root, "data"), deviceId: "device-a", checkExecutor: check });
+    assert.equal((await local.verify({ candidateId: plainCandidate.id, commands: ["plain check"] })).developmentToolchain, undefined);
+    const receiver = new WorkspaceManager({ dataDir: join(root, "toolchain-receiver"), deviceId: "device-b", checkExecutor: check });
+    await assert.rejects(receiver.acceptCandidate({ ...swiftCandidate, developmentToolchain: selected }, await manager.artifacts.path(swiftCandidate.bundleArtifact)), /immutable source evidence/);
+    await receiver.acceptCandidate(swiftCandidate, await manager.artifacts.path(swiftCandidate.bundleArtifact), await manager.artifacts.path(swiftCandidate.diffArtifact));
+    const verified = await receiver.verify({ candidateId: swiftCandidate.id, commands: ["node and swift check", "second check"] });
+    assert.deepEqual(verified.candidateDevelopmentToolchain, author);
+    assert.deepEqual(verified.developmentToolchain, checker);
+    const integrated = await receiver.integrate({ candidateId: swiftCandidate.id, projectPath: project, commands: ["combined check"], isCurrent: () => true });
+    assert.equal(integrated.status, "integrated");
+    assert.deepEqual(integrated.report?.candidateDevelopmentToolchain, author);
+    assert.deepEqual(integrated.report?.developmentToolchain, checker);
+    const evidence = JSON.parse((await receiver.artifacts.read(integrated.report!.logArtifact)).toString());
+    assert.deepEqual(evidence.candidateDevelopmentToolchain, author);
+    assert.deepEqual(evidence.developmentToolchain, checker);
+    assert.deepEqual(integrated.report!.logArtifact.metadata?.developmentToolchain, checker);
+    assert.equal(seen[0], undefined);
+    for (const frozen of seen.slice(1)) assert.deepEqual(frozen, author);
+    await assert.rejects(manager.create({ projectPath: project, goalId: "goal", taskId: "invalid", attemptId: "invalid-toolchain", developmentToolchain: { ...author, image: "unrelated:latest" } }), /pinned recipe/);
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 

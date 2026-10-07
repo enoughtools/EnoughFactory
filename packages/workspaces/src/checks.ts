@@ -1,13 +1,45 @@
 import { randomUUID } from "node:crypto";
 import { dirname, resolve } from "node:path";
+import { prepareToolchain, validatePreparedToolchain, verifyPreparedToolchain } from "@enoughfactory/runtime";
 import { resolveDockerRuntime, runManagedDocker, type DockerRuntimeEndpoint } from "./docker.ts";
-import type { CheckExecutor } from "./types.ts";
+import type { Candidate, CheckExecutor, DevelopmentToolchain } from "./types.ts";
+
+export function frozenDevelopmentToolchain(value?: DevelopmentToolchain): DevelopmentToolchain | undefined {
+  if (value === undefined) return;
+  return validatePreparedToolchain(value);
+}
+
+export function sameDevelopmentRecipe(author: DevelopmentToolchain, checker: DevelopmentToolchain): boolean {
+  return author.id === checker.id && author.recipeSha256 === checker.recipeSha256 && author.baseImage === checker.baseImage && author.swiftVersion === checker.swiftVersion && author.nodeVersion === checker.nodeVersion;
+}
+
+export function candidateDevelopmentToolchain(candidate: Pick<Candidate, "developmentToolchain" | "bundleArtifact" | "diffArtifact">): DevelopmentToolchain | undefined {
+  const toolchain = frozenDevelopmentToolchain(candidate.developmentToolchain);
+  for (const artifact of [candidate.bundleArtifact, candidate.diffArtifact]) {
+    const evidence = frozenDevelopmentToolchain(artifact.metadata?.developmentToolchain as DevelopmentToolchain | undefined);
+    if (JSON.stringify(evidence) !== JSON.stringify(toolchain)) throw new Error("Candidate toolchain does not match its immutable source evidence");
+  }
+  return toolchain;
+}
 
 /** Commands run as root with full network/tool access inside an isolated container. */
 export function dockerCheckExecutor(options: { image?: string; dockerRuntime?: DockerRuntimeEndpoint } = {}): CheckExecutor {
   const metadataVolumes = new Map<string, Map<string, string>>();
+  const preparedToolchains = new Map<string, Promise<DevelopmentToolchain>>();
   const execute: CheckExecutor = async (context) => {
+    const authorToolchain = candidateDevelopmentToolchain(context.candidate);
     const dockerRuntime = resolveDockerRuntime(options.dockerRuntime);
+    let toolchain: DevelopmentToolchain | undefined;
+    if (authorToolchain) {
+      let preparation = preparedToolchains.get(context.path);
+      if (!preparation) {
+        preparation = prepareToolchain(dockerRuntime, authorToolchain.id, { signal: context.signal });
+        preparedToolchains.set(context.path, preparation);
+      }
+      toolchain = frozenDevelopmentToolchain(await preparation)!;
+      if (!sameDevelopmentRecipe(authorToolchain, toolchain)) throw new Error("The check runtime prepared a different development recipe from the candidate");
+      await verifyPreparedToolchain(dockerRuntime, toolchain, { signal: context.signal });
+    }
     for (const root of context.workingDirectories ?? []) {
       if (dirname(resolve(root.path)) !== resolve(`${context.path}-working-directories`)) throw new Error("Check working directories must use this report's private snapshot copies");
     }
@@ -55,15 +87,16 @@ export function dockerCheckExecutor(options: { image?: string; dockerRuntime?: D
       // Attest captured modes before accessibility cleanup. Restore only directories that
       // matched then; real mode edits fail the command and remain visible in final evidence.
       const cleanup = `cleanup() { command_status=$?; ${emptyDirectoryChecks.join("; ")}${emptyDirectoryChecks.length ? "; " : ""}chmod -R a+rwX ${roots.map(root => root.containerPath).join(" ")} 2>/dev/null || true; ${emptyDirectoryRestorations.join("; ")}${emptyDirectoryRestorations.length ? "; " : ""}trap - EXIT; exit "$command_status"; }`;
-      const wrapper = `${initialization.join("; ")}; ${cleanup}; trap cleanup EXIT; sh -lc "$1"`;
-      const result = await runManagedDocker(dockerRuntime, ["run", "--name", name, "--rm", "--user", "0:0", "--label", "enoughfactory.role=check", ...mounts, ...environment, "--workdir", "/work", options.image ?? "node:22-bookworm", "sh", "-c", wrapper, "enoughfactory-check", context.command], { timeoutMs: context.timeoutMs, signal: context.signal });
-      return { command: context.command, ...result, startedAt, endedAt: new Date().toISOString() };
+      const wrapper = `${initialization.join("; ")}; ${cleanup}; trap cleanup EXIT; ${toolchain ? "bash" : "sh"} -lc "$1"`;
+      const result = await runManagedDocker(dockerRuntime, ["run", "--name", name, "--rm", "--user", "0:0", "--label", "enoughfactory.role=check", ...mounts, ...environment, "--workdir", "/work", toolchain?.image ?? options.image ?? "node:22-bookworm", "sh", "-c", wrapper, "enoughfactory-check", context.command], { timeoutMs: context.timeoutMs, signal: context.signal });
+      return { command: context.command, ...result, developmentToolchain: toolchain, startedAt, endedAt: new Date().toISOString() };
     } finally {
       // Killing the Docker client does not confirm container termination.
       await runManagedDocker(dockerRuntime, ["rm", "--force", name]).catch(() => undefined);
     }
   };
   execute.release = async path => {
+    preparedToolchains.delete(path);
     const volumes = metadataVolumes.get(path);
     metadataVolumes.delete(path);
     if (!volumes) return;

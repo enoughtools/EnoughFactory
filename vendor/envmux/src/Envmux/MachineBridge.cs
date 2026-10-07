@@ -21,18 +21,19 @@ internal static class MachineBridge
 
     public static bool Active => Writer is not null;
 
-    /// <summary>Private startup descriptors and workspace authority belong to one process.</summary>
+    /// <summary>Private startup descriptors, workspace authority and image selection belong to one process.</summary>
     /// <remarks>
     /// Self-spawned agents and editor endpoints retain the managed daemon, but
     /// Process.Start does not transfer the supervisor's descriptor or create a
     /// new writable ArtifactFS attempt. Never let their inherited environment
-    /// claim either resource belongs to the new child.
+    /// claim either resource or the manager's per-launch toolchain belongs to the new child.
     /// </remarks>
     public static void PrepareChild(ProcessStartInfo info)
     {
         info.Environment.Remove("ENVMUX_BOOTSTRAP_FD");
         info.Environment.Remove("ENVMUX_WORKSPACE_BIND");
         info.Environment.Remove("ENVMUX_ARTIFACT_STATE_VOLUME");
+        info.Environment.Remove("ENVMUX_MANAGED_GOLDEN_IMAGE");
     }
 
     private static StreamWriter? Open()
@@ -51,7 +52,8 @@ internal static class MachineBridge
         }
 
         return new StreamWriter(new FileStream(new SafeFileHandle((IntPtr)descriptor,
-            ownsHandle: false), FileAccess.Write), new UTF8Encoding(false)) { AutoFlush = true };
+            ownsHandle: false), FileAccess.Write), new UTF8Encoding(false))
+        { AutoFlush = true };
     }
 
     public static void Emit(MachineEvent message)
@@ -103,6 +105,7 @@ internal sealed record MachineEvent(
     string? Token = null,
     string? Proxy = null,
     string? DockerHost = null,
+    string? GoldenImage = null,
     string? Project = null,
     string? Session = null,
     string? Instance = null,
@@ -123,4 +126,4 @@ internal sealed record MachineEvent(
 internal sealed partial class MachineJsonContext : JsonSerializerContext;
 
 /// <summary>A supervisor checks the managed endpoint contract before creating anything.</summary>
-internal sealed record MachineCapabilities(int ProtocolVersion, bool ManagedDocker);
+internal sealed record MachineCapabilities(int ProtocolVersion, bool ManagedDocker, bool ManagedGoldenImage);

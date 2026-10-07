@@ -2,7 +2,7 @@ import { randomUUID, createHash } from 'node:crypto';
 import { createReadStream } from 'node:fs';
 import { mkdir, readFile, writeFile, lstat, readlink, open } from 'node:fs/promises';
 import path from 'node:path';
-import type { Attempt, FactoryTask, Goal, Project, Decision, ControllerRun, ContainerRuntimeStatus } from '@enoughfactory/contracts';
+import type { Attempt, FactoryTask, Goal, Project, Decision, ControllerRun, ContainerRuntimeStatus, DevelopmentToolchain, DevelopmentToolchainId } from '@enoughfactory/contracts';
 import {
   FactoryCoordinator, FactoryOperationError, type FactoryWorkspacePort, type FactoryRuntimePort, type WorkspaceRef,
   type CandidateRef, type ExecutionResult, type CheckResult, type CreateGoalInput,
@@ -11,7 +11,7 @@ import {
 import { WorkspaceManager, ArtifactFsWorkspaceProvider, dockerCheckExecutor, appleCheckExecutor, isAppleCheckCommand, appleCheckArtifacts, fingerprintWorkingDirectories, type WorkingDirectorySource, type WorkingDirectoryCapture, type ArtifactManifest, type Candidate, type CheckReport, type WorkspaceRecord } from '@enoughfactory/workspaces';
 import type { PeerManager } from '@enoughfactory/peers';
 import type { TurnResult } from '@enoughfactory/agents';
-import { dockerInvocation } from '@enoughfactory/runtime';
+import { dockerInvocation, SWIFT_TOOLCHAIN, validatePreparedToolchain } from '@enoughfactory/runtime';
 import type { DeviceApp, ApiCall } from './app.ts';
 import type { ChatController } from './chats.ts';
 import { exec, HttpError, now } from './util.ts';
@@ -19,6 +19,7 @@ import { inspectAttempt, inspectGoal, inspectTask, taskControlReason, taskDispat
 import { factoryChatBinding } from './factory-chat.ts';
 import { controllerError } from './factory-controller-error.ts';
 import { prepareControllerContext } from './controller-context.ts';
+import { developmentToolchainChoice, parseDevelopmentToolchain, prepareDevelopmentToolchain, type FrozenDevelopmentToolchain } from './development-toolchain.ts';
 
 interface WorkerRecord {
   id: string; coordinatorId: string; goal: Goal; task: FactoryTask; attempt: Attempt; project: Project;
@@ -27,6 +28,7 @@ interface WorkerRecord {
   candidate?: CandidateRef; error?: string; updatedAt: string;
   cancellationAcknowledged?: boolean;
   workingDirectorySources?: WorkingDirectorySource[];
+  developmentToolchain?: FrozenDevelopmentToolchain;
 }
 interface ReceivedArtifact { id: string; peerId: string; manifest: ArtifactManifest; path: string; }
 interface GoalOptions { id: string; workspaceProvider: 'git' | 'artifactfs'; }
@@ -113,6 +115,7 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
     if (process.platform !== 'darwin') return common;
     return `${common} The coordinator can run fixed Apple validation profiles on exact saved candidates. Use a check string such as enoughfactory:apple-build {"tool":"swift","package":".","action":"build"} or enoughfactory:apple-build {"tool":"xcodebuild","project":"EnoughMail.xcodeproj","scheme":"EnoughMail","platform":"macos","configuration":"Debug"}; ios-simulator is also supported. These are structured check profiles, not container shell commands. Native validation has private build output, no network, personal files, keychain, signing or simulator launch. Vendor required dependencies inside the primary repository and use portable relative paths. A passing Xcode build retains unsigned app products as artifacts. Only the recorded check result is build evidence; a profile in a plan is not proof that it passed. Credential-dependent or signed distribution checks must remain explicitly unresolved until their real inputs exist.`;
   }
+  function toolchainInstructions(toolchain?:DevelopmentToolchain):string{return toolchain?`This environment has the fixed Swift ${toolchain.swiftVersion} and Node ${toolchain.nodeVersion} toolchain. Both are available through bash -lc. Use that toolchain directly; the factory checks the saved candidate with the same pinned recipe. Native Apple validation remains a separate recorded check.`:'';}
   async function artifactPath(manifest: ArtifactManifest): Promise<string> {
     const prior = verifiedArtifacts.get(manifest.sha256);
     if (prior) {
@@ -128,6 +131,11 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
   async function projectConfig(project: Project): Promise<string | undefined> {
     try { return await readFile(path.join(project.path, '.envmux.json'), 'utf8'); }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+  }
+  async function resolveToolchain(project:Project,signal?:AbortSignal,frozen?:FrozenDevelopmentToolchain):Promise<FrozenDevelopmentToolchain>{
+    const resolved=await prepareDevelopmentToolchain(app.runtime.endpoint,project,{signal,frozen,onProgress:phase=>app.emit('toolchain-progress',{projectId:project.sourceProjectId||project.id,phase})});
+    app.store.set('project-toolchains',{id:project.sourceProjectId||project.id,profile:resolved==='default'?'default':resolved.id,developmentToolchain:resolved==='default'?undefined:resolved});
+    return resolved;
   }
   async function configureHandoff(workspace: WorkspaceRecord): Promise<void> {
     const filename = path.join(workspace.path, '.envmux.json');
@@ -163,13 +171,15 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
     return app.sessions.workingDirectorySources(attemptId,{...project,workingDirectories:sources});
   }
   async function prepareLocal(record: WorkerRecord, project = record.project, previousCandidate?: CandidateRef): Promise<void> {
-    return app.withRuntimeOperation(async()=>{
+    return app.withRuntimeOperation(async signal=>{
     await app.ensureRuntimeReady();
+    const developmentToolchain=await resolveToolchain(project,signal,record.developmentToolchain);
+    patchWorker(record.id,{developmentToolchain});
     const name = sessionName(record.id);
     const config = await projectConfig(project);
     let workspace = await workspaces.create({ projectPath: project.path, goalId: record.goal.id,
       taskId: record.task.id, attemptId: record.id, provider: sourceProvider(record.goal), fallbackToGit: true, sessionName: name,
-      workspaceBranch: `${config ? envmuxBranchPrefix(config) : 'envmux/'}${name}` });
+      workspaceBranch: `${config ? envmuxBranchPrefix(config) : 'envmux/'}${name}`,developmentToolchain:developmentToolchain==='default'?undefined:developmentToolchain });
     if (previousCandidate) {
       const promoted = await workspaces.promotePreviousCandidate({ candidateId: previousCandidate.id, workspaceId: workspace.id });
       if (promoted.conflicts.length) app.store.set('factory-repair-input', { id: record.id, conflicts: promoted.conflicts, message: promoted.message });
@@ -181,7 +191,7 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
     patchWorker(record.id,{workingDirectorySources});
     const owned = internalProject(project, workspace, record.task.title);
     const state = workspace.providerState;
-    const session = await app.sessions.create(owned, name,{workingDirectorySources,...(state && typeof state.bindSource === 'string' && typeof state.stateVolume === 'string'
+    const session = await app.sessions.create(owned, name,{workingDirectorySources,developmentToolchain,...(state && typeof state.bindSource === 'string' && typeof state.stateVolume === 'string'
       ? { workspace: { bindSource: state.bindSource, stateVolume: state.stateVolume } } : {})});
     patchWorker(record.id, { workspace: ref(workspace, session.id), sessionId: session.id });
     await app.sessions.waitReady(session.id);
@@ -215,7 +225,7 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
     if (attempt) app.store.set('attempts', { ...attempt, sessionId: record.sessionId, chatId: chat.id });
     const repair = app.store.get<{ id: string; conflicts: string[]; message?: string }>('factory-repair-input', record.id);
     const result = await chats.run(chat.id, repair ? `${prompt}\n\nRetained work was merged as repair input. Resolve conflict markers in these files before completing: ${repair.conflicts.join(', ')}. ${repair.message || ''}` : prompt, { attemptId: record.id, autonomous: record.goal.autonomy === 'autonomous',
-      systemInstructions: `You are implementing an assigned EnoughFactory task toward this goal:\n${record.goal.objective}\n\nYou have full permissions inside this container. Enough owns the configured ${record.goal.approvalMode} policy. Make routine implementation decisions and execute the task completely. Do not stop at a plan or ask for permission already granted. Keep verification proportionate. Preserve changes and describe concrete evidence and any remaining work. The factory will independently capture, check, integrate and evaluate your result.\n\n${validationInstructions()}` });
+      systemInstructions: `You are implementing an assigned EnoughFactory task toward this goal:\n${record.goal.objective}\n\nYou have full permissions inside this container. Enough owns the configured ${record.goal.approvalMode} policy. Make routine implementation decisions and execute the task completely. Do not stop at a plan or ask for permission already granted. Keep verification proportionate. Preserve changes and describe concrete evidence and any remaining work. The factory will independently capture, check, integrate and evaluate your result.\n\n${validationInstructions()}\n\n${toolchainInstructions(app.sessions.record(record.sessionId).developmentToolchain)}` });
     if (worker(record.id).status === 'canceled') return;
     patchWorker(record.id, { status: 'succeeded', result: { status: 'succeeded', text: result.text, sessionId: record.sessionId, chatId: chat.id, spend: spend(result) } });
   }
@@ -314,10 +324,16 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
   }
   const workspacePort: FactoryWorkspacePort = {
     async prepare({ goal, task, attempt, project, previousCandidate }) {
+      const toolchainProfile=await developmentToolchainChoice(project);
+      project={...project,developmentToolchain:toolchainProfile};
       if (local(attempt.deviceId)) {
         const record = beginWorker({ id: attempt.id, coordinatorId: app.device.id, goal, task, attempt, project });
         if (record.status === 'preparing') track(record.id, () => prepareLocal(record, project, previousCandidate));
       } else {
+        if(toolchainProfile!=='default'){
+          const health=await rpc<{deviceId:string;capabilities?:{developmentToolchains?:Array<{id:string;recipeSha256:string}>}}>(attempt.deviceId,'GET','/api/health');
+          if(health.deviceId!==attempt.deviceId||!health.capabilities?.developmentToolchains?.some(profile=>profile.id===toolchainProfile&&profile.recipeSha256===SWIFT_TOOLCHAIN.recipeSha256))throw new Error('Update the selected worker device to the same fixed Swift toolchain recipe before dispatching this task.');
+        }
         if(project.workingDirectories?.length||(previousCandidate?.workingDirectories as unknown[]|undefined)?.length){const health=await rpc<{deviceId:string;capabilities?:{workingDirectories?:boolean}}>(attempt.deviceId,'GET','/api/health');if(health.deviceId!==attempt.deviceId||health.capabilities?.workingDirectories!==true)throw new Error('Update the selected worker device before using additional working folders.');}
         const source = await workspaces.exportSource({ projectPath: project.path }); rememberArtifacts(source);
         await sendArtifact(attempt.deviceId, source);
@@ -329,10 +345,12 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
         }
         await rpc(attempt.deviceId, 'POST', '/api/factory/worker/prepare', { goal, task, attempt,
           project: publicWorkerProject(project), source, workingDirectorySources, config: await projectConfig(project), previousCandidate,
-          workspaceProvider: sourceProvider(goal) });
+          workspaceProvider: sourceProvider(goal),toolchainRecipe:toolchainProfile==='default'?undefined:{id:SWIFT_TOOLCHAIN.id,recipeSha256:SWIFT_TOOLCHAIN.recipeSha256} });
       }
       const record = await waitWorker(attempt.deviceId, attempt.id, 'prepared');
       if (!record.workspace || !['prepared', 'running', 'succeeded'].includes(record.status)) throw new Error(record.error || 'Worker preparation did not complete.');
+      if(toolchainProfile!=='default')validatePreparedToolchain(record.workspace.developmentToolchain);
+      else if(record.workspace.developmentToolchain)throw new Error('The worker did not honor the selected default development environment.');
       const sources=local(attempt.deviceId)?worker(attempt.id).workingDirectorySources||[]:await app.sessions.directoryManager.sourceSnapshots(attempt.id);
       const mounts=record.workspace.workingDirectories as import('@enoughfactory/contracts').WorkingDirectoryMount[]|undefined;
       if(sources.length&&(!mounts||mounts.length!==sources.length||sources.some(source=>!mounts.some(root=>root.id===source.id&&root.name===source.name&&root.path===source.containerPath&&root.baseCommit===source.baseCommit&&root.kind===source.kind))))throw new Error('The worker did not confirm the exact additional working folder snapshots. No task execution was authorized.');
@@ -345,6 +363,7 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
         const record = await rpc<WorkerRecord>(workspace.deviceId!, 'GET', `/api/factory/worker/${attempt.id}`);
         if (record.candidate) {
           const value = record.candidate as unknown as Candidate;
+          if(JSON.stringify(value.developmentToolchain)!==JSON.stringify(workspace.developmentToolchain))throw new Error('The captured candidate does not match its prepared development toolchain.');
           assertCapturedRoots(value.workingDirectories||[],(workspace.workingDirectories as import('@enoughfactory/contracts').WorkingDirectoryMount[]|undefined)||[]);
           if (candidateArtifacts(value).every(manifest => app.store.get<ReceivedArtifact>('peer-artifacts', manifest.id)?.peerId === workspace.deviceId)) {
             await acceptRemoteCandidate(workspace.deviceId!, record.candidate); return record.candidate;
@@ -382,12 +401,17 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
         else for await (const chunk of createReadStream(filename)) hash.update(chunk);
       }
       hash.update(await fingerprintWorkingDirectories(project.workingDirectories||[]));
-      return { head, branch, status, summary, diff, fingerprint: hash.digest('hex') };
+      const profile=await developmentToolchainChoice(project);
+      const saved=app.store.get<{id:string;profile:DevelopmentToolchainId;developmentToolchain?:DevelopmentToolchain}>('project-toolchains',project.sourceProjectId||project.id);
+      const developmentToolchain=profile!=='default'&&saved?.profile===profile&&saved.developmentToolchain?validatePreparedToolchain(saved.developmentToolchain):undefined;
+      hash.update(JSON.stringify({profile,...(profile==='default'?{}:{recipeSha256:SWIFT_TOOLCHAIN.recipeSha256}),developmentToolchain}));
+      return { head, branch, status, summary, diff, fingerprint: hash.digest('hex'),developmentToolchain };
     },
     async checkGoal(project,commands){
+      const developmentToolchain=await app.withRuntimeOperation(async signal=>{await app.ensureRuntimeReady();return resolveToolchain(project,signal);});
       const repository=await workspacePort.inspect(project),operation=randomUUID();
       if(repository.status.trim())throw new Error('Goal checks require a clean primary working tree so they can verify the integrated commit. Commit or preserve the remaining primary edits before evaluating.');
-      const workspace=await workspaces.create({projectPath:project.path,goalId:operation,taskId:'goal-check',attemptId:operation,baseCommit:repository.head});
+      const workspace=await workspaces.create({projectPath:project.path,goalId:operation,taskId:'goal-check',attemptId:operation,baseCommit:repository.head,developmentToolchain:developmentToolchain==='default'?undefined:developmentToolchain});
       try{
         const roots=await app.sessions.directoryManager.prepare({identity:operation,sources:project.workingDirectories||[]});
         const workingDirectories:WorkingDirectoryCapture[]=[];for(const root of roots)workingDirectories.push(await app.sessions.directoryManager.captureFromPath(root,root.path));
@@ -415,13 +439,14 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
       signal=signal?AbortSignal.any([signal,runtimeSignal]):runtimeSignal;
       if (signal?.aborted) throw new Error('The controller decision was revoked.');
       await app.ensureRuntimeReady();
+      const developmentToolchain=await resolveToolchain(project,signal);
       const operation = randomUUID();
-      const workspace = await workspaces.create({ projectPath: project.path, goalId: goal.id, taskId: `control-${role}`, attemptId: operation });
+      const workspace = await workspaces.create({ projectPath: project.path, goalId: goal.id, taskId: `control-${role}`, attemptId: operation,developmentToolchain:developmentToolchain==='default'?undefined:developmentToolchain });
       await configureHandoff(workspace);
       const context = await prepareControllerContext({ operation, goalId: goal.id, role, project, store: app.store,
         workspaces, directoryManager: app.sessions.directoryManager, dataDir: app.dataDir });
       const owned = internalProject(project, workspace, `${goal.title} · ${role}`);
-      const session = await app.sessions.create(owned, sessionName(operation), { workingDirectorySources: context.workingDirectorySources });
+      const session = await app.sessions.create(owned, sessionName(operation), { workingDirectorySources: context.workingDirectorySources,developmentToolchain });
       const record: ControllerRun = { id: operation, goalId: goal.id, role, sessionId: session.id, status: 'starting', updatedAt: now() };
       app.store.set('factory-controller-runs', record);
       let chatId: string | undefined;
@@ -440,7 +465,7 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
         app.store.set('factory-controller-runs', { ...record, chatId: chat.id, status: 'running', updatedAt: now() });
         providerInvoked = true;
         const result = await chats.run(chat.id, prompt, { autonomous: goal.autonomy === 'autonomous',
-          systemInstructions: [`You are the EnoughFactory ${role}. This container contains an isolated snapshot of the current project repository. Inspect the actual source and relevant runtime evidence to make your decision. You have full container permissions under ${goal.approvalMode} policy. Your role is to decide the next factory action; implementation belongs to assigned worker tasks. Do not modify product source as part of this decision. Return the structured JSON requested in the prompt. Goal: ${goal.objective}`, validationInstructions(), context.instructions].filter(Boolean).join('\n\n') });
+          systemInstructions: [`You are the EnoughFactory ${role}. This container contains an isolated snapshot of the current project repository. Inspect the actual source and relevant runtime evidence to make your decision. You have full container permissions under ${goal.approvalMode} policy. Your role is to decide the next factory action; implementation belongs to assigned worker tasks. Do not modify product source as part of this decision. Return the structured JSON requested in the prompt. Goal: ${goal.objective}`, validationInstructions(), toolchainInstructions(app.sessions.record(session.id).developmentToolchain), context.instructions].filter(Boolean).join('\n\n') });
         app.store.set('factory-controller-runs', { ...record, chatId: chat.id, status: 'completed', updatedAt: now(), result: result.text });
         return { text: result.text, chatId: chat.id, spend: spend(result) };
       } catch (error) {
@@ -643,6 +668,11 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
       const goal = body.goal as Goal, task = body.task as FactoryTask, attempt = body.attempt as Attempt, project = body.project as Project;
       if (!goal || !task || !attempt || !project || attempt.deviceId !== app.device.id || task.goalId !== goal.id || attempt.taskId !== task.id || goal.coordinatorId !== peerId)
         throw new HttpError(400, 'The worker assignment does not match its coordinator, task and device.');
+      const toolchainProfile=parseDevelopmentToolchain(project.developmentToolchain);
+      if(toolchainProfile==='swift-6.0.3'){
+        const recipe=body.toolchainRecipe as {id?:unknown;recipeSha256?:unknown}|undefined;
+        if(recipe?.id!==SWIFT_TOOLCHAIN.id||recipe.recipeSha256!==SWIFT_TOOLCHAIN.recipeSha256)throw new HttpError(409,'The coordinator and worker must agree on the exact fixed Swift toolchain recipe.');
+      }else if(body.toolchainRecipe!==undefined)throw new HttpError(400,'A toolchain recipe must match the selected development toolchain.');
       for (const value of [attempt.id, task.id, goal.id]) if (typeof value !== 'string' || !/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,79}$/.test(value)) throw new HttpError(400, 'Invalid factory identity.');
       const source = body.source as ArtifactManifest; await importReceived(peerId, source);
       const workingDirectorySources=body.workingDirectorySources as WorkingDirectorySource[]|undefined;
@@ -759,8 +789,8 @@ function spend(result: TurnResult): number | undefined {
   return typeof cost === 'number' && Number.isFinite(cost) && cost >= 0 ? cost : undefined;
 }
 function checkResults(report: CheckReport, candidateCommit: string): CheckResult[] {
-  const results = report.commands.map(command => ({ command: command.command, passed: command.exitCode === 0 && !command.timedOut,
-    output: `${command.stdout}${command.stderr}`, exitCode: command.exitCode, candidateCommit, checkedCommit: report.commit }));
+  const results:CheckResult[] = report.commands.map(command => ({ command: command.command, passed: command.exitCode === 0 && !command.timedOut,
+    output: `${command.stdout}${command.stderr}`, exitCode: command.exitCode, candidateCommit, checkedCommit: report.commit,developmentToolchain:command.developmentToolchain }));
   if (['failed', 'canceled'].includes(report.status) && results.every(result => result.passed)) {
     results.push({ command: 'Repository integrity after checks', passed: false, output: 'Checks changed the tracked candidate or were canceled.', exitCode: 1, candidateCommit, checkedCommit: report.commit });
   }

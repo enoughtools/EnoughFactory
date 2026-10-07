@@ -68,6 +68,9 @@ internal sealed class DockerImages(IDockerEngine engine, DockerBackendConfig con
         /// this being present; that is what <see cref="Kind"/> is for.
         /// </summary>
         public const string Golden = "envmux.golden";
+
+        /// <summary>The exact manager-prepared base; feature caches cannot substitute another recipe.</summary>
+        public const string GoldenImage = "envmux.golden.image";
     }
 
     /// <summary>What every name this makes starts with.</summary>
@@ -95,7 +98,8 @@ internal sealed class DockerImages(IDockerEngine engine, DockerBackendConfig con
     /// The golden image's reference on the engine — what a session's container is created from.
     /// </summary>
     /// <remarks>
-    /// The one place <c>goldenTag</c> is read. Null, which is the default, is
+    /// The manager's immutable image wins for its one launch. Otherwise the
+    /// one place <c>goldenTag</c> is read. Null, which is the default, is
     /// the locally built image under this binary's build; anything else is a
     /// reference somebody chose, used exactly as written.
     /// </remarks>
@@ -113,8 +117,17 @@ internal sealed class DockerImages(IDockerEngine engine, DockerBackendConfig con
 
     public bool CanBuildProject => exec is not null;
 
-    public async Task<bool> HasGoldenAsync(CancellationToken ct = default) =>
-        await engine.ImageAsync(GoldenImage, ct).ConfigureAwait(false) is not null;
+    public async Task<bool> HasGoldenAsync(CancellationToken ct = default)
+    {
+        var image = await engine.ImageAsync(GoldenImage, ct).ConfigureAwait(false);
+        if (image is not null && config.ManagedGoldenImage is { } managed &&
+            !string.Equals(image.Id, managed, StringComparison.Ordinal))
+        {
+            throw new BackendException($"the managed engine returned another image for {managed}; prepare the exact immutable image before starting");
+        }
+
+        return image is not null;
+    }
 
     /// <summary>
     /// Build the golden image on the engine — or pull it, when the record names a published one.
@@ -139,6 +152,11 @@ internal sealed class DockerImages(IDockerEngine engine, DockerBackendConfig con
     public async Task BuildGoldenAsync(Action<string> report, CancellationToken ct = default)
     {
         var reference = GoldenImage;
+
+        if (config.ManagedGoldenImage is not null)
+        {
+            throw new BackendException($"the prepared managed golden image {reference} is unavailable; prepare it on the owned engine before starting");
+        }
 
         if (GoldenIsPublished)
         {
@@ -195,6 +213,12 @@ internal sealed class DockerImages(IDockerEngine engine, DockerBackendConfig con
         if (image is null)
         {
             return false;
+        }
+
+        if (config.ManagedGoldenImage is { } managed)
+        {
+            return image.Labels.TryGetValue(Labels.GoldenImage, out var baseId) &&
+                   string.Equals(baseId, managed, StringComparison.Ordinal);
         }
 
         return GoldenIsPublished ||
@@ -264,6 +288,11 @@ internal sealed class DockerImages(IDockerEngine engine, DockerBackendConfig con
 
             golden = await engine.ImageAsync(GoldenImage, ct).ConfigureAwait(false)
                      ?? throw new BackendException($"{GoldenImage} was built and the engine does not have it");
+        }
+
+        if (config.ManagedGoldenImage is { } managed && !string.Equals(golden.Id, managed, StringComparison.Ordinal))
+        {
+            throw new BackendException($"the managed engine returned another image for {managed}; prepare the exact immutable image before starting");
         }
 
         if (features.Any(f => f.Name.Contains("docker", StringComparison.OrdinalIgnoreCase)))
@@ -463,6 +492,11 @@ internal sealed class DockerImages(IDockerEngine engine, DockerBackendConfig con
 
         labels[Labels.Kind] = Labels.KindImage;
 
+        if (config.ManagedGoldenImage is not null)
+        {
+            labels[Labels.GoldenImage] = golden.Id;
+        }
+
         // The golden image's own account of which build it is, so a published
         // one that says is believed and one that does not is not guessed at.
         if (golden.Labels.TryGetValue(Labels.Golden, out var build))
@@ -499,9 +533,9 @@ internal sealed class DockerImages(IDockerEngine engine, DockerBackendConfig con
         };
 
     private static string GoldenReference(DockerBackendConfig config, string prefix) =>
-        string.IsNullOrWhiteSpace(config.GoldenTag)
+        config.ManagedGoldenImage ?? (string.IsNullOrWhiteSpace(config.GoldenTag)
             ? $"{prefix}golden:{GoldenBuild}"
-            : config.GoldenTag.Trim();
+            : config.GoldenTag.Trim());
 
     private static string ProjectReference(string project, string fingerprint, string prefix)
     {

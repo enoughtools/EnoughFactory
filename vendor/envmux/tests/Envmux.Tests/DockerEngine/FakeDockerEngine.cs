@@ -254,7 +254,8 @@ internal sealed class FakeDockerEngine : IDockerEngine
                 throw Refuse(409, $"Conflict. The container name \"/{name}\" is already in use");
             }
 
-            if (ImagesMustExist && !_images.ContainsKey(body.Image))
+            if (ImagesMustExist && !_images.ContainsKey(body.Image) &&
+                !_images.Values.Any(image => string.Equals(image.Id, body.Image, StringComparison.Ordinal)))
             {
                 throw Refuse(404, $"No such image: {body.Image}");
             }

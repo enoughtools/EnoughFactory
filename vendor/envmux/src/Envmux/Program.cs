@@ -95,10 +95,13 @@ internal static class Program
               --all                prune: also take down instances that are running
           -h, --help               This
               --version            Print the version
+              --factory-capabilities  Print the private supervisor capabilities
 
         Sessions use the local Linux Docker engine by default. Incus is optional.
         Press b for the session browser: its localhost reaches the instance.
         With no .envmux.json, envmux offers to write one.
+        Managed supervisors may select a prepared immutable base with
+        ENVMUX_MANAGED_GOLDEN_IMAGE when ENVMUX_MANAGED_DOCKER=1.
         """;
 
     private static async Task<int> Main(string[] args)
@@ -209,7 +212,7 @@ internal static class Program
 
                 case "--factory-capabilities":
                     Console.WriteLine(System.Text.Json.JsonSerializer.Serialize(
-                        new MachineCapabilities(1, ManagedDocker: true), MachineJsonContext.Default.MachineCapabilities));
+                        new MachineCapabilities(1, ManagedDocker: true, ManagedGoldenImage: true), MachineJsonContext.Default.MachineCapabilities));
                     return 0;
 
                 case "--dry-run":
@@ -461,6 +464,7 @@ internal static class Program
                 MachineBridge.Emit(new MachineEvent("ready",
                     Endpoint: $"http://127.0.0.1:{session.Port}", Token: plan.Portal.Token,
                     Proxy: session.BrowserProxyUrl, DockerHost: session.Backend.Name,
+                    GoldenImage: (session.Backend as Backends.DockerBackend)?.ManagedGoldenImage,
                     Project: plan.Project, Session: plan.Session,
                     Instance: plan.InstanceName, Workdir: plan.Workdir, User: session.ContainerUser,
                     Branch: plan.Branch));

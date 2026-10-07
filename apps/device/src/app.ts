@@ -6,7 +6,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { createReadStream } from 'node:fs';
 import WebSocket, { WebSocketServer } from 'ws';
 import type { FactoryState, Project, Session, Chat, Settings, Device, Diagnostics, ContainerRuntimeStatus } from '@enoughfactory/contracts';
-import { ManagedRuntimeManager, type DockerRuntimeEndpoint } from '@enoughfactory/runtime';
+import { ManagedRuntimeManager, SWIFT_TOOLCHAIN, type DockerRuntimeEndpoint } from '@enoughfactory/runtime';
 import { PRODUCT } from '@enoughfactory/contracts';
 import { Store } from './store.ts';
 import { SessionController } from './sessions.ts';
@@ -14,6 +14,7 @@ import { validateWorkingDirectories } from '@enoughfactory/workspaces';
 import { CatalogRemoval } from './catalog-removal.ts';
 import { equalSecret, exec, HttpError, id, now } from './util.ts';
 import { configuredWorkerCapacity, runtimeWorkerResources, validWorkerCapacity } from './worker-capacity.ts';
+import { parseDevelopmentToolchain } from './development-toolchain.ts';
 
 export interface ApiCall { method: string; url: URL; body: Record<string, unknown>; peerId?: string; }
 export type Extension = (call: ApiCall) => Promise<unknown | undefined>;
@@ -168,7 +169,7 @@ export class DeviceApp {
   private async dispatchRequest(call: ApiCall): Promise<unknown> {
     const {method,url,body}=call;const route=url.pathname;
     if(this.routeRemote){const remote=await this.routeRemote(call);if(remote!==undefined)return remote;}
-    if(method==='GET' && route==='/api/health')return {ok:true,product:PRODUCT,version:'0.1.6',deviceId:this.device.id,capabilities:{idleServiceUpdate:true,workingDirectories:true},runtime:{kind:process.platform==='darwin'?'lima':'rootless',stateDirectory:this.runtime.dataDirectory,socketPath:this.runtime.endpoint.host.slice(7)}};
+    if(method==='GET' && route==='/api/health')return {ok:true,product:PRODUCT,version:'0.1.6',deviceId:this.device.id,capabilities:{idleServiceUpdate:true,workingDirectories:true,developmentToolchains:[SWIFT_TOOLCHAIN]},runtime:{kind:process.platform==='darwin'?'lima':'rootless',stateDirectory:this.runtime.dataDirectory,socketPath:this.runtime.endpoint.host.slice(7)}};
     if(method==='GET' && route==='/api/state')return this.state();
     if(method==='GET'&&route==='/api/service/update-status')return this.serviceUpdateStatus();
     if(method==='POST' && route==='/api/service/shutdown'){
@@ -212,9 +213,10 @@ export class DeviceApp {
     if(method==='POST' && route==='/api/projects'){
       if(typeof body.path!=='string'||!body.path.trim())throw new HttpError(400,'Choose a repository folder.');
       const projectPath=path.resolve(body.path);await exec('git',['-C',projectPath,'rev-parse','--show-toplevel']).catch(()=>{throw new HttpError(400,'This folder must contain a Git repository.');});
-      const existing=this.store.list<Project>('projects').find(p=>!p.internal&&p.path===projectPath);if(existing){if(Array.isArray(body.workingDirectories)&&body.workingDirectories.length)throw new HttpError(409,'This project is already added. Update its working folders in Project settings.');return existing.archivedAt?this.removals.restoreProject(existing.id):existing;}
+      const existing=this.store.list<Project>('projects').find(p=>!p.internal&&p.path===projectPath);if(existing){if((Array.isArray(body.workingDirectories)&&body.workingDirectories.length)||body.developmentToolchain!==undefined)throw new HttpError(409,'This project is already added. Update its working folders or development toolchain in Project settings.');return existing.archivedAt?this.removals.restoreProject(existing.id):existing;}
       const project:Project={id:id('project'),name:String(body.name||path.basename(projectPath)),path:projectPath,deviceId:this.device.id,createdAt:now(),runtime:['codex','antigravity','claude'].includes(String(body.runtime))?body.runtime as Project['runtime']:this.settings.defaultRuntime,approvalMode:['approve-all','rules','manual'].includes(String(body.approvalMode))?body.approvalMode as Project['approvalMode']:this.settings.defaultApprovalMode,rules:[]};
       if(body.workingDirectories!==undefined)project.workingDirectories=await validateWorkingDirectories(project.path,body.workingDirectories as never).catch(error=>{throw new HttpError(400,error.message);});
+      if(body.developmentToolchain!==undefined)project.developmentToolchain=parseDevelopmentToolchain(body.developmentToolchain);
       this.store.set('projects',project);this.changed();return project;
     }
     const projectRoute=route.match(/^\/api\/projects\/([^/]+)(?:\/(validate|config|archive|restore))?$/);
@@ -235,7 +237,7 @@ export class DeviceApp {
         if(method==='GET'||method==='PUT'){const validation=await this.sessions.engine.validate(project.path);return {content:existsSync(filename)?readFileSync(filename,'utf8'):'{}',...validation};}
       }
       if(method==='DELETE'&&!projectRoute[2])return {ok:true,project:this.removals.archiveProject(project.id)};
-      if(method==='PATCH'&&!projectRoute[2]){const next={...project};if(typeof body.name==='string')next.name=body.name;if(['codex','antigravity','claude'].includes(String(body.runtime)))next.runtime=body.runtime as Project['runtime'];if(['approve-all','rules','manual'].includes(String(body.approvalMode)))next.approvalMode=body.approvalMode as Project['approvalMode'];if(Array.isArray(body.rules))next.rules=body.rules as Project['rules'];if(body.workingDirectories!==undefined)next.workingDirectories=await validateWorkingDirectories(next.path,body.workingDirectories as never).catch(error=>{throw new HttpError(400,error.message);});this.store.set('projects',next);this.changed();return next;}
+      if(method==='PATCH'&&!projectRoute[2]){const next={...project};if(typeof body.name==='string')next.name=body.name;if(['codex','antigravity','claude'].includes(String(body.runtime)))next.runtime=body.runtime as Project['runtime'];if(['approve-all','rules','manual'].includes(String(body.approvalMode)))next.approvalMode=body.approvalMode as Project['approvalMode'];if(Array.isArray(body.rules))next.rules=body.rules as Project['rules'];if(body.developmentToolchain!==undefined)next.developmentToolchain=parseDevelopmentToolchain(body.developmentToolchain);if(body.workingDirectories!==undefined)next.workingDirectories=await validateWorkingDirectories(next.path,body.workingDirectories as never).catch(error=>{throw new HttpError(400,error.message);});this.store.set('projects',next);this.changed();return next;}
     }
     if(method==='GET'&&route==='/api/sessions')return ['1','true'].includes(url.searchParams.get('archived')||'')?this.state(true).sessions.filter(session=>session.archivedAt):this.state().sessions;
     if(method==='POST'&&route==='/api/sessions'){

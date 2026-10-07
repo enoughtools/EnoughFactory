@@ -2,10 +2,10 @@ import { randomUUID } from "node:crypto";
 import { mkdir, readFile, writeFile, copyFile, rm, access, readdir } from "node:fs/promises";
 import { join, resolve, dirname, isAbsolute } from "node:path";
 import { ArtifactStore, writeAtomic } from "./artifacts.ts";
-import { dockerCheckExecutor } from "./checks.ts";
+import { candidateDevelopmentToolchain, dockerCheckExecutor, frozenDevelopmentToolchain, sameDevelopmentRecipe } from "./checks.ts";
 import { git, run, safeId } from "./process.ts";
 import { WorkingDirectoryManager, workingDirectoryEmptyDirectories } from "./working-directories.ts";
-import type { ArtifactManifest, Candidate, CheckContext, CheckExecutor, CheckReport, IntegrationResult, ManagedWorkspaceProvider, WorkingDirectoryCapture, WorkspaceProvider, WorkspaceRecord } from "./types.ts";
+import type { ArtifactManifest, Candidate, CheckContext, CheckExecutor, CheckReport, DevelopmentToolchain, IntegrationResult, ManagedWorkspaceProvider, WorkingDirectoryCapture, WorkspaceProvider, WorkspaceRecord } from "./types.ts";
 
 export interface WorkspaceManagerOptions {
   dataDir: string;
@@ -29,7 +29,8 @@ export class WorkspaceManager {
     this.workingDirectories = new WorkingDirectoryManager({ dataDir: this.root, artifacts: this.artifacts });
   }
 
-  async create(input: { projectPath: string; goalId: string; taskId: string; attemptId: string; baseCommit?: string; provider?: WorkspaceProvider; fallbackToGit?: boolean; sessionName?: string; workspaceBranch?: string }): Promise<WorkspaceRecord> {
+  async create(input: { projectPath: string; goalId: string; taskId: string; attemptId: string; baseCommit?: string; provider?: WorkspaceProvider; fallbackToGit?: boolean; sessionName?: string; workspaceBranch?: string; developmentToolchain?: DevelopmentToolchain }): Promise<WorkspaceRecord> {
+    const developmentToolchain = frozenDevelopmentToolchain(input.developmentToolchain);
     for (const id of [input.goalId, input.taskId, input.attemptId]) safeId(id);
     const projectPath = await git(resolve(input.projectPath), "rev-parse", "--show-toplevel");
     const baseCommit = await git(projectPath, "rev-parse", "--verify", `${input.baseCommit ?? "HEAD"}^{commit}`);
@@ -39,6 +40,7 @@ export class WorkspaceManager {
     try {
       const existing = await this.workspace(workspaceId);
       if (existing.goalId !== input.goalId || existing.taskId !== input.taskId || existing.baseCommit !== baseCommit) throw new Error("Attempt identity already belongs to a different workspace");
+      if (JSON.stringify(existing.developmentToolchain) !== JSON.stringify(developmentToolchain)) throw new Error("Attempt identity already has a different frozen development toolchain");
       return existing;
     } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
 
@@ -55,7 +57,7 @@ export class WorkspaceManager {
       // Configuration can be local/untracked; the new repository gets only this explicit runtime config.
       const config = join(projectPath, ".envmux.json");
       if (await exists(config)) await copyFile(config, join(path, ".envmux.json"));
-      const record: WorkspaceRecord = { id: workspaceId, goalId: input.goalId, taskId: input.taskId, attemptId: input.attemptId, deviceId: this.options.deviceId, projectPath, path, provider: "git", baseCommit, branch, createdAt: new Date().toISOString() };
+      const record: WorkspaceRecord = { id: workspaceId, goalId: input.goalId, taskId: input.taskId, attemptId: input.attemptId, deviceId: this.options.deviceId, projectPath, path, provider: "git", baseCommit, branch, developmentToolchain, createdAt: new Date().toISOString() };
       if (input.provider === "artifactfs") {
         try {
           if (!this.options.artifactFs) throw new Error("ArtifactFS manager is not installed on this device");
@@ -73,7 +75,9 @@ export class WorkspaceManager {
   }
 
   async workspace(id: string): Promise<WorkspaceRecord> {
-    return JSON.parse(await readFile(join(this.root, "workspaces", safeId(id), "workspace.json"), "utf8")) as WorkspaceRecord;
+    const workspace = JSON.parse(await readFile(join(this.root, "workspaces", safeId(id), "workspace.json"), "utf8")) as WorkspaceRecord;
+    workspace.developmentToolchain = frozenDevelopmentToolchain(workspace.developmentToolchain);
+    return workspace;
   }
 
   async candidate(id: string): Promise<Candidate> {
@@ -109,10 +113,10 @@ export class WorkspaceManager {
     try {
       await git(path, "bundle", "create", bundlePath, ref);
       const metadata = { goalId: workspace.goalId, taskId: workspace.taskId, attemptId: workspace.attemptId };
-      const bundleArtifact = await this.artifacts.putFile(bundlePath, { ...metadata, name: `candidate-${id}.bundle`, mime: "application/x-git-bundle", metadata: { commit, ref, baseCommit: workspace.baseCommit } });
+      const bundleArtifact = await this.artifacts.putFile(bundlePath, { ...metadata, name: `candidate-${id}.bundle`, mime: "application/x-git-bundle", metadata: { commit, ref, baseCommit: workspace.baseCommit, developmentToolchain: workspace.developmentToolchain } });
       const diff = await git(path, "diff", "--binary", workspace.baseCommit, commit);
-      const diffArtifact = await this.artifacts.put(diff, { ...metadata, name: `candidate-${id}.patch`, mime: "text/x-diff", metadata: { commit, baseCommit: workspace.baseCommit } });
-      const candidate: Candidate = { id, workspaceId: workspace.id, ...metadata, deviceId: this.options.deviceId, baseCommit: workspace.baseCommit, commit, branch: reference, bundleArtifact, diffArtifact, repairConflicts: workspace.repairConflicts, workingDirectories: input.workingDirectories, createdAt: new Date().toISOString() };
+      const diffArtifact = await this.artifacts.put(diff, { ...metadata, name: `candidate-${id}.patch`, mime: "text/x-diff", metadata: { commit, baseCommit: workspace.baseCommit, developmentToolchain: workspace.developmentToolchain } });
+      const candidate: Candidate = { id, workspaceId: workspace.id, ...metadata, deviceId: this.options.deviceId, baseCommit: workspace.baseCommit, commit, branch: reference, bundleArtifact, diffArtifact, repairConflicts: workspace.repairConflicts, workingDirectories: input.workingDirectories, developmentToolchain: workspace.developmentToolchain, createdAt: new Date().toISOString() };
       validateCandidate(candidate);
       await mkdir(join(this.root, "candidates"), { recursive: true });
       await writeFile(join(this.root, "candidates", `${id}.json`), JSON.stringify(candidate), { flag: "wx", mode: 0o600 });
@@ -224,11 +228,20 @@ export class WorkspaceManager {
 
   private async checkAt(candidate: Candidate, path: string, commit: string, commands: string[], signal?: AbortSignal, baseCommit?: string): Promise<CheckReport> {
     const workingDirectories = await this.importWorkingDirectories(candidate, `${path}-working-directories`);
-    const report: CheckReport = { id: randomUUID(), candidateId: candidate.id, commit, baseCommit, status: commands.length ? "passed" : "not-configured", commands: [], logArtifact: undefined as unknown as ArtifactManifest, createdAt: new Date().toISOString() };
+    const report: CheckReport = { id: randomUUID(), candidateId: candidate.id, commit, baseCommit, candidateDevelopmentToolchain: frozenDevelopmentToolchain(candidate.developmentToolchain), status: commands.length ? "passed" : "not-configured", commands: [], logArtifact: undefined as unknown as ArtifactManifest, createdAt: new Date().toISOString() };
     for (const command of commands) {
       if (signal?.aborted) { report.status = "canceled"; break; }
       let result;
-      try { result = await this.executor({ path, commit, candidate, workingDirectories, command, timeoutMs: this.options.checkTimeoutMs ?? 15 * 60 * 1000, signal }); }
+      try {
+        result = await this.executor({ path, commit, candidate, workingDirectories, command, timeoutMs: this.options.checkTimeoutMs ?? 15 * 60 * 1000, signal });
+        const actualToolchain = frozenDevelopmentToolchain(result.developmentToolchain);
+        if (actualToolchain) {
+          if (!report.candidateDevelopmentToolchain || !sameDevelopmentRecipe(report.candidateDevelopmentToolchain, actualToolchain)) throw new Error("Checker development recipe does not match the frozen candidate");
+          if (report.developmentToolchain && JSON.stringify(report.developmentToolchain) !== JSON.stringify(actualToolchain)) throw new Error("The checker development toolchain changed within one report");
+          report.developmentToolchain = actualToolchain;
+          result = { ...result, developmentToolchain: actualToolchain };
+        }
+      }
       catch (error) { result = { command, exitCode: 1, stdout: "", stderr: error instanceof Error ? error.message : String(error), startedAt: new Date().toISOString(), endedAt: new Date().toISOString() }; }
       report.commands.push(result);
       if (result.exitCode !== 0 || result.timedOut) { report.status = signal?.aborted ? "canceled" : "failed"; break; }
@@ -249,7 +262,7 @@ export class WorkspaceManager {
       if (/^<{7} /m.test(contents) && /^>{7} /m.test(contents)) unresolved.push(file);
     }
     if (dirty || actualHead !== commit || unresolved.length || rootStates.some(root => root.dirty || root.actualHead !== root.commit || !root.emptyDirectoriesMatch)) report.status = "failed";
-    report.logArtifact = await this.artifacts.put(JSON.stringify({ ...report, logArtifact: undefined, dirty, actualHead, unresolved, workingDirectories: rootStates }), { name: `checks-${report.id}.json`, mime: "application/json", goalId: candidate.goalId, taskId: candidate.taskId, attemptId: candidate.attemptId, metadata: { commit, candidateId: candidate.id } });
+    report.logArtifact = await this.artifacts.put(JSON.stringify({ ...report, logArtifact: undefined, dirty, actualHead, unresolved, workingDirectories: rootStates }), { name: `checks-${report.id}.json`, mime: "application/json", goalId: candidate.goalId, taskId: candidate.taskId, attemptId: candidate.attemptId, metadata: { commit, candidateId: candidate.id, developmentToolchain: report.developmentToolchain, candidateDevelopmentToolchain: report.candidateDevelopmentToolchain } });
     await mkdir(join(this.root, "reports"), { recursive: true });
     await writeFile(join(this.root, "reports", `${report.id}.json`), JSON.stringify(report), { flag: "wx", mode: 0o600 });
     return report;
@@ -401,6 +414,7 @@ async function workingDirectoryGit(path: string, ...args: string[]): Promise<str
   return result.stdout.trim();
 }
 function validateCandidate(candidate: Candidate): void {
+  candidateDevelopmentToolchain(candidate);
   for (const value of [candidate.id, candidate.workspaceId, candidate.goalId, candidate.taskId, candidate.attemptId]) safeId(value);
   for (const commit of [candidate.baseCommit, candidate.commit]) if (!/^[a-f0-9]{40,64}$/.test(commit)) throw new Error("Candidate must identify exact Git commits");
   for (const path of candidate.repairConflicts ?? []) {

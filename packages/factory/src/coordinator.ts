@@ -295,6 +295,8 @@ export class FactoryCoordinator {
     const attempt = this.attempt(attemptId), task = this.task(attempt.taskId), goal = this.goal(task.goalId);
     if (terminalGoals.has(goal.status) || task.status === "completed") throw new Error("Integrated or terminal work cannot be retired as a live attempt.");
     if (!this.isCurrent(attempt)) throw new FactoryOperationError("stale", "This attempt no longer owns its task's execution authority.");
+    if (attempt.status === "failed") await this.retainFailedWork(attempt);
+    if (!this.isCurrent(attempt)) throw new FactoryOperationError("stale", "This attempt changed while its partial work was being retained.");
     this.options.store.transaction(() => {
       this.revoke(attempt); this.writeTask(task.id, { status: "queued", currentAttemptId: undefined });
       this.decision(goal.id, "attempt-retired", "Attempt authority was retired explicitly. A new isolated attempt may now be placed; external effects still require reconciliation.", { attemptId });
@@ -473,19 +475,13 @@ export class FactoryCoordinator {
       const retained = this.attemptDetail(attempt.id);
       if (retained.workspace && !retained.candidate) {
         try {
-          const partial = await this.options.workspaces.capture(retained.workspace, { goal, task, attempt: this.attempt(attempt.id) });
-          if (!this.isCurrent(attempt)) return;
-          this.options.store.transaction(() => {
-            this.options.store.set(TABLE.attemptDetails, { ...this.attemptDetail(attempt.id), candidate: partial });
-            this.options.store.set(TABLE.taskDetails, { ...this.taskDetail(task.id), lastCandidate: partial });
-            this.writeAttempt(attempt.id, { candidate: partial.commit });
-            this.decision(goal.id, "partial-work-retained", "Useful source from the confirmed failed turn was retained for its repair attempt.", { attemptId: attempt.id, candidate: partial.commit });
-          });
+          await this.retainFailedWork(attempt);
         } catch (error) {
           if (!this.isCurrent(attempt)) return;
           this.decision(goal.id, "partial-work-unavailable", "The failed attempt's environment remains preserved, but its candidate could not be captured.", { attemptId: attempt.id, error: this.error(error) });
         }
       }
+      if (!this.isCurrent(attempt)) return;
       this.failAttempt(attempt, result.error || result.text || "The runtime reported failure."); return;
     }
     this.writeAttempt(attempt.id, { status: "succeeded", endedAt: this.now() });
@@ -617,18 +613,23 @@ export class FactoryCoordinator {
     const operation = this.beginOperation(goal, "diagnosis"), control = this.control(goal.id);
     const taskId = control.diagnosisTaskId;
     if (!taskId) { this.operationFailed(goal.id, operation, new Error("Diagnosis has no task reference.")); return; }
-    const task = this.task(taskId), detail = this.taskDetail(taskId), attempt = task.currentAttemptId ? this.attempt(task.currentAttemptId) : undefined;
-    const repeated = detail.failureSignatures.length >= 3 && new Set(detail.failureSignatures.slice(-3)).size === 1;
-    const prompt = [
-      "You are the EnoughFactory repair supervisor. Decide the next concrete action after a confirmed failure. Return JSON {action:'retry'|'replan'|'wait',reason:string,instructions?:string,waitReason?:string,wakeCondition?:string}.",
-      "Retry must change the implementation approach or address the observed failure. Replan changes task decomposition or dependencies. Wait only for an identified external condition; do not ask for human permission already granted by project policy.",
-      "If a configured check is prose rather than an executable command, or requires future task outputs unrelated to this task's contract, replan to correct the verification scope. Do not make a worker fabricate missing future application layers or repeat unchanged invalid commands. Retain useful candidate work and keep checks proportionate to the task's actual deliverables.",
-      repeated ? "Three equivalent failures occurred. Choose a changed decomposition or external wait rather than repeating the same attempt." : "Make a proportionate repair decision and continue.",
-      this.context(goal), `Failed task: ${JSON.stringify(task)}`, `Failure: ${detail.lastError}`, `Retained work: ${JSON.stringify(detail.lastCandidate)}`, `Attempt evidence: ${JSON.stringify(attempt ? this.attemptDetail(attempt.id) : {})}`,
-    ].join("\n\n");
+    const task = this.task(taskId), attempt = task.currentAttemptId ? this.attempt(task.currentAttemptId) : undefined;
+    const diagnosisCurrent = () => this.operationCurrent(goal.id, operation) && (!attempt || (this.isCurrent(attempt) && this.attempt(attempt.id).status === "failed"));
     try {
+      if (attempt && attempt.status !== "failed") throw new FactoryControllerError("The attempt's failure is not confirmed. Reconcile its owner before preparing recovery.", "controller-retry-required");
+      if (attempt) await this.retainFailedWork(attempt, diagnosisCurrent);
+      if (!diagnosisCurrent()) return;
+      const detail = this.taskDetail(taskId);
+      const repeated = detail.failureSignatures.length >= 3 && new Set(detail.failureSignatures.slice(-3)).size === 1;
+      const prompt = [
+        "You are the EnoughFactory repair supervisor. Decide the next concrete action after a confirmed failure. Return JSON {action:'retry'|'replan'|'wait',reason:string,instructions?:string,waitReason?:string,wakeCondition?:string}.",
+        "Retry must change the implementation approach or address the observed failure. Replan changes task decomposition or dependencies. Wait only for an identified external condition; do not ask for human permission already granted by project policy.",
+        "If a configured check is prose rather than an executable command, or requires future task outputs unrelated to this task's contract, replan to correct the verification scope. Do not make a worker fabricate missing future application layers or repeat unchanged invalid commands. Retain useful candidate work and keep checks proportionate to the task's actual deliverables.",
+        repeated ? "Three equivalent failures occurred. Choose a changed decomposition or external wait rather than repeating the same attempt." : "Make a proportionate repair decision and continue.",
+        this.context(goal), `Failed task: ${JSON.stringify(task)}`, `Failure: ${detail.lastError}`, `Retained work: ${JSON.stringify(detail.lastCandidate)}`, `Attempt evidence: ${JSON.stringify(attempt ? this.attemptDetail(attempt.id) : {})}`,
+      ].join("\n\n");
       const response = await this.options.runtime.complete({ goal, role: "diagnosis", prompt, project: this.project(goal), signal: this.operationControllers.get(goal.id)?.signal });
-      if (!this.operationCurrent(goal.id, operation)) return;
+      if (!diagnosisCurrent()) return;
       this.recordSpend(goal.id, response.spend);
       const decision = readJsonObject(response.text);
       if (!["retry", "replan", "wait"].includes(String(decision.action)) || typeof decision.reason !== "string" || !decision.reason.trim()) throw new FactoryDecisionError("Repair decision must specify retry, replan or wait and a reason.");
@@ -653,6 +654,26 @@ export class FactoryCoordinator {
       }
       this.changed();
     } catch (error) { this.operationFailed(goal.id, operation, error); }
+  }
+
+  /** Retention is evidence of source only; a confirmed failure stays failed and unchecked. */
+  private async retainFailedWork(attempt: Attempt, canRetain = () => this.isCurrent(attempt)): Promise<void> {
+    if (!canRetain()) return;
+    const detail = this.attemptDetail(attempt.id), current = this.attempt(attempt.id);
+    if (!detail.workspace || detail.candidate || (current.status !== "failed" && detail.result?.status !== "failed")) return;
+    const task = this.task(attempt.taskId), goal = this.goal(task.goalId);
+    let candidate: CandidateRef;
+    try { candidate = await this.options.workspaces.capture(detail.workspace, { goal, task, attempt: current }); }
+    catch (error) {
+      throw new FactoryControllerError(`The failed attempt's partial work could not be saved. Its original environment is preserved. Resolve the storage or runtime problem, then retry recovery. ${this.error(error)}`, "controller-retry-required", { cause: error });
+    }
+    if (!canRetain() || this.attemptDetail(attempt.id).candidate) return;
+    this.options.store.transaction(() => {
+      this.options.store.set(TABLE.attemptDetails, { ...this.attemptDetail(attempt.id), candidate });
+      this.options.store.set(TABLE.taskDetails, { ...this.taskDetail(task.id), lastCandidate: candidate });
+      this.writeAttempt(attempt.id, { candidate: candidate.commit });
+      this.decision(goal.id, "partial-work-retained", "Useful source from the confirmed failed turn was retained for its repair attempt.", { attemptId: attempt.id, candidate: candidate.commit });
+    });
   }
 
   private async evaluate(goal: Goal): Promise<void> {

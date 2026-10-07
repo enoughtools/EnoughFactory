@@ -5,6 +5,12 @@ export type ApprovalMode = "approve-all" | "rules" | "manual";
 export type AutonomyMode = "manual" | "assisted" | "autonomous";
 export interface PolicyRule { id: string; tool?: string; commandPattern?: string; decision: "allow" | "deny" | "ask"; }
 export interface WorkingDirectory { id: string; name: string; path: string; }
+export type DevelopmentToolchainId = "default" | "swift-6.0.3";
+/** Fixed recipe and immutable image actually used by an owned container runtime. */
+export interface DevelopmentToolchain {
+  id: "swift-6.0.3"; recipeSha256: string; image: string; baseImage: string;
+  platform: "linux/arm64" | "linux/amd64"; swiftVersion: string; nodeVersion: string;
+}
 export interface WorkingDirectoryMount {
   id: string; name: string; path: string; kind: "git" | "folder"; baseCommit: string; sourceCommit?: string;
   status: "preparing" | "ready" | "captured" | "failed"; error?: string;
@@ -16,6 +22,8 @@ export interface Project {
   internal?: boolean; sourceProjectId?: string;
   /** Additional roots are writable isolated snapshots; only the primary repository auto-integrates. */
   workingDirectories?: WorkingDirectory[];
+  /** Absent detects Swift source; default explicitly retains the ordinary environment. */
+  developmentToolchain?: DevelopmentToolchainId;
   /** Reversible catalog removal. Repository files and retained history are unchanged. */
   archivedAt?: string;
 }
@@ -28,6 +36,7 @@ export interface Session {
   phase?: string; error?: string; createdAt: string; updatedAt: string; branch?: string;
   services: Service[]; containerId?: string; enginePid?: number;
   workingDirectories?: WorkingDirectoryMount[];
+  developmentToolchain?: DevelopmentToolchain;
   /** Reversible catalog removal; execution and evidence records remain available by identity. */
   archivedAt?: string;
 }
@@ -87,12 +96,13 @@ export type TaskWorkState = "blocked" | "ready" | "queued" | "running" | "review
 export interface TaskCheck {
   command: string; passed: boolean; output: string; exitCode?: number;
   candidateCommit: string; checkedCommit?: string; outputTruncated?: boolean;
+  developmentToolchain?: DevelopmentToolchain;
 }
 export interface AttemptInspection {
   attempt: Attempt; phase?: AttemptPhase; cancellation?: "none" | "requested" | "acknowledged";
   contract?: { title: string; description: string; kind?: TaskKind; acceptanceCriteria?: string[]; expectedOutputs?: string[]; estimatedMinutes?: number; writePaths?: string[]; resources?: TaskResources; dependsOn: string[]; checks: string[]; planRevision: number };
-  workspace?: { id: string; provider: "git" | "artifactfs"; baseCommit: string; sessionId?: string; deviceId?: string; workingDirectories?: WorkingDirectoryMount[] };
-  candidate?: { id: string; commit: string; baseCommit: string; branch?: string; tree?: string; deviceId?: string };
+  workspace?: { id: string; provider: "git" | "artifactfs"; baseCommit: string; sessionId?: string; deviceId?: string; workingDirectories?: WorkingDirectoryMount[]; developmentToolchain?: DevelopmentToolchain };
+  candidate?: { id: string; commit: string; baseCommit: string; branch?: string; tree?: string; deviceId?: string; developmentToolchain?: DevelopmentToolchain };
   result?: { status: string; text: string; error?: string; waitReason?: string; wakeCondition?: string };
   checks?: TaskCheck[];
   integration?: { commit: string; previousHead: string; candidateCommit: string; checks: TaskCheck[] };

@@ -191,6 +191,11 @@ internal static class DockerSpec
 
         var (memory, cpus) = Limits(spec);
         var workspace = MachineWorkspaceBinding.ForSpec(spec);
+        var labels = LabelsFor(spec);
+        if (config.ManagedGoldenImage is { } golden && !IsService(spec))
+        {
+            labels[DockerImages.Labels.GoldenImage] = golden;
+        }
 
         var container = new ContainerCreate
         {
@@ -198,7 +203,7 @@ internal static class DockerSpec
             Hostname = spec.Name,
             Init = true,
             Env = EnvironmentOf(spec),
-            Labels = LabelsFor(spec),
+            Labels = labels,
             Mounts = [.. Volumes(spec).Select(v => new MountSpec("volume", v.Name, v.Path)),
                 .. workspace?.BindMounts ?? Array.Empty<MountSpec>()],
             Network = network,
