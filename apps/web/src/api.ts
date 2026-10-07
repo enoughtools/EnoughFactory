@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { FactoryState } from '@enoughfactory/contracts';
 import { browserPeerClient, PeerSocket, peerChanges, type ClientSocket } from './browserPeers';
+import { connectFactoryEvents, onFactoryForeground } from './live-updates';
 
 export interface Connection { url: string; token: string; mode?: 'http' | 'peer'; deviceId?: string; version?: string; appVersion?: string }
 export interface DesktopBridge {
@@ -110,6 +111,7 @@ export function useFactory() {
   const [bootstrapped, setBootstrapped] = useState(() => !window.enoughFactory);
   const bootstrappedRef = useRef(bootstrapped);
   const requestGeneration = useRef(0);
+  const refreshSequence = useRef(0);
   const desktopServiceUrl = useRef<string | null>(null);
   const desktopReconnectNeeded = useRef(Boolean(window.enoughFactory));
   const client = useRef(new DeviceClient(connection));
@@ -117,16 +119,18 @@ export function useFactory() {
     if (!bootstrappedRef.current) return;
     if (!canConnect(client.current.connection)) { setError(CONNECT_DEVICE_MESSAGE); setLoading(false); return; }
     const generation = requestGeneration.current;
+    const sequence = ++refreshSequence.current;
+    const current = () => generation === requestGeneration.current && sequence === refreshSequence.current;
     try {
       const next = await client.current.request<FactoryState>('/api/state', { signal: AbortSignal.timeout(8000) });
-      if (generation !== requestGeneration.current) return;
+      if (!current()) return;
       desktopReconnectNeeded.current = false; setState(next); setError(null);
     } catch (cause) {
-      if (generation === requestGeneration.current) {
+      if (current()) {
         desktopReconnectNeeded.current = Boolean(window.enoughFactory) && client.current.connection.mode !== 'peer' && client.current.connection.url === desktopServiceUrl.current;
         setError(cause instanceof Error ? cause.message : 'The device is unavailable.');
       }
-    } finally { if (generation === requestGeneration.current) setLoading(false); }
+    } finally { if (current()) setLoading(false); }
   }, []);
   const setConnection = useCallback((next: Connection) => {
     bootstrappedRef.current = true; setBootstrapped(true);
@@ -162,7 +166,6 @@ export function useFactory() {
   useEffect(() => {
     if (!bootstrapped) return;
     if (!canConnect(connection)) { setError(CONNECT_DEVICE_MESSAGE); setLoading(false); return; }
-    const abort = new AbortController();
     void refresh();
     const fallback = setInterval(() => void refresh(), 15_000);
     let debounce: ReturnType<typeof setTimeout> | undefined;
@@ -174,21 +177,19 @@ export function useFactory() {
       }
       clearTimeout(debounce); debounce = setTimeout(() => void refresh(), 100);
     };
-    async function subscribe() {
-      try {
-        const response = await fetch(client.current.url('/api/events'), { signal: abort.signal, headers: connection.token ? { Authorization: `Bearer ${connection.token}` } : {} });
-        if (!response.ok || !response.body) return;
-        const reader = response.body.getReader();
-        while (!abort.signal.aborted) {
-          const result = await reader.read();
-          if (result.done) break;
-          clearTimeout(debounce); debounce = setTimeout(() => void refresh(), 100);
-        }
-      } catch { /* Polling retains a live catalog if the event stream reconnects. */ }
-    }
+    const stream = connection.mode === 'peer' ? undefined : connectFactoryEvents({
+      url: client.current.url('/api/events'),
+      headers: connection.token ? { Authorization: `Bearer ${connection.token}` } : {},
+      onChange: () => { clearTimeout(debounce); debounce = setTimeout(() => void refresh(), 100); },
+      onDisconnect: () => { void refresh(); },
+    });
+    const stopForeground = onFactoryForeground(window, document, () => {
+      clearTimeout(debounce);
+      void refresh();
+      stream?.reconnect();
+    });
     if (connection.mode === 'peer') { peerChanges.addEventListener('change', peerUpdated); peerChanges.addEventListener('devices', peerUpdated); }
-    else void subscribe();
-    return () => { abort.abort(); clearInterval(fallback); clearTimeout(debounce); peerChanges.removeEventListener('change', peerUpdated); peerChanges.removeEventListener('devices', peerUpdated); };
+    return () => { stream?.close(); stopForeground(); clearInterval(fallback); clearTimeout(debounce); peerChanges.removeEventListener('change', peerUpdated); peerChanges.removeEventListener('devices', peerUpdated); };
   }, [bootstrapped, connection, refresh]);
   return { state, error, loading, client: client.current, refresh, connection, setConnection };
 }
