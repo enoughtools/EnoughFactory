@@ -207,7 +207,7 @@ export class FactoryCoordinator {
     if (terminalGoals.has(goal.status)) throw new Error("The goal is terminal.");
     if (this.attempts(goalId).some(attempt => activeAttempts.has(attempt.status)) || this.tasks(goalId).some(task => task.status === "review")) throw new Error("Work is active or awaiting integration. Use goal steering to revise and revoke it explicitly.");
     this.options.store.transaction(() => {
-      this.options.store.set(TABLE.control, { ...this.control(goalId), stage: "plan", manualAction: "plan", operation: undefined, replanReason: "A fresh plan was requested.", replanInstructions: undefined, waitingFor: undefined, waitReason: undefined, wakeAt: undefined, controllerFailures: undefined });
+      this.options.store.set(TABLE.control, { ...this.control(goalId), stage: "plan", manualAction: "plan", operation: undefined, replanReason: "A fresh plan was requested.", replanInstructions: undefined, replanTaskIds: undefined, decisionFailures: undefined, waitingFor: undefined, waitReason: undefined, wakeAt: undefined, controllerFailures: undefined });
       this.writeGoal(goalId, { revision: goal.revision + 1, status: goal.status === "paused" ? "paused" : "planning", nextAction: "Plan the requested work" });
       for (const task of this.tasks(goalId).filter(task => task.status !== "completed")) this.writeTask(task.id, { status: "canceled" });
       this.decision(goalId, "plan-requested", "A new plan was requested from current accepted work; pending proposals were replaced.");
@@ -271,7 +271,7 @@ export class FactoryCoordinator {
     const attempts = this.attempts(goalId).filter(attempt => activeAttempts.has(attempt.status));
     this.options.store.transaction(() => {
       const control = this.control(goalId);
-      this.options.store.set(TABLE.control, { ...control, stage: "plan", operation: undefined, steering: input.context ? [...control.steering, input.context.trim()] : control.steering, replanReason: "User steering changed the goal context.", replanInstructions: undefined, waitingFor: undefined, waitReason: undefined, wakeAt: undefined, controllerFailures: undefined });
+      this.options.store.set(TABLE.control, { ...control, stage: "plan", operation: undefined, steering: input.context ? [...control.steering, input.context.trim()] : control.steering, replanReason: "User steering changed the goal context.", replanInstructions: undefined, replanTaskIds: undefined, decisionFailures: undefined, waitingFor: undefined, waitReason: undefined, wakeAt: undefined, controllerFailures: undefined });
       this.writeGoal(goalId, {
         revision: goal.revision + 1, status: goal.status === "paused" ? "paused" : "planning", nextAction: "Revise the plan for the updated goal",
         ...(input.objective === undefined ? {} : { objective: input.objective.trim() }),
@@ -348,10 +348,39 @@ export class FactoryCoordinator {
     this.changed();
   }
 
+  /** Include settled failures in the same repair, without revoking unrelated execution. */
+  private expandRepairScope(goalId: string): string[] | undefined {
+    const control = this.control(goalId);
+    if (!control.replanTaskIds?.length) return control.replanTaskIds;
+    const tasks = this.tasks(goalId), scope = new Set(control.replanTaskIds);
+    const reserved = new Set(this.activeWork().map(task => task.id));
+    const attempts = this.attempts(goalId), added: string[] = [];
+    for (const failed of tasks.filter(task => task.status === "failed" && !scope.has(task.id))) {
+      const branch = new Set([failed.id, ...descendants(tasks, [failed.id])]);
+      const additional = tasks.filter(task => branch.has(task.id) && task.status !== "completed" && !scope.has(task.id));
+      if (additional.some(task => reserved.has(task.id) || task.status === "running" || task.status === "review" || this.taskDetail(task.id).waitingFor)) continue;
+      const ids = new Set(additional.map(task => task.id));
+      if (attempts.some(attempt => {
+        if (!ids.has(attempt.taskId)) return false;
+        const detail = this.options.store.get<AttemptDetail>(TABLE.attemptDetails, attempt.id);
+        const needsRetention = detail?.workspace && !detail.candidate && tasks.some(task => task.id === attempt.taskId && task.currentAttemptId === attempt.id) && (attempt.status === "failed" || detail.result?.status === "failed");
+        return !detail || needsRetention || activeAttempts.has(attempt.status) || detail.cancellation === "requested" || this.busyAttempts.has(attempt.id) || this.reconciling.has(attempt.id);
+      })) continue;
+      for (const task of additional) { scope.add(task.id); added.push(task.id); }
+    }
+    if (!added.length) return control.replanTaskIds;
+    this.options.store.transaction(() => {
+      this.options.store.set(TABLE.control, { ...this.control(goalId), replanTaskIds: [...scope], decisionFailures: undefined });
+      for (const id of added) this.writeTask(id, { status: "canceled" });
+      this.decision(goalId, "repair-scope-expanded", "The repair also includes settled failed work and its pending dependents; unrelated execution and accepted work remain preserved.", { taskIds: added });
+    });
+    return [...scope];
+  }
+
   private async plan(goal: Goal): Promise<void> {
+    const scope = this.expandRepairScope(goal.id);
     const operation = this.beginOperation(goal, "planner"), project = this.project(goal);
     const completed = this.tasks(goal.id).filter(task => task.status === "completed");
-    const scope = this.control(goal.id).replanTaskIds;
     const preserved = scope ? this.tasks(goal.id).filter(task => !scope.includes(task.id) && task.status !== "canceled") : completed;
     try {
       const prompt = controllerPrompt(evidence => {

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { chmod, lstat, mkdtemp, mkdir, readFile, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, cp, lstat, mkdtemp, mkdir, readFile, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -105,5 +105,60 @@ test("extra roots retain ignored/untracked files, isolate identities, and recons
     assert.equal(await git(source, "status", "--porcelain=v1", "--untracked-files=all"), originalStatus);
     assert.equal(await readFile(join(source, "tracked.txt"), "utf8"), "local edit\n");
     assert.equal(await readFile(join(source, "ignored.txt"), "utf8"), "ignored input\n");
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("extra-root capture separates generated Swift caches from source without dropping tracked or arbitrary build inputs", async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "enough-working-swift-cache-")));
+  try {
+    const source = join(root, "source"), owned = join(root, "owned"), exported = join(owned, "exported");
+    await mkdir(source); await mkdir(owned);
+    await git(source, "init", "--quiet");
+    await git(source, "config", "user.name", "Fixture"); await git(source, "config", "user.email", "fixture@example.test");
+    await writeFile(join(source, ".gitignore"), "*.txt\n");
+    for (const name of ["Generated", "Tracked", "Linked"]) {
+      await mkdir(join(source, "Packages", name), { recursive: true });
+      await writeFile(join(source, "Packages", name, "Package.swift"), "// swift-tools-version: 6.0\n");
+    }
+    await mkdir(join(source, "Packages", "Tracked", ".build"));
+    await writeFile(join(source, "Packages", "Tracked", ".build", "input.swift"), "let authoredInput = true\n");
+    await git(source, "add", "."); await git(source, "commit", "-m", "Swift source and tracked build input");
+    const artifacts = new ArtifactStore(join(owned, "artifacts"), "fixture-device");
+    const manager = new WorkingDirectoryManager({ dataDir: owned, artifacts });
+    const snapshot = (await manager.prepare({ identity: "swift-attempt", sources: [{ id: "swift", name: "swift", path: source }] }))[0]!;
+    await cp(snapshot.path, exported, { recursive: true });
+    await writeFile(join(exported, ".git", "config"), "untrusted exported metadata\n");
+    await mkdir(join(exported, "Packages", "New"), { recursive: true });
+    await writeFile(join(exported, "Packages", "New", "Package.swift"), "// swift-tools-version: 6.0\n");
+    await writeFile(join(exported, "cache-input.bin"), "authored symlink target\n");
+    for (const name of ["Generated", "Tracked", "New", "Linked"]) {
+      const cache = join(exported, "Packages", name, ".build");
+      await mkdir(join(cache, "aarch64-unknown-linux-gnu", "debug"), { recursive: true });
+      if (name === "Linked") await symlink("../../../cache-input.bin", join(cache, "build.db"));
+      else await writeFile(join(cache, "build.db"), `${name} generated cache\n`);
+      await writeFile(join(cache, "aarch64-unknown-linux-gnu", "debug", "description.json"), "{}\n");
+      await writeFile(join(cache, "aarch64-unknown-linux-gnu", "debug", "output.o"), "generated object\n");
+    }
+    await writeFile(join(exported, "analysis.txt"), "authored ignored output\n");
+    await writeFile(join(exported, "Added.swift"), "let addedSource = true\n");
+    await mkdir(join(exported, "notes", ".build"), { recursive: true });
+    await writeFile(join(exported, "notes", ".build", "design.txt"), "authored arbitrary build directory\n");
+    const capture = await manager.captureFromPath(snapshot, exported);
+    const imported = join(owned, "checks", "swift");
+    await manager.importCapture(capture, imported);
+    const tracked = (await git(imported, "ls-files", "-z")).split("\0").filter(Boolean);
+    for (const name of ["Generated", "New"]) {
+      assert.equal(tracked.some((path) => path.startsWith(`Packages/${name}/.build/`)), false);
+      assert.ok(tracked.includes(`Packages/${name}/Package.swift`));
+      assert.equal(await readFile(join(exported, "Packages", name, ".build", "build.db"), "utf8"), `${name} generated cache\n`);
+    }
+    assert.ok(tracked.includes("Packages/Tracked/.build/input.swift"));
+    assert.ok(tracked.includes("Packages/Tracked/.build/build.db"));
+    assert.ok(tracked.includes("Packages/Linked/.build/build.db"));
+    assert.equal((await lstat(join(imported, "Packages", "Linked", ".build", "build.db"))).isSymbolicLink(), true);
+    assert.equal(await readFile(join(imported, "analysis.txt"), "utf8"), "authored ignored output\n");
+    assert.equal(await readFile(join(imported, "Added.swift"), "utf8"), "let addedSource = true\n");
+    assert.equal(await readFile(join(imported, "notes", ".build", "design.txt"), "utf8"), "authored arbitrary build directory\n");
+    assert.equal(await readFile(join(exported, ".git", "config"), "utf8"), "untrusted exported metadata\n");
   } finally { await rm(root, { recursive: true, force: true }); }
 });

@@ -183,6 +183,104 @@ test("localized replanning preserves unrelated running authority, immutable chec
   } finally { await factory.close(); }
 });
 
+test("localized planning includes independently failed branches without changing accepted or live authority", async () => {
+  const factory = harness(plan([
+    planned("accepted"), planned("broken", { estimatedMinutes: 100 }),
+    planned("independent-failure", { estimatedMinutes: 90 }),
+    planned("dependent", { dependsOn: ["broken", "independent-failure"] }),
+    planned("independent-dependent", { dependsOn: ["independent-failure"] }),
+    planned("live", { estimatedMinutes: 80 }), planned("queued", { resources: { cpus: 4 } }),
+  ]), { capacity: 4, cpus: 4 });
+  try {
+    await factory.startPlan(); await factory.coordinator.tick();
+    await settle(() => factory.calls.executions.length === 4, "independent authors entered");
+    factory.finish("accepted"); factory.finish("broken", "failed"); factory.finish("independent-failure", "failed");
+    await settle(() => factory.task("accepted").status === "completed" && factory.task("broken").status === "failed" && factory.task("independent-failure").status === "failed", "accepted and failed outcomes retained");
+    await factory.coordinator.tick(); await factory.coordinator.tick();
+    await settle(() => factory.calls.diagnoses.length === 1, "localized diagnosis entered");
+    factory.diagnosis.resolve({ action: "replan", reason: "Repair the two failed prerequisites", instructions: "Keep both retained candidates and their stable keys" });
+    await settle(() => factory.control().stage === "plan", "localized repair persisted");
+    assert.deepEqual(new Set(factory.control().replanTaskIds), new Set([factory.task("broken").id, factory.task("dependent").id]));
+    const accepted = factory.task("accepted"), acceptedDetail = factory.detail("accepted");
+    const live = factory.task("live"), liveAttempt = factory.attempt("live"), liveDetail = factory.attemptDetail("live");
+    const queued = factory.task("queued"), queuedDetail = factory.detail("queued");
+    const failedId = factory.task("independent-failure").id, dependentId = factory.task("independent-dependent").id;
+    const retainedCandidate = factory.detail("independent-failure").lastCandidate;
+    const ended = factory.store.list<Attempt>("attempts").filter(attempt => attempt.status !== "running");
+    const endedDetails = ended.map(attempt => factory.store.get<AttemptDetail>("factory-attempt-details", attempt.id));
+    factory.store.set("factory-control", { ...factory.control(), decisionFailures: { signature: "preserved-key-conflict", count: 4 } });
+    await factory.coordinator.tick();
+    await settle(() => factory.calls.plans.length === 2, "expanded repair planner entered");
+    assert.deepEqual(new Set(factory.control().replanTaskIds), new Set([factory.task("broken").id, factory.task("dependent").id, failedId, dependentId]));
+    assert.equal(factory.control().decisionFailures, undefined, "the corrected repair scope starts a fresh validation budget");
+    assert.equal(factory.store.get<Goal>("goals", factory.goal.id)!.revision, 2);
+    assert.equal(factory.task("independent-failure").status, "canceled");
+    assert.deepEqual(factory.task("live"), live);
+    assert.deepEqual(factory.attempt("live"), liveAttempt);
+    assert.deepEqual(factory.attemptDetail("live"), liveDetail);
+    factory.nextPlan.resolve(plan([
+      planned("broken"), planned("independent-failure", { title: "Repair both retained failure paths" }),
+      planned("dependent", { dependsOn: ["broken", "independent-failure"] }),
+      planned("independent-dependent", { dependsOn: ["independent-failure"] }),
+    ]));
+    await settle(() => factory.control().stage === "dispatch", "all failed work accepted in the repair plan");
+    assert.equal(factory.task("independent-failure").id, failedId);
+    assert.equal(factory.task("independent-dependent").id, dependentId);
+    assert.equal(factory.task("independent-failure").status, "queued");
+    assert.deepEqual(factory.detail("independent-failure").lastCandidate, retainedCandidate);
+    assert.deepEqual(factory.task("accepted"), accepted);
+    assert.deepEqual(factory.detail("accepted"), acceptedDetail);
+    assert.deepEqual(factory.task("queued"), queued);
+    assert.deepEqual(factory.detail("queued"), queuedDetail);
+    assert.deepEqual(ended.map(attempt => factory.store.get<Attempt>("attempts", attempt.id)), ended, "ended execution outcomes are never rewritten by widening or applying a repair");
+    assert.deepEqual(ended.map(attempt => factory.store.get<AttemptDetail>("factory-attempt-details", attempt.id)), endedDetails, "candidate, check and integration evidence stays immutable");
+    assert.deepEqual(factory.calls.cancelled, []);
+  } finally { await factory.close(); }
+});
+
+for (const fence of ["running", "unknown", "unconfirmed", "review", "external-wait", "uncaptured-source"] as const) {
+  test(`localized planning preserves an independent failed branch with ${fence} authority`, async () => {
+    const factory = harness(plan([
+      planned("scoped", { resources: { cpus: 2 } }), planned("failed", { resources: { cpus: 2 } }),
+      planned("protected", { dependsOn: ["failed"], resources: { cpus: 2 } }),
+    ]), { capacity: 1, cpus: 1 });
+    const cancellation = deferred<void>();
+    try {
+      await factory.startPlan();
+      factory.store.set("tasks", { ...factory.task("scoped"), status: "canceled" });
+      factory.store.set("tasks", { ...factory.task("failed"), status: "failed", currentAttemptId: "ended-failure" });
+      const ended: Attempt = { id: "ended-failure", taskId: factory.task("failed").id, deviceId: factory.device.id, generation: 1, status: "failed", startedAt: factory.device.lastSeen };
+      const endedDetail: AttemptDetail = { id: ended.id, goalId: factory.goal.id, goalRevision: 1, phase: "done", cancellation: "none", result: { status: "failed", text: "Known failure" }, candidate: { id: "retained", commit: "retained-source", baseCommit: "base" } };
+      if (fence === "uncaptured-source") {
+        delete endedDetail.candidate;
+        endedDetail.workspace = { id: "failed-workspace", path: "/workspace/uncaptured", baseCommit: "base", provider: "git" };
+      }
+      factory.store.set("attempts", ended); factory.store.set("factory-attempt-details", endedDetail);
+      if (fence === "external-wait") factory.store.set("factory-task-details", { ...factory.detail("failed"), waitingFor: "credentials-available" });
+      else if (fence === "review") factory.store.set("tasks", { ...factory.task("protected"), status: "review" });
+      else if (fence !== "uncaptured-source") {
+        const status = fence === "unconfirmed" ? "retired" : fence;
+        const attempt: Attempt = { id: "protected-owner", taskId: factory.task("protected").id, deviceId: factory.device.id, generation: 1, status, startedAt: factory.device.lastSeen };
+        factory.store.set("attempts", attempt);
+        factory.store.set<AttemptDetail>("factory-attempt-details", { id: attempt.id, goalId: factory.goal.id, goalRevision: 1, phase: "executing", cancellation: fence === "unconfirmed" ? "requested" : "none" });
+        factory.store.set("tasks", { ...factory.task("protected"), currentAttemptId: attempt.id, status: fence === "running" ? "running" : "queued" });
+      }
+      factory.store.set("factory-control", { ...factory.control(), stage: "plan", replanTaskIds: [factory.task("scoped").id] });
+      // Keep a requested remote cancellation unresolved for this planner turn.
+      if (fence === "unconfirmed") factory.cancelling(() => cancellation.promise);
+      await factory.coordinator.tick();
+      await settle(() => factory.calls.plans.length === 2, "fenced localized planner entered");
+      assert.deepEqual(factory.control().replanTaskIds, [factory.task("scoped").id]);
+      factory.nextPlan.resolve(plan([planned("scoped")]));
+      await settle(() => factory.control().stage === "dispatch", "fenced repair accepted");
+      assert.equal(factory.task("failed").status, "failed");
+      assert.deepEqual(factory.store.get<Attempt>("attempts", ended.id), ended);
+      assert.deepEqual(factory.store.get<AttemptDetail>("factory-attempt-details", ended.id), endedDetail);
+      assert.ok(factory.task("protected").status !== "canceled");
+    } finally { cancellation.resolve(); await factory.close(); }
+  });
+}
+
 test("diagnosis handoff reaches replacement planning and execution without reviving obsolete retry instructions", async () => {
   const factory = harness(plan([
     planned("accepted"), planned("integration", { dependsOn: ["accepted"] }),
@@ -247,10 +345,12 @@ test("explicit replanning and user steering cannot leak an older pending diagnos
       const retained = { id: "latest-retained-source", commit: "latest-retained-commit", baseCommit: "base" };
       const obsolete = "Restore the superseded source and implement the obsolete deployment requirement";
       factory.store.set("factory-task-details", { ...factory.detail("integration"), repairInstructions: obsolete, lastCandidate: retained });
-      factory.store.set("factory-control", { ...factory.control(), replanInstructions: "Superseded diagnosis handoff" });
+      factory.store.set("factory-control", { ...factory.control(), replanInstructions: "Superseded diagnosis handoff", replanTaskIds: [factory.task("integration").id], decisionFailures: { signature: "old-localized-conflict", count: 4 } });
       if (action !== "steer") factory.coordinator.requestPlan(factory.goal.id);
       else await factory.coordinator.steer(factory.goal.id, { context: "Use the new user-requested integration behavior" });
       assert.equal(factory.control().replanInstructions, undefined);
+      assert.equal(factory.control().replanTaskIds, undefined, "a full replan cannot inherit an older localized repair boundary");
+      assert.equal(factory.control().decisionFailures, undefined);
       await factory.coordinator.tick();
       await settle(() => factory.calls.plans.length === 2, "explicit replacement planner entered");
       assert.ok(!factory.calls.plans[1]!.includes("Superseded diagnosis handoff"));

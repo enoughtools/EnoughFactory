@@ -8,7 +8,7 @@ import {
   type CandidateRef, type ExecutionResult, type CheckResult, type CreateGoalInput,
   type RepositoryEvidence, type EvaluationRecord, type ControlRecord, type TaskDetail, type AttemptDetail, type FactoryStore,
 } from '@enoughfactory/factory';
-import { WorkspaceManager, ArtifactFsWorkspaceProvider, dockerCheckExecutor, appleCheckExecutor, isAppleCheckCommand, appleCheckArtifacts, fingerprintWorkingDirectories, type WorkingDirectorySource, type WorkingDirectoryCapture, type ArtifactManifest, type Candidate, type CheckReport, type WorkspaceRecord } from '@enoughfactory/workspaces';
+import { WorkspaceManager, ArtifactFsWorkspaceProvider, dockerCheckExecutor, appleCheckExecutor, isAppleCheckCommand, appleCheckArtifacts, fingerprintWorkingDirectories, stageCapturedSource, type WorkingDirectorySource, type WorkingDirectoryCapture, type ArtifactManifest, type Candidate, type CheckReport, type WorkspaceRecord } from '@enoughfactory/workspaces';
 import type { PeerManager } from '@enoughfactory/peers';
 import type { TurnResult } from '@enoughfactory/agents';
 import { dockerInvocation, SWIFT_TOOLCHAIN, validatePreparedToolchain } from '@enoughfactory/runtime';
@@ -464,12 +464,16 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
           const engine = app.sessions.get(session.id);
           const containerGit = async (...args: string[]) => {
             const invocation=dockerInvocation(app.runtime.endpoint,['exec',engine.ready.instance,'git','-c','safe.directory=*','-c','core.hooksPath=/dev/null','-C',engine.ready.workdir,...args]);
-            return (await exec(invocation.command,invocation.args,{env:invocation.env,maxBuffer:16*1024*1024})).stdout.trim();
+            return (await exec(invocation.command,invocation.args,{env:invocation.env,maxBuffer:16*1024*1024})).stdout;
           };
-          await containerGit('add', '--all');
+          await stageCapturedSource(containerGit, { isRegularFile: async relativePath => {
+            const invocation=dockerInvocation(app.runtime.endpoint,['exec',engine.ready.instance,'sh','-c','test -f "$1" && test ! -L "$1"','capture-source',path.posix.join(engine.ready.workdir,relativePath)]);
+            try { await exec(invocation.command,invocation.args,{env:invocation.env}); return true; }
+            catch(error) { if((error as {code?:unknown}).code===1)return false; throw error; }
+          } });
           const staged = await containerGit('diff', '--cached', '--name-only');
           if (staged) await containerGit('-c', 'user.name=EnoughFactory', '-c', 'user.email=factory@enoughtools.com', 'commit', '-m', `Preserve EnoughFactory attempt ${id}`);
-          commit = await containerGit('rev-parse', 'HEAD');
+          commit = (await containerGit('rev-parse', 'HEAD')).trim();
           app.store.set('factory-capture-input', { id, commit });
         }
         await app.sessions.stop(session.id);

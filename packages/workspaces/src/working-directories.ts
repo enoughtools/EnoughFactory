@@ -3,6 +3,7 @@ import { constants } from "node:fs";
 import { chmod, copyFile, lstat, mkdir, open, readdir, readFile, readlink, realpath, rename, rm, symlink } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { ArtifactStore, writeAtomic } from "./artifacts.ts";
+import { stageCapturedSource } from "./capture-staging.ts";
 import { run, safeId } from "./process.ts";
 import type { ArtifactManifest, WorkingDirectoryCapture, WorkingDirectoryConfig, WorkingDirectorySnapshot, WorkingDirectorySource } from "./types.ts";
 
@@ -211,7 +212,15 @@ export class WorkingDirectoryManager {
     try {
       await this.importBundle(snapshot.sourceArtifact, path, snapshot.baseCommit, snapshot.baseCommit);
       await replaceTree(exported, path);
-      await ownGit(path, "add", "--all", "--force", "--", ".");
+      await stageCapturedSource((...args) => command(args, path, true), {
+        force: true,
+        isRegularFile: async (relativePath) => {
+          try {
+            const entry = await lstat(join(path, relativePath));
+            return entry.isFile() && !entry.isSymbolicLink();
+          } catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return false; throw error; }
+        },
+      });
       await ownGit(path, "commit", "--allow-empty", "--no-verify", "-m", "EnoughFactory retained working directory output");
       const commit = await ownGit(path, "rev-parse", "HEAD");
       const bundleArtifact = await this.bundle(path, commit, snapshot.baseCommit, snapshot.id, "output", false, context);
@@ -366,10 +375,10 @@ function gitEnvironment(): NodeJS.ProcessEnv {
   return { ...env, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null", GIT_OPTIONAL_LOCKS: "0", GIT_TERMINAL_PROMPT: "0" };
 }
 const gitOptions = ["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "core.attributesFile=/dev/null", "-c", "core.autocrlf=false", "-c", "commit.gpgsign=false", "-c", "init.templateDir=", "-c", "core.protectHFS=true", "-c", "core.protectNTFS=true"];
-async function command(args: string[], path?: string): Promise<string> {
+async function command(args: string[], path?: string, rawOutput = false): Promise<string> {
   const result = await run("git", [...gitOptions, ...(path ? ["-C", path] : []), ...args], { env: gitEnvironment(), inheritEnv: false, timeoutMs: 120_000 });
   if (result.exitCode !== 0) throw new Error(`Working directory Git ${args[0]} failed: ${result.stderr.trim() || result.stdout.trim()}`);
-  return result.stdout.trim();
+  return rawOutput ? result.stdout : result.stdout.trim();
 }
 async function ownGit(path: string, ...args: string[]): Promise<string> { return command(args, path); }
 async function gitResult(path: string, ...args: string[]) { return run("git", [...gitOptions, "-C", path, ...args], { env: gitEnvironment(), inheritEnv: false, timeoutMs: 30_000 }); }
