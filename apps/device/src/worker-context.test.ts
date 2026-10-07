@@ -7,7 +7,7 @@ import type { Attempt, Chat, FactoryTask, Goal, Project } from '@enoughfactory/c
 import type { AttemptDetail, PlanRecord, TaskDetail } from '@enoughfactory/factory';
 import { EnvmuxSession, type EnvmuxReady, type EnvmuxState } from '@enoughfactory/envmux';
 import type { TurnInput } from '@enoughfactory/agents';
-import { DeviceApp } from './app.ts';
+import { DeviceApp, type ApiCall } from './app.ts';
 import type { ChatController } from './chats.ts';
 import { initializeFactory } from './factory.ts';
 import { assertCurrentWorkerAssignment, prepareWorkerContext, workerCandidates, type WorkerEvidenceContext } from './worker-context.ts';
@@ -73,6 +73,65 @@ async function fixture(t: TestContext) {
   return {root,primary,container,app,factory,project,goal,task,attempt,detail,candidate,oldTask,
     setRun(value:typeof run){run=value;},setReferenceCopy(value:typeof beforeReferenceCopy){beforeReferenceCopy=value;},counts:()=>({created,invoked,stopped})};
 }
+
+function deferred() {
+  let resolve!:()=>void;
+  return { promise: new Promise<void>(done=>{resolve=done;}), release:()=>resolve() };
+}
+async function holdPreparationCleanup(t: TestContext, f: Awaited<ReturnType<typeof fixture>>, failure?: Error) {
+  const entered=deferred(),cleanup=deferred(),original=f.app.withRuntimeOperation.bind(f.app);
+  let held=false;
+  t.mock.method(f.app,'withRuntimeOperation',async<T>(operation:(signal:AbortSignal)=>Promise<T>):Promise<T>=>{
+    const result=await original(operation);
+    // Keep the production preparation/session/context path. Delay only final
+    // operation cleanup, after readiness is visible but while its tracked job owns the slot.
+    if(!held&&f.app.store.get<{status:string}>('factory-workers',f.attempt.id)?.status==='prepared'){
+      held=true;entered.release();await cleanup.promise;if(failure)throw failure;
+    }
+    return result;
+  });
+  const preparation=f.factory.workspacePort.prepare({goal:f.goal,task:f.task,attempt:f.attempt,project:f.project});
+  await entered.promise;
+  const workspace=await preparation;
+  return {workspace,release:cleanup.release};
+}
+function pairedExecute(f: Awaited<ReturnType<typeof fixture>>) {
+  return f.app.dispatch({method:'POST',url:new URL(`http://local/api/factory/worker/${f.attempt.id}/execute`),
+    peerId:f.app.device.id,body:{goal:f.goal,project:f.project,prompt:f.task.description}} as ApiCall&{peerId:string});
+}
+
+test('local and paired execution join preparation cleanup and start exactly one provider turn', {timeout:15_000}, async t=>{
+  const f=await fixture(t),cleanup=await holdPreparationCleanup(t,f),started=deferred(),turn=deferred();
+  f.setRun(async()=>{started.release();await turn.promise;return {text:'Completed once after preparation cleanup',threadId:'fixture-thread'};});
+  const input={goal:f.goal,task:f.task,attempt:f.attempt,workspace:cleanup.workspace,project:f.project,prompt:f.task.description};
+  const first=f.factory.runtime.execute(input),second=f.factory.runtime.execute(input),paired=pairedExecute(f);
+  assert.deepEqual(f.counts(),{created:0,invoked:0,stopped:0},'Prepared readiness cannot bypass cleanup ownership');
+  cleanup.release();
+  await started.promise;
+  await paired;
+  await pairedExecute(f); // Repeated paired calls must return while the provider is still blocked.
+  assert.deepEqual(f.counts(),{created:1,invoked:1,stopped:0});
+  turn.release();
+  assert.equal((await first).status,'succeeded');assert.equal((await second).status,'succeeded');
+  assert.equal(f.counts().invoked,1);
+});
+
+for(const outcome of ['canceled','failed','stale'] as const)test(`execution waiting for preparation cleanup does not start after ${outcome} authority`,{timeout:15_000},async t=>{
+  const f=await fixture(t),cleanup=await holdPreparationCleanup(t,f,outcome==='failed'?new Error('Fixture preparation cleanup failed'):undefined);
+  const executing=f.factory.runtime.execute({goal:f.goal,task:f.task,attempt:f.attempt,workspace:cleanup.workspace,project:f.project,prompt:f.task.description});
+  const paired=pairedExecute(f);
+  const settled=Promise.allSettled([executing,paired]);
+  let canceled:Promise<void>|undefined;
+  if(outcome==='canceled')canceled=f.factory.runtime.cancel(f.attempt);
+  if(outcome==='stale')f.app.store.set('tasks',{...f.task,currentAttemptId:'replacement-attempt'});
+  cleanup.release();
+  const results=await settled;await canceled;
+  assert.equal(f.counts().created,0);assert.equal(f.counts().invoked,0);
+  const record=f.app.store.get<{status:string;error?:string;cancellationAcknowledged?:boolean}>('factory-workers',f.attempt.id)!;
+  if(outcome==='canceled'){assert.equal(record.status,'canceled');assert.equal(record.cancellationAcknowledged,true);}
+  if(outcome==='failed'){assert.equal(record.status,'failed');assert.match(record.error!,/preparation cleanup failed/);assert.equal((results[0] as PromiseFulfilledResult<{status:string}>).value.status,'failed');}
+  if(outcome==='stale')for(const result of results){assert.equal(result.status,'rejected');assert.match((result as PromiseRejectedResult).reason.message,/authority changed/);}
+});
 
 test('new repair task receives exact cross-task retained bundles without seeding or capturing the whole candidate',async t=>{
   const f=await fixture(t),acceptedHead=await git(f.primary,'rev-parse','HEAD');

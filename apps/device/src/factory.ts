@@ -93,7 +93,7 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
         : path.join(app.repositoryRoot, 'runtime/workspaces'),
     }),
   });
-  const jobs = new Map<string, Promise<void>>();
+  const jobs = new Map<string, { phase: 'preparing' | 'executing' | 'capturing'; done: Promise<void> }>();
   const captureJobs = new Map<string, Promise<CandidateRef>>();
   const verifiedArtifacts = new Map<string, { path: string; size: number; mtime: number; ctime: number }>();
   const local = (deviceId?: string) => !deviceId || deviceId === app.device.id;
@@ -105,16 +105,17 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
   const patchWorker = (id: string, fields: Partial<WorkerRecord>) => {
     app.store.set(journal, { ...worker(id), ...fields, updatedAt: now() }); app.changed();
   };
-  const track = (id: string, operation: () => Promise<void>) => {
+  const track = (id: string, phase: 'preparing' | 'executing' | 'capturing', operation: () => Promise<void>) => {
     if (jobs.has(id)) return;
-    const running = operation().catch(error => {
+    // Register ownership before invoking the operation, including its final cleanup.
+    const running = Promise.resolve().then(operation).catch(error => {
       const record = worker(id);
       if (record.status === 'canceled') return;
       const uncertain = factoryExecutionIsUncertain(error);
       const result: ExecutionResult = { status: uncertain ? 'unknown' : 'failed', text: '', error: error.message, sessionId: record.sessionId, chatId: record.chatId };
       patchWorker(id, { status: uncertain ? 'unknown' : 'failed', error: error.message, result });
-    }).finally(() => jobs.delete(id));
-    jobs.set(id, running);
+    }).finally(() => { if (jobs.get(id)?.done === running) jobs.delete(id); });
+    jobs.set(id, { phase, done: running });
   };
   async function rpc<T>(peerId: string, method: string, route: string, body?: unknown): Promise<T> {
     if (!network) throw new Error('Device networking is not configured.');
@@ -260,13 +261,33 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
     const record: WorkerRecord = { ...input, status: 'preparing', updatedAt: now() };
     app.store.set(journal, record); app.changed(); return record;
   }
+  function assertExecutionAssignment(record: WorkerRecord): void {
+    if(record.coordinatorId===app.device.id){const detail=app.store.get<AttemptDetail>('factory-attempt-details',record.id);assertCurrentWorkerAssignment(app.store,{...record,goal:{...record.goal,revision:detail?.assignmentGoalRevision??record.referenceContext?.assignment.goalRevision??record.goal.revision}});}
+    if(record.referenceContext)assertWorkerContext(record.referenceContext,{...record,goal:{...record.goal,revision:record.referenceContext.assignment.goalRevision}});
+  }
+  async function startPreparedExecution(record: WorkerRecord, goal: Goal, project: Project, prompt: string): Promise<void> {
+    const pending = jobs.get(record.id);
+    // Readiness can be published before preparation releases its cleanup/operation
+    // lease. Join that phase so an execution request cannot be silently dropped.
+    // A repeated request for an already executing worker never joins its provider turn.
+    if (pending?.phase === 'preparing') await pending.done;
+    const current = worker(record.id);
+    if (current.status !== 'prepared' || jobs.has(record.id)) return;
+    if (current.coordinatorId !== record.coordinatorId || current.attempt.generation !== record.attempt.generation
+      || current.task.id !== record.task.id || current.goal.id !== record.goal.id || current.goal.revision !== record.goal.revision)
+      throw new HttpError(409, 'The worker assignment changed before execution could start.');
+    const execution = { ...current, goal, project };
+    assertExecutionAssignment(execution);
+    // No await separates the final authority check and execution ownership.
+    patchWorker(record.id, { goal, project });
+    track(record.id, 'executing', () => executeLocal(execution, prompt));
+  }
   async function executeLocal(record: WorkerRecord, prompt: string): Promise<void> {
     if (!record.sessionId) throw new Error('The prepared attempt has no container session.');
     if (worker(record.id).status === 'canceled') return;
     await app.sessions.waitReady(record.sessionId);
     if (worker(record.id).status === 'canceled') return;
-    if(record.coordinatorId===app.device.id){const detail=app.store.get<AttemptDetail>('factory-attempt-details',record.id);assertCurrentWorkerAssignment(app.store,{...record,goal:{...record.goal,revision:detail?.assignmentGoalRevision??record.referenceContext?.assignment.goalRevision??record.goal.revision}});}
-    if(record.referenceContext)assertWorkerContext(record.referenceContext,{...record,goal:{...record.goal,revision:record.referenceContext.assignment.goalRevision}});
+    assertExecutionAssignment(record);
     const ownedProject = app.store.get<Project>('projects', app.sessions.record(record.sessionId).projectId);
     if (ownedProject) app.store.set('projects', { ...ownedProject, rules: record.project.rules, runtime: record.goal.runtime, approvalMode: record.goal.approvalMode });
     const chat = record.chatId ? chats.get(record.chatId) : chats.create({ sessionId: record.sessionId,
@@ -384,7 +405,7 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
       project={...project,developmentToolchain:toolchainProfile};
       if (local(attempt.deviceId)) {
         const record = beginWorker({ id: attempt.id, coordinatorId: app.device.id, goal, task, attempt, project });
-        if (record.status === 'preparing') track(record.id, () => prepareLocal(record, project, previousCandidate));
+        if (record.status === 'preparing') track(record.id, 'preparing', () => prepareLocal(record, project, previousCandidate));
       } else {
         if(toolchainProfile!=='default'){
           const health=await rpc<{deviceId:string;capabilities?:{developmentToolchains?:Array<{id:string;recipeSha256:string}>}}>(attempt.deviceId,'GET','/api/health');
@@ -557,7 +578,7 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
       const currentProject = app.store.get<Project>('projects', project.id) || project;
       if (local(attempt.deviceId)) {
         const record = worker(attempt.id);
-        if (record.status === 'prepared') { patchWorker(record.id, { goal, project: currentProject }); track(record.id, () => executeLocal(worker(record.id), prompt)); }
+        if (record.status === 'prepared') await startPreparedExecution(record, goal, currentProject, prompt);
       } else await rpc(attempt.deviceId, 'POST', `/api/factory/worker/${attempt.id}/execute`, {
         // A branch repair advances coordinator authority without replacing this worker's assignment.
         prompt, goal: { ...goal, revision: assignmentGoalRevision ?? goal.revision }, project: publicWorkerProject(currentProject),
@@ -582,7 +603,7 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
     if (record.chatId) {await chats.interrupt(record.chatId);await chats.waitForIdle(record.chatId);}
     if (record.sessionId && !['stopped', 'stopping', 'failed'].includes(app.sessions.record(record.sessionId).status)) await app.sessions.stop(record.sessionId);
     const running = jobs.get(id);
-    if (running) await running;
+    if (running) await running.done;
     const latest = worker(id);
     if (latest.sessionId && app.sessions.record(latest.sessionId).status !== 'stopped') {
       await app.sessions.stop(latest.sessionId); await app.sessions.waitStopped(latest.sessionId);
@@ -836,7 +857,7 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
       app.assertRuntimeCanRun();
       const record = beginWorker({ id: attempt.id, coordinatorId: peerId, goal, task, attempt, project, workingDirectorySources,referenceContext });
       app.store.set<GoalOptions>('factory-options', { id: goal.id, workspaceProvider: body.workspaceProvider === 'artifactfs' ? 'artifactfs' : 'git' });
-      if (record.status === 'preparing') track(record.id, async () => {
+      if (record.status === 'preparing') track(record.id, 'preparing', async () => {
         const sourcePath = path.join(app.dataDir, 'worker-source', record.id);
         await mkdir(path.dirname(sourcePath), { recursive: true });
         try { await git(sourcePath, 'rev-parse', 'HEAD'); }
@@ -859,7 +880,7 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
         if (!goal || goal.id !== record.goal.id || goal.revision !== record.goal.revision || goal.coordinatorId !== peerId) throw new HttpError(409, 'Execution policy belongs to a different goal assignment.');
         const project = body.project as Project;
         if (!project || project.id !== record.project.id || !Array.isArray(project.rules)) throw new HttpError(409, 'Execution rules belong to a different project.');
-        patchWorker(record.id, { goal, project }); track(record.id, () => executeLocal(worker(record.id), body.prompt as string));
+        await startPreparedExecution(record, goal, project, body.prompt);
       }
       else if (!['running', 'succeeded', 'failed', 'unknown', 'canceled'].includes(record.status)) throw new HttpError(409, 'The worker is not prepared.');
       return worker(record.id);
@@ -867,7 +888,7 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
     if (method === 'POST' && action === 'cancel') { await cancelLocal(record.id); return { ok: true }; }
     if (method === 'POST' && action === 'capture') {
       patchWorker(record.id, { error: undefined });
-      track(`capture-${record.id}`, async () => {
+      track(`capture-${record.id}`, 'capturing', async () => {
         try {
           const candidate = await captureLocal(record.id) as unknown as Candidate;
           for(const artifact of candidateArtifacts(candidate))await sendArtifact(peerId,artifact);
