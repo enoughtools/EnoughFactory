@@ -34,6 +34,13 @@ export class AgentManager {
       if (remaining) this.containerUses.set(containerId, remaining); else this.containerUses.delete(containerId);
     }
   }
+  /** Fence idle container retirement against provider, credential and provisioning work. */
+  async withIdleContainer<T>(containerId:string,operation:()=>Promise<T>):Promise<T> {
+    checkContainerId(containerId);this.assertNotReleasing(containerId);
+    if(this.containerUses.has(containerId)||[...this.live.values()].some(turn=>turn.containerId===containerId)||[...this.provisioning.keys()].some(key=>key.startsWith(`${containerId}:`)))throw new AgentError('This container still has an active provider, provisioning or credential operation.','RUNTIME_CLEANUP_ACTIVE',true);
+    this.releasing.add(containerId);
+    try{return await operation();}finally{this.releasing.delete(containerId);}
+  }
   availability(containerId: string): Promise<RuntimeCapability[]> { return this.useContainer(containerId, () => availability(containerId, this.options)); }
   async provision(containerId: string, runtime: RuntimeKind, provision: ProvisionOptions = {}, signal?: AbortSignal): Promise<RuntimeCapability> {
     return this.useContainer(containerId, async () => {

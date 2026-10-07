@@ -146,10 +146,23 @@ test("manager release defers for live turns and pending provisioning or credenti
     const settled = job.catch(() => {});
     const before = calls;
     assert.equal((await manager.releaseCodexPayload("container-a")).status, "deferred");
+    await assert.rejects(manager.withIdleContainer("container-a",async()=>assert.fail('Busy provider retirement cannot start')),{code:'RUNTIME_CLEANUP_ACTIVE'});
     assert.equal(calls, before, "Cleanup cannot launch or interrupt a process while this container is busy");
     child.emit("close", 1);
     await settled;
   });
+});
+
+test("manager idle retirement fences provider and credential work until completion",async()=>{
+  const manager=new AgentManager({autoProvision:false,dockerEndpoint,spawnProcess:(()=>assert.fail('Retirement fence cannot launch a provider')) as unknown as SpawnProcess});
+  let finish!:()=>void;const hold=new Promise<void>(resolve=>{finish=resolve;});
+  const retirement=manager.withIdleContainer('container-a',async()=>{await hold;return 'retired';});
+  await assert.rejects(manager.runTurn(input,{onEvent(){},onApproval:async()=>true}),{code:'RUNTIME_CLEANUP_ACTIVE',agentStarted:false});
+  await assert.rejects(manager.provision('container-a','codex'),{code:'RUNTIME_CLEANUP_ACTIVE',agentStarted:false});
+  await assert.rejects(manager.connectApiKey('container-a','claude','fixture-key'),{code:'RUNTIME_CLEANUP_ACTIVE',agentStarted:false});
+  await assert.rejects(manager.withIdleContainer('container-a',async()=>{}),{code:'RUNTIME_CLEANUP_ACTIVE'});
+  finish();assert.equal(await retirement,'retired');
+  assert.equal(await manager.withIdleContainer('container-a',async()=>true),true);
 });
 
 test("manager fences new turns, provisioning and credential writes during release", async () => {

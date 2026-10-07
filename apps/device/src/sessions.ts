@@ -9,6 +9,7 @@ import { mkdir, rm } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { managedRepositoryReader, readRepositoryChanges } from './repository-changes.ts';
 import { prepareDevelopmentToolchain, validateFrozenDevelopmentToolchain, type FrozenDevelopmentToolchain } from './development-toolchain.ts';
+import { retireStoppedFactoryContainer } from './factory-container-retirement.ts';
 
 interface WorkspaceBinding { bindSource:string; stateVolume:string; }
 interface PrivateSession { id: string; ready: EnvmuxReady; projectPath: string; pid?: number; workspace?:WorkspaceBinding; }
@@ -50,6 +51,17 @@ export class SessionController {
     if(!this.owns(sessionId)||this.record(sessionId).status!=='stopped')throw new HttpError(409,'Confirm the owned environment has stopped before releasing its input copies.','ENVIRONMENT_IN_USE');
     this.stoppedInputReleases.add(sessionId);
     try{return await operation();}finally{this.stoppedInputReleases.delete(sessionId);}
+  }
+  async retireWorkerContainer(sessionId:string,dataDir:string,assertCurrent:()=>void,assertSpace:()=>void):Promise<void> {
+    const saved=this.store.get<PrivateSession>('session-private',sessionId),launch=this.store.get<LaunchRecord>('session-launch',sessionId),record=this.record(sessionId);
+    if(!this.stoppedInputReleases.has(sessionId)||!saved||!launch||saved.ready.dockerHost!==this.runtime.endpoint.host||record.containerId!==saved.ready.instance||!this.owns(sessionId))throw new HttpError(409,'Worker container retirement requires its owned stopped-session lease.');
+    const previous=this.store.get<{id:string;containerId:string;name:string}>('session-container-retirement',sessionId);
+    if(previous&&previous.name!==saved.ready.instance)throw new HttpError(409,'The worker container ownership changed.');
+    const current=()=>{assertCurrent();if(!this.stoppedInputReleases.has(sessionId)||this.record(sessionId).status!=='stopped'||this.store.get<PrivateSession>('session-private',sessionId)?.ready.instance!==saved.ready.instance)throw new HttpError(409,'The stopped worker container identity changed.');this.assertCanArchive(sessionId);};
+    const receipt=await retireStoppedFactoryContainer({endpoint:this.runtime.endpoint,dataDir,assertCurrent:current,assertSpace,pinnedContainerId:previous?.containerId,
+      pinContainerId:containerId=>this.store.set('session-container-retirement',{id:sessionId,containerId,name:saved.ready.instance,status:'archiving',updatedAt:now()}),
+      identity:{sessionId,container:saved.ready.instance,name:saved.ready.instance,project:saved.ready.project,sessionName:saved.ready.session,projectPath:launch.projectPath,branch:saved.ready.branch,workdir:saved.ready.workdir}});
+    this.store.set('session-container-retirement',{id:sessionId,containerId:receipt.containerId,name:saved.ready.instance,status:'removed',archive:receipt.archive,sha256:receipt.sha256,size:receipt.size,rawSha256:receipt.rawSha256,rawSize:receipt.rawSize,updatedAt:now()});
   }
   assertActiveProject(project:Project|undefined):void {
     if(!project)throw new HttpError(404,'The source project is no longer available.');

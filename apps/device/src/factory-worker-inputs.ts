@@ -134,6 +134,7 @@ async function releaseCopies(input: Inputs, operation: string, candidate: Candid
 export async function releaseWorkerInputs(input: Inputs & {
   attemptId: string; sessions: Pick<SessionController, 'record' | 'owns' | 'needsTermination' | 'assertCanArchive' | 'withStoppedInputs'>;
   disposeWorkspace: () => Promise<void>;
+  retireContainer?: (sessionId: string, assertCurrent: () => void) => Promise<void>;
 }): Promise<void> {
   identity(input.attemptId);
   const worker = input.store.get<CapturedWorker>('factory-workers', input.attemptId);
@@ -159,6 +160,8 @@ export async function releaseWorkerInputs(input: Inputs & {
     capturedSources(candidate, sources);
     if (!isDeepStrictEqual(input.store.get<{ roots: Candidate['workingDirectories'] }>('session-working-directory-captures', sessionId)?.roots ?? [], candidate.workingDirectories ?? [])) throw new Error('Factory worker folder capture is not durably retained.');
     await releaseCopies(input, input.attemptId, candidate, [{ identity: input.attemptId, sources }, { identity: sessionId, sources }], assertCurrent);
+    assertCurrent();
+    await input.retireContainer?.(sessionId,assertCurrent);
     assertCurrent();
     await input.disposeWorkspace();
   });

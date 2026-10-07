@@ -248,6 +248,14 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
     if (jobs.has(id) || jobs.has(`capture-${id}`) || captureJobs.has(id)) throw new HttpError(409, 'Wait for the worker and its source capture to finish before releasing inputs.');
     await releaseWorkerInputs({ attemptId: id, dataDir: app.dataDir, store: app.store, sessions: app.sessions,
       directoryManager: app.sessions.directoryManager, artifacts: workspaces.artifacts, workspaces,
+      retireContainer: async (sessionId,assertCurrent) => {
+        const conversations=app.store.list<import('@enoughfactory/contracts').Chat>('chats').filter(chat=>chat.sessionId===sessionId);
+        if(!conversations.length||conversations.some(chat=>chat.runtime!=='codex'))return;
+        if(conversations.some(chat=>chats.isRunning(chat.id)))throw new HttpError(409,'Wait for the worker conversations to finish before retiring its container.');
+        const releaseDisk=hostDisk.reserve(`retire:${sessionId}`);
+        try{await chats.manager.withIdleContainer(app.sessions.record(sessionId).containerId!,()=>app.sessions.retireWorkerContainer(sessionId,app.dataDir,assertCurrent,()=>hostDisk.assert()));}
+        finally{releaseDisk();}
+      },
       disposeWorkspace: async () => {
         try { await workspaces.dispose(id); }
         catch(error) {
