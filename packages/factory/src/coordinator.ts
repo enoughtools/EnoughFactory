@@ -196,7 +196,7 @@ export class FactoryCoordinator {
     if (terminalGoals.has(goal.status)) throw new Error("The goal is terminal.");
     if (this.attempts(goalId).some(attempt => activeAttempts.has(attempt.status)) || this.tasks(goalId).some(task => task.status === "review")) throw new Error("Work is active or awaiting integration. Use goal steering to revise and revoke it explicitly.");
     this.options.store.transaction(() => {
-      this.options.store.set(TABLE.control, { ...this.control(goalId), stage: "plan", manualAction: "plan", operation: undefined, replanReason: "A fresh plan was requested.", waitingFor: undefined, waitReason: undefined, wakeAt: undefined, controllerFailures: undefined });
+      this.options.store.set(TABLE.control, { ...this.control(goalId), stage: "plan", manualAction: "plan", operation: undefined, replanReason: "A fresh plan was requested.", replanInstructions: undefined, waitingFor: undefined, waitReason: undefined, wakeAt: undefined, controllerFailures: undefined });
       this.writeGoal(goalId, { revision: goal.revision + 1, status: goal.status === "paused" ? "paused" : "planning", nextAction: "Plan the requested work" });
       for (const task of this.tasks(goalId).filter(task => task.status !== "completed")) this.writeTask(task.id, { status: "canceled" });
       this.decision(goalId, "plan-requested", "A new plan was requested from current accepted work; pending proposals were replaced.");
@@ -260,7 +260,7 @@ export class FactoryCoordinator {
     const attempts = this.attempts(goalId).filter(attempt => activeAttempts.has(attempt.status));
     this.options.store.transaction(() => {
       const control = this.control(goalId);
-      this.options.store.set(TABLE.control, { ...control, stage: "plan", operation: undefined, steering: input.context ? [...control.steering, input.context.trim()] : control.steering, replanReason: "User steering changed the goal context.", waitingFor: undefined, waitReason: undefined, wakeAt: undefined, controllerFailures: undefined });
+      this.options.store.set(TABLE.control, { ...control, stage: "plan", operation: undefined, steering: input.context ? [...control.steering, input.context.trim()] : control.steering, replanReason: "User steering changed the goal context.", replanInstructions: undefined, waitingFor: undefined, waitReason: undefined, wakeAt: undefined, controllerFailures: undefined });
       this.writeGoal(goalId, {
         revision: goal.revision + 1, status: goal.status === "paused" ? "paused" : "planning", nextAction: "Revise the plan for the updated goal",
         ...(input.objective === undefined ? {} : { objective: input.objective.trim() }),
@@ -352,7 +352,8 @@ export class FactoryCoordinator {
       this.context(goal),
       `Devices: ${JSON.stringify(this.options.devices())}`,
       `Already integrated work: ${JSON.stringify(completed.map(task => ({ key: this.taskDetail(task.id).key, title: task.title, description: task.description, attempt: this.options.store.get(TABLE.attemptDetails, task.currentAttemptId ?? "") })))}`,
-      `Retained unfinished work: ${JSON.stringify(this.tasks(goal.id).filter(task => task.status !== "completed" && (!scope || scope.includes(task.id))).map(task => ({ key: this.taskDetail(task.id).key, title: task.title, description: task.description, failure: this.taskDetail(task.id).lastError, candidate: this.taskDetail(task.id).lastCandidate, repairInstructions: this.taskDetail(task.id).repairInstructions })))}`,
+      `Retained unfinished work: ${JSON.stringify(this.tasks(goal.id).filter(task => task.status !== "completed" && (!scope || scope.includes(task.id))).map(task => ({ key: this.taskDetail(task.id).key, title: task.title, description: task.description, failure: this.taskDetail(task.id).lastError, candidate: this.taskDetail(task.id).lastCandidate, priorRepairGuidance: { planRevision: this.taskDetail(task.id).planRevision, instructions: this.taskDetail(task.id).repairInstructions } })))}`,
+      "Prior repair guidance belongs to its recorded plan revision. Carry applicable requirements into the new task contracts, resolving obsolete instructions against the current diagnosis and latest retained candidate. Do not replace already accepted implementations merely because an older handoff reported them missing.",
       ...(scope ? [`This is a localized repair. Replace only the affected work above. Preserve these unrelated tasks exactly; their keys may be dependencies but must not be repeated: ${JSON.stringify(preserved.map(task => ({ key: this.taskDetail(task.id).key, title: task.title, status: task.status, dependsOn: task.dependsOn.map(id => this.taskDetail(id).key) })))}`] : []),
       "Do not repeat completed tasks. Their keys may be referenced as dependencies.",
       "Reuse a retained unfinished task's stable key when continuing the same work. Its isolated candidate can seed a replacement workspace; use a new key when the task's purpose changes.",
@@ -366,10 +367,10 @@ export class FactoryCoordinator {
       validateDependencies(plan.tasks, preservedKeys);
       if (plan.tasks.some(task => preservedKeys.has(task.key))) throw new FactoryDecisionError("The planner repeated a preserved task key. Use a new key for improvement work and leave unrelated work unchanged.");
       this.options.store.transaction(() => {
-        this.applyTasks(goal.id, plan.tasks, plan.summary, plan.checks, new Set(preserved.map(task => task.id)));
+        this.applyTasks(goal.id, plan.tasks, plan.summary, plan.checks, new Set(preserved.map(task => task.id)), this.control(goal.id).replanInstructions);
         const recordedCriteria = this.goal(goal.id).criteria;
         this.writeGoal(goal.id, { criteria: recordedCriteria.length ? recordedCriteria : [...new Set(plan.criteria)], status: "running", error: undefined, nextAction: plan.tasks.length ? "Dispatch work whose dependencies are complete" : "Evaluate existing product evidence" });
-          this.options.store.set(TABLE.control, { ...this.control(goal.id), stage: plan.tasks.length || preserved.some(task => task.status !== "completed") ? "dispatch" : "evaluate", operation: undefined, manualAction: undefined, decisionFailures: undefined, controllerFailures: undefined, replanTaskIds: undefined });
+          this.options.store.set(TABLE.control, { ...this.control(goal.id), stage: plan.tasks.length || preserved.some(task => task.status !== "completed") ? "dispatch" : "evaluate", operation: undefined, manualAction: undefined, decisionFailures: undefined, controllerFailures: undefined, replanTaskIds: undefined, replanInstructions: undefined });
         this.decision(goal.id, "plan", plan.summary, { chatId: response.chatId, taskCount: plan.tasks.length, revision: this.goal(goal.id).revision });
       });
       this.changed();
@@ -640,7 +641,7 @@ export class FactoryCoordinator {
       if (!["retry", "replan", "wait"].includes(String(decision.action)) || typeof decision.reason !== "string" || !decision.reason.trim()) throw new FactoryDecisionError("Repair decision must specify retry, replan or wait and a reason.");
       if (repeated && decision.action === "retry") decision.action = "replan";
       this.options.store.set(TABLE.control, { ...this.control(goal.id), decisionFailures: undefined, controllerFailures: undefined });
-      this.decision(goal.id, "repair", decision.reason, { action: decision.action, taskId, chatId: response.chatId });
+      this.decision(goal.id, "repair", decision.reason, { action: decision.action, taskId, chatId: response.chatId, ...(typeof decision.instructions === "string" ? { instructions: decision.instructions } : {}) });
       if (decision.action === "wait") {
         this.options.store.transaction(() => {
           this.options.store.set(TABLE.taskDetails, { ...this.taskDetail(taskId), waitingFor: typeof decision.wakeCondition === "string" ? decision.wakeCondition : "external-condition", waitReason: typeof decision.waitReason === "string" ? decision.waitReason : decision.reason });
@@ -648,7 +649,7 @@ export class FactoryCoordinator {
           this.writeGoal(goal.id, { nextAction: `Waiting for ${task.title}; independent work can continue` });
         });
       } else if (decision.action === "replan") {
-        await this.replan(goal.id, decision.reason, taskId);
+        await this.replan(goal.id, decision.reason, taskId, typeof decision.instructions === "string" ? decision.instructions : undefined);
       } else {
         this.options.store.transaction(() => {
           this.writeTask(taskId, { status: "queued", currentAttemptId: undefined });
@@ -776,7 +777,7 @@ export class FactoryCoordinator {
     } catch (error) { this.operationFailed(goal.id, operation, error); }
   }
 
-  private applyTasks(goalId: string, tasks: PlannedTask[], summary: string, checks: string[], preserveTaskIds = new Set<string>()): void {
+  private applyTasks(goalId: string, tasks: PlannedTask[], summary: string, checks: string[], preserveTaskIds = new Set<string>(), replanInstructions?: string): void {
     const goal = this.goal(goalId), at = this.now(), all = this.tasks(goalId);
     const existing = all.filter(task => task.status === "completed" || preserveTaskIds.has(task.id));
     const previousPlan = this.planRecord(goalId), previousPlanChecks = previousPlan?.checkScope === "goal" ? [] : previousPlan?.checks ?? [];
@@ -789,6 +790,11 @@ export class FactoryCoordinator {
     for (const task of tasks) taskKeys[task.key] = retained.get(task.key)?.id ?? randomUUID();
     for (const task of tasks) {
       const id = taskKeys[task.key]!, previous = retained.get(task.key), previousDetail = previous ? this.taskDetail(previous.id) : undefined;
+      const supersededRepair = previousDetail?.repairInstructions && previousDetail.planRevision !== goal.revision;
+      const priorRepairInstructions = supersededRepair ? [...previousDetail.priorRepairInstructions ?? [], {
+        instructions: previousDetail.repairInstructions!, planRevision: previousDetail.planRevision,
+        ...(previousDetail.lastCandidate ? { retainedCandidateId: previousDetail.lastCandidate.id, retainedCandidateCommit: previousDetail.lastCandidate.commit } : {}),
+      }] : previousDetail?.priorRepairInstructions;
       this.options.store.set<FactoryTask>(TABLE.tasks, { id, goalId, title: task.title, description: task.description, dependsOn: task.dependsOn.map(key => taskKeys[key]!), status: "queued", createdAt: previous?.createdAt ?? at, updatedAt: at, ...(task.deviceId ? { deviceId: task.deviceId } : {}),
         ...(task.kind ?? previous?.kind ? { kind: task.kind ?? previous?.kind } : {}),
         ...(task.acceptanceCriteria ?? previous?.acceptanceCriteria ? { acceptanceCriteria: task.acceptanceCriteria ?? previous?.acceptanceCriteria } : {}),
@@ -796,19 +802,19 @@ export class FactoryCoordinator {
         ...(task.estimatedMinutes ?? previous?.estimatedMinutes ? { estimatedMinutes: task.estimatedMinutes ?? previous?.estimatedMinutes } : {}),
         ...(task.writePaths ?? previous?.writePaths ? { writePaths: task.writePaths ?? previous?.writePaths } : {}),
         ...(task.resources ?? previous?.resources ? { resources: task.resources ?? previous?.resources } : {}) });
-      this.options.store.set<TaskDetail>(TABLE.taskDetails, { ...previousDetail, id, key: task.key, checks: task.checks, planChecks: [], planRevision: goal.revision, waitingFor: undefined, waitReason: undefined, selected: goal.autonomy === "autonomous", failureSignatures: previousDetail?.failureSignatures ?? [] });
+      this.options.store.set<TaskDetail>(TABLE.taskDetails, { ...previousDetail, id, key: task.key, checks: task.checks, planChecks: [], planRevision: goal.revision, waitingFor: undefined, waitReason: undefined, repairInstructions: supersededRepair ? undefined : previousDetail?.repairInstructions, priorRepairInstructions, replanInstructions, selected: goal.autonomy === "autonomous", failureSignatures: previousDetail?.failureSignatures ?? [] });
     }
     this.options.store.set<PlanRecord>(TABLE.plans, { id: goalId, goalId, revision: goal.revision, summary, checks, checkScope: "goal", taskKeys, createdAt: at });
   }
 
-  private async replan(goalId: string, reason: string, failedTaskId?: string): Promise<void> {
+  private async replan(goalId: string, reason: string, failedTaskId?: string, instructions?: string): Promise<void> {
     const goal = this.goal(goalId), tasks = this.tasks(goalId);
     const scope = failedTaskId ? new Set([failedTaskId, ...descendants(tasks, [failedTaskId])]) : undefined;
     const affected = tasks.filter(task => task.status !== "completed" && (!scope || scope.has(task.id)));
     const attempts = this.attempts(goalId).filter(attempt => (activeAttempts.has(attempt.status) || this.task(attempt.taskId).status === "review") && (!scope || scope.has(attempt.taskId)));
     this.options.store.transaction(() => {
       this.writeGoal(goalId, { revision: goal.revision + 1, status: "planning", nextAction: "Revise the plan from retained evidence" });
-      this.options.store.set(TABLE.control, { ...this.control(goalId), stage: "plan", operation: undefined, replanReason: reason, diagnosisTaskId: undefined, replanTaskIds: scope ? affected.map(task => task.id) : undefined, waitingFor: undefined, waitReason: undefined, wakeAt: undefined, controllerFailures: undefined });
+      this.options.store.set(TABLE.control, { ...this.control(goalId), stage: "plan", operation: undefined, replanReason: reason, replanInstructions: instructions?.trim() || undefined, diagnosisTaskId: undefined, replanTaskIds: scope ? affected.map(task => task.id) : undefined, waitingFor: undefined, waitReason: undefined, wakeAt: undefined, controllerFailures: undefined });
       for (const task of affected) this.writeTask(task.id, { status: "canceled" });
       for (const attempt of attempts) this.revoke(attempt);
       if (scope) {
@@ -967,9 +973,10 @@ export class FactoryCoordinator {
   }
   private context(goal: Goal): string {
     const control = this.control(goal.id);
-    return `Original objective:\n${goal.objective}\n\nRequired completion criteria:\n${goal.criteria.map(value => `- ${value}`).join("\n")}\n\nAutonomy: ${goal.autonomy}; approvals: ${goal.approvalMode}.\n\nSteering context:\n${control.steering.join("\n")}\n\nReplanning reason:\n${control.replanReason ?? "Initial plan"}`;
+    return `Original objective:\n${goal.objective}\n\nRequired completion criteria:\n${goal.criteria.map(value => `- ${value}`).join("\n")}\n\nAutonomy: ${goal.autonomy}; approvals: ${goal.approvalMode}.\n\nSteering context:\n${control.steering.join("\n")}\n\nReplanning reason:\n${control.replanReason ?? "Initial plan"}${control.replanInstructions ? `\n\nCurrent diagnosis handoff:\n${control.replanInstructions}` : ""}`;
   }
   private executionPrompt(goal: Goal, task: FactoryTask): string {
+    const detail = this.executionTaskDetail(task);
     const guidance = {
       feature: "Feature contract: deliver the observable product behavior across the necessary layers. Account for the acceptance scenarios, including relevant failure or loading behavior. Report concrete behavior and evidence rather than only implementation details.",
       unit: "Unit contract: complete the bounded component or change described by this task. Preserve surrounding interfaces and integrate with its callers. Verify the relevant behavior without expanding into unrelated work.",
@@ -979,8 +986,32 @@ export class FactoryCoordinator {
     return ["You are executing an EnoughFactory task inside its isolated full-permission container. Make routine decisions and deliver the requested outcome. Run focused relevant checks, preserve useful work, and finish with evidence of what actually changed. Do not stop at a proposal.", this.context(goal), `Task: ${task.title}\n${task.description}`, task.kind ? guidance[task.kind] : "Generic task contract: complete the described work and provide concrete evidence of its outcome.",
       `Task acceptance criteria:\n${task.acceptanceCriteria?.map(value => `- ${value}`).join("\n") || "Use the task description and goal criteria."}`,
       `Expected deliverables:\n${task.expectedOutputs?.map(value => `- ${value}`).join("\n") || "Preserved changes and a factual outcome summary."}`,
+      "A few passing scenarios do not complete this task. Continue in-scope work until its acceptance criteria and expected deliverables are satisfied and relevant checks pass. Investigate and repair your own check failures before ending. If a genuine dependency outside this task's scope prevents progress, preserve useful work and identify the exact missing API or behavior and its owner; do not leave unrelated in-scope work unfinished.",
       `Planned write paths: ${JSON.stringify(task.writePaths ?? "Not declared on this legacy task")}. Other independent work may run in parallel. Preserve shared interfaces, keep changes focused on this task and report any necessary changes outside its declared scope. These paths coordinate ownership; your container retains full permissions.`,
-      `Repair instructions: ${this.taskDetail(task.id).repairInstructions ?? "None"}`, `Configured checks: ${JSON.stringify(this.taskDetail(task.id).checks)}`, "The factory will capture and integrate the exact candidate. Do not merge into another attempt's workspace. Project-configured deployment capabilities are authorized according to the goal policy; report any uncertain external effects explicitly."].join("\n\n");
+      ...(detail.lastCandidate ? [`Latest retained source input: ${JSON.stringify({ id: detail.lastCandidate.id, commit: detail.lastCandidate.commit })}. This candidate seeds the prepared workspace. Preserve its useful work and accepted changes; older restoration references do not supersede this source input.`] : []),
+      ...(detail.replanInstructions ? [`Current diagnosis handoff for this replacement plan:\n${detail.replanInstructions}\nApply it within this task's current contract and dependencies.`] : []),
+      `Repair instructions: ${detail.repairInstructions ?? "None"}`, `Configured checks: ${JSON.stringify(detail.checks)}`, "The factory will capture and integrate the exact candidate. Do not merge into another attempt's workspace. Project-configured deployment capabilities are authorized according to the goal policy; report any uncertain external effects explicitly."].join("\n\n");
+  }
+  /** Old services carried retry text into replacement plans without recording its revision. */
+  private executionTaskDetail(task: FactoryTask): TaskDetail {
+    const detail = this.taskDetail(task.id), plan = this.planRecord(task.goalId);
+    if (!detail.repairInstructions || !plan || plan.revision !== detail.planRevision) return detail;
+    const instructions = detail.repairInstructions;
+    const issued = this.options.store.list<Decision>(TABLE.decisions).filter(decision => {
+      const data = decision.data && typeof decision.data === "object" && !Array.isArray(decision.data) ? decision.data as Record<string, unknown> : undefined;
+      if (decision.goalId !== task.goalId || !data || data.taskId !== task.id) return false;
+      if (decision.kind === "task-retry-instructions") return data.repairInstructions === instructions;
+      return decision.kind === "repair" && data.action === "retry" && (data.instructions === instructions || (data.instructions === undefined && decision.text === instructions));
+    }).sort((a, b) => Date.parse(b.at) - Date.parse(a.at))[0];
+    // Only durable, strictly older evidence justifies upgrading legacy guidance to history.
+    // An unbound legacy record stays intact; fresh explicit retry instructions remain current.
+    if (!issued || !(Date.parse(issued.at) < Date.parse(plan.createdAt))) return detail;
+    const updated: TaskDetail = { ...detail, repairInstructions: undefined, priorRepairInstructions: [...detail.priorRepairInstructions ?? [], {
+      instructions, recordedAt: issued.at,
+      ...(detail.lastCandidate ? { retainedCandidateId: detail.lastCandidate.id, retainedCandidateCommit: detail.lastCandidate.commit } : {}),
+    }] };
+    this.options.store.set(TABLE.taskDetails, updated);
+    return updated;
   }
   private goals(): Goal[] { return this.options.store.list<Goal>(TABLE.goals); }
   private goal(id: string): Goal { const value = this.options.store.get<Goal>(TABLE.goals, id); if (!value) throw new Error("Goal not found."); return value; }

@@ -183,6 +183,106 @@ test("localized replanning preserves unrelated running authority, immutable chec
   } finally { await factory.close(); }
 });
 
+test("diagnosis handoff reaches replacement planning and execution without reviving obsolete retry instructions", async () => {
+  const factory = harness(plan([
+    planned("accepted"), planned("integration", { dependsOn: ["accepted"] }),
+  ]));
+  try {
+    await factory.startPlan();
+    await factory.coordinator.tick();
+    await settle(() => factory.calls.executions.length === 1, "prerequisite author entered");
+    factory.finish("accepted");
+    await settle(() => factory.task("accepted").status === "completed", "prerequisite accepted");
+    const accepted = factory.task("accepted"), acceptedDetail = factory.detail("accepted");
+    await factory.coordinator.tick();
+    await settle(() => factory.calls.executions.length === 2, "integration author entered");
+    factory.finish("integration", "failed");
+    await settle(() => factory.task("integration").status === "failed", "partial integration retained");
+    const latestCandidate = factory.detail("integration").lastCandidate!;
+    const obsolete = "Restore obsolete-candidate at obsolete-commit and replace the old authentication implementation";
+    factory.store.set("factory-task-details", { ...factory.detail("integration"), repairInstructions: obsolete });
+    const instructions = `Preserve ${latestCandidate.id} at ${latestCandidate.commit}; wire the accepted authentication API instead of replacing it`;
+    await factory.coordinator.tick();
+    await factory.coordinator.tick();
+    await settle(() => factory.calls.diagnoses.length === 1, "repair diagnosis entered");
+    factory.diagnosis.resolve({ action: "replan", reason: "Separate missing adapter work from composition", instructions });
+    await settle(() => factory.control().stage === "plan", "diagnosis handoff persisted");
+    assert.equal(factory.control().replanInstructions, instructions);
+    await factory.coordinator.tick();
+    await settle(() => factory.calls.plans.length === 2, "replacement planner entered");
+    assert.ok(factory.calls.plans[1]!.includes(instructions), "complete supervisor instructions reach the planner");
+    factory.nextPlan.resolve(plan([planned("integration", { description: "Wire the accepted authentication API and finish both app roots", dependsOn: ["accepted"] })]));
+    await settle(() => factory.control().stage === "dispatch", "replacement plan accepted");
+    assert.equal(factory.control().replanInstructions, undefined, "handoff is consumed by this plan");
+    assert.deepEqual(factory.task("accepted"), accepted);
+    assert.deepEqual(factory.detail("accepted"), acceptedDetail);
+    assert.deepEqual(factory.store.get<Goal>("goals", factory.goal.id)!.criteria, ["Requested behavior works"]);
+    assert.deepEqual(factory.detail("integration").lastCandidate, latestCandidate);
+    assert.equal(factory.detail("integration").repairInstructions, undefined);
+    assert.deepEqual(factory.detail("integration").priorRepairInstructions, [{ instructions: obsolete, planRevision: 1, retainedCandidateId: latestCandidate.id, retainedCandidateCommit: latestCandidate.commit }]);
+    assert.equal(factory.detail("integration").replanInstructions, instructions);
+    await factory.coordinator.tick();
+    await settle(() => factory.calls.executions.length === 3, "replacement author entered");
+    const prompt = factory.calls.executionInputs[2]!.prompt;
+    assert.ok(prompt.includes(instructions));
+    assert.ok(prompt.includes(latestCandidate.commit));
+    assert.ok(!prompt.includes(obsolete), "old restoration commands stay inspectable without becoming new instructions");
+    factory.finish("integration", "failed");
+    await settle(() => factory.task("integration").status === "failed", "replacement source retained");
+    const freshRetry = "Keep the current wiring and repair the new controlled authentication failure";
+    await factory.coordinator.retireAttempt(factory.attempt("integration").id, { repairInstructions: freshRetry });
+    await factory.coordinator.tick();
+    await settle(() => factory.calls.executions.length === 4, "explicit retry author entered");
+    assert.equal(factory.detail("integration").repairInstructions, freshRetry);
+    assert.ok(factory.calls.executionInputs[3]!.prompt.includes(freshRetry), "intentional current retry guidance remains active");
+    assert.ok(!factory.calls.executionInputs[3]!.prompt.includes(obsolete));
+  } finally { await factory.close(); }
+});
+
+test("explicit replanning and user steering cannot leak an older pending diagnosis into new task contracts", async () => {
+  for (const action of ["plan", "steer", "unbound"] as const) {
+    const factory = harness(plan([planned("integration")]));
+    try {
+      await factory.startPlan();
+      const retained = { id: "latest-retained-source", commit: "latest-retained-commit", baseCommit: "base" };
+      const obsolete = "Restore the superseded source and implement the obsolete deployment requirement";
+      factory.store.set("factory-task-details", { ...factory.detail("integration"), repairInstructions: obsolete, lastCandidate: retained });
+      factory.store.set("factory-control", { ...factory.control(), replanInstructions: "Superseded diagnosis handoff" });
+      if (action !== "steer") factory.coordinator.requestPlan(factory.goal.id);
+      else await factory.coordinator.steer(factory.goal.id, { context: "Use the new user-requested integration behavior" });
+      assert.equal(factory.control().replanInstructions, undefined);
+      await factory.coordinator.tick();
+      await settle(() => factory.calls.plans.length === 2, "explicit replacement planner entered");
+      assert.ok(!factory.calls.plans[1]!.includes("Superseded diagnosis handoff"));
+      factory.nextPlan.resolve(plan([planned("integration", { description: "Complete the current app integration" })]));
+      await settle(() => factory.control().stage === "dispatch", "explicit replacement accepted");
+      assert.deepEqual(factory.detail("integration").lastCandidate, retained);
+      assert.equal(factory.detail("integration").priorRepairInstructions?.[0]?.instructions, obsolete);
+      assert.equal(factory.detail("integration").replanInstructions, undefined);
+      // Simulate upgrading after an old service already applied this replacement plan.
+      const replacementPlan = factory.store.get<PlanRecord>("factory-plans", factory.goal.id)!;
+      const issuedAt = new Date(Date.parse(replacementPlan.createdAt) - 1_000).toISOString();
+      factory.store.set("factory-task-details", { ...factory.detail("integration"), repairInstructions: obsolete, priorRepairInstructions: undefined });
+      factory.store.set("decisions", { id: "legacy-retry-guidance", goalId: factory.goal.id, at: issuedAt,
+        kind: action === "steer" ? "task-retry-instructions" : "repair", text: action === "unbound" ? "An unrelated older retry reason" : obsolete,
+        data: { taskId: factory.task("integration").id, ...(action === "steer" ? { repairInstructions: obsolete } : { action: "retry" }) } });
+      await factory.coordinator.tick();
+      await settle(() => factory.calls.executions.length === 1, "explicit replacement author entered");
+      if (action === "unbound") {
+        assert.equal(factory.detail("integration").repairInstructions, obsolete, "unrelated retry evidence cannot revoke unbound current guidance");
+        assert.equal(factory.detail("integration").priorRepairInstructions, undefined);
+        assert.ok(factory.calls.executionInputs[0]!.prompt.includes(obsolete));
+      } else {
+        assert.equal(factory.detail("integration").repairInstructions, undefined);
+        assert.equal(factory.detail("integration").priorRepairInstructions?.[0]?.recordedAt, issuedAt);
+        assert.ok(!factory.calls.executionInputs[0]!.prompt.includes(obsolete));
+      }
+      assert.ok(!factory.calls.executionInputs[0]!.prompt.includes("Superseded diagnosis handoff"));
+      if (action === "steer") assert.ok(factory.calls.executionInputs[0]!.prompt.includes("Use the new user-requested integration behavior"));
+    } finally { await factory.close(); }
+  }
+});
+
 test("a preserved remote preparation keeps its assignment revision when execution resumes after localized replanning", async () => {
   const factory = harness(plan([
     planned("broken", { estimatedMinutes: 100, writePaths: ["packages/shared"] }),

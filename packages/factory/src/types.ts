@@ -78,6 +78,10 @@ export interface TaskDetail {
   id: string; key: string; checks: string[]; planRevision: number;
   planChecks?: string[]; waitingFor?: string; waitReason?: string;
   lastError?: string; lastCandidate?: CandidateRef; repairInstructions?: string;
+  /** A replacement plan archives prior retry guidance instead of treating it as current. */
+  priorRepairInstructions?: Array<{ instructions: string; planRevision?: number; recordedAt?: string; retainedCandidateId?: string; retainedCandidateCommit?: string }>;
+  /** Diagnosis guidance accepted with this replacement task's plan. */
+  replanInstructions?: string;
   selected: boolean; failureSignatures: string[];
 }
 export interface AttemptDetail {
@@ -109,6 +113,8 @@ export interface ControlRecord {
   spent: number; unpricedTurns?: number; startedAt: string; maxDurationMs?: number;
   waitingFor?: string; waitReason?: string; wakeAt?: string;
   diagnosisTaskId?: string; steering: string[]; replanReason?: string;
+  /** Pending diagnosis handoff, consumed only by the replacement plan. */
+  replanInstructions?: string;
   /** Only these unfinished tasks are replaced by a localized repair plan. */
   replanTaskIds?: string[];
   operation?: { id: string; revision: number; kind: "planner" | "evaluator" | "diagnosis" };
