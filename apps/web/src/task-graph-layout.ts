@@ -97,3 +97,27 @@ export function taskGraphLayout(tasks: FactoryTask[]): TaskGraphLayout {
     layers: columns.length, missing, unresolved, duplicates,
   };
 }
+
+/** Hide cards only after validating and ordering the complete dependency graph. */
+export function hideCompletedGraphNodes(layout: TaskGraphLayout): TaskGraphLayout {
+  const visible = layout.nodes.filter(node => node.task.status !== 'completed');
+  const ids = new Set(visible.map(node => node.task.id));
+  const layers = [...new Set(visible.map(node => node.layer))].sort((a, b) => a - b);
+  const columns = layers.map(layer => visible.filter(node => node.layer === layer).sort((a, b) => a.y - b.y));
+  const positions = new Map(columns.flatMap((column, index) => column.map((node, row) => [node.task.id, { column: index, row }] as const)));
+  const { width, height, columnGap, rowGap, padding, header } = GRAPH_CARD;
+  const longestColumn = Math.max(0, ...columns.map(column => column.length));
+  return {
+    ...layout,
+    nodes: visible.map(node => ({ ...node,
+      x: padding + positions.get(node.task.id)!.column * (width + columnGap),
+      y: padding + header + positions.get(node.task.id)!.row * (height + rowGap),
+    })),
+    // Keep actual dependency edges; a hidden prerequisite never becomes a missing
+    // reference or an invented direct link between its neighbors.
+    edges: layout.edges.filter(edge => ids.has(edge.from) && ids.has(edge.to)),
+    width: Math.max(width + padding * 2, columns.length * (width + columnGap) - columnGap + padding * 2),
+    height: Math.max(height + padding * 2 + header, longestColumn * (height + rowGap) - rowGap + padding * 2 + header),
+    layers: columns.length,
+  };
+}

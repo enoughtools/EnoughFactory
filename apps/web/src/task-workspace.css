@@ -40,7 +40,7 @@
 .task-index-owner, .task-index-reason { font-size: 10px; line-height: 1.45; color: var(--factory-secondary); }
 .task-index-reason { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
 .task-column-empty { min-height: 50px; padding: 9px 2px; color: var(--factory-secondary); font-size: 10px; }
-.task-empty-filter { padding: 12px; font-size: 11px; color: var(--factory-secondary); }
+.task-empty-filter { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; padding: 12px; font-size: 11px; color: var(--factory-secondary); }
 .task-table-scroll { flex: 1; min-height: 0; overflow: auto; border: 1px solid var(--factory-line); }
 .task-work-table { width: 100%; border-collapse: separate; border-spacing: 0; text-align: left; font-size: 11px; }
 .task-work-table thead { position: sticky; top: 0; z-index: 1; background: var(--factory-paper); }

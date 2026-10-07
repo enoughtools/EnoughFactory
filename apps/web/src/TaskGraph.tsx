@@ -4,7 +4,7 @@ import type { Device, TaskOverview, TaskWorkState } from '@enoughfactory/contrac
 import { criticalPathMinutes } from '@enoughfactory/factory/scheduler';
 import { Maximize, Minus, Plus } from 'lucide-react';
 import { Button } from './ui';
-import { GRAPH_CARD, criticalGraphBranches, taskGraphLayout } from './task-graph-layout';
+import { GRAPH_CARD, criticalGraphBranches, hideCompletedGraphNodes, taskGraphLayout } from './task-graph-layout';
 import { fitGraphViewport, MAX_GRAPH_ZOOM, MIN_GRAPH_ZOOM, panGraphViewport, zoomGraphViewport } from './graph-viewport';
 import type { GraphPoint, GraphViewport } from './graph-viewport';
 import './task-graph.css';
@@ -16,20 +16,24 @@ export function estimatedTime(minutes: number) {
   return minutes < 60 ? `${Math.round(minutes)}m` : `${Math.floor(minutes / 60)}h${Math.round(minutes % 60) ? ` ${Math.round(minutes % 60)}m` : ''}`;
 }
 
-export function TaskGraph({ tasks, devices, selectedId, matchingIds, concurrency, onSelect }: {
-  tasks: TaskOverview[]; devices: Device[]; selectedId?: string; matchingIds: string[]; concurrency: number; onSelect: (id: string) => void;
+export function TaskGraph({ tasks, devices, selectedId, matchingIds, concurrency, onSelect, hideCompleted = false }: {
+  tasks: TaskOverview[]; devices: Device[]; selectedId?: string; matchingIds: string[]; concurrency: number; onSelect: (id: string) => void; hideCompleted?: boolean;
 }) {
   const viewport = useRef<HTMLDivElement>(null);
   const marker = useId().replaceAll(':', '');
   const [view, setView] = useState<GraphViewport>({ x: 0, y: 0, zoom: 1 });
   const [dragging, setDragging] = useState(false);
   const fitting = useRef(true);
+  const previousHideCompleted = useRef(hideCompleted);
   const pointerPositions = useRef(new Map<number, GraphPoint>());
   const drag = useRef<{ pointerId: number; origin: GraphPoint; previous: GraphPoint } | null>(null);
   const pinch = useRef<{ center: GraphPoint; distance: number } | null>(null);
   const suppressClick = useRef(false);
   const [available, setAvailable] = useState({ width: 800, height: 400 });
-  const layout = useMemo(() => taskGraphLayout(tasks.map(item => item.task)), [tasks]);
+  const fullLayout = useMemo(() => taskGraphLayout(tasks.map(item => item.task)), [tasks]);
+  const layout = useMemo(() => hideCompleted ? hideCompletedGraphNodes(fullLayout) : fullLayout, [fullLayout, hideCompleted]);
+  const layers = [...new Set(layout.nodes.map(node => node.layer))].sort((a, b) => a - b);
+  const hiddenCount = fullLayout.nodes.length - layout.nodes.length;
   const valid = !layout.unresolved.length && !layout.missing.length && !layout.duplicates.length;
   const critical = useMemo(() => valid ? criticalGraphBranches(tasks.map(item => item.task), criticalPathMinutes(tasks.map(item => item.task))) : { marked: new Set<string>(), edges: new Set<string>(), longest: 0 }, [tasks, valid]);
   const overview = new Map(tasks.map(item => [item.task.id, item]));
@@ -61,8 +65,9 @@ export function TaskGraph({ tasks, devices, selectedId, matchingIds, concurrency
     return () => observer.disconnect();
   }, []);
   useEffect(() => {
+    if (previousHideCompleted.current !== hideCompleted) { previousHideCompleted.current = hideCompleted; fitting.current = true; }
     if (fitting.current) setView(fitGraphViewport(layout, available));
-  }, [layout.width, layout.height, available]);
+  }, [layout.width, layout.height, available, hideCompleted]);
   useEffect(() => {
     const element = viewport.current;
     if (!element) return;
@@ -148,7 +153,7 @@ export function TaskGraph({ tasks, devices, selectedId, matchingIds, concurrency
     event.preventDefault();
   };
   return <section className="task-graph" aria-label="Task dependency graph">
-    <div className="task-graph-toolbar"><div className="task-graph-facts"><strong>{running} active / {concurrency} limit</strong><span>{ready} ready or queued</span><span>{blocked} blocked or attention</span>{critical.longest > 0 && <span title="Planner estimates; unestimated tasks count as one minute for scheduling.">Remaining path · {estimatedTime(critical.longest)} estimated</span>}{matchingIds.length !== tasks.length && <span>{matchingIds.length} matches · surrounding tasks dimmed</span>}</div><div className="task-graph-zoom"><Button size="sm" variant="ghost" aria-label="Zoom out dependency graph" disabled={zoom <= MIN_GRAPH_ZOOM} onClick={() => zoomAt(1 / 1.2)}><Minus size={13} /></Button><span>{Math.round(zoom * 100)}%</span><Button size="sm" variant="ghost" aria-label="Zoom in dependency graph" disabled={zoom >= MAX_GRAPH_ZOOM} onClick={() => zoomAt(1.2)}><Plus size={13} /></Button><Button size="sm" variant="ghost" onClick={fit} title="Fit the whole graph (F)"><Maximize size={13} />Fit</Button></div></div>
+    <div className="task-graph-toolbar"><div className="task-graph-facts"><strong>{running} active / {concurrency} limit</strong><span>{ready} ready or queued</span><span>{blocked} blocked or attention</span>{critical.longest > 0 && <span title="Planner estimates; unestimated tasks count as one minute for scheduling.">Remaining path · {estimatedTime(critical.longest)} estimated</span>}{hiddenCount > 0 && <span>{hiddenCount} completed hidden</span>}{matchingIds.length !== layout.nodes.length && <span>{matchingIds.length} matches · surrounding tasks dimmed</span>}</div><div className="task-graph-zoom"><Button size="sm" variant="ghost" aria-label="Zoom out dependency graph" disabled={zoom <= MIN_GRAPH_ZOOM} onClick={() => zoomAt(1 / 1.2)}><Minus size={13} /></Button><span>{Math.round(zoom * 100)}%</span><Button size="sm" variant="ghost" aria-label="Zoom in dependency graph" disabled={zoom >= MAX_GRAPH_ZOOM} onClick={() => zoomAt(1.2)}><Plus size={13} /></Button><Button size="sm" variant="ghost" onClick={fit} title="Fit the whole graph (F)"><Maximize size={13} />Fit</Button></div></div>
     {!valid && <div className="task-graph-notice" role="status">{layout.missing.length > 0 && <span>{layout.missing.length} prerequisite references are missing. </span>}{layout.unresolved.length > 0 && <span>{layout.unresolved.length} tasks have cyclic or unresolved ordering. </span>}{layout.duplicates.length > 0 && <span>{layout.duplicates.length} duplicate task identities. </span>}Showing recorded links; critical path is unavailable.</div>}
     {!matchingIds.length && <div className="task-graph-notice" role="status">No tasks match these filters.</div>}
     <div className={`task-graph-viewport ${dragging ? 'is-panning' : ''}`} ref={viewport} tabIndex={0} aria-label="Task graph workspace" aria-describedby={`${marker}-help`} onPointerDown={pointerDown} onPointerMove={pointerMove} onPointerUp={pointerUp} onPointerCancel={pointerUp} onKeyDown={keyboard} onClickCapture={event => { if (event.detail === 0) { suppressClick.current = false; return; } if (suppressClick.current) { event.preventDefault(); event.stopPropagation(); suppressClick.current = false; } }} style={{ backgroundSize: `${24 * zoom}px ${24 * zoom}px`, backgroundPosition: `${view.x}px ${view.y}px` }}>
@@ -162,11 +167,13 @@ export function TaskGraph({ tasks, devices, selectedId, matchingIds, concurrency
           const selectedLink = edge.from === selectedId || edge.to === selectedId;
           return <path key={`${edge.from}:${edge.to}`} className={`${criticalLink ? 'critical' : ''} ${selectedLink ? 'selected' : ''} ${!matched.has(edge.from) && !matched.has(edge.to) ? 'dimmed' : ''}`} d={`M${startX},${startY} C${startX + bend},${startY} ${endX - bend},${endY} ${endX},${endY}`} markerEnd={`url(#${marker}-arrow)`} />;
         })}</svg>
-        {Array.from({ length: layout.layers }, (_, layer) => <span key={layer} className="task-graph-layer" style={{ left: GRAPH_CARD.padding + layer * (GRAPH_CARD.width + GRAPH_CARD.columnGap), width: GRAPH_CARD.width }}>{layout.unresolved.length && layer === layout.layers - 1 ? 'Unresolved ordering' : layer === 0 ? 'Independent roots' : `Dependency step ${layer}`}</span>)}
+        {layers.map((layer, column) => <span key={layer} className="task-graph-layer" style={{ left: GRAPH_CARD.padding + column * (GRAPH_CARD.width + GRAPH_CARD.columnGap), width: GRAPH_CARD.width }}>{fullLayout.unresolved.length && layer === fullLayout.layers - 1 ? 'Unresolved ordering' : layer === 0 ? 'Independent roots' : `Dependency step ${layer}`}</span>)}
         {layout.nodes.map(node => {
           const item = overview.get(node.task.id)!;
           const owner = devices.find(device => device.id === node.task.deviceId);
           const criticalTask = critical.marked.has(node.task.id);
+          const hiddenPrerequisites = hideCompleted ? node.task.dependsOn.filter(id => overview.get(id)?.task.status === 'completed').length : 0;
+          const prerequisiteSummary = node.task.dependsOn.length ? `${node.task.dependsOn.length} prerequisite${node.task.dependsOn.length === 1 ? '' : 's'}${hiddenPrerequisites ? ` · ${hiddenPrerequisites} completed hidden` : ''}` : 'No prerequisites';
           const stateLabel = item.state === 'canceled' && /^Replaced during (replanning|goal steering)\./.test(item.reason ?? '') ? 'Superseded' : taskWorkLabels[item.state];
           return <button key={node.task.id} className={`task-graph-node ${selectedId === node.task.id ? 'selected' : ''} ${criticalTask ? 'critical' : ''} ${connected.has(node.task.id) ? 'connected' : ''} ${!matched.has(node.task.id) ? 'dimmed' : ''} ${working.has(item.state) ? 'working' : ''}`} style={{ left: node.x, top: node.y, width: GRAPH_CARD.width, height: GRAPH_CARD.height }} aria-pressed={selectedId === node.task.id} onClick={() => onSelect(node.task.id)} onFocus={event => {
             if (!event.currentTarget.matches(':focus-visible')) return;
@@ -179,8 +186,8 @@ export function TaskGraph({ tasks, devices, selectedId, matchingIds, concurrency
               if (x || y) { fitting.current = false; return panGraphViewport(previous, { x, y }); }
               return previous;
             });
-          }} title={[node.task.title, item.reason, owner?.online === false ? `${owner.name} is offline` : undefined].filter(Boolean).join('\n')}>
-            <div className="task-graph-node-state"><span className={`status-dot state-${item.state}`} /><span>{stateLabel}</span>{criticalTask && <span className="task-graph-critical-tag">Critical path</span>}</div><strong>{node.task.title}</strong><span className="task-graph-owner">{owner?.name ?? 'Unassigned'}{owner?.online === false ? ' · offline' : ''}{node.task.estimatedMinutes ? ` · ${estimatedTime(node.task.estimatedMinutes)}` : ''}</span><span className="task-graph-reason">{node.unresolved ? 'Dependency order unresolved' : item.reason ?? (node.task.dependsOn.length ? `${node.task.dependsOn.length} prerequisite${node.task.dependsOn.length === 1 ? '' : 's'}` : 'No prerequisites')}</span>
+          }} title={[node.task.title, item.reason, prerequisiteSummary, owner?.online === false ? `${owner.name} is offline` : undefined].filter(Boolean).join('\n')}>
+            <div className="task-graph-node-state"><span className={`status-dot state-${item.state}`} /><span>{stateLabel}</span>{criticalTask && <span className="task-graph-critical-tag">Critical path</span>}</div><strong>{node.task.title}</strong><span className="task-graph-owner">{owner?.name ?? 'Unassigned'}{owner?.online === false ? ' · offline' : ''}{node.task.estimatedMinutes ? ` · ${estimatedTime(node.task.estimatedMinutes)}` : ''}</span><span className="task-graph-reason">{node.unresolved ? 'Dependency order unresolved' : item.reason ? `${item.reason}${hiddenPrerequisites ? ` · ${hiddenPrerequisites} completed prerequisites hidden` : ''}` : prerequisiteSummary}</span>
           </button>;
         })}
       </div>
