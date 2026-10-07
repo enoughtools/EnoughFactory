@@ -72,8 +72,13 @@ if [ ! -x /opt/enoughfactory/node/bin/node ]; then
   mkdir -p /opt/enoughfactory/node
   tar -xJf "$node_stage/$filename" --strip-components=1 -C /opt/enoughfactory/node
 fi
+${runtime === "codex" ? `case "$(uname -m)" in
+  x86_64) native_package='@openai/codex-linux-x64@npm:@openai/codex@${RUNTIME_PINS.codex}-linux-x64';;
+  aarch64|arm64) native_package='@openai/codex-linux-arm64@npm:@openai/codex@${RUNTIME_PINS.codex}-linux-arm64';;
+  *) echo 'Unsupported Linux Codex architecture; expected x86_64, aarch64 or arm64.' >&2; exit 1;;
+esac` : ""}
 npm_cache=$(mktemp -d "\${TMPDIR:-/tmp}/enoughfactory-npm.XXXXXXXX")
-npm install --global --prefix /opt/enoughfactory/node --cache "$npm_cache" --no-audit --no-fund '${runtime === "codex" ? `@openai/codex@${RUNTIME_PINS.codex}` : `@anthropic-ai/claude-code@${RUNTIME_PINS.claude}`}'
+npm install --global --prefix /opt/enoughfactory/node --cache "$npm_cache" --no-audit --no-fund '${runtime === "codex" ? `@openai/codex@${RUNTIME_PINS.codex}` : `@anthropic-ai/claude-code@${RUNTIME_PINS.claude}`}'${runtime === "codex" ? ' "$native_package"' : ""}
 `;
 }
 
@@ -112,7 +117,19 @@ export async function provisionRuntime(containerId: string, runtime: RuntimeKind
     const script = await readFile(resolve(options.runtimeAssetsDir ?? assetsDirectory, "antigravity_bridge.py"));
     await writePrivateFile(containerId, "/opt/enoughfactory/agents/antigravity_bridge.py", script, options);
   }
-  const result = (await availability(containerId, options)).find((entry) => entry.kind === runtime)!;
+  let result = (await availability(containerId, options)).find((entry) => entry.kind === runtime)!;
+  if (runtime === "codex") {
+    // npm can succeed with only the JavaScript wrapper. Probe the real executable
+    // without a pipeline masking its status, before forwarding any credentials.
+    let version: string;
+    try { version = await containerCommand(containerId, ["sh", "-c", `${paths} exec codex --version`], { ...options, timeout: 30_000 }); }
+    catch (error) {
+      if (!(error instanceof AgentError) || error.code !== "CONTAINER_COMMAND_FAILED") throw error;
+      const detail = error.message.replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, "").slice(-2048);
+      throw new AgentError(`Codex ${desired} native executable verification failed: ${detail}`, "RUNTIME_MISSING");
+    }
+    result = { ...result, available: !!version, version: version || undefined, interactiveApprovals: hasPinnedVersion({ ...result, version }, desired) };
+  }
   if (!result.available) throw new AgentError(`The ${runtime} runtime was not installed successfully.`, "RUNTIME_MISSING");
   if (!hasPinnedVersion(result, desired) || runtime === "antigravity" && !result.interactiveApprovals) throw new AgentError(`The ${runtime} runtime did not report the required version ${desired}.`, "RUNTIME_VERSION_MISMATCH");
   if (provision.copyHostAuth) await copyMinimalAuth(containerId, runtime, provision, options);

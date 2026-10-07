@@ -11,7 +11,7 @@ import { RUNTIME_PINS } from "./types.ts";
 const dockerEndpoint = { cliPath: "/owned/docker", host: "unix:///owned/docker.sock", configDirectory: "/owned/config" };
 
 /** Execute the actual provisioning shell in a disposable local filesystem, without Docker or downloads. */
-async function fixture() {
+async function fixture(architecture = "aarch64") {
   const directory = await mkdtemp(join(tmpdir(), "enough-provision-test-"));
   const node = join(directory, "node"), home = join(directory, "home"), temporary = join(directory, "tmp");
   await Promise.all([mkdir(join(node, "bin"), { recursive: true }), mkdir(join(home, ".npm", "_cacache"), { recursive: true }), mkdir(join(home, ".codex"), { recursive: true }), mkdir(temporary)]);
@@ -23,17 +23,21 @@ async function fixture() {
   }
   await executable("node", "exit 0");
   await executable("setsid", "exit 0");
+  await executable("uname", 'printf "%s\\n" "$FIXTURE_ARCH"');
   await executable("codex", `if [ ! -f "$FIXTURE_ROOT/installed-version" ]; then exit 1; fi
 version=$(cat "$FIXTURE_ROOT/installed-version")
 if [ "$version" = broken ]; then echo 'The native optional dependency is missing' >&2; exit 127; fi
 printf 'codex-cli %s\\n' "$version"`);
   await executable("npm", `cache=''
 package=''
+native_package=''
+printf '%s\\n' "$@" >> "$FIXTURE_ROOT/npm-arguments"
 while [ "$#" -gt 0 ]; do
-  case "$1" in --cache) shift; cache=$1;; @openai/codex@*) package=$1;; esac
+  case "$1" in --cache) shift; cache=$1;; @openai/codex@*) package=$1;; @openai/codex-linux-*@npm:*) native_package=$1;; esac
   shift
 done
 test "$package" = '@openai/codex@${RUNTIME_PINS.codex}'
+test -n "$native_package"
 test -d "$cache"
 case "$cache" in "$TMPDIR"/enoughfactory-npm.*) ;; *) echo 'Cache escaped the disposable directory' >&2; exit 1;; esac
 printf '%s\\n' "$cache" >> "$FIXTURE_ROOT/cache-paths"
@@ -56,16 +60,19 @@ esac`);
     assert.equal(shell[0], "sh");
     const replacements = `s|/opt/enoughfactory/node|${node}|g;s|/opt/enoughfactory/agents|${join(directory, "agents")}|g;s|/root|${home}|g`;
     const localArgs = shell[1] === "-s" ? ["-c", `sed ${quote(replacements)} | /bin/sh -s`] : shell.slice(1).map(translate);
-    return spawn("/bin/sh", localArgs, { stdio: "pipe", env: { PATH: `${node}/bin:/usr/bin:/bin`, HOME: home, TMPDIR: temporary, FIXTURE_ROOT: directory, FIXTURE_MODE: mode } });
+    return spawn("/bin/sh", localArgs, { stdio: "pipe", env: { PATH: `${node}/bin:/usr/bin:/bin`, HOME: home, TMPDIR: temporary, FIXTURE_ROOT: directory, FIXTURE_MODE: mode, FIXTURE_ARCH: architecture } });
   }) as SpawnProcess;
   return {
     options: { dockerEndpoint, spawnProcess },
     setMode(value: string) { mode = value; },
+    async npmArguments() { return (await readFile(join(directory, "npm-arguments"), "utf8")).trim().split("\n"); },
     async assertPreserved() {
       assert.equal(await readFile(join(home, ".npm", "_cacache", "existing"), "utf8"), "previous cache must survive");
       assert.equal(await readFile(join(home, ".codex", "continuation"), "utf8"), "provider state must survive");
       await access(join(node, "bin", "node"));
-      const paths = (await readFile(join(directory, "cache-paths"), "utf8")).trim().split("\n");
+      let paths: string[] = [];
+      try { paths = (await readFile(join(directory, "cache-paths"), "utf8")).trim().split("\n"); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
       assert.equal(new Set(paths).size, paths.length, "Every installation must receive its own cache");
       for (const path of paths) await assert.rejects(access(path), { code: "ENOENT" });
       assert.deepEqual(await readdir(temporary), [], "Failed and successful installation caches must both be gone");
@@ -94,9 +101,40 @@ test("npm success cannot hide a missing native optional dependency or a differen
       const context = await fixture();
       try {
         context.setMode(mode!);
-        await assert.rejects(provisionRuntime("fixture-container", "codex", {}, context.options), { code });
+        await assert.rejects(provisionRuntime("fixture-container", "codex", {}, context.options), error => {
+          assert.equal((error as { code: string }).code, code);
+          if (mode === "broken") assert.match((error as Error).message, /Codex 0\.160\.0 native executable verification failed: The native optional dependency is missing/);
+          return true;
+        });
         assert.equal((await context.assertPreserved()).length, 1);
       } finally { await context.close(); }
     });
   }
+});
+
+test("Codex requires the pinned native package on every supported architecture with existing Node", async t => {
+  for (const [architecture, platform] of [["x86_64", "x64"], ["aarch64", "arm64"], ["arm64", "arm64"]]) {
+    await t.test(architecture!, async () => {
+      const context = await fixture(architecture);
+      try {
+        const runtime = await provisionRuntime("fixture-container", "codex", {}, context.options);
+        assert.equal(runtime.version, `codex-cli ${RUNTIME_PINS.codex}`);
+        const args = await context.npmArguments();
+        assert.deepEqual(args.filter(arg => arg.startsWith("@openai/")), [
+          `@openai/codex@${RUNTIME_PINS.codex}`,
+          `@openai/codex-linux-${platform}@npm:@openai/codex@${RUNTIME_PINS.codex}-linux-${platform}`,
+        ]);
+        assert.equal((await context.assertPreserved()).length, 1);
+      } finally { await context.close(); }
+    });
+  }
+});
+
+test("Codex rejects an unsupported Linux architecture before npm installation", async () => {
+  const context = await fixture("riscv64");
+  try {
+    await assert.rejects(provisionRuntime("fixture-container", "codex", {}, context.options), /Unsupported Linux Codex architecture/);
+    await assert.rejects(context.npmArguments(), { code: "ENOENT" });
+    assert.deepEqual(await context.assertPreserved(), []);
+  } finally { await context.close(); }
 });
