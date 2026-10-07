@@ -20,6 +20,7 @@ import { inspectAttempt, inspectGoal, inspectTask, taskControlReason, taskDispat
 import { factoryChatBinding } from './factory-chat.ts';
 import { controllerError } from './factory-controller-error.ts';
 import { releaseControllerInputs } from './factory-controller-inputs.ts';
+import { releaseFactoryCodexPayload } from './factory-codex-cleanup.ts';
 import { prepareControllerContext } from './controller-context.ts';
 import { assertCurrentWorkerAssignment, assertWorkerContext, disposeWorkerContext, prepareWorkerContext, type WorkerEvidenceContext } from './worker-context.ts';
 import { developmentToolchainChoice, parseDevelopmentToolchain, prepareDevelopmentToolchain, type FrozenDevelopmentToolchain } from './development-toolchain.ts';
@@ -68,6 +69,7 @@ export async function factoryAttemptWorkingDirectorySources(dataDir: string, ses
 
 /** The service owns execution and the supervisor; no open window is required. */
 export async function initializeFactory(app: DeviceApp, chats: ChatController, network?: { peers: PeerManager }) {
+  app.sessions.afterCaptureBeforeStop.push(sessionId => releaseFactoryCodexPayload({ store: app.store, sessions: app.sessions, chats, manager: chats.manager }, sessionId));
   for (const run of app.store.list<ControllerRun>('factory-controller-runs')) {
     if (run.status === 'starting' || run.status === 'running') app.store.set('factory-controller-runs', { ...run, status: 'interrupted', error: 'The device service restarted before this decision completed. Its conversation and environment remain inspectable.', updatedAt: now() });
   }

@@ -47,11 +47,13 @@ if [ ! -x /opt/enoughfactory/antigravity/bin/python ]; then python3 -m venv /opt
   return `${common}
 node_stage=''
 npm_cache=''
+receipt_stage=''
 cleanup_provisioning() {
   cleanup_status=$?
   trap - EXIT
   if [ -n "$node_stage" ]; then rm -rf -- "$node_stage" || cleanup_status=1; fi
   if [ -n "$npm_cache" ]; then rm -rf -- "$npm_cache" || cleanup_status=1; fi
+  if [ -n "$receipt_stage" ]; then rm -f -- "$receipt_stage" || cleanup_status=1; fi
   exit "$cleanup_status"
 }
 trap cleanup_provisioning EXIT
@@ -73,13 +75,108 @@ if [ ! -x /opt/enoughfactory/node/bin/node ]; then
   tar -xJf "$node_stage/$filename" --strip-components=1 -C /opt/enoughfactory/node
 fi
 ${runtime === "codex" ? `case "$(uname -m)" in
-  x86_64) native_package='@openai/codex-linux-x64@npm:@openai/codex@${RUNTIME_PINS.codex}-linux-x64';;
-  aarch64|arm64) native_package='@openai/codex-linux-arm64@npm:@openai/codex@${RUNTIME_PINS.codex}-linux-arm64';;
+  x86_64) native_platform=x64;;
+  aarch64|arm64) native_platform=arm64;;
   *) echo 'Unsupported Linux Codex architecture; expected x86_64, aarch64 or arm64.' >&2; exit 1;;
-esac` : ""}
+esac
+native_alias="@openai/codex-linux-$native_platform"
+native_version="${RUNTIME_PINS.codex}-linux-$native_platform"
+native_package="$native_alias@npm:@openai/codex@$native_version"` : ""}
 npm_cache=$(mktemp -d "\${TMPDIR:-/tmp}/enoughfactory-npm.XXXXXXXX")
 npm install --global --prefix /opt/enoughfactory/node --cache "$npm_cache" --no-audit --no-fund${runtime === "codex" ? " --omit=optional" : ""} '${runtime === "codex" ? `@openai/codex@${RUNTIME_PINS.codex}` : `@anthropic-ai/claude-code@${RUNTIME_PINS.claude}`}'${runtime === "codex" ? ' "$native_package"' : ""}
+${runtime === "codex" ? `receipt_stage=$(mktemp /opt/enoughfactory/agents/.codex-install.XXXXXXXX)
+printf '{"schemaVersion":1,"runtime":"codex","wrapperVersion":"${RUNTIME_PINS.codex}","nativeAlias":"%s","nativeVersion":"%s"}\\n' "$native_alias" "$native_version" > "$receipt_stage"
+chmod 600 "$receipt_stage"
+mv -f -- "$receipt_stage" /opt/enoughfactory/agents/codex-install.json
+receipt_stage=''` : ""}
 `;
+}
+
+export interface CodexPayloadRelease { status: "released" | "deferred"; reason?: string; }
+
+/** Discard only app-provisioned payload locations with matching metadata; retain provider state. */
+export async function releaseCodexPayload(containerId: string, options: RuntimeOptions = {}): Promise<CodexPayloadRelease> {
+  const script = `
+const fs = require('node:fs'), path = require('node:path');
+const prefix = '/opt/enoughfactory/node';
+const receiptPath = '/opt/enoughfactory/agents/codex-install.json';
+const wrapper = prefix + '/lib/node_modules/@openai/codex';
+const link = prefix + '/bin/codex';
+function defer(reason) { console.log(JSON.stringify({ status: 'deferred', reason })); process.exit(0); }
+function stat(filename) {
+  try { return fs.lstatSync(filename); }
+  catch (error) { if (error.code === 'ENOENT') return undefined; throw error; }
+}
+function directory(filename) {
+  const value = stat(filename);
+  if (value && (!value.isDirectory() || value.isSymbolicLink())) defer('A runtime path is no longer a plain directory.');
+  return !!value;
+}
+function ancestors(filename) {
+  const parts = path.dirname(filename).split('/').filter(Boolean);
+  let current = '';
+  for (const part of parts) { current += '/' + part; directory(current); }
+}
+function json(filename, limit = 65536) {
+  const value = stat(filename);
+  if (!value || !value.isFile() || value.isSymbolicLink() || value.size > limit) defer('Runtime ownership metadata is missing or changed.');
+  try { return JSON.parse(fs.readFileSync(filename, 'utf8')); }
+  catch { defer('Runtime ownership metadata is unreadable.'); }
+}
+let native;
+try {
+  ancestors(receiptPath);
+  if (!stat(receiptPath)) defer('This Codex installation has no app ownership receipt.');
+  const receipt = json(receiptPath, 4096);
+  const platform = receipt.nativeAlias === '@openai/codex-linux-arm64' ? 'arm64' : receipt.nativeAlias === '@openai/codex-linux-x64' ? 'x64' : undefined;
+  if (receipt.schemaVersion !== 1 || receipt.runtime !== 'codex' || receipt.wrapperVersion !== '${RUNTIME_PINS.codex}' || !platform || receipt.nativeVersion !== '${RUNTIME_PINS.codex}-linux-' + platform) defer('The Codex ownership receipt does not match the pinned runtime.');
+  native = prefix + '/lib/node_modules/' + receipt.nativeAlias;
+  for (const filename of [wrapper, native, link]) ancestors(filename);
+  if (directory(wrapper)) {
+    const metadata = json(wrapper + '/package.json');
+    if (metadata.name !== '@openai/codex' || metadata.version !== receipt.wrapperVersion || metadata.bin?.codex !== 'bin/codex.js') defer('The Codex wrapper has changed since provisioning.');
+    ancestors(wrapper + '/bin/codex.js');
+    const entry = stat(wrapper + '/bin/codex.js');
+    if (!entry?.isFile() || entry.isSymbolicLink()) defer('The Codex wrapper entry point has changed.');
+  }
+  if (directory(native)) {
+    const metadata = json(native + '/package.json');
+    if (metadata.name !== '@openai/codex' || metadata.version !== receipt.nativeVersion) defer('The Codex native package has changed since provisioning.');
+  }
+  const entry = stat(link);
+  if (entry && (!entry.isSymbolicLink() || path.resolve(path.dirname(link), fs.readlinkSync(link)) !== wrapper + '/bin/codex.js')) defer('The Codex executable link has changed since provisioning.');
+  const processes = fs.readdirSync('/proc').filter(value => /^[0-9]+$/.test(value));
+  if (processes.length > 4096) defer('Container process state is too large to verify safely.');
+  const payloadPath = value => [wrapper, native, link].some(root => value === root || value.startsWith(root + '/'));
+  for (const pid of processes) {
+    if (pid === String(process.pid)) continue;
+    try {
+      let executable = '';
+      try { executable = fs.readlinkSync('/proc/' + pid + '/exe').replace(/ \\(deleted\\)$/, ''); }
+      catch (error) { if (error.code !== 'ENOENT' && error.code !== 'ESRCH') throw error; }
+      if (payloadPath(executable)) defer('A Codex process is still using this payload.');
+      const descriptor = fs.openSync('/proc/' + pid + '/cmdline', 'r');
+      const bytes = Buffer.alloc(65536);
+      let count;
+      try { count = fs.readSync(descriptor, bytes, 0, bytes.length, 0); } finally { fs.closeSync(descriptor); }
+      if (count === bytes.length) defer('A container command line could not be fully inspected.');
+      const arguments_ = bytes.subarray(0, count).toString('utf8').split('\\0');
+      if (arguments_.some(value => payloadPath(value) || ['codex', 'codex.js'].includes(path.basename(value)))) defer('A Codex wrapper or native process is still active.');
+    } catch (error) {
+      if (error.code !== 'ENOENT' && error.code !== 'ESRCH') defer('Container process state could not be verified.');
+    }
+  }
+} catch { defer('Codex payload ownership or container process state could not be verified.'); }
+// Validate every target before deleting any. Keep the tiny receipt for retry and inspection.
+if (stat(link)) fs.unlinkSync(link);
+fs.rmSync(wrapper, { recursive: true, force: true });
+fs.rmSync(native, { recursive: true, force: true });
+console.log(JSON.stringify({ status: 'released' }));
+`;
+  const output = await containerCommand(containerId, ["/opt/enoughfactory/node/bin/node", "--input-type=commonjs", "-e", script], { ...options, timeout: 30_000 });
+  const result = JSON.parse(output) as CodexPayloadRelease;
+  if (result.status !== "released" && result.status !== "deferred") throw new AgentError("Codex payload cleanup did not confirm its outcome.", "RUNTIME_CLEANUP_UNKNOWN");
+  return result;
 }
 
 function hasPinnedVersion(capability: RuntimeCapability, desired: string): boolean {

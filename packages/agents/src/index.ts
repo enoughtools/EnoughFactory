@@ -1,15 +1,16 @@
 import type { RuntimeCapability, RuntimeKind } from "@enoughfactory/contracts";
 import { CodexTurn } from "./codex.ts";
-import { ContainerProcess, containerCommand, type SpawnProcess } from "./process.ts";
+import { ContainerProcess, containerCommand, checkContainerId, type SpawnProcess } from "./process.ts";
 import { ApprovalRouter } from "./policy.ts";
-import { availability, copyMinimalAuth, provisionRuntime, writePrivateFile, type RuntimeOptions } from "./provision.ts";
+import { availability, copyMinimalAuth, provisionRuntime, releaseCodexPayload, writePrivateFile, type CodexPayloadRelease, type RuntimeOptions } from "./provision.ts";
 import { AgentError, type ProvisionOptions, type TurnCallbacks, type TurnInput, type TurnResult } from "./types.ts";
 
 export * from "./types.ts";
 export { ApprovalRouter, matchPolicyRule } from "./policy.ts";
 export { CODEX_PROTOCOL_VERSION, codexApprovalResponse } from "./codex.ts";
+export type { CodexPayloadRelease } from "./provision.ts";
 
-interface LiveTurn { controller: AbortController; process?: ContainerProcess; router: ApprovalRouter; codex?: CodexTurn; }
+interface LiveTurn { containerId: string; controller: AbortController; process?: ContainerProcess; router: ApprovalRouter; codex?: CodexTurn; }
 export interface AgentManagerOptions extends RuntimeOptions {
   autoProvision?: boolean;
   copyHostAuth?: boolean;
@@ -18,39 +19,66 @@ export interface AgentManagerOptions extends RuntimeOptions {
 export class AgentManager {
   private live = new Map<string, LiveTurn>();
   private provisioning = new Map<string, Promise<RuntimeCapability>>();
+  private containerUses = new Map<string, number>();
+  private releasing = new Set<string>();
   constructor(private options: AgentManagerOptions = {}) {}
-  availability(containerId: string): Promise<RuntimeCapability[]> { return availability(containerId, this.options); }
-  async provision(containerId: string, runtime: RuntimeKind, provision: ProvisionOptions = {}, signal?: AbortSignal): Promise<RuntimeCapability> {
-    const key = `${containerId}:${runtime}`;
-    const existing = this.provisioning.get(key);
-    if (existing) {
-      const result = await existing;
-      if (provision.copyHostAuth) await copyMinimalAuth(containerId, runtime, provision, this.options);
-      return result;
+  private assertNotReleasing(containerId: string): void {
+    if (this.releasing.has(containerId)) throw Object.assign(new AgentError("This container is releasing its idle Codex payload. Retry after cleanup completes.", "RUNTIME_CLEANUP_ACTIVE", true), { agentStarted: false });
+  }
+  private async useContainer<T>(containerId: string, operation: () => Promise<T>): Promise<T> {
+    this.assertNotReleasing(containerId);
+    this.containerUses.set(containerId, (this.containerUses.get(containerId) ?? 0) + 1);
+    try { return await operation(); }
+    finally {
+      const remaining = this.containerUses.get(containerId)! - 1;
+      if (remaining) this.containerUses.set(containerId, remaining); else this.containerUses.delete(containerId);
     }
-    const job = provisionRuntime(containerId, runtime, provision, { ...this.options, signal });
-    this.provisioning.set(key, job);
-    try { return await job; } finally { this.provisioning.delete(key); }
+  }
+  availability(containerId: string): Promise<RuntimeCapability[]> { return this.useContainer(containerId, () => availability(containerId, this.options)); }
+  async provision(containerId: string, runtime: RuntimeKind, provision: ProvisionOptions = {}, signal?: AbortSignal): Promise<RuntimeCapability> {
+    return this.useContainer(containerId, async () => {
+      const key = `${containerId}:${runtime}`;
+      const existing = this.provisioning.get(key);
+      if (existing) {
+        const result = await existing;
+        if (provision.copyHostAuth) await copyMinimalAuth(containerId, runtime, provision, this.options);
+        return result;
+      }
+      const job = provisionRuntime(containerId, runtime, provision, { ...this.options, signal });
+      this.provisioning.set(key, job);
+      try { return await job; } finally { this.provisioning.delete(key); }
+    });
   }
   async connectApiKey(containerId: string, runtime: RuntimeKind, apiKey: string): Promise<void> {
     if (!apiKey.trim() || apiKey.includes("\0")) throw new AgentError("A provider key is required.", "INVALID_CREDENTIAL");
-    if (runtime === "codex") {
-      await this.provision(containerId, runtime);
-      await containerCommand(containerId, ["sh", "-c", "export PATH=/opt/enoughfactory/node/bin:$PATH; export CODEX_HOME=/root/.codex; exec codex login --with-api-key"], { ...this.options, input: apiKey });
-    } else {
-      const key = runtime === "claude" ? "ANTHROPIC_API_KEY" : "GEMINI_API_KEY";
-      const shellValue = `'${apiKey.replace(/'/g, `'"'"'`)}'`;
-      await writePrivateFile(containerId, `/root/.enoughfactory/providers/${runtime}.env`, `export ${key}=${shellValue}\n`, this.options);
-    }
+    return this.useContainer(containerId, async () => {
+      if (runtime === "codex") {
+        await this.provision(containerId, runtime);
+        await containerCommand(containerId, ["sh", "-c", "export PATH=/opt/enoughfactory/node/bin:$PATH; export CODEX_HOME=/root/.codex; exec codex login --with-api-key"], { ...this.options, input: apiKey });
+      } else {
+        const key = runtime === "claude" ? "ANTHROPIC_API_KEY" : "GEMINI_API_KEY";
+        const shellValue = `'${apiKey.replace(/'/g, `'"'"'`)}'`;
+        await writePrivateFile(containerId, `/root/.enoughfactory/providers/${runtime}.env`, `export ${key}=${shellValue}\n`, this.options);
+      }
+    });
+  }
+  async releaseCodexPayload(containerId: string): Promise<CodexPayloadRelease> {
+    checkContainerId(containerId);
+    if (this.releasing.has(containerId)) return { status: "deferred", reason: "Codex payload cleanup is already active for this container." };
+    if (this.containerUses.has(containerId) || [...this.live.values()].some(turn => turn.containerId === containerId) || [...this.provisioning.keys()].some(key => key.startsWith(`${containerId}:`))) return { status: "deferred", reason: "This container still has an active agent, provisioning or credential operation." };
+    this.releasing.add(containerId);
+    try { return await releaseCodexPayload(containerId, this.options); }
+    finally { this.releasing.delete(containerId); }
   }
   async runTurn(input: TurnInput, callbacks: TurnCallbacks): Promise<TurnResult> {
     if (this.live.has(input.chatId)) throw new AgentError("This conversation already has a live agent turn.", "TURN_ALREADY_RUNNING");
     if (!input.containerId) throw new AgentError("Agent work requires an isolated container session.", "CONTAINER_REQUIRED");
     if (!input.prompt.trim()) throw new AgentError("A message is required.", "EMPTY_PROMPT");
     if (input.runtime === "claude" && input.approvalMode !== "approve-all") throw new AgentError("Claude's current headless adapter supports Approve all. Choose Codex or Antigravity for typed approvals.", "UNSUPPORTED_APPROVAL_MODE");
+    this.assertNotReleasing(input.containerId);
     const controller = new AbortController();
     const router = new ApprovalRouter(input, callbacks, controller.signal);
-    const live: LiveTurn = { controller, router };
+    const live: LiveTurn = { containerId: input.containerId, controller, router };
     this.live.set(input.chatId, live);
     try {
       if (this.options.autoProvision !== false && input.antigravityTransport !== "cli") {

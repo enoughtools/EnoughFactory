@@ -4,11 +4,15 @@ import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test, { type TestContext } from 'node:test';
-import type { Session } from '@enoughfactory/contracts';
+import type { Session, ChatEvent } from '@enoughfactory/contracts';
 import type { FactoryStore } from '@enoughfactory/factory';
 import { ArtifactStore, WorkingDirectoryManager, type WorkingDirectorySource } from '@enoughfactory/workspaces';
 import { controllerError } from './factory-controller-error.ts';
 import { releaseControllerInputs } from './factory-controller-inputs.ts';
+import { releaseFactoryCodexPayload } from './factory-codex-cleanup.ts';
+import { SessionController } from './sessions.ts';
+import type { Store } from './store.ts';
+import type { EnvmuxSession } from '@enoughfactory/envmux';
 
 test('controller recovery requires both known preparation and a transient failure', () => {
   const cases = [
@@ -125,4 +129,73 @@ test('controller input cleanup requires durable launch sources and receipts befo
   assert.equal((await f.directoryManager.sourceSnapshots(`${f.operation}-project-context`)).length, 1);
   assert.equal((await f.directoryManager.sourceSnapshots(`${f.operation}-evidence-context`)).length, 1);
   assert.equal((await f.directoryManager.sourceSnapshots(f.sessionId)).length, 1);
+});
+
+function payloadCleanupFixture(kind: 'controller' | 'worker' | 'ordinary' = 'controller') {
+  const tables = new Map<string, Map<string, unknown>>();
+  const store: FactoryStore = {
+    list: <T>(table: string) => [...(tables.get(table)?.values() ?? [])] as T[],
+    get: <T>(table: string, id: string) => tables.get(table)?.get(id) as T | undefined,
+    set: (table, value) => { if (!tables.has(table)) tables.set(table, new Map()); tables.get(table)!.set(value.id, value); },
+    delete: (table, id) => { tables.get(table)?.delete(id); }, transaction: fn => fn(),
+  };
+  const sessionId = 'session', chatId = 'chat', operation = 'operation';
+  store.set('sessions', { id: sessionId, projectId: `workspace-${operation}`, containerId: 'owned-container', status: 'stopping' });
+  store.set('chats', { id: chatId, sessionId, runtime: 'codex', status: 'idle' });
+  store.set('chat-results', { id: chatId, result: { text: 'Durable completed result' }, ...(kind === 'worker' ? { attemptId: operation } : {}) });
+  if (kind === 'controller') store.set('factory-controller-runs', { id: operation, sessionId, chatId, status: 'completed' });
+  if (kind === 'worker') store.set('factory-workers', { id: operation, sessionId, chatId, status: 'succeeded', workspace: { id: operation, provider: 'git' } });
+  let calls = 0;
+  const messages: string[] = [];
+  const input: Parameters<typeof releaseFactoryCodexPayload>[0] = {
+    store,
+    sessions: { record: id => store.get<Session>('sessions', id)!, owns: () => true, get: () => ({ ready: { instance: 'owned-container' } }) as EnvmuxSession },
+    chats: { isRunning: () => false, event: (_id, event) => { messages.push(event.text ?? ''); return {} as ChatEvent; } },
+    manager: { releaseCodexPayload: async containerId => { assert.equal(containerId, 'owned-container'); calls++; return { status: 'released' }; } },
+  };
+  return { input, sessionId, store, messages, calls: () => calls };
+}
+
+test('factory Codex cleanup requires retained completed results and exact source ownership', async () => {
+  const controller = payloadCleanupFixture();
+  await releaseFactoryCodexPayload(controller.input, controller.sessionId);
+  assert.equal(controller.calls(), 1);
+  assert.equal(controller.store.get<{ status: string }>('session-runtime-cleanup', controller.sessionId)?.status, 'released');
+  const worker = payloadCleanupFixture('worker');
+  await releaseFactoryCodexPayload(worker.input, worker.sessionId);
+  assert.equal(worker.calls(), 0, 'Unconfirmed source capture retains the installation');
+  assert.match(worker.messages[0]!, /source capture has not been confirmed/);
+  worker.store.set('factory-capture-input', { id: 'operation', commit: 'a'.repeat(40) });
+  await releaseFactoryCodexPayload(worker.input, worker.sessionId);
+  assert.equal(worker.calls(), 1);
+  assert(worker.store.get('chat-results', 'chat'), 'Cleanup preserves durable chat evidence');
+  const ordinary = payloadCleanupFixture('ordinary');
+  await releaseFactoryCodexPayload(ordinary.input, ordinary.sessionId); assert.equal(ordinary.calls(), 0);
+  const active = payloadCleanupFixture(); active.input.chats.isRunning = () => true;
+  await releaseFactoryCodexPayload(active.input, active.sessionId); assert.equal(active.calls(), 0);
+  assert.match(active.messages[0]!, /still active/);
+  active.store.delete('chat-results', 'chat'); active.input.chats.isRunning = () => false;
+  await releaseFactoryCodexPayload(active.input, active.sessionId); assert.equal(active.calls(), 0);
+  const unknown = payloadCleanupFixture(); unknown.store.set('factory-controller-runs', { id: 'operation', sessionId: 'session', chatId: 'chat', status: 'interrupted' });
+  await releaseFactoryCodexPayload(unknown.input, unknown.sessionId); assert.equal(unknown.calls(), 0);
+});
+
+test('post-capture runtime cleanup preserves payload on failed capture and runs before engine stop', async t => {
+  const root = await mkdtemp(path.join(tmpdir(), 'enough-post-capture-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const f = payloadCleanupFixture();
+  const endpoint = { host: 'unix:///unused/private.sock', cliPath: '/unused/docker', configDirectory: path.join(root, 'config') };
+  const sessions = new SessionController(f.store as Store, 'device', () => {}, () => {}, { endpoint, ensureReady: async () => assert.fail('No runtime start'), bridgeHostAddress: () => undefined }, root);
+  t.after(() => sessions.close());
+  const order: string[] = [];
+  let captureFails = true;
+  const engine = { stop: async () => { order.push('engine-stop'); } } as EnvmuxSession;
+  (sessions as unknown as { live: Map<string, EnvmuxSession> }).live.set(f.sessionId, engine);
+  sessions.captureWorkingDirectories = async () => { order.push('capture'); if (captureFails) throw new Error('Capture failed'); return []; };
+  sessions.afterCaptureBeforeStop.push(async () => { order.push('release-payload'); });
+  await assert.rejects(sessions.stop(f.sessionId), /Capture failed/);
+  assert.deepEqual(order, ['capture']);
+  captureFails = false;
+  await sessions.stop(f.sessionId);
+  assert.deepEqual(order, ['capture', 'capture', 'release-payload', 'engine-stop']);
 });

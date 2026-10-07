@@ -27,6 +27,7 @@ export class SessionController {
   private generations = new Map<string,number>();
   private runtimeWaits = new Set<string>();
   readonly beforeStop: Array<(sessionId:string)=>Promise<void>> = [];
+  readonly afterCaptureBeforeStop: Array<(sessionId:string)=>Promise<void>> = [];
   directoryManager: WorkingDirectoryManager;
   private directoryCaptures = new Map<string,Promise<WorkingDirectoryCapture[]>>();
   constructor(private store: Store, private deviceId: string, private changed: () => void, private event: (topic: string, data: unknown) => void, private runtime:RuntimeAccess, private workspaceDataDir=path.join(path.dirname(path.dirname(runtime.endpoint.configDirectory)),'workspace-data')) {
@@ -181,7 +182,7 @@ export class SessionController {
     this.patch(sessionId,{status:'stopping',phase:'Returning work to Git'});
     if(this.starts.has(sessionId)&&!this.live.has(sessionId)){this.starts.get(sessionId)!.abort();await this.launchJobs.get(sessionId);if(this.record(sessionId).status==='failed')throw new Error(this.record(sessionId).error||'Startup has not confirmed termination.');return;}
     if(this.starts.has(sessionId))await this.launchJobs.get(sessionId);
-    try {for(const hook of this.beforeStop)await hook(sessionId);let engine=this.live.get(sessionId);if(!engine){const saved=this.store.get<PrivateSession>('session-private',sessionId);if(!saved)throw new HttpError(409,'The environment owner has not confirmed its state.');engine=await this.attach(saved);}await this.captureWorkingDirectories(sessionId);await engine.stop();}catch(error){this.stopping.delete(sessionId);this.patch(sessionId,{status:'unknown',phase:'Could not confirm work was returned; environment retained',error:(error as Error).message});throw error;}
+    try {for(const hook of this.beforeStop)await hook(sessionId);let engine=this.live.get(sessionId);if(!engine){const saved=this.store.get<PrivateSession>('session-private',sessionId);if(!saved)throw new HttpError(409,'The environment owner has not confirmed its state.');engine=await this.attach(saved);}await this.captureWorkingDirectories(sessionId);for(const hook of this.afterCaptureBeforeStop)await hook(sessionId);await engine.stop();}catch(error){this.stopping.delete(sessionId);this.patch(sessionId,{status:'unknown',phase:'Could not confirm work was returned; environment retained',error:(error as Error).message});throw error;}
     this.stopping.delete(sessionId);this.patch(sessionId,{status:'stopped',phase:'Work returned to Git'});
     this.streams.get(sessionId)?.abort();this.live.delete(sessionId);
     await this.disposeReferenceContext(sessionId);
