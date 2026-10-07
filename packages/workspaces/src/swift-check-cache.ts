@@ -8,6 +8,12 @@ export interface SwiftBuildCache {
   rootPath: string;
 }
 
+export interface SwiftBuildMountpoint {
+  rootPath: string;
+  device: number;
+  inode: number;
+}
+
 /** Read the immutable checked tree, including integration's combined commit, not a mutable index. */
 export async function discoverSwiftBuildCaches(roots: Array<{ path: string; containerPath: string; commit: string }>): Promise<SwiftBuildCache[]> {
   const caches: SwiftBuildCache[] = [];
@@ -50,36 +56,40 @@ async function realPackageAncestors(path: string, rootPath: string): Promise<voi
   }
 }
 
-export async function prepareSwiftBuildMountpoint(cache: SwiftBuildCache, created: Map<string, string>, allowExisting: boolean): Promise<void> {
+export async function prepareSwiftBuildMountpoint(cache: SwiftBuildCache, created: Map<string, SwiftBuildMountpoint>, allowExisting: boolean): Promise<void> {
   await realPackageAncestors(cache.path, cache.rootPath);
   const entry = await lstat(cache.path).catch(error => {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
     throw error;
   });
+  const owned = created.get(cache.path);
+  if (owned && (!entry || owned.rootPath !== cache.rootPath || entry.dev !== owned.device || entry.ino !== owned.inode)) throw new Error(`Swift build-cache mountpoint identity changed during the report: ${cache.path}`);
   if (entry) {
     // A captured secondary empty directory is source evidence too. Do not hide its later
     // contents behind a build volume or alter its recorded mode/inventory semantics.
-    if (!allowExisting) throw new Error(`Cannot hide a captured Swift build directory: ${cache.path}`);
+    if (!allowExisting && !owned) throw new Error(`Cannot hide a captured Swift build directory: ${cache.path}`);
     if (!entry.isDirectory() || entry.isSymbolicLink() || (await readdir(cache.path)).length) throw new Error(`Cannot hide existing Swift build-cache inputs: ${cache.path}`);
     return;
   }
   // No recursive creation: the package ancestors above have already been checked.
   await mkdir(cache.path);
-  created.set(cache.path, cache.rootPath);
+  const made = await lstat(cache.path);
+  if (!made.isDirectory() || made.isSymbolicLink()) throw new Error(`Swift build-cache mountpoint changed during preparation: ${cache.path}`);
+  created.set(cache.path, { rootPath: cache.rootPath, device: made.dev, inode: made.ino });
 }
 
 /** Never recursively delete an edited directory or follow a check-created symlink. */
-export async function removeSwiftBuildMountpoints(created: Map<string, string>): Promise<void> {
+export async function removeSwiftBuildMountpoints(created: Map<string, SwiftBuildMountpoint>): Promise<void> {
   const failures: unknown[] = [];
-  for (const [path, rootPath] of created) {
+  for (const [path, owned] of created) {
     try {
-      await realPackageAncestors(path, rootPath);
+      await realPackageAncestors(path, owned.rootPath);
       const entry = await lstat(path).catch(error => {
         if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
         throw error;
       });
       if (!entry) { created.delete(path); continue; }
-      if (!entry.isDirectory() || entry.isSymbolicLink()) throw new Error(`Swift build-cache mountpoint changed during the check: ${path}`);
+      if (!entry.isDirectory() || entry.isSymbolicLink() || entry.dev !== owned.device || entry.ino !== owned.inode) throw new Error(`Swift build-cache mountpoint changed during the check: ${path}`);
       // rmdir fails if a check left host-visible bytes. Keep those bytes for the source audit.
       await rmdir(path);
       created.delete(path);

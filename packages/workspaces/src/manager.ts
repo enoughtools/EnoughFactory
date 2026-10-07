@@ -206,24 +206,43 @@ export class WorkspaceManager {
     return roots;
   }
 
-  private async releaseCheck(path: string): Promise<void> {
-    try { await this.executor.release?.(path); }
-    finally {
+  private async releaseCheck(path: string, report?: CheckReport): Promise<boolean> {
+    // Completed reports already released their runtime before auditing source. Never
+    // delete snapshots that may still be mounted or contain unresolved cleanup evidence.
+    if (report?.cleanupErrors?.length) return false;
+    if (!report) await this.executor.release?.(path);
+    try {
       await rm(path, { recursive: true, force: true });
       await rm(`${path}-working-directories`, { recursive: true, force: true });
+      return true;
+    } catch (error) {
+      if (!report) throw error;
+      report.status = "failed";
+      report.cleanupErrors = [`Could not remove check snapshots: ${error instanceof Error ? error.message : String(error)}`];
+      const evidence = JSON.parse((await this.artifacts.read(report.logArtifact)).toString()) as Record<string, unknown>;
+      await this.saveCheckReport(report, { ...evidence, retainedCheckPath: path }, report.logArtifact);
+      return false;
     }
+  }
+
+  private async saveCheckReport(report: CheckReport, evidence: Record<string, unknown>, identity: Pick<ArtifactManifest, "goalId" | "taskId" | "attemptId">): Promise<void> {
+    report.logArtifact = await this.artifacts.put(JSON.stringify({ ...evidence, ...report, logArtifact: undefined }), { name: `checks-${report.id}.json`, mime: "application/json", goalId: identity.goalId, taskId: identity.taskId, attemptId: identity.attemptId, metadata: { commit: report.commit, candidateId: report.candidateId, developmentToolchain: report.developmentToolchain, candidateDevelopmentToolchain: report.candidateDevelopmentToolchain } });
+    await mkdir(join(this.root, "reports"), { recursive: true });
+    await writeAtomic(join(this.root, "reports", `${report.id}.json`), report);
   }
 
   async verify(input: { candidateId: string; commands: string[]; baseCommit?: string; signal?: AbortSignal }): Promise<CheckReport> {
     const candidate = await this.candidate(input.candidateId);
     const path = join(this.root, "checks", randomUUID());
+    let report: CheckReport | undefined;
     try {
       await this.cloneCandidate(candidate, path);
       if (input.baseCommit && input.baseCommit !== candidate.baseCommit) {
         throw new Error("Combined checks require integrate() so the current target commit is imported and merged exactly");
       }
-      return await this.checkAt(candidate, path, candidate.commit, input.commands, input.signal, input.baseCommit);
-    } finally { await this.releaseCheck(path); }
+      report = await this.checkAt(candidate, path, candidate.commit, input.commands, input.signal, input.baseCommit);
+      return report;
+    } finally { await this.releaseCheck(path, report); }
   }
 
   private async checkAt(candidate: Candidate, path: string, commit: string, commands: string[], signal?: AbortSignal, baseCommit?: string): Promise<CheckReport> {
@@ -244,27 +263,37 @@ export class WorkspaceManager {
       }
       catch (error) { result = { command, exitCode: 1, stdout: "", stderr: error instanceof Error ? error.message : String(error), startedAt: new Date().toISOString(), endedAt: new Date().toISOString() }; }
       report.commands.push(result);
+      if (result.cleanupErrors?.length) {
+        report.cleanupErrors = [...report.cleanupErrors ?? [], ...result.cleanupErrors];
+        report.status = "failed";
+        break;
+      }
       if (result.exitCode !== 0 || result.timedOut) { report.status = signal?.aborted ? "canceled" : "failed"; break; }
     }
+    let sourceAuditSkipped: string | undefined;
+    try { await this.executor.release?.(path); }
+    catch (error) {
+      report.cleanupErrors = [...report.cleanupErrors ?? [], `Could not release check resources: ${error instanceof Error ? error.message : String(error)}`];
+      report.status = "failed";
+      sourceAuditSkipped = "Check resource release was not confirmed; private snapshots were retained without inspecting potentially active mounts";
+    }
     // Checks that edit tracked files cannot attest the original candidate after those edits.
-    const dirty = await git(path, "status", "--porcelain", "--untracked-files=no");
-    const actualHead = await git(path, "rev-parse", "HEAD");
-    const rootStates = await Promise.all(workingDirectories.map(async (root, index) => {
+    const dirty = sourceAuditSkipped ? undefined : await git(path, "status", "--porcelain", "--untracked-files=no");
+    const actualHead = sourceAuditSkipped ? undefined : await git(path, "rev-parse", "HEAD");
+    const rootStates = sourceAuditSkipped ? undefined : await Promise.all(workingDirectories.map(async (root, index) => {
       const expectedEmptyDirectories = candidate.workingDirectories![index]!.bundleArtifact.metadata?.emptyDirectories ?? [];
       const emptyDirectories = await workingDirectoryEmptyDirectories(root.path);
       return { containerPath: root.containerPath, commit: root.commit, dirty: await workingDirectoryGit(root.path, "status", "--porcelain", "--untracked-files=all"), actualHead: await workingDirectoryGit(root.path, "rev-parse", "HEAD"), emptyDirectories, expectedEmptyDirectories, emptyDirectoriesMatch: JSON.stringify(emptyDirectories) === JSON.stringify(expectedEmptyDirectories) };
     }));
     const unresolved: string[] = [];
-    for (const file of candidate.repairConflicts ?? []) {
+    for (const file of sourceAuditSkipped ? [] : candidate.repairConflicts ?? []) {
       // Read the immutable Git object; a candidate symlink must never cause a host filesystem read.
       const blob = await run("git", ["-C", path, "show", `${commit}:${file}`]);
       const contents = blob.exitCode === 0 ? blob.stdout : "";
       if (/^<{7} /m.test(contents) && /^>{7} /m.test(contents)) unresolved.push(file);
     }
-    if (dirty || actualHead !== commit || unresolved.length || rootStates.some(root => root.dirty || root.actualHead !== root.commit || !root.emptyDirectoriesMatch)) report.status = "failed";
-    report.logArtifact = await this.artifacts.put(JSON.stringify({ ...report, logArtifact: undefined, dirty, actualHead, unresolved, workingDirectories: rootStates }), { name: `checks-${report.id}.json`, mime: "application/json", goalId: candidate.goalId, taskId: candidate.taskId, attemptId: candidate.attemptId, metadata: { commit, candidateId: candidate.id, developmentToolchain: report.developmentToolchain, candidateDevelopmentToolchain: report.candidateDevelopmentToolchain } });
-    await mkdir(join(this.root, "reports"), { recursive: true });
-    await writeFile(join(this.root, "reports", `${report.id}.json`), JSON.stringify(report), { flag: "wx", mode: 0o600 });
+    if (!sourceAuditSkipped && (dirty || actualHead !== commit || unresolved.length || rootStates?.some(root => root.dirty || root.actualHead !== root.commit || !root.emptyDirectoriesMatch))) report.status = "failed";
+    await this.saveCheckReport(report, { dirty, actualHead, unresolved: sourceAuditSkipped ? undefined : unresolved, workingDirectories: rootStates, sourceAuditSkipped, retainedCheckPath: report.cleanupErrors?.length ? path : undefined }, candidate);
     return report;
   }
 
@@ -288,6 +317,8 @@ export class WorkspaceManager {
     if (currentBranch === targetBranch && await git(input.projectPath, "status", "--porcelain")) return { ...result, status: "target-dirty", message: "Integration target has local edits; all candidate work remains cached" };
     const path = join(this.root, "integration", randomUUID());
     const temporaryRef = `refs/enoughfactory/integration/${randomUUID()}`;
+    let report: CheckReport | undefined;
+    let snapshotsRemoved = false;
     try {
       await this.cloneCandidate(candidate, path);
       await git(path, "fetch", input.projectPath, `${targetRef}:refs/enoughfactory/target`);
@@ -298,13 +329,15 @@ export class WorkspaceManager {
         return { ...result, status: "conflict", conflicts, message: merged.stderr.trim() || merged.stdout.trim() };
       }
       const commit = await git(path, "rev-parse", "HEAD");
-      const report = await this.checkAt(candidate, path, commit, input.commands, input.signal, previousCommit);
+      report = await this.checkAt(candidate, path, commit, input.commands, input.signal, previousCommit);
       if (report.status === "failed" || report.status === "canceled") return { ...result, status: "checks-failed", commit, report };
       if (!await input.isCurrent() || input.signal?.aborted) return { ...result, report, message: "Attempt authority was retired while checking" };
       if (await git(input.projectPath, "rev-parse", targetRef) !== previousCommit) return { ...result, status: "target-moved", report, message: "Target moved while checks ran; recompute and check the combined result" };
       if (currentBranch === targetBranch && await git(input.projectPath, "status", "--porcelain")) return { ...result, status: "target-dirty", report, message: "Local edits appeared while checking; they were preserved" };
       // Cache merged objects before accepting the ref. The object import cannot update the user's branch.
       await git(input.projectPath, "fetch", path, `${commit}:${temporaryRef}`);
+      if (!await this.releaseCheck(path, report)) return { ...result, status: "checks-failed", commit, report };
+      snapshotsRemoved = true;
       const intentId = randomUUID();
       const intent = { ...result, status: "integrated" as const, commit, report, projectPath: input.projectPath, createdAt: new Date().toISOString() };
       await mkdir(join(this.root, "integration-intents"), { recursive: true });
@@ -330,7 +363,7 @@ export class WorkspaceManager {
       return accepted;
     } finally {
       await git(input.projectPath, "update-ref", "-d", temporaryRef).catch(() => undefined);
-      await this.releaseCheck(path);
+      if (!snapshotsRemoved) await this.releaseCheck(path, report);
     }
   }
 
@@ -345,6 +378,7 @@ export class WorkspaceManager {
         const record = JSON.parse(await readFile(join(this.root, directory, file), "utf8")) as IntegrationResult & { projectPath: string };
         if (record.candidateId !== candidate.id || record.projectPath !== projectPath || !record.commit || record.report?.commit !== record.commit) continue;
         if (record.report.status !== "passed" && record.report.status !== "not-configured") continue;
+        if (record.report.cleanupErrors?.length || record.report.commands.some(command => command.cleanupErrors?.length)) continue;
         // Read and hash the check evidence before interpreting the acceptance journal.
         await this.artifacts.path(record.report.logArtifact);
         const targetRef = `refs/heads/${record.targetBranch}`;

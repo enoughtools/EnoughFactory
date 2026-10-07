@@ -98,6 +98,8 @@ export interface CommandResult {
   developmentToolchain?: DevelopmentToolchain;
   /** An explicit check-container compatibility layer; separate from the frozen compiler image. */
   runtimeCompatibility?: CheckCompatibilityEvidence;
+  /** Resource cleanup failures do not replace the command's output or original status. */
+  cleanupErrors?: string[];
 }
 
 export interface CheckCompatibilityEvidence {
@@ -134,6 +136,8 @@ export interface CheckReport {
   commands: CommandResult[];
   logArtifact: ArtifactManifest;
   createdAt: string;
+  /** A failed release keeps the private snapshots available for diagnosis. */
+  cleanupErrors?: string[];
 }
 
 export interface IntegrationResult {

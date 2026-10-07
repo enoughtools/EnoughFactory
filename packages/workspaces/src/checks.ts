@@ -2,9 +2,9 @@ import { randomUUID } from "node:crypto";
 import { dirname, resolve } from "node:path";
 import { prepareToolchain, validatePreparedToolchain, verifyPreparedToolchain } from "@enoughfactory/runtime";
 import { resolveDockerRuntime, runManagedDocker, type DockerRuntimeEndpoint } from "./docker.ts";
-import { discoverSwiftBuildCaches, prepareSwiftBuildMountpoint, removeSwiftBuildMountpoints, type SwiftBuildCache } from "./swift-check-cache.ts";
+import { discoverSwiftBuildCaches, prepareSwiftBuildMountpoint, removeSwiftBuildMountpoints, type SwiftBuildCache, type SwiftBuildMountpoint } from "./swift-check-cache.ts";
 import { captureSwiftCheckCompatibility, swiftCheckCompatibilityBootstrap } from "./swift-check-compatibility.ts";
-import type { Candidate, CheckExecutor, DevelopmentToolchain } from "./types.ts";
+import type { Candidate, CheckExecutor, CommandResult, DevelopmentToolchain } from "./types.ts";
 
 export function frozenDevelopmentToolchain(value?: DevelopmentToolchain): DevelopmentToolchain | undefined {
   if (value === undefined) return;
@@ -29,7 +29,7 @@ export function dockerCheckExecutor(options: { image?: string; dockerRuntime?: D
   const metadataVolumes = new Map<string, Map<string, string>>();
   const buildCaches = new Map<string, Array<SwiftBuildCache & { volume: string }>>();
   const containers = new Map<string, Set<string>>();
-  const mountpoints = new Map<string, Map<string, string>>();
+  const mountpoints = new Map<string, Map<string, SwiftBuildMountpoint>>();
   const preparedToolchains = new Map<string, Promise<DevelopmentToolchain>>();
   const release = async (path: string) => {
     preparedToolchains.delete(path);
@@ -39,11 +39,12 @@ export function dockerCheckExecutor(options: { image?: string; dockerRuntime?: D
     for (const name of containers.get(path) ?? []) {
       try {
         const result = await runManagedDocker(dockerRuntime, ["rm", "--force", name], { timeoutMs: 30_000 });
-        if (result.exitCode !== 0 && !/no such container/i.test(result.stderr)) throw new Error(result.stderr.trim() || "Could not terminate check container");
+        if (result.timedOut || result.exitCode !== 0 && !/no such container/i.test(result.stderr)) throw new Error(result.timedOut ? "Check container removal timed out; termination is unconfirmed" : result.stderr.trim() || "Could not terminate check container");
         containers.get(path)?.delete(name);
       } catch (error) { failures.push(error); }
     }
     if (!containers.get(path)?.size) containers.delete(path);
+    if (containers.has(path)) throw new AggregateError(failures, `Could not confirm private check containers stopped: ${failures.map(error => error instanceof Error ? error.message : String(error)).join("; ")}`);
     if (!containers.has(path)) {
       try { await removeSwiftBuildMountpoints(mountpoints.get(path) ?? new Map()); }
       catch (error) { failures.push(error); }
@@ -54,7 +55,7 @@ export function dockerCheckExecutor(options: { image?: string; dockerRuntime?: D
     for (const volume of new Set([...(volumes?.values() ?? []), ...(caches ?? []).map(cache => cache.volume)])) {
       try {
         const result = await runManagedDocker(dockerRuntime, ["volume", "rm", "--force", volume], { timeoutMs: 30_000 });
-        if (result.exitCode !== 0 && !/no such volume/i.test(result.stderr)) throw new Error(result.stderr.trim() || "Could not remove private check volume");
+        if (result.timedOut || result.exitCode !== 0 && !/no such volume/i.test(result.stderr)) throw new Error(result.timedOut ? "Private check volume removal timed out; removal is unconfirmed" : result.stderr.trim() || "Could not remove private check volume");
         for (const [destination, name] of volumes ?? []) if (name === volume) volumes!.delete(destination);
         if (caches) buildCaches.set(path, (buildCaches.get(path) ?? []).filter(cache => cache.volume !== volume));
       } catch (error) { failures.push(error); }
@@ -92,10 +93,11 @@ export function dockerCheckExecutor(options: { image?: string; dockerRuntime?: D
       const reportContainers = containers.get(context.path) ?? new Set<string>();
       containers.set(context.path, reportContainers);
       reportContainers.add(name);
-      const createdMountpoints = mountpoints.get(context.path) ?? new Map<string, string>();
+      const createdMountpoints = mountpoints.get(context.path) ?? new Map<string, SwiftBuildMountpoint>();
       mountpoints.set(context.path, createdMountpoints);
       let passed = false;
       let failureDetail = "";
+      let completed: CommandResult | undefined;
       try {
         const volumes = metadataVolumes.get(context.path) ?? new Map<string, string>();
         metadataVolumes.set(context.path, volumes);
@@ -150,26 +152,30 @@ export function dockerCheckExecutor(options: { image?: string; dockerRuntime?: D
         const result = compatibility ? captureSwiftCheckCompatibility(output) : output;
         passed = result.exitCode === 0 && !result.timedOut;
         failureDetail = result.stderr;
-        return { command: context.command, ...result, developmentToolchain: toolchain, startedAt, endedAt: new Date().toISOString() };
+        completed = { command: context.command, ...result, developmentToolchain: toolchain, startedAt, endedAt: new Date().toISOString() };
+        return completed;
       } catch (error) {
         failureDetail = error instanceof Error ? error.message : String(error);
         throw error;
       } finally {
         try {
-          // Killing the client does not confirm termination. Remove the exact container before
-          // touching its host mountpoints; failed removals remain registered for release().
+          // Killing the client does not confirm termination. Remove the exact container;
+          // mountpoint objects stay stable until the whole report is released.
           const removed = await runManagedDocker(dockerRuntime, ["rm", "--force", name], { timeoutMs: 30_000 });
-          if (removed.exitCode !== 0 && !/no such container/i.test(removed.stderr)) throw new Error(removed.stderr.trim() || "Could not terminate check container");
+          if (removed.timedOut || removed.exitCode !== 0 && !/no such container/i.test(removed.stderr)) throw new Error(removed.timedOut ? "Check container removal timed out; termination is unconfirmed" : removed.stderr.trim() || "Could not terminate check container");
           reportContainers.delete(name);
-          await removeSwiftBuildMountpoints(createdMountpoints);
         } catch (error) {
           passed = false;
           failureDetail = `${failureDetail ? `${failureDetail}\n` : ""}Check cleanup failed: ${error instanceof Error ? error.message : String(error)}`;
-          throw new Error(failureDetail);
+          if (completed) completed.cleanupErrors = [...completed.cleanupErrors ?? [], error instanceof Error ? error.message : String(error)];
+          else throw new Error(failureDetail);
         } finally {
           if (!passed) {
             try { await release(context.path); }
-            catch (error) { throw new Error(`${failureDetail ? `${failureDetail}\n` : ""}${error instanceof Error ? error.message : String(error)}`); }
+            catch (error) {
+              if (completed) completed.cleanupErrors = [...completed.cleanupErrors ?? [], error instanceof Error ? error.message : String(error)];
+              else throw new Error(`${failureDetail ? `${failureDetail}\n` : ""}${error instanceof Error ? error.message : String(error)}`);
+            }
           }
         }
       }

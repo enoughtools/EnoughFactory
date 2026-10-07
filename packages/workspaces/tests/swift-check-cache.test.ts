@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { dockerCheckExecutor } from "../src/checks.ts";
 import { WorkspaceManager } from "../src/manager.ts";
 import { git, run } from "../src/process.ts";
-import { discoverSwiftBuildCaches, prepareSwiftBuildMountpoint, removeSwiftBuildMountpoints } from "../src/swift-check-cache.ts";
+import { discoverSwiftBuildCaches, prepareSwiftBuildMountpoint, removeSwiftBuildMountpoints, type SwiftBuildMountpoint } from "../src/swift-check-cache.ts";
 import type { Candidate, CheckContext } from "../src/types.ts";
 
 async function repository(path: string, nested = false) {
@@ -50,8 +50,10 @@ if (args[0] === 'run') {
   const command = args.at(-1);
   if (command === 'source-mutation') fs.writeFileSync(mounts.find(mount => mount.type === 'bind' && mount.target === '/work').source + '/source.txt', 'changed by check\\n');
   if (command === 'fail') { process.stderr.write('deliberate check failure'); process.exitCode = 7; }
+  if (command === 'cleanup-failure') { state.blocked = true; save(); process.stdout.write('original stdout'); process.stderr.write('original stderr'); process.exitCode = 7; }
   if (command === 'timeout') { process.on('SIGTERM', () => process.exit(0)); setInterval(() => {}, 1000); }
 } else if (args[0] === 'rm') {
+  if (state.blocked) { process.stderr.write('uncertain container removal'); process.exit(1); }
   state.containers = state.containers.filter(name => name !== args.at(-1)); save();
 } else if (args[0] === 'volume' && args[1] === 'rm') {
   const name = args.at(-1);
@@ -67,6 +69,7 @@ if (args[0] === 'run') {
     root, path, extra, commit, context, endpoint,
     calls: async (): Promise<string[][]> => (await readFile(calls, "utf8")).trim().split("\n").filter(Boolean).map(line => JSON.parse(line)),
     resources: async (): Promise<{ volumes: string[]; containers: string[] }> => JSON.parse(await readFile(resources, "utf8")),
+    allowCleanup: async () => { const value = JSON.parse(await readFile(resources, "utf8")); delete value.blocked; await writeFile(resources, JSON.stringify(value)); },
   };
 }
 
@@ -100,7 +103,7 @@ test("mountpoint preparation and cleanup preserve existing inputs, modes and ext
   const f = await fixture();
   try {
     const [cache, nested, extra] = await discoverSwiftBuildCaches([{ path: f.path, commit: f.commit, containerPath: "/work" }, ...f.context.workingDirectories!]);
-    const created = new Map<string, string>();
+    const created = new Map<string, SwiftBuildMountpoint>();
     await prepareSwiftBuildMountpoint(cache, created, true);
     await removeSwiftBuildMountpoints(created);
     await assert.rejects(lstat(cache.path), /ENOENT/);
@@ -132,10 +135,12 @@ test("all check commands reuse distinct per-package Linux volumes without changi
   const execute = dockerCheckExecutor({ dockerRuntime: f.endpoint });
   try {
     const command = "swift test --package-path Packages/With\\ spaces --scratch-path /tmp/explicit-build";
+    let identities: number[] | undefined;
     for (const text of [command, "second check"]) {
       assert.equal((await execute({ ...f.context, command: text })).exitCode, 0);
-      await assert.rejects(lstat(join(f.path, ".build")), /ENOENT/);
-      await assert.rejects(lstat(join(f.extra, ".build")), /ENOENT/);
+      const actual = await Promise.all([join(f.path, ".build"), join(f.extra, ".build")].map(async path => (await lstat(path)).ino));
+      if (identities) assert.deepEqual(actual, identities, "Report mountpoint objects must survive successive containers");
+      identities = actual;
       assert.equal(await git(f.extra, "status", "--porcelain", "--untracked-files=all"), "");
     }
     const runs = (await f.calls()).filter(args => args[0] === "run");
@@ -147,8 +152,45 @@ test("all check commands reuse distinct per-package Linux volumes without changi
     assert.equal(runs.some(args => args.some(value => /SWIFTPM_BUILD_DIR|CLANG_MODULE_CACHE_PATH/.test(value))), false);
     assert.equal((await f.resources()).volumes.length, 5); // Three caches plus two private Git roots.
     await execute.release!(f.path);
+    await assert.rejects(lstat(join(f.path, ".build")), /ENOENT/);
+    await assert.rejects(lstat(join(f.extra, ".build")), /ENOENT/);
     assert.deepEqual(await f.resources(), { volumes: [], containers: [] });
   } finally { await execute.release!(f.path); await rm(f.root, { recursive: true, force: true }); }
+});
+
+test("replaced or populated owned mountpoints cannot hide new inputs between commands", async () => {
+  const f = await fixture();
+  try {
+    const [cache] = await discoverSwiftBuildCaches([{ path: f.path, commit: f.commit, containerPath: "/work" }]);
+    const created = new Map<string, SwiftBuildMountpoint>();
+    await prepareSwiftBuildMountpoint(cache, created, true);
+    await rename(cache.path, `${cache.path}-original`);
+    await mkdir(cache.path);
+    await assert.rejects(prepareSwiftBuildMountpoint(cache, created, true), /identity changed/);
+    await assert.rejects(removeSwiftBuildMountpoints(created), /mountpoint changed/);
+    await rm(cache.path, { recursive: true });
+    await rename(`${cache.path}-original`, cache.path);
+    await writeFile(join(cache.path, "new-input"), "preserve");
+    await assert.rejects(prepareSwiftBuildMountpoint(cache, created, true), /Cannot hide existing/);
+    await assert.rejects(removeSwiftBuildMountpoints(created), /ENOTEMPTY/);
+    assert.equal(await readFile(join(cache.path, "new-input"), "utf8"), "preserve");
+  } finally { await rm(f.root, { recursive: true, force: true }); }
+});
+
+test("uncertain container cleanup preserves original command evidence and all mounted resources", async () => {
+  const f = await fixture();
+  const execute = dockerCheckExecutor({ dockerRuntime: f.endpoint });
+  try {
+    const result = await execute({ ...f.context, command: "cleanup-failure" });
+    assert.equal(result.exitCode, 7);
+    assert.equal(result.stdout, "original stdout");
+    assert.equal(result.stderr, "original stderr");
+    assert.ok(result.cleanupErrors?.some(message => /uncertain container removal/.test(message)));
+    const retained = await f.resources();
+    assert.equal(retained.containers.length, 1);
+    assert.equal(retained.volumes.length, 5);
+    assert.ok((await lstat(join(f.path, ".build"))).isDirectory());
+  } finally { await f.allowCleanup(); await execute.release!(f.path); await rm(f.root, { recursive: true, force: true }); }
 });
 
 test("setup failure, failed commands and timeouts release caches without retrying commands", async () => {
@@ -160,7 +202,7 @@ test("setup failure, failed commands and timeouts release caches without retryin
         await symlink(join(f.root, "external"), join(f.extra, ".build"));
         await assert.rejects(execute(f.context), /Cannot hide a captured/);
       } else {
-        const result = await execute({ ...f.context, command: failure, timeoutMs: failure === "timeout" ? 300 : 3_000 });
+        const result = await execute({ ...f.context, command: failure, timeoutMs: failure === "timeout" ? 1_000 : 3_000 });
         if (failure === "timeout") assert.equal(result.timedOut, true);
         else { assert.equal(result.exitCode, 7); assert.equal(result.stderr, "deliberate check failure"); }
       }
