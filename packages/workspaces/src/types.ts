@@ -96,6 +96,16 @@ export interface CommandResult {
   timedOut?: boolean;
   /** Actual checker image, which can differ from the author device's architecture. */
   developmentToolchain?: DevelopmentToolchain;
+  /** An explicit check-container compatibility layer; separate from the frozen compiler image. */
+  runtimeCompatibility?: CheckCompatibilityEvidence;
+}
+
+export interface CheckCompatibilityEvidence {
+  id: "swift-foundation-provenance-v1";
+  helperSha256: string;
+  sourceSha256: string;
+  compiledSha256: string;
+  scope: "check-command-and-descendants; suppress-only-EOPNOTSUPP/ENOTSUP-for-com.apple.provenance-on-real-directories";
 }
 
 export interface CheckContext {

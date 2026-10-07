@@ -3,6 +3,7 @@ import { dirname, resolve } from "node:path";
 import { prepareToolchain, validatePreparedToolchain, verifyPreparedToolchain } from "@enoughfactory/runtime";
 import { resolveDockerRuntime, runManagedDocker, type DockerRuntimeEndpoint } from "./docker.ts";
 import { discoverSwiftBuildCaches, prepareSwiftBuildMountpoint, removeSwiftBuildMountpoints, type SwiftBuildCache } from "./swift-check-cache.ts";
+import { captureSwiftCheckCompatibility, swiftCheckCompatibilityBootstrap } from "./swift-check-compatibility.ts";
 import type { Candidate, CheckExecutor, DevelopmentToolchain } from "./types.ts";
 
 export function frozenDevelopmentToolchain(value?: DevelopmentToolchain): DevelopmentToolchain | undefined {
@@ -143,8 +144,10 @@ export function dockerCheckExecutor(options: { image?: string; dockerRuntime?: D
         // Attest captured modes before accessibility cleanup. Restore only directories that
         // matched then; real mode edits fail the command and remain visible in final evidence.
         const cleanup = `cleanup() { command_status=$?; ${emptyDirectoryChecks.join("; ")}${emptyDirectoryChecks.length ? "; " : ""}chmod -R a+rwX ${roots.map(root => root.containerPath).join(" ")} 2>/dev/null || true; ${emptyDirectoryRestorations.join("; ")}${emptyDirectoryRestorations.length ? "; " : ""}trap - EXIT; exit "$command_status"; }`;
-        const wrapper = `${initialization.join("; ")}; ${cleanup}; trap cleanup EXIT; ${toolchain ? "bash" : "sh"} -lc "$1"`;
-        const result = await runManagedDocker(dockerRuntime, ["run", "--name", name, "--rm", "--user", "0:0", "--label", "enoughfactory.role=check", ...mounts, ...environment, "--workdir", "/work", toolchain?.image ?? options.image ?? "node:22-bookworm", "sh", "-c", wrapper, "enoughfactory-check", context.command], { timeoutMs: context.timeoutMs, signal: context.signal });
+        const compatibility = process.platform === "darwin" && toolchain?.id === "swift-6.0.3" ? swiftCheckCompatibilityBootstrap() : undefined;
+        const wrapper = `${initialization.join("; ")}; ${cleanup}; trap cleanup EXIT; ${compatibility?.preparation ?? ""}${compatibility?.invocation ?? `${toolchain ? "bash" : "sh"} -lc "$1"`}`;
+        const output = await runManagedDocker(dockerRuntime, ["run", "--name", name, "--rm", "--user", "0:0", "--label", "enoughfactory.role=check", ...mounts, ...environment, "--workdir", "/work", toolchain?.image ?? options.image ?? "node:22-bookworm", "sh", "-c", wrapper, "enoughfactory-check", context.command], { timeoutMs: context.timeoutMs, signal: context.signal });
+        const result = compatibility ? captureSwiftCheckCompatibility(output) : output;
         passed = result.exitCode === 0 && !result.timedOut;
         failureDetail = result.stderr;
         return { command: context.command, ...result, developmentToolchain: toolchain, startedAt, endedAt: new Date().toISOString() };
