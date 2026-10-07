@@ -402,3 +402,63 @@ test('stale inspector commands preserve newer attempts, pause and replanning con
     assert.equal(app.store.get<AttemptDetail>('factory-attempt-details', execution.attempt.id)!.checks, undefined);
   } finally { await app.close(); }
 });
+
+test('retry acknowledges its authorized successor dispatched before cancellation returns', async t => {
+  const directory = mkdtempSync(path.join(tmpdir(), 'enoughfactory-retry-dispatch-race-'));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const previousDirectory = process.env.ENOUGHFACTORY_HOME;
+  let app: DeviceApp;
+  try { process.env.ENOUGHFACTORY_HOME = directory; app = new DeviceApp(); }
+  finally { if (previousDirectory === undefined) delete process.env.ENOUGHFACTORY_HOME; else process.env.ENOUGHFACTORY_HOME = previousDirectory; }
+  let finishExecution!: (result: Awaited<ReturnType<FactoryRuntimePort['execute']>>) => void;
+  try {
+    t.mock.method(app, 'ensureRuntimeReady', async () => assert.fail('Retry race verification must not start a runtime'));
+    const chats = new Proxy({} as ChatController, { get(_target, key) { return assert.fail(`Retry race verification must not use providers: ${String(key)}`); } });
+    const factory = await initializeFactory(app, chats);
+    factory.coordinator.stop();
+    const at = '2026-10-06T00:00:00.000Z';
+    const project: Project = { id: 'project', name: 'Product', path: '/unused-race-fixture', deviceId: app.device.id, runtime: 'codex', approvalMode: 'approve-all', rules: [], createdAt: at };
+    const goal: Goal = { id: 'goal', projectId: project.id, coordinatorId: app.device.id, title: 'Deliver', objective: 'Deliver the behavior', criteria: ['Works'], status: 'running', autonomy: 'autonomous', approvalMode: 'approve-all', runtime: 'codex', concurrency: 1, revision: 8, createdAt: at, updatedAt: at };
+    const failed: Attempt = { id: 'failed-attempt', taskId: 'task', generation: 4, deviceId: app.device.id, status: 'failed', startedAt: at, endedAt: at };
+    const task: FactoryTask = { id: failed.taskId, goalId: goal.id, title: 'Repair', description: 'Repair the actual workflow', dependsOn: [], status: 'failed', currentAttemptId: failed.id, createdAt: at, updatedAt: at };
+    const retained = { id: 'retained-candidate', commit: 'retained-commit', baseCommit: 'base' };
+    app.store.transaction(() => {
+      app.store.set('projects', project); app.store.set('goals', goal); app.store.set('tasks', task); app.store.set('attempts', failed);
+      app.store.set<ControlRecord>('factory-control', { id: goal.id, stage: 'dispatch', spent: 0, startedAt: at, steering: [] });
+      app.store.set<TaskDetail>('factory-task-details', { id: task.id, key: task.id, checks: [], planRevision: goal.revision, selected: false, failureSignatures: [], lastCandidate: retained });
+      app.store.set<AttemptDetail>('factory-attempt-details', { id: failed.id, goalId: goal.id, goalRevision: goal.revision, phase: 'done', cancellation: 'none', candidate: retained });
+    });
+    let execution!: Parameters<FactoryRuntimePort['execute']>[0];
+    let entered!: () => void;
+    const executionEntered = new Promise<void>(resolve => { entered = resolve; });
+    const running = new Promise<Awaited<ReturnType<FactoryRuntimePort['execute']>>>(resolve => { finishExecution = resolve; });
+    t.mock.method(factory.runtime, 'cancel', async () => {});
+    t.mock.method(factory.workspacePort, 'prepare', async (input: Parameters<FactoryWorkspacePort['prepare']>[0]) => {
+      assert.deepEqual(input.previousCandidate, retained);
+      return { id: 'successor-workspace', path: '/isolated-fixture', provider: 'git', baseCommit: 'base' };
+    });
+    t.mock.method(factory.runtime, 'execute', async (input: Parameters<FactoryRuntimePort['execute']>[0]) => { execution = input; entered(); return running; });
+    const retire = factory.coordinator.retireAttempt.bind(factory.coordinator);
+    let dispatchedState: unknown[] = [];
+    t.mock.method(factory.coordinator, 'retireAttempt', async (...args: Parameters<typeof retire>) => {
+      await retire(...args);
+      await factory.coordinator.tick();
+      await executionEntered;
+      dispatchedState = ['goals', 'tasks', 'factory-control', 'factory-task-details', 'decisions'].map(bucket => app.store.list(bucket));
+    });
+    await new Promise<void>(resolve => app.server.listen(0, '127.0.0.1', resolve));
+    const origin = `http://127.0.0.1:${(app.server.address() as AddressInfo).port}`;
+    const response = await fetch(`${origin}/api/tasks/${task.id}/retry`, { method: 'POST', headers: { authorization: `Bearer ${app.token}`, 'content-type': 'application/json' }, body: JSON.stringify({ expectedGoalRevision: goal.revision, expectedAttemptId: failed.id, repairInstructions: '  Preserve retained work and repair the submission workflow.  ' }) });
+    assert.equal(response.status, 200, JSON.stringify(await response.json()));
+    assert.equal(execution.attempt.generation, 5); assert.notEqual(execution.attempt.id, failed.id);
+    assert.equal(app.store.get<FactoryTask>('tasks', task.id)!.currentAttemptId, execution.attempt.id);
+    assert.equal(app.store.get<Attempt>('attempts', failed.id)!.status, 'retired');
+    assert.equal(app.store.get<AttemptDetail>('factory-attempt-details', failed.id)!.cancellation, 'acknowledged');
+    assert.match(execution.prompt, /Preserve retained work and repair the submission workflow\./);
+    assert.equal(app.store.get<TaskDetail>('factory-task-details', task.id)!.repairInstructions, 'Preserve retained work and repair the submission workflow.');
+    assert.equal(app.store.list<Attempt>('attempts').length, 2, 'Acknowledging the dispatched retry must not create another successor');
+    assert.deepEqual(['goals', 'tasks', 'factory-control', 'factory-task-details', 'decisions'].map(bucket => app.store.list(bucket)), dispatchedState, 'The successful response must not re-select work or overwrite advanced controller state');
+    finishExecution({ status: 'unknown', text: '', error: 'Fixture provider outcome intentionally unresolved' });
+    await factory.coordinator.waitForIdle();
+  } finally { finishExecution?.({ status: 'unknown', text: '' }); await app.close(); }
+});

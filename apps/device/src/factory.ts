@@ -6,7 +6,7 @@ import type { Attempt, FactoryTask, Goal, Project, Decision, ControllerRun, Cont
 import {
   FactoryCoordinator, FactoryOperationError, type FactoryWorkspacePort, type FactoryRuntimePort, type WorkspaceRef,
   type CandidateRef, type ExecutionResult, type CheckResult, type CreateGoalInput,
-  type RepositoryEvidence, type EvaluationRecord, type ControlRecord, type TaskDetail,
+  type RepositoryEvidence, type EvaluationRecord, type ControlRecord, type TaskDetail, type AttemptDetail,
 } from '@enoughfactory/factory';
 import { WorkspaceManager, ArtifactFsWorkspaceProvider, dockerCheckExecutor, appleCheckExecutor, isAppleCheckCommand, appleCheckArtifacts, fingerprintWorkingDirectories, type WorkingDirectorySource, type WorkingDirectoryCapture, type ArtifactManifest, type Candidate, type CheckReport, type WorkspaceRecord } from '@enoughfactory/workspaces';
 import type { PeerManager } from '@enoughfactory/peers';
@@ -707,10 +707,25 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
         if (task.status !== 'failed' || (task.currentAttemptId && attempt?.status !== 'failed') || (body.expectedAttemptId !== undefined && body.expectedAttemptId !== (task.currentAttemptId ?? null))) throw new HttpError(409, 'This failed attempt has changed. Refresh its current state before retrying.');
         eligible({ ...task, status: 'queued', currentAttemptId: undefined }, goal);
         if (task.currentAttemptId) {
+          const previousAttempts = app.store.list<Attempt>('attempts').filter(item => item.taskId === task.id);
+          const nextGeneration = Math.max(0, ...previousAttempts.map(item => item.generation)) + 1;
           try { await coordinator.retireAttempt(task.currentAttemptId, { preserveController: true, expectedGoalRevision: goal.revision, ...(typeof body.repairInstructions === 'string' ? { repairInstructions: body.repairInstructions } : {}) }); }
           catch (error) { if (error instanceof FactoryOperationError && error.kind === 'stale') throw new HttpError(409, error.message); throw error; }
           const after = currentState(goal.revision);
-          if (after.task.status !== 'queued' || after.task.currentAttemptId) throw new HttpError(409, 'Coordination advanced while cancellation was acknowledged. Refresh the current attempt.');
+          if (after.task.status !== 'queued' || after.task.currentAttemptId) {
+            const successor = after.task.currentAttemptId ? app.store.get<Attempt>('attempts', after.task.currentAttemptId) : undefined;
+            const successorDetail = successor ? app.store.get<AttemptDetail>('factory-attempt-details', successor.id) : undefined;
+            const retired = app.store.get<Attempt>('attempts', task.currentAttemptId);
+            const retirement = app.store.get<AttemptDetail>('factory-attempt-details', task.currentAttemptId);
+            // Acknowledgment can wake the scheduler before retireAttempt returns. The
+            // authorized retry already succeeded when its exact new generation owns
+            // the task; do not select it again or overwrite its repair/controller state.
+            if (successor && successor.taskId === task.id && successor.generation === nextGeneration &&
+              ['running', 'review'].includes(after.task.status) && ['created', 'running', 'unknown', 'succeeded'].includes(successor.status) &&
+              successorDetail?.goalId === goal.id && successorDetail.goalRevision === goal.revision && successorDetail.cancellation === 'none' &&
+              retired?.status === 'retired' && retirement?.cancellation === 'acknowledged') return { ok: true };
+            throw new HttpError(409, 'Coordination advanced while cancellation was acknowledged. Refresh the current attempt.');
+          }
           eligible(after.task, after.goal);
           dispatchControl = after.control;
         } else {
