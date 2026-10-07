@@ -33,5 +33,7 @@ export interface ProvisionOptions { copyHostAuth?: boolean; hostAuthDir?: string
 export const RUNTIME_PINS = { codex: "0.160.0", claude: "2.1.289", antigravitySdk: "0.1.20", node: "22.22.0" } as const;
 
 export class AgentError extends Error {
+  /** False proves no task turn was dispatched; true can still mean an uncertain outcome. */
+  agentStarted?: boolean;
   constructor(message: string, readonly code = "AGENT_RUNTIME_ERROR", readonly executionEnded = false) { super(message); this.name = "AgentError"; }
 }

@@ -130,3 +130,39 @@ test('a nonzero CLI transport exit cannot masquerade as confirmed provider compl
     return true;
   });
 });
+
+test('Codex startup closure is conclusively not started while sent turn requests stay uncertain', async () => {
+  for (const boundary of ['initialize-closed', 'turn-sent-no-ack', 'turn-write-error'] as const) {
+    const requests: string[] = [], events: AgentEvent[] = [];
+    const spawnProcess = ((_command: string, _args: readonly string[], options: { stdio?: string }) => {
+      const child = new EventEmitter() as EventEmitter & { stdout: PassThrough; stderr: PassThrough; stdin: PassThrough; kill: () => boolean };
+      child.stdout = new PassThrough(); child.stderr = new PassThrough(); child.stdin = new PassThrough();
+      child.kill = () => { queueMicrotask(() => child.emit('close', 0)); return true; };
+      if (options.stdio === 'ignore') { queueMicrotask(() => child.emit('close', 0)); return child; }
+      child.stdin.on('data', (bytes: Buffer) => {
+        const message = JSON.parse(bytes.toString()) as RpcMessage;
+        if (message.id === undefined) return;
+        requests.push(message.method!);
+        if (message.method === 'initialize' && boundary === 'initialize-closed') {
+          // Classification must use the protocol boundary, independent of stderr text.
+          queueMicrotask(() => { child.stderr.write('An opaque loader failure'); child.emit('close', 1); });
+        } else if (message.method === 'turn/start') {
+          if (boundary === 'turn-write-error') throw new Error('An arbitrary write failure');
+          queueMicrotask(() => child.emit('close', 1));
+        } else queueMicrotask(() => child.stdout.write(`${JSON.stringify({ id: message.id, result: message.method === 'thread/start' ? { thread: { id: 'thread' } } : {} })}\n`));
+      });
+      return child;
+    }) as unknown as typeof spawn;
+    const manager = new AgentManager({ autoProvision: false, dockerEndpoint: { cliPath: '/managed/docker', host: 'unix:///managed/docker.sock', configDirectory: '/managed/config' }, spawnProcess });
+    const mayHaveStarted = boundary !== 'initialize-closed';
+    await assert.rejects(manager.runTurn({ ...input, cwd: '/work' }, { onEvent: event => { events.push(event); }, onApproval: async () => true }), error => {
+      assert.equal((error as { agentStarted?: boolean }).agentStarted, mayHaveStarted, boundary);
+      assert.equal((error as { executionEnded?: boolean }).executionEnded, !mayHaveStarted, boundary);
+      return true;
+    });
+    assert.deepEqual(requests, mayHaveStarted ? ['initialize', 'thread/start', 'turn/start'] : ['initialize']);
+    assert.equal(events.at(-1)?.data?.agentStarted, mayHaveStarted);
+    assert.equal(events.at(-1)?.data?.executionEnded, !mayHaveStarted);
+    assert.equal(events.at(-1)?.data?.phase, mayHaveStarted ? 'execution' : 'preparation');
+  }
+});

@@ -26,6 +26,9 @@ export class CodexTurn {
   private rejectTurn!: (error: Error) => void;
   private completion: Promise<TurnResult>;
   private finished = false;
+  private failure?: Error;
+  private turnStartRequested = false;
+  get executionMayHaveStarted(): boolean { return this.turnStartRequested; }
   constructor(private input: TurnInput, private callbacks: TurnCallbacks, private process: ContainerProcess, private router: ApprovalRouter, private signal: AbortSignal) {
     this.completion = new Promise((resolve, reject) => { this.resolveTurn = resolve; this.rejectTurn = reject; });
     void this.completion.catch(() => {});
@@ -43,15 +46,23 @@ export class CodexTurn {
   private fail(error: Error): void {
     if (this.finished) return;
     this.finished = true;
+    // Starting the app-server, initializing it and loading a thread cannot execute
+    // this task. Once turn/start is offered to the transport, even a missing reply
+    // can hide real effects, so only a terminal provider response proves it ended.
+    Object.assign(error, { agentStarted: this.executionMayHaveStarted, executionEnded: !this.executionMayHaveStarted || (error instanceof AgentError && error.executionEnded) });
+    this.failure = error;
     for (const request of this.requests.values()) { clearTimeout(request.timer); request.reject(error); }
     this.requests.clear(); this.rejectTurn(error);
   }
   request(method: string, params: JsonRecord): Promise<JsonRecord> {
+    if (this.finished) return Promise.reject(this.failure ?? new AgentError("Codex turn already ended.", "AGENT_TURN_ENDED", true));
     if (this.signal.aborted) return Promise.reject(new AgentError("Agent turn interrupted.", "INTERRUPTED"));
     const id = ++this.sequence;
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => { this.requests.delete(id); reject(new AgentError(`Codex did not acknowledge ${method}.`, "PROTOCOL_TIMEOUT")); }, 30_000);
       this.requests.set(id, { resolve, reject, timer });
+      // Mark before writing: write/ack failure cannot establish that no bytes arrived.
+      if (method === "turn/start") this.turnStartRequested = true;
       this.process.write({ id, method, params });
     });
   }
@@ -70,7 +81,7 @@ export class CodexTurn {
     }
     if (params.threadId && this.threadId && params.threadId !== this.threadId) return;
     if (params.turnId && this.turnId && params.turnId !== this.turnId) return;
-    if (method === "turn/started") this.turnId = params.turn?.id;
+    if (method === "turn/started") { this.turnStartRequested = true; this.turnId = params.turn?.id; }
     else if (method === "item/agentMessage/delta") {
       const key = params.itemId ?? "assistant";
       this.messages.set(key, (this.messages.get(key) ?? "") + (params.delta ?? ""));
@@ -124,19 +135,21 @@ export class CodexTurn {
     }
   }
   async run(): Promise<TurnResult> {
-    await this.request("initialize", { clientInfo: { name: "enoughfactory", title: "EnoughFactory", version: "0.1.1" }, capabilities: { experimentalApi: false } });
-    this.process.write({ method: "initialized", params: {} });
-    const approvalPolicy = this.input.approvalMode === "approve-all" ? "never" : "on-request";
-    const parameters = { cwd: this.input.cwd, approvalPolicy, approvalsReviewer: "user", sandbox: "danger-full-access", model: this.input.model, developerInstructions: this.input.systemInstructions };
-    const thread = await this.request(this.input.threadId ? "thread/resume" : "thread/start", { ...parameters, ...(this.input.threadId ? { threadId: this.input.threadId } : {}) });
-    this.threadId = thread.thread?.id;
-    if (!this.threadId) throw new AgentError("Codex did not create a conversation identity.", "PROTOCOL_ERROR");
-    await this.emit({ kind: "status", text: "Agent running", data: { threadId: this.threadId, status: "running", fullAccess: true, protocolVersion: CODEX_PROTOCOL_VERSION } });
-    const response = await this.request("turn/start", {
-      threadId: this.threadId, input: [{ type: "text", text: this.input.prompt }], approvalPolicy, approvalsReviewer: "user",
-      sandboxPolicy: { type: "dangerFullAccess" }, cwd: this.input.cwd, model: this.input.model,
-    });
-    this.turnId = response.turn?.id ?? this.turnId;
+    try {
+      await this.request("initialize", { clientInfo: { name: "enoughfactory", title: "EnoughFactory", version: "0.1.1" }, capabilities: { experimentalApi: false } });
+      this.process.write({ method: "initialized", params: {} });
+      const approvalPolicy = this.input.approvalMode === "approve-all" ? "never" : "on-request";
+      const parameters = { cwd: this.input.cwd, approvalPolicy, approvalsReviewer: "user", sandbox: "danger-full-access", model: this.input.model, developerInstructions: this.input.systemInstructions };
+      const thread = await this.request(this.input.threadId ? "thread/resume" : "thread/start", { ...parameters, ...(this.input.threadId ? { threadId: this.input.threadId } : {}) });
+      this.threadId = thread.thread?.id;
+      if (!this.threadId) throw new AgentError("Codex did not create a conversation identity.", "PROTOCOL_ERROR");
+      await this.emit({ kind: "status", text: "Agent running", data: { threadId: this.threadId, status: "running", fullAccess: true, protocolVersion: CODEX_PROTOCOL_VERSION } });
+      const response = await this.request("turn/start", {
+        threadId: this.threadId, input: [{ type: "text", text: this.input.prompt }], approvalPolicy, approvalsReviewer: "user",
+        sandboxPolicy: { type: "dangerFullAccess" }, cwd: this.input.cwd, model: this.input.model,
+      });
+      this.turnId = response.turn?.id ?? this.turnId;
+    } catch (error) { this.fail(error instanceof Error ? error : new Error(String(error))); }
     return this.completion;
   }
   async interrupt(): Promise<void> {

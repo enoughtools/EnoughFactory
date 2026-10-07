@@ -78,8 +78,9 @@ export class AgentManager {
       return result;
     } catch (error) {
       const failure = error instanceof Error ? error : new Error(String(error));
-      Object.assign(failure, { agentStarted: !!live.process, executionEnded: !live.process || (failure instanceof AgentError && failure.executionEnded) });
-      await callbacks.onEvent({ kind: "error", text: failure.message, data: { code: failure instanceof AgentError ? failure.code : "AGENT_RUNTIME_ERROR", interrupted: controller.signal.aborted, agentStarted: !!live.process, executionEnded: (failure as AgentError).executionEnded, phase: live.process ? "execution" : "preparation" } });
+      const agentStarted = input.runtime === "codex" && input.codexTransport !== "exec" ? live.codex?.executionMayHaveStarted === true : !!live.process;
+      Object.assign(failure, { agentStarted, executionEnded: !agentStarted || (failure instanceof AgentError && failure.executionEnded) });
+      await callbacks.onEvent({ kind: "error", text: failure.message, data: { code: failure instanceof AgentError ? failure.code : "AGENT_RUNTIME_ERROR", interrupted: controller.signal.aborted, agentStarted, executionEnded: (failure as AgentError).executionEnded, phase: agentStarted ? "execution" : "preparation" } });
       throw failure;
     } finally {
       controller.abort(); await router.cancel(); await live.process?.stop();

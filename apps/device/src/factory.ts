@@ -38,6 +38,12 @@ const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, m
 function candidateArtifacts(candidate:Candidate):ArtifactManifest[]{return [candidate.bundleArtifact,candidate.diffArtifact,...(candidate.workingDirectories||[]).flatMap(root=>[root.bundleArtifact,root.diffArtifact])];}
 function publicWorkerProject(project:Project):Project{return {...project,path:'',workingDirectories:project.workingDirectories?.map(root=>({...root,path:''}))};}
 function assertCapturedRoots(roots:WorkingDirectoryCapture[],expected:Array<{id:string;name:string;baseCommit:string}>):void{if(roots.length!==expected.length||expected.some(source=>!roots.some(root=>root.id===source.id&&root.name===source.name&&root.baseCommit===source.baseCommit)))throw new Error('Every prepared working folder must have an exact retained capture before this attempt can be accepted.');}
+export function factoryExecutionIsUncertain(error: { agentStarted?: boolean; executionEnded?: boolean; code?: string }): boolean {
+  // Adapter boundary facts outrank transport codes. Only older failures lacking both
+  // facts need the legacy fallback; an unacknowledged task request may have real effects.
+  if (typeof error.agentStarted === 'boolean' || typeof error.executionEnded === 'boolean') return error.agentStarted !== false && error.executionEnded !== true;
+  return ['RUNTIME_DISCONNECTED', 'PROTOCOL_TIMEOUT', 'PROTOCOL_ERROR', 'RUNTIME_TIMEOUT', 'CONTAINER_UNAVAILABLE'].includes(error.code ?? '');
+}
 
 /** The service owns execution and the supervisor; no open window is required. */
 export async function initializeFactory(app: DeviceApp, chats: ChatController, network?: { peers: PeerManager }) {
@@ -84,7 +90,7 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
     const running = operation().catch(error => {
       const record = worker(id);
       if (record.status === 'canceled') return;
-      const uncertain = error.agentStarted !== false && ['RUNTIME_DISCONNECTED', 'PROTOCOL_TIMEOUT', 'PROTOCOL_ERROR', 'RUNTIME_TIMEOUT', 'CONTAINER_UNAVAILABLE'].includes(error.code);
+      const uncertain = factoryExecutionIsUncertain(error);
       const result: ExecutionResult = { status: uncertain ? 'unknown' : 'failed', text: '', error: error.message, sessionId: record.sessionId, chatId: record.chatId };
       patchWorker(id, { status: uncertain ? 'unknown' : 'failed', error: error.message, result });
     }).finally(() => jobs.delete(id));

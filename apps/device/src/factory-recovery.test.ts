@@ -9,7 +9,7 @@ import type { TurnCallbacks, TurnInput, TurnResult } from '@enoughfactory/agents
 import type { AddressInfo } from 'node:net';
 import { DeviceApp } from './app.ts';
 import { ChatController } from './chats.ts';
-import { initializeFactory } from './factory.ts';
+import { factoryExecutionIsUncertain, initializeFactory } from './factory.ts';
 
 interface WorkerReceipt {
   id: string; coordinatorId: string; goal: Goal; task: FactoryTask; attempt: Attempt; project: Project;
@@ -17,6 +17,18 @@ interface WorkerReceipt {
   sessionId: string; chatId: string; updatedAt: string; error?: string; result?: unknown;
 }
 interface CompletionReceipt { id: string; result: TurnResult; attemptId?: string; completedAt?: string; }
+
+test('typed execution boundaries distinguish startup failure from ambiguous task dispatch', () => {
+  assert.equal(factoryExecutionIsUncertain({ code: 'RUNTIME_DISCONNECTED', agentStarted: false, executionEnded: true }), false);
+  assert.equal(factoryExecutionIsUncertain({ code: 'AGENT_RUNTIME_ERROR', agentStarted: true, executionEnded: false }), true, 'an arbitrary write exception after dispatch is uncertain');
+  assert.equal(factoryExecutionIsUncertain({ code: 'AGENT_TURN_FAILED', agentStarted: true, executionEnded: true }), false);
+  assert.equal(factoryExecutionIsUncertain({ agentStarted: true }), true);
+  assert.equal(factoryExecutionIsUncertain({ executionEnded: false }), true);
+  assert.equal(factoryExecutionIsUncertain({ code: 'RUNTIME_DISCONNECTED', executionEnded: true }), false);
+  assert.equal(factoryExecutionIsUncertain({ code: 'RUNTIME_DISCONNECTED', agentStarted: false }), false);
+  assert.equal(factoryExecutionIsUncertain({ code: 'RUNTIME_DISCONNECTED' }), true, 'legacy transport failures retain their fallback');
+  assert.equal(factoryExecutionIsUncertain({ code: 'AGENT_TURN_FAILED' }), false, 'legacy nontransport failures retain their fallback');
+});
 
 async function harness(t: TestContext) {
   const directory = mkdtempSync(path.join(tmpdir(), 'enoughfactory-recovery-'));
