@@ -20,6 +20,7 @@ import { inspectAttempt, inspectGoal, inspectTask, taskControlReason, taskDispat
 import { factoryChatBinding } from './factory-chat.ts';
 import { controllerError } from './factory-controller-error.ts';
 import { prepareControllerContext } from './controller-context.ts';
+import { assertCurrentWorkerAssignment, assertWorkerContext, disposeWorkerContext, prepareWorkerContext, type WorkerEvidenceContext } from './worker-context.ts';
 import { developmentToolchainChoice, parseDevelopmentToolchain, prepareDevelopmentToolchain, type FrozenDevelopmentToolchain } from './development-toolchain.ts';
 import { retainManualContinuation, type ManualContinuationInput } from './manual-continuation-retention.ts';
 
@@ -30,6 +31,7 @@ interface WorkerRecord {
   candidate?: CandidateRef; error?: string; updatedAt: string;
   cancellationAcknowledged?: boolean;
   workingDirectorySources?: WorkingDirectorySource[];
+  referenceContext?: WorkerEvidenceContext;
   developmentToolchain?: FrozenDevelopmentToolchain;
 }
 interface ReceivedArtifact { id: string; peerId: string; manifest: ArtifactManifest; path: string; }
@@ -194,39 +196,64 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
   }
   async function prepareLocal(record: WorkerRecord, project = record.project, previousCandidate?: CandidateRef): Promise<void> {
     return app.withRuntimeOperation(async signal=>{
+    const assertCurrent = () => {
+      const current = worker(record.id);
+      if(signal.aborted||current.status==='canceled'||current.attempt.generation!==record.attempt.generation||current.task.id!==record.task.id||current.goal.id!==record.goal.id||current.goal.revision!==record.goal.revision)throw new Error('Worker preparation was canceled or its assignment changed.');
+      if(record.coordinatorId===app.device.id)assertCurrentWorkerAssignment(app.store,record);
+    };
+    try {
+    assertCurrent();
     await app.ensureRuntimeReady();
+    assertCurrent();
     const developmentToolchain=await resolveToolchain(project,signal,record.developmentToolchain);
+    assertCurrent();
     patchWorker(record.id,{developmentToolchain});
     const name = sessionName(record.id);
     const config = await projectConfig(project);
     let workspace = await workspaces.create({ projectPath: project.path, goalId: record.goal.id,
       taskId: record.task.id, attemptId: record.id, provider: sourceProvider(record.goal), fallbackToGit: true, sessionName: name,
       workspaceBranch: `${config ? envmuxBranchPrefix(config) : 'envmux/'}${name}`,developmentToolchain:developmentToolchain==='default'?undefined:developmentToolchain });
+    assertCurrent();
     if (previousCandidate) {
       const promoted = await workspaces.promotePreviousCandidate({ candidateId: previousCandidate.id, workspaceId: workspace.id });
       if (promoted.conflicts.length) app.store.set('factory-repair-input', { id: record.id, conflicts: promoted.conflicts, message: promoted.message });
       workspace = await workspaces.workspace(workspace.id);
     }
-    if (worker(record.id).status === 'canceled') return;
+    assertCurrent();
     await configureHandoff(workspace);
     const workingDirectorySources=record.workingDirectorySources||await sourceRootsForAttempt(record.id,project,previousCandidate);
+    assertCurrent();
     patchWorker(record.id,{workingDirectorySources});
+    const referenceContext=record.referenceContext||(record.coordinatorId===app.device.id?await prepareWorkerContext({goal:record.goal,task:record.task,attempt:record.attempt,project,store:app.store,workspaces,directoryManager:app.sessions.directoryManager,dataDir:app.dataDir,reservedNames:workingDirectorySources.map(root=>root.name),assertCurrent}):undefined);
+    assertCurrent();
+    if(referenceContext){assertWorkerContext(referenceContext,record);patchWorker(record.id,{referenceContext});}
     const owned = internalProject(project, workspace, record.task.title);
     const state = workspace.providerState;
-    const session = await app.sessions.create(owned, name,{workingDirectorySources,developmentToolchain,...(state && typeof state.bindSource === 'string' && typeof state.stateVolume === 'string'
+    const session = await app.sessions.create(owned, name,{workingDirectorySources,referenceContext:referenceContext?.source,assertCurrent,developmentToolchain,...(state && typeof state.bindSource === 'string' && typeof state.stateVolume === 'string'
       ? { workspace: { bindSource: state.bindSource, stateVolume: state.stateVolume } } : {})});
     patchWorker(record.id, { workspace: ref(workspace, session.id), sessionId: session.id });
     await app.sessions.waitReady(session.id);
+    assertCurrent();
     patchWorker(record.id,{workspace:{...ref(workspace,session.id),workingDirectories:app.sessions.record(session.id).workingDirectories}});
     if (worker(record.id).status === 'canceled') { await app.sessions.stop(session.id); return; }
     patchWorker(record.id, { status: 'prepared' });
+    } catch(error) {
+      const latest=worker(record.id);
+      if(latest.sessionId&&app.sessions.needsTermination(latest.sessionId)){await app.sessions.stop(latest.sessionId);await app.sessions.waitStopped(latest.sessionId);}
+      throw error;
+    } finally {
+      await disposeWorkerContext(app.dataDir,record.id,record.attempt.generation);
+      const latest=worker(record.id);
+      if(latest.sessionId&&!app.sessions.needsTermination(latest.sessionId))await app.sessions.disposeReferenceContext(latest.sessionId);
+    }
     });
   }
   function beginWorker(input: Omit<WorkerRecord, 'status' | 'updatedAt'>): WorkerRecord {
     const previous = app.store.get<WorkerRecord>(journal, input.id);
     if (previous) {
       if (previous.coordinatorId !== input.coordinatorId || previous.attempt.generation !== input.attempt.generation
-        || previous.goal.id !== input.goal.id || previous.goal.revision !== input.goal.revision || previous.task.id !== input.task.id)
+        || previous.goal.id !== input.goal.id || previous.goal.revision !== input.goal.revision || previous.task.id !== input.task.id
+        || input.coordinatorId!==app.device.id&&previous.referenceContext?.source.sourceArtifact.sha256 !== input.referenceContext?.source.sourceArtifact.sha256)
         throw new HttpError(409, 'Attempt identity is already bound to a different assignment.');
       return previous;
     }
@@ -238,6 +265,8 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
     if (worker(record.id).status === 'canceled') return;
     await app.sessions.waitReady(record.sessionId);
     if (worker(record.id).status === 'canceled') return;
+    if(record.coordinatorId===app.device.id){const detail=app.store.get<AttemptDetail>('factory-attempt-details',record.id);assertCurrentWorkerAssignment(app.store,{...record,goal:{...record.goal,revision:detail?.assignmentGoalRevision??record.referenceContext?.assignment.goalRevision??record.goal.revision}});}
+    if(record.referenceContext)assertWorkerContext(record.referenceContext,{...record,goal:{...record.goal,revision:record.referenceContext.assignment.goalRevision}});
     const ownedProject = app.store.get<Project>('projects', app.sessions.record(record.sessionId).projectId);
     if (ownedProject) app.store.set('projects', { ...ownedProject, rules: record.project.rules, runtime: record.goal.runtime, approvalMode: record.goal.approvalMode });
     const chat = record.chatId ? chats.get(record.chatId) : chats.create({ sessionId: record.sessionId,
@@ -246,8 +275,9 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
     const attempt = app.store.get<Attempt>('attempts', record.id);
     if (attempt) app.store.set('attempts', { ...attempt, sessionId: record.sessionId, chatId: chat.id });
     const repair = app.store.get<{ id: string; conflicts: string[]; message?: string }>('factory-repair-input', record.id);
-    const result = await chats.run(chat.id, repair ? `${prompt}\n\nRetained work was merged as repair input. Resolve conflict markers in these files before completing: ${repair.conflicts.join(', ')}. ${repair.message || ''}` : prompt, { attemptId: record.id, autonomous: record.goal.autonomy === 'autonomous',
-      systemInstructions: `You are implementing an assigned EnoughFactory task toward this goal:\n${record.goal.objective}\n\nYou have full permissions inside this container. Enough owns the configured ${record.goal.approvalMode} policy. Make routine implementation decisions and execute the task completely. Do not stop at a plan or ask for permission already granted. Keep verification proportionate. Preserve changes and describe concrete evidence and any remaining work. The factory will independently capture, check, integrate and evaluate your result.\n\n${validationInstructions()}\n\n${toolchainInstructions(app.sessions.record(record.sessionId).developmentToolchain)}` });
+    const executionPrompt=[repair ? `${prompt}\n\nRetained work was merged as repair input. Resolve conflict markers in these files before completing: ${repair.conflicts.join(', ')}. ${repair.message || ''}` : prompt,record.referenceContext?.instructions].filter(Boolean).join('\n\n');
+    const result = await chats.run(chat.id, executionPrompt, { attemptId: record.id, autonomous: record.goal.autonomy === 'autonomous',
+      systemInstructions: `You are implementing an assigned EnoughFactory task toward this goal:\n${record.goal.objective}\n\nYou have full permissions inside this container. Enough owns the configured ${record.goal.approvalMode} policy. Make routine implementation decisions and execute the task completely. Do not stop at a plan or ask for permission already granted. Keep verification proportionate. Preserve changes and describe concrete evidence and any remaining work. The factory will independently capture, check, integrate and evaluate your result.\n\n${validationInstructions()}\n\n${toolchainInstructions(app.sessions.record(record.sessionId).developmentToolchain)}\n\n${record.referenceContext?.instructions??''}` });
     if (worker(record.id).status === 'canceled') return;
     patchWorker(record.id, { status: 'succeeded', result: { status: 'succeeded', text: result.text, sessionId: record.sessionId, chatId: chat.id, spend: spend(result) } });
   }
@@ -346,7 +376,11 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
   }
   const workspacePort: FactoryWorkspacePort = {
     async prepare({ goal, task, attempt, project, previousCandidate }) {
+      goal={...goal,revision:app.store.get<AttemptDetail>('factory-attempt-details',attempt.id)?.assignmentGoalRevision??goal.revision};
+      const assertCurrent=()=>assertCurrentWorkerAssignment(app.store,{goal,task,attempt});
+      assertCurrent();
       const toolchainProfile=await developmentToolchainChoice(project);
+      assertCurrent();
       project={...project,developmentToolchain:toolchainProfile};
       if (local(attempt.deviceId)) {
         const record = beginWorker({ id: attempt.id, coordinatorId: app.device.id, goal, task, attempt, project });
@@ -360,19 +394,28 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
         const source = await workspaces.exportSource({ projectPath: project.path }); rememberArtifacts(source);
         await sendArtifact(attempt.deviceId, source);
         const workingDirectorySources=await sourceRootsForAttempt(attempt.id,project,previousCandidate);
+        const referenceContext=await prepareWorkerContext({goal,task,attempt,project,store:app.store,workspaces,directoryManager:app.sessions.directoryManager,dataDir:app.dataDir,reservedNames:workingDirectorySources.map(root=>root.name),assertCurrent});
+        try {
         for(const root of workingDirectorySources){rememberArtifacts(root.sourceArtifact);await sendArtifact(attempt.deviceId,root.sourceArtifact);}
+        if(referenceContext){rememberArtifacts(referenceContext.source.sourceArtifact);await sendArtifact(attempt.deviceId,referenceContext.source.sourceArtifact);}
         if (previousCandidate) {
           const prior = await workspaces.candidate(previousCandidate.id);
           for(const artifact of candidateArtifacts(prior))await sendArtifact(attempt.deviceId,artifact);
         }
+        const config=await projectConfig(project);
+        assertCurrent();
         await rpc(attempt.deviceId, 'POST', '/api/factory/worker/prepare', { goal, task, attempt,
-          project: publicWorkerProject(project), source, workingDirectorySources, config: await projectConfig(project), previousCandidate,
+          project: publicWorkerProject(project), source, workingDirectorySources, referenceContext, config, previousCandidate,
           workspaceProvider: sourceProvider(goal),toolchainRecipe:toolchainProfile==='default'?undefined:{id:SWIFT_TOOLCHAIN.id,recipeSha256:SWIFT_TOOLCHAIN.recipeSha256} });
+        } finally {await disposeWorkerContext(app.dataDir,attempt.id,attempt.generation);}
       }
       const record = await waitWorker(attempt.deviceId, attempt.id, 'prepared');
+      assertCurrent();
       if (!record.workspace || !['prepared', 'running', 'succeeded'].includes(record.status)) throw new Error(record.error || 'Worker preparation did not complete.');
       if(toolchainProfile!=='default')validatePreparedToolchain(record.workspace.developmentToolchain);
       else if(record.workspace.developmentToolchain)throw new Error('The worker did not honor the selected default development environment.');
+      const frozen=app.store.get<{id:string;context?:WorkerEvidenceContext}>('factory-worker-context',attempt.id)?.context;
+      if(frozen?.source.sourceArtifact.sha256!==record.referenceContext?.source.sourceArtifact.sha256)throw new Error('The worker did not confirm its exact frozen retained reference evidence.');
       const sources=local(attempt.deviceId)?worker(attempt.id).workingDirectorySources||[]:await app.sessions.directoryManager.sourceSnapshots(attempt.id);
       const mounts=record.workspace.workingDirectories as import('@enoughfactory/contracts').WorkingDirectoryMount[]|undefined;
       if(sources.length&&(!mounts||mounts.length!==sources.length||sources.some(source=>!mounts.some(root=>root.id===source.id&&root.name===source.name&&root.path===source.containerPath&&root.baseCommit===source.baseCommit&&root.kind===source.kind))))throw new Error('The worker did not confirm the exact additional working folder snapshots. No task execution was authorized.');
@@ -787,9 +830,11 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
       if(project.workingDirectories?.length&&!workingDirectorySources?.length)throw new HttpError(409,'The coordinator did not transfer the configured additional working folders.');
       for(const root of workingDirectorySources||[])await importReceived(peerId,root.sourceArtifact);
       const previousCandidate = body.previousCandidate as CandidateRef | undefined;
+      const referenceContext=body.referenceContext as WorkerEvidenceContext|undefined;
+      if(referenceContext){assertWorkerContext(referenceContext,{goal,task,attempt});await importReceived(peerId,referenceContext.source.sourceArtifact);}
       if (previousCandidate) await acceptRemoteCandidate(peerId, previousCandidate);
       app.assertRuntimeCanRun();
-      const record = beginWorker({ id: attempt.id, coordinatorId: peerId, goal, task, attempt, project, workingDirectorySources });
+      const record = beginWorker({ id: attempt.id, coordinatorId: peerId, goal, task, attempt, project, workingDirectorySources,referenceContext });
       app.store.set<GoalOptions>('factory-options', { id: goal.id, workspaceProvider: body.workspaceProvider === 'artifactfs' ? 'artifactfs' : 'git' });
       if (record.status === 'preparing') track(record.id, async () => {
         const sourcePath = path.join(app.dataDir, 'worker-source', record.id);

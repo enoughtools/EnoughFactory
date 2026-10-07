@@ -7,7 +7,7 @@ import type { WorkingDirectoryManager, WorkingDirectorySnapshot, WorkingDirector
 import { exec } from './util.ts';
 
 type ControllerRole = Parameters<FactoryRuntimePort['complete']>[0]['role'];
-interface SelectedCandidate { task: FactoryTask; candidate: CandidateRef; }
+export interface SelectedCandidate { task: FactoryTask; candidate: CandidateRef; }
 
 /** Select the same retained work that the controller's decision prompt describes. */
 export function controllerCandidates(store: FactoryStore, goalId: string, role: ControllerRole): SelectedCandidate[] {
@@ -27,7 +27,8 @@ export function controllerCandidates(store: FactoryStore, goalId: string, role: 
 interface ContextManifest {
   version: 1;
   goalId: string;
-  role: ControllerRole;
+  role: ControllerRole | 'worker';
+  assignment?: { taskId: string; attemptId: string; generation: number; goalRevision: number };
   projectDirectories: Array<{ id: string; name: string; path: string; sourceCommit?: string; snapshotCommit: string }>;
   candidates: Array<{
     id: string; taskId: string; title: string; taskStatus: string; commit: string; baseCommit: string;
@@ -43,11 +44,14 @@ interface ContextManifest {
  * The current primary repository is deliberately left to the normal session handoff.
  */
 export async function prepareControllerContext(input: {
-  operation: string; goalId: string; role: ControllerRole; project: Project; store: FactoryStore;
+  operation: string; goalId: string; role: ControllerRole | 'worker'; project: Project; store: FactoryStore;
   workspaces: WorkspaceManager; directoryManager: WorkingDirectoryManager; dataDir: string;
+  selected?: SelectedCandidate[]; contextName?: string; bundlesOnly?: boolean; maxBundleBytes?: number;
+  assignment?: ContextManifest['assignment']; assertCurrent?: () => void;
 }): Promise<{ workingDirectorySources: WorkingDirectorySource[]; instructions: string }> {
   if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,100}$/.test(input.operation)) throw new Error('Invalid controller context identity.');
-  const selected = controllerCandidates(input.store, input.goalId, input.role);
+  input.assertCurrent?.();
+  const selected = input.selected ?? (input.role === 'worker' ? [] : controllerCandidates(input.store, input.goalId, input.role));
   const roots = input.project.workingDirectories?.length
     ? await input.directoryManager.prepare({ identity: `${input.operation}-project-context`, sources: input.project.workingDirectories }) : [];
   if (!selected.length) return {
@@ -56,12 +60,14 @@ export async function prepareControllerContext(input: {
   };
 
   // One aggregate evidence source avoids consuming a mount for every retained task.
-  const name = uniqueName('factory-context', roots.map(root => root.name));
+  input.assertCurrent?.();
+  const name = uniqueName(input.contextName ?? 'factory-context', roots.map(root => root.name));
   const containerRoot = `/workspaces/${name}`;
   const staging = path.join(input.dataDir, 'workspace-data', 'controller-context', input.operation);
   const contents = path.join(staging, 'context');
   const aggregateProjectRoots = roots.length === 8;
-  const manifest: ContextManifest = { version: 1, goalId: input.goalId, role: input.role, projectDirectories: [], candidates: [] };
+  const manifest: ContextManifest = { version: 1, goalId: input.goalId, role: input.role, assignment: input.assignment, projectDirectories: [], candidates: [] };
+  let bundleBytes = 0;
   await mkdir(path.dirname(staging), { recursive: true, mode: 0o700 });
   await mkdir(staging, { mode: 0o700 });
   try {
@@ -72,6 +78,7 @@ export async function prepareControllerContext(input: {
       manifest.projectDirectories.push({ id: root.id, name: root.name, path: destination, sourceCommit: root.sourceCommit, snapshotCommit: root.baseCommit });
     }
     for (const { task, candidate: reference } of selected) {
+      input.assertCurrent?.();
       const entry: ContextManifest['candidates'][number] = {
         id: reference.id, taskId: task.id, title: task.title, taskStatus: task.status, commit: reference.commit, baseCommit: reference.baseCommit,
       };
@@ -81,6 +88,12 @@ export async function prepareControllerContext(input: {
         if (candidate.id !== reference.id || candidate.goalId !== input.goalId || candidate.taskId !== task.id || candidate.commit !== reference.commit || candidate.baseCommit !== reference.baseCommit
           || candidate.bundleArtifact.metadata?.commit !== candidate.commit || candidate.bundleArtifact.metadata?.baseCommit !== candidate.baseCommit)
           throw new Error('Retained candidate identity does not match the controller task and exact commits.');
+        const size = candidate.bundleArtifact.size + (candidate.workingDirectories ?? []).reduce((total, capture) => total + capture.bundleArtifact.size, 0);
+        if (input.maxBundleBytes !== undefined && bundleBytes + size > input.maxBundleBytes) {
+          entry.unavailable = 'This retained candidate exceeds the bounded reference context byte budget. No source from it was transferred.';
+          continue;
+        }
+        bundleBytes += size;
         const relative = path.join('candidates', candidate.id);
         const candidateRoot = `${containerRoot}/candidates/${candidate.id}`;
         const bundle = await input.workspaces.artifacts.path(candidate.bundleArtifact);
@@ -92,7 +105,7 @@ export async function prepareControllerContext(input: {
         entry.bundleRef = bundleRef;
         entry.bundleSha256 = candidate.bundleArtifact.sha256;
         if (collisions.length) entry.caseCollisions = collisions;
-        else {
+        else if (!input.bundlesOnly) {
           const imported = path.join(staging, 'imports', candidate.id, 'repository');
           await input.workspaces.importSource({ artifact: candidate.bundleArtifact, targetPath: imported });
           await copyTree(imported, path.join(contents, relative, 'repository'));
@@ -111,13 +124,14 @@ export async function prepareControllerContext(input: {
             sourceBundle: `${candidateRoot}/bundles/${capture.id}.bundle`, bundleRef: extraRef,
             commit: capture.commit, baseCommit: capture.baseCommit, bundleSha256: capture.bundleArtifact.sha256, ...inventory };
           if (extraCollisions.length) extra.caseCollisions = extraCollisions;
-          else {
+          else if (!input.bundlesOnly) {
             const retained = path.join(staging, 'imports', candidate.id, 'working-directories', capture.id);
             await input.directoryManager.importCapture(capture, retained);
             await copyTree(retained, path.join(contents, relative, 'working-directories', capture.id));
             extra.path = `${candidateRoot}/working-directories/${capture.id}`;
           }
           entry.workingDirectories.push(extra);
+          input.assertCurrent?.();
         }
       } catch (error) {
         // A missing cached artifact is observable missing evidence, never proof of completion.
@@ -125,15 +139,17 @@ export async function prepareControllerContext(input: {
         if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
         entry.unavailable = 'Some retained candidate source is not available in the coordinator artifact cache. Only source locations actually listed here were reconstructed. Do not infer unavailable contents or completion from metadata.';
       }
+      input.assertCurrent?.();
     }
     await writeFile(path.join(contents, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`, { mode: 0o600 });
     const evidence = await input.directoryManager.prepare({ identity: `${input.operation}-evidence-context`,
       sources: [{ id: `controller-context-${input.operation}`, name, path: contents }] });
+    input.assertCurrent?.();
     const unavailable = manifest.candidates.filter(candidate => candidate.unavailable).map(candidate => `${candidate.id} (${candidate.title})`);
     const colliding = manifest.candidates.filter(candidate => candidate.caseCollisions?.length || candidate.workingDirectories?.some(root => root.caseCollisions?.length)).map(candidate => candidate.id);
     return {
       workingDirectorySources: [...(aggregateProjectRoots ? [] : publicSources(roots)), ...publicSources(evidence)],
-      instructions: `${unavailable.length ? `Unavailable retained source: ${unavailable.join(', ')}. Missing evidence was not inspected and cannot prove completion; use the manifest to distinguish available trees from missing inputs. ` : ''}${colliding.length ? `Native tree reconstruction was skipped for case/Unicode-colliding Git paths in candidates: ${colliding.join(', ')}. The manifest lists the exact conflicting paths. Their verified raw bundles are available: reconstruct them in this Linux container for faithful inspection, rather than inspecting a case-folded Mac tree. ` : ''}Inspect ${containerRoot}/manifest.json for the exact retained candidate IDs, commits, source locations and project folder locations. Each sourceBundle retains the exact Git objects: in a fresh container directory use git init, git fetch <sourceBundle> <bundleRef>, then git checkout --detach <commit>. For captured extra folders, also restore each emptyDirectories entry under that checkout and apply its recorded mode; their validated inventory/hash preserves directories Git omits. Candidate trees are isolated copies of retained output, not the current integrated repository or live worker environments. Their original Git metadata is omitted; the manifest records the verified bundle identity. The main working directory remains the current project snapshot. Use candidate evidence to preserve useful work and diagnose failures, never to claim it was integrated. Changes to these controller folders are not integrated or used to change a retained candidate.`,
+      instructions: `${unavailable.length ? `Unavailable retained source: ${unavailable.join(', ')}. Missing evidence was not inspected and cannot prove completion; use the manifest to distinguish available trees from missing inputs. ` : ''}${colliding.length ? `Native tree reconstruction was skipped for case/Unicode-colliding Git paths in candidates: ${colliding.join(', ')}. The manifest lists the exact conflicting paths. Their verified raw bundles are available: reconstruct them in this Linux container for faithful inspection, rather than inspecting a case-folded Mac tree. ` : ''}Inspect ${containerRoot}/manifest.json for the exact retained candidate IDs, commits, source locations and project folder locations. Each sourceBundle retains the exact Git objects: in a fresh container directory use git init, git fetch <sourceBundle> <bundleRef>, then git checkout --detach <commit>. For captured extra folders, also restore each emptyDirectories entry under that checkout and apply its recorded mode; their validated inventory/hash preserves directories Git omits. Candidate trees are isolated copies of retained output, not the current integrated repository or live worker environments. Their original Git metadata is omitted; the manifest records the verified bundle identity. The main working directory remains the current project snapshot. Use candidate evidence to preserve useful work and diagnose failures, never to claim it was integrated. Changes to these ${input.role === 'worker' ? 'reference' : 'controller'} folders are not integrated or used to change a retained candidate.`,
     };
   } finally {
     // Snapshots/artifacts now own their inputs; disposable imports must not become mutable shared state.

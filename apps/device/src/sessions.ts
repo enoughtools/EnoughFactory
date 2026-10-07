@@ -5,15 +5,15 @@ import { ArtifactStore, WorkingDirectoryManager, type WorkingDirectorySource, ty
 import { Store } from './store.ts';
 import { exec, HttpError, id, now } from './util.ts';
 import path from 'node:path';
-import { mkdir } from 'node:fs/promises';
+import { mkdir, rm } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { managedRepositoryReader, readRepositoryChanges } from './repository-changes.ts';
 import { prepareDevelopmentToolchain, validateFrozenDevelopmentToolchain, type FrozenDevelopmentToolchain } from './development-toolchain.ts';
 
 interface WorkspaceBinding { bindSource:string; stateVolume:string; }
 interface PrivateSession { id: string; ready: EnvmuxReady; projectPath: string; pid?: number; workspace?:WorkspaceBinding; }
-interface LaunchRecord { id:string;projectPath:string;generation:number;dockerHost:string;workspace?:WorkspaceBinding; workingDirectorySources?:WorkingDirectorySource[]; developmentToolchain?:FrozenDevelopmentToolchain; }
-interface LaunchOptions { workspace?:WorkspaceBinding; workingDirectorySources?:WorkingDirectorySource[]; developmentToolchain?:FrozenDevelopmentToolchain; }
+interface LaunchRecord { id:string;projectPath:string;generation:number;dockerHost:string;workspace?:WorkspaceBinding; workingDirectorySources?:WorkingDirectorySource[]; referenceContext?:WorkingDirectorySource; developmentToolchain?:FrozenDevelopmentToolchain; }
+interface LaunchOptions { workspace?:WorkspaceBinding; workingDirectorySources?:WorkingDirectorySource[]; referenceContext?:WorkingDirectorySource; developmentToolchain?:FrozenDevelopmentToolchain; assertCurrent?:()=>void; }
 interface RuntimeAccess { endpoint:DockerRuntimeEndpoint; ensureReady():Promise<DockerRuntimeEndpoint>; bridgeHostAddress():string|undefined; }
 class SessionGenerationChangedError extends HttpError {constructor(){super(409,'A newer environment connection replaced this request.');}}
 export class SessionController {
@@ -77,6 +77,7 @@ export class SessionController {
     const engine=await this.engine.attach(saved);if(!current())throw new SessionGenerationChangedError();
     this.live.set(saved.id,engine);
     if(this.record(saved.id).workingDirectories?.length&&!this.store.get<{id:string;complete:boolean}>('session-working-directory-provision',saved.id)?.complete)throw new HttpError(409,'Additional folders were not fully provisioned. The retained container has not been reseeded; inspect its files before restarting.');
+    if(this.store.get<LaunchRecord>('session-launch',saved.id)?.referenceContext&&!this.store.get<{id:string;complete:boolean}>('session-reference-context-provision',saved.id)?.complete)throw new HttpError(409,'Retained reference evidence was not fully provisioned. No worker execution can use this environment yet.');
     const state=await engine.state();if(!current()||this.live.get(saved.id)!==engine)throw new SessionGenerationChangedError();
     await this.update(saved.id,state);this.observe(saved.id,engine,generation);return engine;
   }
@@ -90,7 +91,7 @@ export class SessionController {
   }
   private launch(record:Session,project:Project,options?:LaunchOptions):void{
     const generation=(this.generations.get(record.id)||this.store.get<LaunchRecord>('session-launch',record.id)?.generation||0)+1;this.generations.set(record.id,generation);
-    this.store.set<LaunchRecord>('session-launch',{id:record.id,projectPath:project.path,generation,dockerHost:this.runtime.endpoint.host,workspace:options?.workspace,workingDirectorySources:options?.workingDirectorySources,developmentToolchain:options?.developmentToolchain});
+    this.store.set<LaunchRecord>('session-launch',{id:record.id,projectPath:project.path,generation,dockerHost:this.runtime.endpoint.host,workspace:options?.workspace,workingDirectorySources:options?.workingDirectorySources,referenceContext:options?.referenceContext,developmentToolchain:options?.developmentToolchain});
     const current=()=>this.generations.get(record.id)===generation;
     const abort = new AbortController(); this.starts.set(record.id,abort);this.runtimeWaits.add(record.id);
     const job=(async()=>{await this.runtime.ensureReady();this.runtimeWaits.delete(record.id);if(abort.signal.aborted)throw new Error('Environment startup canceled.');
@@ -108,7 +109,15 @@ export class SessionController {
       }else{
         this.store.set('session-launch',{...this.store.get<LaunchRecord>('session-launch',record.id)!,workingDirectorySources:[]});
       }
+      if(options?.referenceContext){
+        if(!current()||abort.signal.aborted)throw new SessionGenerationChangedError();options.assertCurrent?.();
+        if((options.workingDirectorySources||[]).some(root=>root.name.toLowerCase()===options.referenceContext!.name.toLowerCase()))throw new Error('Reference evidence must not overlap an authored working folder.');
+        await this.directoryManager.prepare({identity:`${record.id}-reference-context`,transferred:[options.referenceContext]});
+        if(!current()||abort.signal.aborted)throw new SessionGenerationChangedError();options.assertCurrent?.();
+        this.store.set('session-reference-context-provision',{id:record.id,complete:false});
+      }
       if(abort.signal.aborted)throw new Error('Environment startup canceled.');
+      options?.assertCurrent?.();
       if(current())this.patch(record.id,{phase:'Preparing environment',error:undefined});
       return this.engine.start({projectPath:project.path,name:record.name,workspace:options?.workspace,goldenImage:developmentToolchain==='default'?undefined:developmentToolchain.image,signal:abort.signal,onEvent: e=>{
       if(!current())return;
@@ -126,6 +135,10 @@ export class SessionController {
       this.live.set(record.id,engine);
       this.store.set<PrivateSession>('session-private',{id:record.id,ready:engine.ready,projectPath:project.path,pid:engine.process?.pid,workspace:options?.workspace});
       await this.provisionWorkingDirectories(record.id,engine,true);
+      const assertCurrent=()=>{if(!current()||this.live.get(record.id)!==engine||abort.signal.aborted)throw new SessionGenerationChangedError();options?.assertCurrent?.();};
+      assertCurrent();
+      await this.provisionReferenceContext(record.id,engine,assertCurrent);
+      assertCurrent();
       this.patch(record.id,{status:'ready',containerId:engine.ready.instance,enginePid:engine.process?.pid,branch:engine.ready.branch});
       engine.process?.once('exit',code=>{if(!current())return; this.streams.get(record.id)?.abort(); this.streams.delete(record.id); this.live.delete(record.id);const requested=this.stopping.has(record.id);this.stopping.delete(record.id);this.patch(record.id,{status:code!==0?'failed':requested?'stopped':'unknown',phase:code!==0?'Environment stopped with an error':requested?'Work returned to Git':'Engine disconnected',error:code!==0?`Engine exited with ${code}; inspect retained work before retrying.`:undefined}); });
       const state=await engine.state();if(!current()||this.live.get(record.id)!==engine)return;
@@ -171,6 +184,7 @@ export class SessionController {
     try {for(const hook of this.beforeStop)await hook(sessionId);let engine=this.live.get(sessionId);if(!engine){const saved=this.store.get<PrivateSession>('session-private',sessionId);if(!saved)throw new HttpError(409,'The environment owner has not confirmed its state.');engine=await this.attach(saved);}await this.captureWorkingDirectories(sessionId);await engine.stop();}catch(error){this.stopping.delete(sessionId);this.patch(sessionId,{status:'unknown',phase:'Could not confirm work was returned; environment retained',error:(error as Error).message});throw error;}
     this.stopping.delete(sessionId);this.patch(sessionId,{status:'stopped',phase:'Work returned to Git'});
     this.streams.get(sessionId)?.abort();this.live.delete(sessionId);
+    await this.disposeReferenceContext(sessionId);
   }
   async restart(sessionId: string): Promise<void> {
     this.assertWorkAvailable(sessionId);
@@ -181,7 +195,7 @@ export class SessionController {
     if(record.status!=='stopped'){if(!saved)throw new HttpError(409,'Reconnect or inspect the environment before restarting uncertain work.');await this.runtime.ensureReady();const engine=await this.attach(saved);await engine.restart();await this.update(sessionId,await engine.state());return;}
     if((launch?.dockerHost||saved?.ready.dockerHost)!==this.runtime.endpoint.host)throw new HttpError(409,'This session used a previous container engine. Create a new EnoughFactory environment from its returned Git branch.');
     const project=this.store.get<Project>('projects',record.projectId);if(!project)throw new HttpError(404,'The source project is no longer available.');
-    this.patch(sessionId,{status:'starting',phase:'Preparing EnoughFactory runtime',error:undefined,services:[]});this.launch(record,project,{workspace:launch?.workspace||saved?.workspace,workingDirectorySources:launch?.workingDirectorySources,developmentToolchain:launch?.developmentToolchain||record.developmentToolchain});
+    this.patch(sessionId,{status:'starting',phase:'Preparing EnoughFactory runtime',error:undefined,services:[]});this.launch(record,project,{workspace:launch?.workspace||saved?.workspace,workingDirectorySources:launch?.workingDirectorySources,referenceContext:launch?.referenceContext,developmentToolchain:launch?.developmentToolchain||record.developmentToolchain});
   }
   async changes(sessionId: string, selectedPath?: string, rootId?:string): Promise<RepositoryChanges> {
     if(!rootId){const engine=this.get(sessionId);return readRepositoryChanges(managedRepositoryReader(this.runtime.endpoint,engine.ready),selectedPath);}
@@ -209,6 +223,27 @@ export class SessionController {
     this.patch(sessionId,{workingDirectories:snapshots.map(root=>this.publicRoot(root,'ready'))});
   }
   async workingDirectorySources(identity:string,project:Project):Promise<WorkingDirectorySource[]>{const roots=await this.directoryManager.prepare({identity,sources:project.workingDirectories||[]});return roots.map(({path:_,...source})=>source);}
+  private async provisionReferenceContext(sessionId:string,engine:EnvmuxSession,assertCurrent:()=>void):Promise<void>{
+    const source=this.store.get<LaunchRecord>('session-launch',sessionId)?.referenceContext;if(!source)return;
+    assertCurrent();
+    const [snapshot]=await this.directoryManager.prepare({identity:`${sessionId}-reference-context`,transferred:[source]});
+    assertCurrent();
+    if(!snapshot)throw new Error('The worker reference evidence snapshot is unavailable.');
+    await this.docker(['exec','--user','0',engine.ready.instance,'mkdir','-p','--',snapshot.containerPath]);
+    assertCurrent();
+    await this.docker(['cp',`${snapshot.path}/.`,`${engine.ready.instance}:${snapshot.containerPath}`]);
+    assertCurrent();
+    // This discourages accidental edits, not root access. Retained authority stays
+    // in verified immutable artifacts; this private copy is never captured.
+    await this.docker(['exec','--user','0',engine.ready.instance,'chmod','-R','a-w','--',snapshot.containerPath]);
+    assertCurrent();
+    this.store.set('session-reference-context-provision',{id:sessionId,complete:true,sha256:source.sourceArtifact.sha256});
+  }
+  async disposeReferenceContext(sessionId:string):Promise<void>{
+    if(!/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,79}$/.test(sessionId))throw new Error('Invalid reference context session identity.');
+    if(this.needsTermination(sessionId))throw new Error('Confirm environment termination before disposing its reference inputs.');
+    await rm(path.join(this.workspaceDataDir,'working-directories',`${sessionId}-reference-context`),{recursive:true,force:true});
+  }
   async captureWorkingDirectories(sessionId:string):Promise<WorkingDirectoryCapture[]>{
     if(!this.record(sessionId).workingDirectories?.length)return [];
     if(this.store.list<Chat>('chats').some(chat=>chat.sessionId===sessionId&&['running','waiting'].includes(chat.status)))throw new HttpError(409,'Wait for or interrupt the active agent before capturing working folders.');
