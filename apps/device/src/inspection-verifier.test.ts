@@ -181,6 +181,59 @@ async function nativeFixture(t: TestContext) {
   return { ...f, sessions, verifier, forbiddenCalls };
 }
 
+/** Guard-only container fixture. Real CAS/frozen roots replace the Docker exporter,
+ * whose byte transfer is covered separately; provider and archive lifecycle are fake. */
+async function legacyContainerFixture(t: TestContext, seed: 'waiting' | 'unknown', state: 'ready' | 'stopped' = 'stopped') {
+  const f = await fixture(t), restarted: string[] = [];
+  const quality: TaskQualityRequirements = { platforms: ['web'], workflows: [{ id: 'open-inbox', platform: 'web' }], referenceIds: ['enough-mail-web'] };
+  const input: VerificationInput = { ...f.input, quality };
+  const target: ExecutionTargetAdvertisement = { id: 'private-container', kind: 'container', protocolVersion: 1, readiness: 'ready', runtimes: ['codex'], capabilities: [{ kind: 'linux-shell', readiness: 'ready' }, { kind: 'chromium-inspection', readiness: 'ready' }] };
+  let lease = false, sourceChecks = 0;
+  const fakeSessions = {
+    ...f.options.app.sessions,
+    execution: (_id: string) => ({ kind: 'container' as const, targetId: target.id, containerId: 'legacy-container', workdir: '/workspaces/primary' }),
+    waitExecutionReady: async (_id: string) => ({ kind: 'container' as const, targetId: target.id, containerId: 'legacy-container', workdir: '/workspaces/primary' }),
+    archivedEnvironment: (id: string) => f.store.get('session-container-retirement', id),
+    canRetireEnvironment: (id: string) => f.options.app.sessions.owns(id) && f.store.get<Session>('sessions', id)?.status === 'stopped',
+    withStoppedInputs: async <T>(id: string, operation: () => Promise<T>): Promise<T> => {
+      assert.equal(lease, false); assert.equal(f.store.get<Session>('sessions', id)!.status, 'stopped');
+      assert.equal(f.options.app.sessions.owns(id), true); lease = true;
+      try { return await operation(); } finally { lease = false; }
+    },
+    restart: async (id: string) => {
+      assert.equal(lease, false, 'Execution restarts after the reconciliation lease ends');
+      restarted.push(id); f.store.set('sessions', { ...f.store.get<Session>('sessions', id)!, status: 'ready' });
+    },
+  };
+  const verifier = f.anotherVerifier({
+    app: { ...f.options.app, sessions: fakeSessions } as unknown as DeviceApp, readiness: async () => [target],
+    prepareExecution: async preparation => {
+      const prepared = await f.options.prepareExecution!(preparation);
+      const session = { ...prepared, status: state, executionTargetKind: undefined, containerId: 'legacy-container' } as Session;
+      preparation.onSession(session);
+      if (state === 'stopped') f.store.set('session-container-retirement', { id: session.id, containerId: 'e'.repeat(64), name: 'legacy-container', status: 'removed', receipt: { version: 2, status: 'removed', containerId: 'e'.repeat(64), identity: { sessionId: session.id, name: 'legacy-container', sessionName: session.name } }, archive: path.join(f.directory, 'retained-container.tar'), updatedAt: new Date().toISOString() });
+      throw seed === 'waiting'
+        ? Object.assign(new Error('Independent source export is temporarily unavailable'), { agentStarted: false, executionEnded: true })
+        : Object.assign(new Error('The independent setup owner changed.'), { code: 'HOST_PROCESS_UNKNOWN' });
+    },
+  });
+  // Explicitly narrow seam: exercise production guard/reconciliation and verify
+  // the genuine retained snapshot/CAS rather than invoke an actual Docker daemon.
+  (verifier as unknown as { assertExecutionSource: (sessionId: string, snapshot: InspectionSnapshot, signal: AbortSignal) => Promise<void> }).assertExecutionSource = async (sessionId, snapshot, signal) => {
+    sourceChecks++;
+    const session = f.store.get<Session>('sessions', sessionId)!;
+    assert.equal(session.verificationRunId, inspectionVerificationKey(input));
+    assert.equal(session.deviceId, 'mac'); assert.equal(session.executionTargetKind ?? 'container', 'container');
+    assert.deepEqual(session.workingDirectories!.map(root => ({ id: root.id, path: root.path })), snapshot.roots.slice(1).map(root => ({ id: root.id, path: root.path })));
+    await new InspectionSnapshotManager({ dataDir: path.dirname(path.dirname(snapshot.path)) }).verify(snapshot, signal);
+    const saved = retained(f, f.store.get<InspectionVerificationRun>(INSPECTION_VERIFIER_RUNS, inspectionVerificationKey(input))!);
+    for (const artifact of [saved.transfer.sourceManifest, ...saved.transfer.sourceArtifacts.map(root => root.manifest)]) await f.artifacts.path(artifact);
+  };
+  const run = await verifier.ensure(input);
+  assert.equal(run.status, seed === 'waiting' ? 'waiting' : 'unknown'); assert.equal(f.calls.length, 0);
+  return { ...f, verifier, input, run, containerSessions: fakeSessions, restarted, sourceChecks: () => sourceChecks };
+}
+
 type RetainedInputs = { id: string; transfer: InspectionSnapshotTransfer; snapshot?: InspectionSnapshot; retiredAt?: string; retirement?: { primarySource?: InspectionSnapshotTransfer; [key: string]: unknown } };
 function retained(f: { store: Store }, run: InspectionVerificationRun): RetainedInputs {
   const inputs = f.store.get<RetainedInputs>('inspection-verifier-inputs', run.id); assert.ok(inputs); return inputs;
@@ -242,6 +295,129 @@ test('a known setup failure waits and retries the same independent owner without
   assert.deepEqual(retried.source, originalSource); assert.deepEqual(f.source, originalSource);
   assert.equal(f.store.get<Chat>('chats', retried.chatId!)!.attemptId, undefined);
   assert.equal(f.stopped.length, 1);
+});
+
+test('legacy container metadata reuses ready and stopped independent owners while explicit native mismatches stay unknown', async t => {
+  for (const state of ['ready', 'stopped'] as const) {
+    await t.test(`ordinary legacy container ${state}`, async inner => {
+      const f = await legacyContainerFixture(inner, 'waiting', state);
+      const retried = await f.verifier.ensure(f.input);
+      assert.equal(retried.status, 'failed', 'The provider ran, but genuine receipts are still required');
+      assert.equal(retried.id, f.run.id); assert.equal(retried.sessionId, f.run.sessionId);
+      assert.equal(f.preparations.length, 1); assert.equal(f.calls.length, 1); assert.equal(f.sourceChecks(), 1);
+      assert.equal(f.store.get<Session>('sessions', retried.sessionId!)!.executionTargetKind, undefined, 'Legacy metadata does not need a database rewrite');
+      assert.deepEqual(f.restarted, state === 'stopped' ? [f.run.sessionId] : []);
+      assert.deepEqual(retried.source, f.run.source);
+    });
+  }
+  await t.test('explicit native session cannot be reused as a container', async inner => {
+    const f = await legacyContainerFixture(inner, 'waiting', 'ready');
+    f.store.set('sessions', { ...f.store.get<Session>('sessions', f.run.sessionId!)!, executionTargetKind: 'host-macos' });
+    const unknown = await f.verifier.ensure(f.input);
+    assert.equal(unknown.status, 'unknown'); assert.match(unknown.reason!, /setup owner changed/);
+    assert.equal(f.calls.length, 0); assert.equal(f.sourceChecks(), 0); assert.deepEqual(f.restarted, []);
+  });
+});
+
+test('confirmed removed container setup is reconciled once from retained source independent of error text or legacy target metadata', async t => {
+  for (const executionTargetKind of [undefined, 'container'] as const) {
+    for (const reason of ['The independent setup owner changed.', 'The source export connection disappeared.']) {
+      await t.test(`${executionTargetKind ?? 'legacy container'}: ${reason}`, async inner => {
+        const f = await legacyContainerFixture(inner, 'unknown');
+        const original = { ...f.run, reason }, originalSource = structuredClone(f.run.source);
+        f.store.set(INSPECTION_VERIFIER_RUNS, original);
+        f.store.set('sessions', { ...f.store.get<Session>('sessions', f.run.sessionId!)!, executionTargetKind });
+        const [retried, concurrent] = await Promise.all([f.verifier.ensure(f.input), f.verifier.ensure(f.input)]);
+        assert.deepEqual(concurrent, retried);
+        assert.equal(retried.id, original.id); assert.equal(retried.sessionId, original.sessionId);
+        assert.equal(retried.status, 'failed', 'Reconciliation dispatches a verifier, never synthesizes passing evidence');
+        assert.equal(f.calls.length, 1); assert.equal(f.preparations.length, 1); assert.equal(f.sourceChecks(), 1);
+        assert.deepEqual(f.restarted, [original.sessionId]); assert.deepEqual(retried.source, originalSource);
+        assert.equal(f.calls[0]!.options.verificationRunId, original.id);
+        assert.equal(f.store.get<Chat>('chats', retried.chatId!)!.attemptId, undefined);
+        const audit = f.store.events<{ action: string; previous: InspectionVerificationRun; source: InspectionSourceIdentity }>('inspection-verifier-reconciliation', original.id);
+        assert.equal(audit.length, 1); assert.equal(audit[0]!.value.action, 'stopped-container-setup');
+        assert.deepEqual(audit[0]!.value.previous, original); assert.deepEqual(audit[0]!.value.source, originalSource);
+        assert.equal(f.store.get<Session>('sessions', original.sessionId!)!.executionTargetKind, executionTargetKind, 'Reconciliation does not rewrite execution target metadata');
+        assert.equal((await f.verifier.ensure(f.input)).id, retried.id); assert.equal(f.calls.length, 1);
+        assert.equal(f.store.events('inspection-verifier-reconciliation', original.id).length, 1);
+        await f.snapshotManager.verify(f.snapshot);
+      });
+    }
+  }
+});
+
+test('stopped setup reconciliation never revives dispatched execution, stale authority, changed ownership or unverifiable source', async t => {
+  const f = await legacyContainerFixture(t, 'unknown');
+  const session = f.store.get<Session>('sessions', f.run.sessionId!)!, inputs = retained(f, f.run);
+  const archive = f.store.get<{ id: string; status: string; receipt: { version: number; status: string; containerId: string; identity: { sessionId: string; name: string; sessionName: string } } }>('session-container-retirement', session.id)!;
+  const blocked = async () => {
+    const before = f.store.get<InspectionVerificationRun>(INSPECTION_VERIFIER_RUNS, f.run.id)!;
+    const result = await f.verifier.ensure(f.input);
+    assert.deepEqual(result, before); assert.equal(result.status, 'unknown');
+    assert.equal(f.calls.length, 0); assert.equal(f.preparations.length, 1); assert.equal(f.sourceChecks(), 0);
+    assert.deepEqual(f.restarted, []); assert.equal(f.store.events('inspection-verifier-reconciliation', f.run.id).length, 0);
+  };
+  for (const [name, fields] of [
+    ['provider already started', { startedAt: new Date().toISOString() }],
+    ['recorded chat owner', { chatId: 'possible-provider-chat' }],
+    ['recorded completed outcome', { completedAt: new Date().toISOString() }],
+    ['malformed empty chat owner', { chatId: '' }],
+    ['malformed null dispatch timestamp', { startedAt: null }],
+    ['malformed empty outcome timestamp', { completedAt: '' }],
+    ['foreign run device', { ownerDeviceId: 'another-mac' }],
+    ['changed original candidate', { source: { ...f.run.source, candidateCommit: 'd'.repeat(40) } }],
+    ['changed policy hash', { policySha256: '0'.repeat(64) }],
+  ] as const) {
+    await t.test(name, async () => { f.store.set(INSPECTION_VERIFIER_RUNS, { ...f.run, ...fields }); try { await blocked(); } finally { f.store.set(INSPECTION_VERIFIER_RUNS, f.run); } });
+  }
+  for (const [name, fields] of [
+    ['session not confirmed stopped', { status: 'ready' as const }],
+    ['session itself unknown', { status: 'unknown' as const }],
+    ['explicit native target', { executionTargetKind: 'host-macos' as const }],
+    ['malformed null session target', { executionTargetKind: null }],
+    ['malformed unrecognized session target', { executionTargetKind: 'unrecognized-runtime' }],
+    ['another session verification owner', { verificationRunId: 'another-run' }],
+    ['foreign session device', { deviceId: 'another-mac' }],
+    ['another container identity', { containerId: 'another-container' }],
+    ['another archived session name', { name: 'another-session' }],
+  ] as const) {
+    await t.test(name, async () => { f.store.set('sessions', { ...session, ...fields }); try { await blocked(); } finally { f.store.set('sessions', session); } });
+  }
+  await t.test('current authority retired', async () => { f.setCurrent(false); try { await blocked(); } finally { f.setCurrent(true); } });
+  await t.test('existing session chat indicates possible provider history', async () => {
+    const chat: Chat = { id: 'possible-session-history', sessionId: session.id, deviceId: 'mac', runtime: 'codex', approvalMode: 'approve-all', title: 'Possible verifier', status: 'failed', createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
+    f.store.set('chats', chat); try { await blocked(); } finally { f.store.delete('chats', chat.id); }
+  });
+  await t.test('archive not confirmed removed', async () => { f.store.set('session-container-retirement', { ...archive, status: 'archiving' }); try { await blocked(); } finally { f.store.set('session-container-retirement', archive); } });
+  await t.test('archive missing', async () => { f.store.delete('session-container-retirement', session.id); try { await blocked(); } finally { f.store.set('session-container-retirement', archive); } });
+  await t.test('archive removal receipt missing', async () => { f.store.set('session-container-retirement', { ...archive, receipt: undefined }); try { await blocked(); } finally { f.store.set('session-container-retirement', archive); } });
+  await t.test('archive belongs to another session', async () => { f.store.set('session-container-retirement', { ...archive, receipt: { ...archive.receipt, identity: { ...archive.receipt.identity, sessionId: 'another-session' } } }); try { await blocked(); } finally { f.store.set('session-container-retirement', archive); } });
+  await t.test('archive receipt has a different container name', async () => { f.store.set('session-container-retirement', { ...archive, receipt: { ...archive.receipt, identity: { ...archive.receipt.identity, name: 'another-container' } } }); try { await blocked(); } finally { f.store.set('session-container-retirement', archive); } });
+  await t.test('environment still has a runtime owner', async () => {
+    const original = f.containerSessions.canRetireEnvironment; f.containerSessions.canRetireEnvironment = () => false;
+    try { await blocked(); } finally { f.containerSessions.canRetireEnvironment = original; }
+  });
+  await t.test('ownership changes inside the stopped-input lease', async () => {
+    const original = f.containerSessions.withStoppedInputs;
+    f.containerSessions.withStoppedInputs = async (id, operation) => original(id, async () => {
+      f.store.set('sessions', { ...session, verificationRunId: 'new-verification-owner' });
+      return operation();
+    });
+    try { await blocked(); } finally { f.containerSessions.withStoppedInputs = original; f.store.set('sessions', session); }
+  });
+  await t.test('forged durable source descriptor', async () => {
+    f.store.set('inspection-verifier-inputs', { ...inputs, transfer: { ...inputs.transfer, sourceManifest: { ...inputs.transfer.sourceManifest, name: 'forged-source.json' } } });
+    try { await blocked(); } finally { f.store.set('inspection-verifier-inputs', inputs); }
+  });
+  await t.test('missing durable source bytes', async () => {
+    const filename = await f.artifacts.path(inputs.transfer.sourceArtifacts[0]!.manifest), bytes = await readFile(filename); await rm(filename);
+    try { await blocked(); } finally { await writeFile(filename, bytes, { flag: 'wx', mode: 0o600 }); }
+  });
+  await t.test('run points at another session', async () => {
+    const other = { ...session, id: 'another-session' }; f.store.set('sessions', other); f.store.set(INSPECTION_VERIFIER_RUNS, { ...f.run, sessionId: other.id });
+    try { await blocked(); } finally { f.store.set(INSPECTION_VERIFIER_RUNS, f.run); f.store.delete('sessions', other.id); }
+  });
 });
 
 test('an unconfirmed setup process remains unknown and cannot allocate or dispatch a replacement', async t => {

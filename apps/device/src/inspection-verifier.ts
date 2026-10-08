@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { chmod, cp, lchmod, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
-import type { ExecutionCapability, ExecutionTargetAdvertisement, Goal, InspectionAuthority, InspectionSourceIdentity, InspectionVerificationRun, Project, Session, TaskQualityRequirements } from '@enoughfactory/contracts';
+import type { Chat, ExecutionCapability, ExecutionTargetAdvertisement, Goal, InspectionAuthority, InspectionSourceIdentity, InspectionVerificationRun, Project, Session, TaskQualityRequirements } from '@enoughfactory/contracts';
 import { ArtifactStore, InspectionSnapshotManager, WorkspaceManager, exportInspectionContainerRoots, exportInspectionSnapshot, importInspectionSnapshot, verifyInspectionSnapshotContents, writeAtomic, type InspectionSnapshot, type InspectionSnapshotTransfer, type WorkspaceRecord } from '@enoughfactory/workspaces';
 import { dockerInvocation } from '@enoughfactory/runtime';
 import type { DeviceApp } from './app.ts';
@@ -15,6 +15,7 @@ const INPUTS = 'inspection-verifier-inputs';
 const terminal = new Set<InspectionVerificationRun['status']>(['succeeded', 'failed', 'canceled', 'unknown']);
 const sha = /^[a-f0-9]{64}$/;
 const commit = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/;
+const setupOwnerChangedReason = 'The independent setup owner changed.';
 
 export interface VerificationInput {
   authority: InspectionAuthority;
@@ -128,7 +129,8 @@ export class InspectionVerifier {
     const id = inspectionVerificationKey(input), existing = this.options.app.store.get<InspectionVerificationRun>(INSPECTION_VERIFIER_RUNS, id);
     const live = this.active.get(id);
     if (live) return live.promise;
-    if (existing && terminal.has(existing.status)) return Promise.resolve(existing);
+    const reconcileSetup = existing && this.preDispatchContainerSetupUnknown(existing);
+    if (existing && terminal.has(existing.status) && !reconcileSetup) return Promise.resolve(existing);
     if (existing && ['preparing', 'running'].includes(existing.status)) return Promise.resolve(this.patch(id, { status: 'unknown', completedAt: undefined, reason: 'The verifier process lost its service owner. Reconcile its retained conversation and jobs before continuing.' }));
     const target = input.quality.platforms.includes('web') ? 'container' : 'host-macos';
     if (!existing) {
@@ -138,9 +140,61 @@ export class InspectionVerifier {
     const abort = new AbortController();
     const forward = () => abort.abort(input.signal?.reason);
     input.signal?.addEventListener('abort', forward, { once: true });
-    const promise = Promise.resolve().then(() => this.execute(id, input, abort)).then(() => this.get(id)).finally(() => { input.signal?.removeEventListener('abort', forward); this.active.delete(id); });
+    const promise = Promise.resolve().then(async () => {
+      if (reconcileSetup && !await this.reconcilePreDispatchContainerSetup(id, input, abort.signal)) return this.get(id);
+      return this.execute(id, input, abort);
+    }).then(() => this.get(id)).finally(() => { input.signal?.removeEventListener('abort', forward); this.active.delete(id); });
     this.active.set(id, { promise, abort });
     return promise;
+  }
+
+  private preDispatchContainerSetupUnknown(run: InspectionVerificationRun): boolean {
+    return run.status === 'unknown' && run.executionTargetKind === 'container' && !!run.sessionId && run.chatId === undefined && run.startedAt === undefined && run.completedAt === undefined;
+  }
+
+  /** Only a removed original container and no provider dispatch permit setup replay. */
+  private async reconcilePreDispatchContainerSetup(id: string, input: VerificationInput, signal: AbortSignal): Promise<boolean> {
+    const original = this.get(id);
+    const eligible = () => {
+      signal.throwIfAborted();
+      const run = this.get(id);
+      if (this.closing || !this.preDispatchContainerSetupUnknown(run) || canonical(run) !== canonical(original) || run.ownerDeviceId !== this.options.app.device.id || run.id !== inspectionVerificationKey(run) || run.policySha256 !== inspectionQualityPolicySha256(run.quality) || !this.options.authorityCurrent(run.authority)) return false;
+      if (run.purpose === 'goal-final' && this.options.app.store.get<Goal>('goals', run.authority.goalId)?.revision !== run.goalRevision) return false;
+      if (canonical(run.authority) !== canonical(input.authority) || canonical(run.quality) !== canonical(input.quality) || run.source.candidateId !== input.source.candidateId || run.source.candidateCommit !== input.source.candidateCommit || !inspectionSourceContentMatches(run.source, input.source)) return false;
+      const session = this.options.app.sessions.record(run.sessionId!);
+      const archive = this.options.app.sessions.archivedEnvironment(session.id);
+      return (session.executionTargetKind === undefined ? 'container' : session.executionTargetKind) === 'container' && session.deviceId === run.ownerDeviceId && session.verificationRunId === run.id && session.status === 'stopped' && this.options.app.sessions.owns(session.id)
+        && !this.options.app.store.list<Chat>('chats').some(chat => chat.sessionId === session.id)
+        && archive?.status === 'removed' && archive.id === session.id && /^[a-f0-9]{64}$/.test(archive.containerId)
+        && archive.receipt?.version === 2 && archive.receipt.status === 'removed' && archive.receipt.containerId === archive.containerId && archive.receipt.identity.sessionId === session.id
+        && archive.receipt.identity.name === archive.name && archive.receipt.identity.sessionName === session.name
+        && (session.containerId === undefined || session.containerId === archive.containerId || session.containerId === archive.name);
+    };
+    try {
+      if (!eligible() || !this.options.app.sessions.canRetireEnvironment(original.sessionId!)) return false;
+      return await this.options.app.sessions.withStoppedInputs(original.sessionId!, async () => {
+        if (!eligible()) return false;
+        const saved = this.options.app.store.get<VerificationInputs>(INPUTS, id);
+        if (!saved || saved.retiredAt || saved.retirement) return false;
+        for (const artifact of [saved.transfer.sourceManifest, ...saved.transfer.sourceArtifacts.map(root => root.manifest)]) {
+          if (canonical(await this.artifacts.get(artifact.id)) !== canonical(artifact)) return false;
+          await this.artifacts.path(artifact);
+        }
+        const snapshot = await importInspectionSnapshot({ dataDir: path.join(this.options.app.dataDir, 'workspace-data', 'inspection-verification', id), artifacts: this.artifacts, sourceArtifacts: saved.transfer.sourceArtifacts, sourceManifest: saved.transfer.sourceManifest, expectedSource: { snapshotId: original.source.snapshotId, sourceDigest: original.source.sha256 }, context: original.authority, signal });
+        if (!eligible() || !inspectionSourceContentMatches(original.source, { snapshotId: snapshot.id, sha256: snapshot.sourceDigest, roots: snapshot.roots.map(root => ({ id: root.id, sha256: root.sourceDigest })) })) return false;
+        this.options.app.store.transaction(() => {
+          if (!eligible()) throw new Error('The stopped setup reconciliation owner changed.');
+          this.options.app.store.append('inspection-verifier-reconciliation', id, { action: 'stopped-container-setup', previous: original, sessionId: original.sessionId, source: original.source, archiveContainerId: this.options.app.sessions.archivedEnvironment(original.sessionId!)!.containerId, at: this.now() });
+          this.options.app.store.set(INPUTS, { ...saved, snapshot });
+          this.patch(id, { status: 'waiting', reason: 'The original container was confirmed removed before any verifier turn started. Retrying the retained independent setup.', completedAt: undefined });
+        });
+        return true;
+      });
+    } catch {
+      // Missing archives, changed authority/source or a busy owner retain the
+      // original unknown record. They cannot authorize another provider turn.
+      return false;
+    }
   }
 
   private async retain(id: string, input: VerificationInput, signal: AbortSignal): Promise<InspectionSnapshot> {
@@ -202,7 +256,7 @@ export class InspectionVerifier {
       let session: Session;
       if (run.sessionId) {
         session = this.options.app.sessions.record(run.sessionId);
-        if (session.verificationRunId !== id || !this.options.app.sessions.owns(session.id) || session.executionTargetKind !== run.executionTargetKind) throw Object.assign(new Error('The independent setup owner changed.'), { code: 'HOST_PROCESS_UNKNOWN' });
+        if (session.verificationRunId !== id || session.deviceId !== run.ownerDeviceId || !this.options.app.sessions.owns(session.id) || (session.executionTargetKind === undefined ? 'container' : session.executionTargetKind) !== run.executionTargetKind) throw Object.assign(new Error(setupOwnerChangedReason), { code: 'HOST_PROCESS_UNKNOWN' });
         if (session.status === 'unknown') throw Object.assign(new Error('The independent setup execution outcome is unknown.'), { code: 'HOST_PROCESS_UNKNOWN' });
         if (session.status === 'stopped') await this.options.app.sessions.restart(session.id);
         await abortable(this.options.app.sessions.waitExecutionReady(session.id, this.timeoutMs), abort.signal);
@@ -254,7 +308,7 @@ export class InspectionVerifier {
 
   private prompt(run: InspectionVerificationRun, context: string): string {
     return [
-      'Independently verify the exact saved application source below. The author has finished; you are a separate verifier and must not resume, repair, commit or integrate its source. Build and launch only with the Factory inspection tools, which are bound to the immutable checked snapshot. Use shell only to inspect source and discover the declared build/reference paths. Keep generated files out of source roots.',
+      'Independently verify the exact saved application source below. The author has finished; you are a separate verifier and must not resume, repair, commit or integrate its source. Native builds and app start/restart must use the Factory inspection tools bound to the immutable checked snapshot. For web, you may use shell to launch the declared local fixture/development server from this owned verification workspace; operate and inspect its browser only through Factory tools. Use shell to inspect source and discover declared build/reference paths. Preserve the checked source bytes and keep generated files out of source roots.',
       `Verification run: ${run.id}\nChecked source: ${JSON.stringify(run.source)}\nFrozen quality requirements: ${JSON.stringify(run.quality)}`,
       'Use factory_capabilities. For native platforms select the configured fixture profile, factory_native_build, poll its job, then factory_native_start. For web start the app from this private verification workspace and use factory_browser_start. View original screenshot image tool responses, inspect required reference/design-system files with factory_reference, execute every required workflow, re-observe and use factory_assert on resulting state. Distinguish screenshot evidence IDs from observation/action IDs.',
       'Submit a version 1 QualityEvidenceReport through factory_quality_submit using the EXACT Checked source object. Each passed workflow requires before/action/after plus assertionEvidenceId. Review hierarchy, spacing, clipping, typography, controls and states against the inspected reference; record serious defects honestly. Missing capabilities or failed interactions are blocked/failed evidence, never a success claim. Finish by stopping the owned app/browser sessions. Do not ask the user or start another author attempt.',
