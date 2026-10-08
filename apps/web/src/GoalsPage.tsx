@@ -123,8 +123,12 @@ function GoalWorkspace({ goal, state, client, run, selection, select, openSessio
   const controllerStage = control?.stage && ['plan', 'diagnose', 'evaluate'].includes(control.stage) ? control.stage : undefined;
   const waitingTask = overview.find(item => item.state === 'waiting');
   const waitingOnTask = active && goal.status !== 'paused' && !controllerStage && waitingTask && !overview.some(item => ['preparing', 'executing', 'capturing', 'checking', 'integrating', 'running'].includes(item.state));
-  const taskWaitTitle = /native.*(?:build|evidence)|ArtifactStore/i.test(waitingTask?.reason ?? '') ? 'Waiting for native build evidence' : 'Waiting for a prerequisite';
-  const taskWaitDetail = taskWaitTitle === 'Waiting for native build evidence' ? `${state.devices.find(device => device.id === goal.coordinatorId)?.name ?? 'The coordinating device'} needs to supply native build reports and validation inputs. No agent is running for this task.` : waitingTask?.reason || 'This task needs an external input before another attempt can start.';
+  const taskWaitContext = [waitingTask?.task.title, waitingTask?.reason].filter(Boolean).join(' ');
+  const taskWaitTitle = /\bnative\b.*\b(?:workflows?|parity|interactions?|ui)\b|\b(?:workflows?|parity|ui)\b.*\bnative\b/i.test(taskWaitContext)
+    ? 'Waiting for native workflow validation'
+    : /\bnative\b.*\b(?:builds?|compile|compilation)\b|\b(?:builds?|compile|compilation)\b.*\bnative\b/i.test(taskWaitContext)
+      ? 'Waiting for native build evidence' : 'Waiting for a prerequisite';
+  const taskWaitDetail = waitingTask?.reason || 'This task needs an external input before another attempt can start.';
   const stageTitle = controllerStage === 'plan' ? 'Planning work' : controllerStage === 'diagnose' ? 'Investigating failed work' : 'Checking goal completion';
   const stageDetail = latestController?.status === 'interrupted' || latestController?.status === 'failed' ? 'The agent stopped before returning its decision.' : controllerStage === 'plan' ? 'The planner is defining tasks and dependencies.' : controllerStage === 'diagnose' ? 'The factory is deciding whether to retry or revise the plan.' : 'The evaluator is checking accepted work against the goal criteria.';
   useEffect(() => { setToolFocus(null); }, [selection.taskId, selection.attemptId]);
