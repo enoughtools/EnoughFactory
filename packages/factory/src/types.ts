@@ -48,7 +48,7 @@ export interface FactoryWorkspacePort {
 
 export interface ExecutionResult {
   status: "succeeded" | "failed" | "waiting" | "unknown";
-  text: string; chatId?: string; sessionId?: string; spend?: number;
+  text: string; chatId?: string; sessionId?: string;
   error?: string; waitReason?: string; wakeCondition?: string;
   /** Only an owning adapter may positively report that no provider execution began. */
   agentStarted?: false;
@@ -56,7 +56,7 @@ export interface ExecutionResult {
 export interface FactoryRuntimePort {
   /** Promises immutable mounted JSON records, verified against complete() requirements. */
   controllerRecordReferences?: true;
-  complete(input: { goal: Goal; role: "planner" | "evaluator" | "diagnosis"; prompt: string; project: Project; signal?: AbortSignal; recordRequirements?: ControllerRecordRequirement[] }): Promise<{ text: string; chatId?: string; spend?: number }>;
+  complete(input: { goal: Goal; role: "planner" | "evaluator" | "diagnosis"; prompt: string; project: Project; signal?: AbortSignal; recordRequirements?: ControllerRecordRequirement[] }): Promise<{ text: string; chatId?: string }>;
   execute(input: { goal: Goal; task: FactoryTask; attempt: Attempt; workspace: WorkspaceRef; prompt: string; project: Project; assignmentGoalRevision?: number }): Promise<ExecutionResult>;
   reconcile(attempt: Attempt): Promise<{ status: "prepared" | "running" | "succeeded" | "failed" | "unknown"; result?: ExecutionResult; workspace?: WorkspaceRef }>;
   /** Returns after the owner acknowledges cancellation; rejection leaves termination unknown. */
@@ -100,7 +100,6 @@ export interface AttemptDetail {
   contract?: AttemptInspection['contract'];
   candidate?: CandidateRef; result?: ExecutionResult; checks?: CheckResult[];
   integration?: IntegrationResult; cancellation: "none" | "requested" | "acknowledged";
-  usageAccounted?: boolean; accountedSpend?: number;
   phase: "preparing" | "executing" | "capturing" | "checking" | "integrating" | "done";
   capacityWait?: "preparing" | "executing";
 }
@@ -120,7 +119,7 @@ export interface GoalCheckRecord {
 }
 export interface ControlRecord {
   id: string; stage: "plan" | "dispatch" | "evaluate" | "diagnose" | "wait" | "done";
-  spent: number; unpricedTurns?: number; startedAt: string; maxDurationMs?: number;
+  startedAt: string; maxDurationMs?: number;
   waitingFor?: string; waitReason?: string; wakeAt?: string;
   diagnosisTaskId?: string; steering: string[]; replanReason?: string;
   /** Pending diagnosis handoff, consumed only by the replacement plan. */
@@ -136,11 +135,11 @@ export interface ControlRecord {
 export interface CreateGoalInput {
   projectId: string; title?: string; objective: string; criteria?: string[];
   runtime?: RuntimeKind; approvalMode?: ApprovalMode; autonomy?: AutonomyMode;
-  concurrency?: number; maxSpend?: number; maxAttempts?: number; maxDurationMs?: number;
+  concurrency?: number; maxAttempts?: number; maxDurationMs?: number;
 }
 export interface ConfigureGoalInput {
   autonomy?: AutonomyMode; approvalMode?: ApprovalMode; runtime?: RuntimeKind; concurrency?: number;
-  maxSpend?: number | null; maxAttempts?: number | null; maxDurationMs?: number | null;
+  maxAttempts?: number | null; maxDurationMs?: number | null;
 }
 export interface CoordinatorOptions {
   store: FactoryStore; runtime: FactoryRuntimePort; workspaces: FactoryWorkspacePort;

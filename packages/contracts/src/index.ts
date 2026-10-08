@@ -73,7 +73,7 @@ export interface Goal {
   id: string; projectId: string; coordinatorId: string; title: string; objective: string;
   criteria: string[]; status: GoalStatus; autonomy: AutonomyMode; approvalMode: ApprovalMode;
   runtime: RuntimeKind; createdAt: string; updatedAt: string; revision: number;
-  nextAction?: string; error?: string; concurrency: number; maxSpend?: number; maxAttempts?: number;
+  nextAction?: string; error?: string; concurrency: number; maxAttempts?: number;
   workspaceProvider?: "git" | "artifactfs";
 }
 export type TaskKind = "feature" | "unit" | "architecture" | "test";
@@ -121,7 +121,7 @@ export interface ControllerRun {
 export interface GoalInspection {
   goal: Goal; tasks: TaskOverview[]; controllers: ControllerRun[];
   plan?: { revision: number; summary: string; checks: string[]; createdAt: string };
-  control?: { stage: "plan" | "dispatch" | "evaluate" | "diagnose" | "wait" | "done"; waitingFor?: string; waitReason?: string; wakeAt?: string; replanReason?: string; diagnosisTaskId?: string; replanTaskIds?: string[]; operation?: { kind: "planner" | "evaluator" | "diagnosis"; revision: number }; spent: number; unpricedTurns?: number; maxDurationMs?: number };
+  control?: { stage: "plan" | "dispatch" | "evaluate" | "diagnose" | "wait" | "done"; waitingFor?: string; waitReason?: string; wakeAt?: string; replanReason?: string; diagnosisTaskId?: string; replanTaskIds?: string[]; operation?: { kind: "planner" | "evaluator" | "diagnosis"; revision: number }; maxDurationMs?: number };
 }
 export interface Decision { id: string; goalId: string; at: string; kind: string; text: string; data?: unknown; }
 export interface Artifact { id: string; goalId?: string; taskId?: string; attemptId?: string; name: string; mime: string; sha256: string; size: number; deviceId: string; createdAt: string; }

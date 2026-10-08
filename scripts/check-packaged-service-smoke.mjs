@@ -52,7 +52,7 @@ export async function seedSmokeFixture(node, home) {
   const rows = [
     ['projects', project], ['goals', goal], ['tasks', task], ['tasks', legacy], ['attempts', attempt], ['attempts', failedAttempt],
     ['factory-plans', { id: goal.id, goalId: goal.id, revision: goal.revision, summary: 'Retained fixture plan', checks: [check.command], taskKeys: { typed: task.id, legacy: legacy.id }, createdAt: at }],
-    ['factory-control', { id: goal.id, stage: 'dispatch', spent: 0, startedAt: at, steering: [] }],
+    ['factory-control', { id: goal.id, stage: 'dispatch', startedAt: at, steering: [] }],
     ['factory-task-details', { id: task.id, key: 'typed', checks: [check.command], planRevision: goal.revision, selected: false, failureSignatures: [], repairInstructions: 'Inspect retained evidence only.' }],
     ['factory-attempt-details', detail],
     ['factory-attempt-details', { id: failedAttempt.id, goalId: goal.id, goalRevision: 2, phase: 'checking', cancellation: 'none', checks: [{ ...check, passed: false, output: 'Retained failure evidence.\n', exitCode: 17 }], result: { status: 'failed', text: '', error: failedAttempt.error } }],

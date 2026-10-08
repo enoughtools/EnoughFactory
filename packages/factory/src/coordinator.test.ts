@@ -1135,3 +1135,60 @@ test("explicit retry cannot retire confirmed failed work until its source is ret
   assert.deepEqual(factory.store.get<AttemptDetail>("factory-attempt-details", attempt.id)!.candidate, partial);
   assert.equal(factory.calls.execute, 1);
 });
+
+test("legacy monetary waits recover while attempt and time limits remain enforced", async t => {
+  await t.test("old monetary fields neither block continuation nor change retained history", async () => {
+    const factory = harness(), goal = factory.goal();
+    assert.equal(Object.hasOwn(factory.store.get<ControlRecord>("factory-control", goal.id)!, "spent"), false);
+    const historical = { id: "legacy-cost-history", goalId: goal.id, at: device.lastSeen, kind: "configuration", text: "Legacy settings", data: { maxSpend: 0.01 } };
+    factory.store.set("decisions", historical);
+    factory.store.set("goals", { ...goal, status: "waiting", maxSpend: 0.01 });
+    factory.store.set("factory-control", { ...factory.store.get<ControlRecord>("factory-control", goal.id)!, spent: 99, unpricedTurns: 7,
+      waitingFor: "budget-changed", waitReason: "Configured spend budget reached (99)." });
+    factory.executing(async () => ({ status: "succeeded", text: "Legacy adapter response", chatId: "legacy-chat", sessionId: "legacy-session", spend: 12.34 }));
+    const recovered = factory.recover();
+    for (let step = 0; step < 3; step++) { await recovered.tick(); await recovered.waitForIdle(); }
+    assert.equal(factory.calls.planner, 1);
+    assert.equal(factory.calls.execute, 1);
+    assert.equal(factory.calls.evaluator, 1);
+    assert.equal(factory.store.get<Goal>("goals", goal.id)!.status, "completed");
+    const retained = factory.store.get<ControlRecord & { spent: number; unpricedTurns: number }>("factory-control", goal.id)!;
+    assert.equal(retained.spent, 99, "old stored amounts are not updated");
+    assert.equal(retained.unpricedTurns, 7, "controller turns no longer record missing prices");
+    assert.equal((factory.store.get<Goal>("goals", goal.id) as Goal & { maxSpend: number }).maxSpend, 0.01);
+    assert.deepEqual(factory.store.get("decisions", historical.id), historical, "historical decisions remain intact");
+    const detail = factory.store.list<AttemptDetail>("factory-attempt-details")[0]!;
+    assert.equal(Object.hasOwn(detail, "usageAccounted"), false);
+    assert.equal(Object.hasOwn(detail, "accountedSpend"), false);
+    assert.equal(Object.hasOwn(detail.result!, "spend"), false, "an older adapter cannot persist a new monetary value");
+    assert.deepEqual(detail.result, { status: "succeeded", text: "Legacy adapter response", chatId: "legacy-chat", sessionId: "legacy-session" });
+  });
+  await t.test("the real attempt limit still waits before diagnosis or another attempt", async () => {
+    const factory = harness(), goal = await planGoal(factory);
+    factory.store.set("goals", { ...factory.store.get<Goal>("goals", goal.id)!, maxAttempts: 1 });
+    factory.executing(async () => ({ status: "failed", text: "Repair required", error: "Meaningful execution failure" }));
+    await factory.coordinator.tick(); await factory.coordinator.waitForIdle();
+    factory.store.set("goals", { ...factory.store.get<Goal>("goals", goal.id)!, status: "waiting", maxSpend: 0.01 });
+    factory.store.set("factory-control", { ...factory.store.get<ControlRecord>("factory-control", goal.id)!, spent: 99,
+      waitingFor: "budget-changed", waitReason: "Configured spend budget reached (99)." });
+    for (let step = 0; step < 2; step++) { await factory.coordinator.tick(); await factory.coordinator.waitForIdle(); }
+    assert.equal(factory.calls.execute, 1);
+    assert.equal(factory.calls.diagnosis, 0);
+    assert.equal(factory.store.list<Attempt>("attempts").length, 1);
+    assert.equal(factory.store.get<Goal>("goals", goal.id)!.status, "waiting");
+    assert.match(factory.store.get<ControlRecord>("factory-control", goal.id)!.waitReason!, /attempt budget reached/);
+  });
+  await t.test("the real time limit still waits until its setting changes", async () => {
+    let now = Date.parse(device.lastSeen);
+    const factory = harness([device], () => new Date(now)), goal = await planGoal(factory);
+    factory.coordinator.configure(goal.id, { maxDurationMs: 1000 }); now += 1000;
+    for (let step = 0; step < 2; step++) { await factory.coordinator.tick(); await factory.coordinator.waitForIdle(); }
+    assert.equal(factory.calls.execute, 0);
+    assert.equal(factory.store.get<Goal>("goals", goal.id)!.status, "waiting");
+    assert.match(factory.store.get<ControlRecord>("factory-control", goal.id)!.waitReason!, /time budget reached/);
+    factory.coordinator.configure(goal.id, { maxDurationMs: null });
+    await factory.coordinator.tick(); await factory.coordinator.waitForIdle();
+    assert.equal(factory.calls.execute, 1);
+    assert.equal(factory.calls.integrate, 1);
+  });
+});

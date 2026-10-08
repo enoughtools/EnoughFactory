@@ -105,5 +105,5 @@ export function inspectGoal(store: FactoryStore, devices: Device[], goal: Goal):
     controllers: store.list<ControllerRun>('factory-controller-runs').filter(run => run.goalId === goal.id).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)).map(run => ({ id: run.id, goalId: run.goalId, role: run.role, sessionId: run.sessionId, chatId: run.chatId, status: run.status, updatedAt: run.updatedAt, error: run.error })),
     ...(plan ? { plan: { revision: plan.revision, summary: plan.summary, checks: plan.checks, createdAt: plan.createdAt } } : {}),
     ...(control ? { control: { stage: control.stage, waitingFor: control.waitingFor, waitReason: control.waitReason, wakeAt: control.wakeAt, replanReason: control.replanReason, replanTaskIds: control.replanTaskIds, diagnosisTaskId: control.diagnosisTaskId,
-      operation: control.operation ? { kind: control.operation.kind, revision: control.operation.revision } : undefined, spent: control.spent, unpricedTurns: control.unpricedTurns, maxDurationMs: control.maxDurationMs } } : {}) };
+      operation: control.operation ? { kind: control.operation.kind, revision: control.operation.revision } : undefined, maxDurationMs: control.maxDurationMs } } : {}) };
 }

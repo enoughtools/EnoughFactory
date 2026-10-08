@@ -89,7 +89,7 @@ test('final snapshot candidates and check artifacts retain the real goal owner t
   const commit = (await exec('git', ['-C', repository, 'rev-parse', 'HEAD'])).stdout.trim();
   fixture.app.store.set('tasks', { ...state.task, status: 'completed' });
   fixture.app.store.set('attempts', { ...state.attempt, status: 'succeeded' });
-  fixture.app.store.set<ControlRecord>('factory-control', { id: state.goal.id, stage: 'evaluate', spent: 0, startedAt: state.goal.createdAt, steering: [] });
+  fixture.app.store.set<ControlRecord>('factory-control', { id: state.goal.id, stage: 'evaluate', startedAt: state.goal.createdAt, steering: [] });
   fixture.app.store.set<PlanRecord>('factory-plans', { id: state.goal.id, goalId: state.goal.id, revision: state.goal.revision, summary: 'Verify the integrated fixture', checks: ['fixture/final-check'], checkScope: 'goal', taskKeys: {}, createdAt: state.goal.createdAt });
   t.mock.method(fixture.app, 'ensureRuntimeReady', async () => fixture.app.runtime.endpoint);
   t.mock.method(fixture.factory.runtime, 'complete', async () => ({ text: JSON.stringify({ complete: true, summary: 'Fixture verified', criteria: [{ criterion: state.goal.criteria[0], satisfied: true, evidence: ['fixture/final-check'] }] }) }));
@@ -297,7 +297,7 @@ test('stale authority and mismatched legacy receipts remain unknown instead of a
 test('real runtime readiness wakes availability waits without resuming paused or canceled goals', async t => {
   const fixture = await harness(t);
   const state = fixture.seed();
-  const base: ControlRecord = { id: state.goal.id, stage: 'plan', spent: 0, startedAt: state.goal.createdAt, steering: [], waitingFor: 'runtime-available', waitReason: 'The runtime was stopped', wakeAt: '2026-10-05T00:01:00Z' };
+  const base: ControlRecord = { id: state.goal.id, stage: 'plan', startedAt: state.goal.createdAt, steering: [], waitingFor: 'runtime-available', waitReason: 'The runtime was stopped', wakeAt: '2026-10-05T00:01:00Z' };
   fixture.app.store.set('factory-task-details', { id: state.task.id, key: state.task.id, checks: [], planRevision: state.goal.revision, selected: true, failureSignatures: [] });
   for (const status of ['waiting', 'paused', 'canceled'] as const) {
     fixture.app.store.set('goals', { ...state.goal, status });

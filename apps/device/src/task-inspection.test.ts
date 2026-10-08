@@ -102,7 +102,7 @@ test('authenticated inspection projects exact receipts without writes and isolat
       id: goal.id, goalId: goal.id, revision: goal.revision, summary: 'Deliver and verify',
       checks: ['verify/feature'], taskKeys: { accepted: accepted.id, uncertain: uncertain.id, queued: queued.id }, createdAt: at,
     });
-    app.store.set<ControlRecord>('factory-control', { id: goal.id, stage: 'dispatch', spent: 2, startedAt: at, steering: [] });
+    app.store.set<ControlRecord>('factory-control', { id: goal.id, stage: 'dispatch', startedAt: at, steering: [] });
     app.store.set<TaskDetail>('factory-task-details', {
       id: accepted.id, key: 'accepted', checks: ['verify/feature'], planRevision: goal.revision,
       selected: true, failureSignatures: [], repairInstructions: 'Restore the health response',
@@ -230,7 +230,7 @@ test('stale inspector commands preserve newer attempts, pause and replanning con
         for (const bucket of buckets) for (const record of app.store.list<{ id: string }>(bucket)) app.store.delete(bucket, record.id);
         const currentGoal = { ...goal, ...goalPatch };
         app.store.set('goals', currentGoal); app.store.set('tasks', { ...task, ...taskPatch });
-        app.store.set<ControlRecord>('factory-control', { id: goal.id, stage, spent: 0, startedAt: at, steering: [] });
+        app.store.set<ControlRecord>('factory-control', { id: goal.id, stage, startedAt: at, steering: [] });
         app.store.set<TaskDetail>('factory-task-details', { id: task.id, key: task.id, checks: [], planRevision: currentGoal.revision, selected: false, failureSignatures: [] });
         for (const attempt of [first, second]) {
           app.store.set('attempts', attempt);
@@ -316,7 +316,7 @@ test('stale inspector commands preserve newer attempts, pause and replanning con
       app.store.set('tasks', failure);
       app.store.set<TaskDetail>('factory-task-details', { id: failure.id, key: failure.id, checks: [], planRevision: goal.revision, selected: false, failureSignatures: [] });
       app.store.set<TaskDetail>('factory-task-details', { id: uncertain.id, key: uncertain.id, checks: [], planRevision: goal.revision, selected: true, failureSignatures: [] });
-      const control: ControlRecord = { id: goal.id, stage, diagnosisTaskId: failure.id, ...(stage === 'plan' ? { replanTaskIds: [failure.id] } : {}), spent: 0, startedAt: at, steering: [], operation: { id: 'controller', revision: goal.revision, kind: stage === 'plan' ? 'planner' : 'diagnosis' } };
+      const control: ControlRecord = { id: goal.id, stage, diagnosisTaskId: failure.id, ...(stage === 'plan' ? { replanTaskIds: [failure.id] } : {}), startedAt: at, steering: [], operation: { id: 'controller', revision: goal.revision, kind: stage === 'plan' ? 'planner' : 'diagnosis' } };
       app.store.set('factory-control', control);
       assert.equal(await post(run, expected), 200);
       assert.equal(app.store.get<TaskDetail>('factory-task-details', task.id)!.selected, true);
@@ -424,7 +424,7 @@ test('retry acknowledges its authorized successor dispatched before cancellation
     const retained = { id: 'retained-candidate', commit: 'retained-commit', baseCommit: 'base' };
     app.store.transaction(() => {
       app.store.set('projects', project); app.store.set('goals', goal); app.store.set('tasks', task); app.store.set('attempts', failed);
-      app.store.set<ControlRecord>('factory-control', { id: goal.id, stage: 'dispatch', spent: 0, startedAt: at, steering: [] });
+      app.store.set<ControlRecord>('factory-control', { id: goal.id, stage: 'dispatch', startedAt: at, steering: [] });
       app.store.set<TaskDetail>('factory-task-details', { id: task.id, key: task.id, checks: [], planRevision: goal.revision, selected: false, failureSignatures: [], lastCandidate: retained });
       app.store.set<AttemptDetail>('factory-attempt-details', { id: failed.id, goalId: goal.id, goalRevision: goal.revision, phase: 'done', cancellation: 'none', candidate: retained });
     });

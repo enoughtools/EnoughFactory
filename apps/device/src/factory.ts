@@ -393,7 +393,7 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
     const result = await chats.run(chat.id, executionPrompt, { attemptId: record.id, autonomous: record.goal.autonomy === 'autonomous',
       systemInstructions: `You are implementing an assigned EnoughFactory task toward this goal:\n${record.goal.objective}\n\nYou have full permissions inside this container. Enough owns the configured ${record.goal.approvalMode} policy. Make routine implementation decisions and execute the task completely. Do not stop at a plan or ask for permission already granted. Keep verification proportionate. Preserve changes and describe concrete evidence and any remaining work. The factory will independently capture, check, integrate and evaluate your result.\n\n${validationInstructions()}\n\n${toolchainInstructions(app.sessions.record(record.sessionId).developmentToolchain)}\n\n${record.referenceContext?.instructions??''}` });
     if (worker(record.id).status === 'canceled') return;
-    patchWorker(record.id, { status: 'succeeded', result: { status: 'succeeded', text: result.text, sessionId: record.sessionId, chatId: chat.id, spend: spend(result) } });
+    patchWorker(record.id, { status: 'succeeded', result: { status: 'succeeded', text: result.text, sessionId: record.sessionId, chatId: chat.id } });
     } finally { releaseDisk(); }
   }
   async function reconcileLocal(id: string): Promise<WorkerRecord> {
@@ -408,7 +408,7 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
       const completed = app.store.get<{ id: string; result: TurnResult; attemptId?: string; completedAt?: string }>('chat-results', record.chatId);
       if (completed?.attemptId === record.id) {
         patchWorker(id, { status: 'succeeded', error: undefined, result: { status: 'succeeded', text: completed.result.text,
-          chatId: record.chatId, sessionId: record.sessionId, spend: spend(completed.result) } });
+          chatId: record.chatId, sessionId: record.sessionId } });
       } else {
         const chat = chats.get(record.chatId), binding = factoryChatBinding(app.store, chat, app.device.id);
         // Older manual continuations lost their task binding. Reuse the assignment with its
@@ -693,7 +693,7 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
         const result = await chats.run(chat.id, prompt, { autonomous: goal.autonomy === 'autonomous',
           systemInstructions: [`You are the EnoughFactory ${role}. This container contains an isolated snapshot of the current project repository. Inspect the actual source and relevant runtime evidence to make your decision. You have full container permissions under ${goal.approvalMode} policy. Your role is to decide the next factory action; implementation belongs to assigned worker tasks. Do not modify product source as part of this decision. Return the structured JSON requested in the prompt. Goal: ${goal.objective}`, role === 'evaluator' ? 'Audit current behavior in the integrated primary repository. Historical candidate source bundles are not duplicated into this audit; full stored task/attempt contracts, checks and integration records remain available through the evidence manifest. Historical artifact references do not promise their bodies are present and cannot be claimed inspected.' : '', validationInstructions(), toolchainInstructions(app.sessions.record(session.id).developmentToolchain), context.instructions].filter(Boolean).join('\n\n') });
         app.store.set('factory-controller-runs', { ...record, chatId: chat.id, status: 'completed', updatedAt: now(), result: result.text });
-        return { text: result.text, chatId: chat.id, spend: spend(result) };
+        return { text: result.text, chatId: chat.id };
       } catch (error) {
         if (record) app.store.set('factory-controller-runs', { ...record, chatId, status: signal?.aborted ? 'interrupted' : 'failed', error: (error as Error).message, updatedAt: now() });
         throw error;
@@ -801,7 +801,7 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
         }
         if (body.objective !== undefined || body.context !== undefined || body.criteria !== undefined) await coordinator.steer(goal.id, steeringInput(body));
         coordinator.configure(goal.id, { ...steeringInput(body), runtime: body.runtime as Goal['runtime'] | undefined, concurrency: numberOption(body.concurrency),
-          maxSpend: body.maxSpend === null ? null : numberOption(body.maxSpend), maxAttempts: body.maxAttempts === null ? null : numberOption(body.maxAttempts),
+          maxAttempts: body.maxAttempts === null ? null : numberOption(body.maxAttempts),
           maxDurationMs: body.maxDurationMs === null ? null : numberOption(body.maxDurationMs) });
         return app.store.get('goals', goal.id);
       }
@@ -1135,10 +1135,6 @@ function envmuxConfig(text: string): Record<string, unknown> {
 async function git(repository: string, ...args: string[]): Promise<string> {
   const result = await exec('git', ['-C', repository, ...args], { maxBuffer: 16 * 1024 * 1024 }); return result.stdout.trim();
 }
-function spend(result: TurnResult): number | undefined {
-  const cost = result.usage?.costUsd ?? result.usage?.cost_usd ?? result.usage?.total_cost_usd;
-  return typeof cost === 'number' && Number.isFinite(cost) && cost >= 0 ? cost : undefined;
-}
 function checkResults(report: CheckReport, candidateCommit: string): CheckResult[] {
   const results:CheckResult[] = report.commands.map(command => ({ command: command.command, passed: command.exitCode === 0 && !command.timedOut,
     output: `${command.stdout}${command.stderr}`, exitCode: command.exitCode, candidateCommit, checkedCommit: report.commit,developmentToolchain:command.developmentToolchain }));
@@ -1157,7 +1153,7 @@ function createGoalInput(body: Record<string, unknown>): CreateGoalInput {
   return { projectId: body.projectId, objective: body.objective, title: typeof body.title === 'string' ? body.title : undefined,
     criteria: controls.criteria, autonomy: controls.autonomy, approvalMode: controls.approvalMode,
     runtime: body.runtime as Goal['runtime'] | undefined,
-    concurrency: numberOption(body.concurrency), maxSpend: numberOption(body.maxSpend), maxAttempts: numberOption(body.maxAttempts), maxDurationMs: numberOption(body.maxDurationMs) };
+    concurrency: numberOption(body.concurrency), maxAttempts: numberOption(body.maxAttempts), maxDurationMs: numberOption(body.maxDurationMs) };
 }
 function numberOption(value: unknown): number | undefined {
   if (value === undefined || value === null || value === '') return undefined;

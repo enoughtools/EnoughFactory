@@ -14,7 +14,7 @@ An attempt has one task, owner and generation. The current task pointer plus goa
 
 `create`, `pause`, `resume`, `cancel`, `steer`, `requestPlan`, `requestEvaluation`, `selectTasks`, `retireAttempt`, `configure` and `notifyCondition` provide the application controls. Manual and assisted modes select work independently of approval policy. Autonomous mode continues through diagnosis, changed attempts, replanning and evaluation without requiring a person to advance the loop. Explicit waiting conditions suspend inference until a device, provider, configured external event or changed budget wakes the goal.
 
-Spend limits use amounts actually reported by runtime adapters. Missing monetary usage is recorded as `unpricedTurns`, rather than treated as proof of zero cost. Time and attempt budgets remain available for runtimes without prices. Updating a budget never reports completion.
+Time and attempt limits remain explicit controls alongside worker concurrency. Reaching a limit waits for changed settings rather than reporting completion. Legacy monetary fields in retained records have no effect on coordination.
 
 Tables `goals`, `tasks`, `attempts` and `decisions` are shared application records. `factory-control`, `factory-plans`, `factory-task-details`, `factory-attempt-details`, `factory-goal-checks` and `factory-evaluations` store transition context and evidence separately from device-local transcripts. Do not synchronize SQLite files across owners or instantiate two coordinators for the same authority.
 

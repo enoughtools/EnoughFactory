@@ -41,7 +41,6 @@ export class FactoryCoordinator {
     if (!project) throw new Error("Choose an existing project for the goal.");
     if (!input.objective.trim()) throw new Error("A goal needs an objective.");
     if (input.concurrency !== undefined && (!Number.isInteger(input.concurrency) || input.concurrency < 1 || input.concurrency > 32)) throw new Error("Concurrency must be between 1 and 32.");
-    if (input.maxSpend !== undefined && (!Number.isFinite(input.maxSpend) || input.maxSpend <= 0)) throw new Error("Spend budget must be positive.");
     if (input.maxAttempts !== undefined && (!Number.isInteger(input.maxAttempts) || input.maxAttempts < 1)) throw new Error("Attempt budget must be a positive integer.");
     if (input.maxDurationMs !== undefined && (!Number.isFinite(input.maxDurationMs) || input.maxDurationMs <= 0)) throw new Error("Time budget must be positive.");
     const at = this.now(), autonomy = input.autonomy ?? "autonomous";
@@ -54,13 +53,12 @@ export class FactoryCoordinator {
       createdAt: at, updatedAt: at, revision: 1,
       nextAction: autonomy === "manual" ? "Plan when requested" : "Plan the goal and its completion criteria",
       concurrency: Math.max(1, Math.min(32, Math.floor(input.concurrency ?? 8))),
-      ...(input.maxSpend === undefined ? {} : { maxSpend: input.maxSpend }),
       ...(input.maxAttempts === undefined ? {} : { maxAttempts: input.maxAttempts }),
     };
     this.options.store.transaction(() => {
       this.options.store.set(TABLE.goals, goal);
       this.options.store.set<ControlRecord>(TABLE.control, {
-        id: goal.id, stage: "plan", spent: 0, startedAt: at, steering: [],
+        id: goal.id, stage: "plan", startedAt: at, steering: [],
         ...(input.maxDurationMs === undefined ? {} : { maxDurationMs: input.maxDurationMs }),
       });
       this.decision(goal.id, "goal-created", `Goal created in ${autonomy} mode with ${goal.approvalMode} policy.`);
@@ -148,7 +146,11 @@ export class FactoryCoordinator {
           current = this.goal(goal.id); control = this.control(goal.id);
         }
         if (current.status === "waiting") {
-          if (control.waitingFor === "host-disk-space" && this.options.admission && !this.options.admission(current)) this.wake(current.id, "Host disk space is available; continuing work.");
+          if (control.waitingFor === "budget-changed") {
+            const reason = this.limitReason(current);
+            if (reason) { this.wait(current.id, reason, "budget-changed"); continue; }
+            this.wake(current.id, "No configured execution limit is currently reached; continuing work.");
+          } else if (control.waitingFor === "host-disk-space" && this.options.admission && !this.options.admission(current)) this.wake(current.id, "Host disk space is available; continuing work.");
           else if (control.waitingFor === "device-online" && this.hasAvailableDevice(current)) this.wake(current.id, "A worker device is available.");
           else if (control.wakeAt && Date.parse(control.wakeAt) <= Date.parse(this.now())) this.wake(current.id, "The configured wait has elapsed.");
           else continue;
@@ -218,7 +220,7 @@ export class FactoryCoordinator {
   configure(goalId: string, input: ConfigureGoalInput): void {
     const goal = this.goal(goalId);
     if (terminalGoals.has(goal.status)) throw new Error("The goal is terminal.");
-    for (const name of ["maxSpend", "maxDurationMs"] as const) if (input[name] !== undefined && input[name] !== null && (!Number.isFinite(input[name]) || input[name]! <= 0)) throw new Error(`${name} must be positive or null.`);
+    if (input.maxDurationMs !== undefined && input.maxDurationMs !== null && (!Number.isFinite(input.maxDurationMs) || input.maxDurationMs <= 0)) throw new Error("maxDurationMs must be positive or null.");
     if (input.maxAttempts !== undefined && input.maxAttempts !== null && (!Number.isInteger(input.maxAttempts) || input.maxAttempts < 1)) throw new Error("Attempt budget must be a positive integer or null.");
     if (input.concurrency !== undefined && (!Number.isInteger(input.concurrency) || input.concurrency < 1 || input.concurrency > 32)) throw new Error("Concurrency must be between 1 and 32.");
     this.options.store.transaction(() => {
@@ -227,12 +229,14 @@ export class FactoryCoordinator {
         ...(input.approvalMode === undefined ? {} : { approvalMode: input.approvalMode }),
         ...(input.runtime === undefined ? {} : { runtime: input.runtime }),
         ...(input.concurrency === undefined ? {} : { concurrency: input.concurrency }),
-        ...(input.maxSpend === undefined ? {} : { maxSpend: input.maxSpend ?? undefined }),
         ...(input.maxAttempts === undefined ? {} : { maxAttempts: input.maxAttempts ?? undefined }),
       });
       if (input.maxDurationMs !== undefined) this.options.store.set(TABLE.control, { ...this.control(goalId), maxDurationMs: input.maxDurationMs ?? undefined });
       if (input.autonomy && input.autonomy !== "manual" && goal.status === "draft") this.writeGoal(goalId, { status: this.control(goalId).stage === "plan" ? "planning" : "running" });
-      this.decision(goalId, "configuration", "Goal execution settings updated. Approval changes apply to subsequently started turns.", input);
+      this.decision(goalId, "configuration", "Goal execution settings updated. Approval changes apply to subsequently started turns.", {
+        autonomy: input.autonomy, approvalMode: input.approvalMode, runtime: input.runtime, concurrency: input.concurrency,
+        maxAttempts: input.maxAttempts, maxDurationMs: input.maxDurationMs,
+      });
       if (this.control(goalId).waitingFor === "budget-changed") this.wake(goalId, "Execution budget was updated.");
       else if (input.runtime && this.control(goalId).waitingFor === "runtime-available") this.wake(goalId, "The goal runtime was updated.");
     });
@@ -415,7 +419,6 @@ export class FactoryCoordinator {
       }, { recordReferences: this.options.runtime.controllerRecordReferences, recordRequirements });
       const response = await this.options.runtime.complete({ goal, role: "planner", prompt, project, signal: this.operationControllers.get(goal.id)?.signal, recordRequirements });
       if (!this.operationCurrent(goal.id, operation)) return;
-      this.recordSpend(goal.id, response.spend);
       const plan = readPlan(response.text);
       const preservedKeys = new Set(preserved.map(task => this.taskDetail(task.id).key));
       validateDependencies(plan.tasks, preservedKeys);
@@ -528,15 +531,16 @@ export class FactoryCoordinator {
 
   private async processResult(attemptInput: Attempt, result: ExecutionResult): Promise<void> {
     if (!this.isCurrent(attemptInput)) return;
+    // An older owning device may still include its obsolete monetary field.
+    const { spend: _legacySpend, ...currentResult } = result as ExecutionResult & { spend?: unknown };
+    result = currentResult;
     const attempt = this.attempt(attemptInput.id), task = this.task(attempt.taskId), goal = this.goal(task.goalId), project = this.project(goal);
     if (result.status === "waiting" && result.agentStarted === false && result.wakeCondition === "host-disk-space") {
       this.deferExecution(attempt, result.waitReason || "Waiting for host disk space before provider setup.", "executing"); return;
     }
     this.options.store.transaction(() => {
       const saved = this.attemptDetail(attempt.id);
-      if (!saved.usageAccounted) this.recordSpend(goal.id, result.spend);
-      else if (result.spend !== undefined && Number.isFinite(result.spend) && result.spend > (saved.accountedSpend ?? 0)) this.recordSpend(goal.id, result.spend - (saved.accountedSpend ?? 0));
-      this.options.store.set(TABLE.attemptDetails, { ...saved, result, usageAccounted: true, accountedSpend: result.spend ?? saved.accountedSpend });
+      this.options.store.set(TABLE.attemptDetails, { ...saved, result });
       this.writeAttempt(attempt.id, { ...(result.chatId ? { chatId: result.chatId } : {}), ...(result.sessionId ? { sessionId: result.sessionId } : {}) });
       if (result.sessionId) this.writeTask(task.id, { sessionId: result.sessionId });
     });
@@ -636,7 +640,7 @@ export class FactoryCoordinator {
         }
       }
       if (["capturing", "checking", "integrating"].includes(detail.phase) && detail.result?.status === "succeeded") {
-        await this.processResult(attempt, { ...detail.result, spend: undefined }); return;
+        await this.processResult(attempt, detail.result); return;
       }
       const report = await this.options.runtime.reconcile(attempt);
       if (!this.isCurrent(attempt)) return;
@@ -708,7 +712,6 @@ export class FactoryCoordinator {
       ], { recordReferences: this.options.runtime.controllerRecordReferences, recordRequirements });
       const response = await this.options.runtime.complete({ goal, role: "diagnosis", prompt, project: this.project(goal), signal: this.operationControllers.get(goal.id)?.signal, recordRequirements });
       if (!diagnosisCurrent()) return;
-      this.recordSpend(goal.id, response.spend);
       const decision = readJsonObject(response.text);
       if (!["retry", "replan", "wait"].includes(String(decision.action)) || typeof decision.reason !== "string" || !decision.reason.trim()) throw new FactoryDecisionError("Repair decision must specify retry, replan or wait and a reason.");
       if (repeated && decision.action === "retry") decision.action = "replan";
@@ -806,7 +809,6 @@ export class FactoryCoordinator {
       ], { recordReferences: this.options.runtime.controllerRecordReferences, recordRequirements });
       const response = await this.options.runtime.complete({ goal, role: "evaluator", prompt, project, signal: this.operationControllers.get(goal.id)?.signal, recordRequirements });
       if (!this.operationCurrent(goal.id, operation)) return;
-      this.recordSpend(goal.id, response.spend);
       const evaluation = readEvaluation(response.text);
       const after = await this.options.workspaces.inspect(project);
       if (!this.operationCurrent(goal.id, operation)) return;
@@ -1009,20 +1011,15 @@ export class FactoryCoordinator {
   private hasAvailableDevice(goal: Goal): boolean {
     return this.tasks(goal.id).filter(task => ["queued", "ready"].includes(task.status)).some(task => !!this.place(task));
   }
-  private checkBudget(goal: Goal): boolean {
+  private limitReason(goal: Goal): string | undefined {
     const control = this.control(goal.id), attempts = this.attempts(goal.id).length;
-    const reason = goal.maxSpend !== undefined && control.spent >= goal.maxSpend ? `Configured spend budget reached (${control.spent}).` :
-      goal.maxAttempts !== undefined && attempts >= goal.maxAttempts && this.tasks(goal.id).some(task => ["queued", "ready", "failed"].includes(task.status)) ? `Configured attempt budget reached (${attempts}).` :
+    return goal.maxAttempts !== undefined && attempts >= goal.maxAttempts && this.tasks(goal.id).some(task => ["queued", "ready", "failed"].includes(task.status)) ? `Configured attempt budget reached (${attempts}).` :
       control.maxDurationMs !== undefined && Date.parse(this.now()) - Date.parse(control.startedAt) >= control.maxDurationMs ? "Configured time budget reached." : undefined;
+  }
+  private checkBudget(goal: Goal): boolean {
+    const reason = this.limitReason(goal);
     if (!reason) return false;
     this.wait(goal.id, reason, "budget-changed"); return true;
-  }
-  private recordSpend(goalId: string, spend?: number): void {
-    const control = this.control(goalId);
-    if (spend === undefined || !Number.isFinite(spend) || spend < 0) {
-      this.options.store.set(TABLE.control, { ...control, unpricedTurns: (control.unpricedTurns ?? 0) + 1 }); return;
-    }
-    this.options.store.set(TABLE.control, { ...control, spent: control.spent + spend });
   }
   private nextStage(goalId: string): ControlRecord["stage"] {
     if (!this.planRecord(goalId) || this.control(goalId).replanTaskIds?.length) return "plan";

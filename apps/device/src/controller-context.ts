@@ -255,7 +255,7 @@ function controllerRecords(store: FactoryStore, goalId: string, revision?: numbe
         sessionId: detail.workspace.sessionId, deviceId: detail.workspace.deviceId,
         developmentToolchain: toolchainEvidence(detail.workspace.developmentToolchain as DevelopmentToolchain | undefined) } : undefined,
       result: detail.result ? { status: detail.result.status, text: detail.result.text, error: detail.result.error,
-        chatId: detail.result.chatId, sessionId: detail.result.sessionId, spend: detail.result.spend,
+        chatId: detail.result.chatId, sessionId: detail.result.sessionId,
         waitReason: detail.result.waitReason, wakeCondition: detail.result.wakeCondition } : undefined,
       checks: checkEvidence(detail.checks), integration: detail.integration ? { commit: detail.integration.commit,
         previousHead: detail.integration.previousHead, candidateCommit: detail.integration.candidateCommit, checks: checkEvidence(detail.integration.checks) } : undefined,

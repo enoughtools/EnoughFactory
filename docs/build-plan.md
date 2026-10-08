@@ -184,7 +184,7 @@ The Goal workspace shows the objective, current plan, accepted behavior, outstan
 
 Persist context summaries and important decisions separately from provider transcripts so the factory can continue on a replacement runtime. Scope changes have an explicit plan revision. Progress detection should identify repeated failures or equivalent work, then change approach, model or decomposition where configured. Waiting releases inference and resumes from durable state; it should not become a periodic loop that spends tokens saying nothing changed.
 
-Completion comes from the goal's configured criteria. Time, spend and concurrency budgets are explicit configurable controls, not hidden reasons to declare success or keep asking the user to continue. Cancellation stops new dispatch and revokes current authority; the interface preserves the difference between revocation and confirmed remote termination.
+Completion comes from the goal's configured criteria. Time, attempt and concurrency limits are explicit configurable controls, not hidden reasons to declare success or keep asking the user to continue. Cancellation stops new dispatch and revokes current authority; the interface preserves the difference between revocation and confirmed remote termination.
 
 ## Layer 6 OSS distribution and complete experience
 
