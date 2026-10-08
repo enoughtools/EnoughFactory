@@ -1,10 +1,10 @@
 .workspace-content.has-goal { display: flex; flex-direction: column; overflow: hidden; }
 .goal-workspace { display: flex; flex-direction: column; flex: 1; width: 100%; min-width: 0; min-height: 0; overflow: hidden; }
-.goal-workspace:not(.work-view):not(.activity-view) { overflow: auto; }
+.goal-workspace:not(.work-view):not(.activity-view):not(.decisions-view) { overflow: auto; }
 .goal-workspace .page-header { gap: 12px; margin-bottom: 0; padding: 8px 12px; }
 .goal-workspace .page-header .eyebrow { font-size: 10px; line-height: 1.3; margin-bottom: 2px; }
 .goal-workspace .page-header .page-title { font-size: 18px; line-height: 1.35; }
-.goal-workspace > :not(.task-work-layout):not(.task-detail-layout):not(.factory-activity) { flex-shrink: 0; }
+.goal-workspace > :not(.task-work-layout):not(.task-detail-layout):not(.factory-activity):not(.decision-history) { flex-shrink: 0; }
 .goal-workspace .page-header [data-slot="button"], .task-work-toolbar [data-slot="button"], .task-detail-toolbar [data-slot="button"], .goal-action-notice [data-slot="button"], .task-cancellation-summary [data-slot="button"] { min-height: 28px; height: 28px; padding: 4px 8px; font-size: 11px; }
 .goal-view-tabs { margin-bottom: 0; padding: 0 4px; overflow-y: hidden; }
 .goal-workspace .goal-view-tabs .session-tab { min-height: 32px; padding: 6px 10px; font-size: 11px; }
@@ -90,11 +90,14 @@
 .decision-actions { display: flex; gap: 5px; }
 .decision-item details { font-size: 10px; margin-top: 7px; }
 .decision-item pre { max-height: 260px; overflow: auto; }
-.factory-controller-history { margin-top: 16px; }
-.factory-controller-history h3 { font-size: 12px; margin-bottom: 8px; }
-.factory-controller-history > div { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; border-top: 1px solid var(--factory-line); padding: 7px 0; font-size: 11px; }
-.factory-controller-history > div > strong { text-transform: capitalize; }
-.factory-controller-history > div > p { width: 100%; color: var(--factory-secondary); }
+.goal-workspace > .decision-history { display: flex; flex-direction: column; flex: 1; min-height: 0; overflow: hidden; }
+.decision-history > .panel-header { flex-shrink: 0; }
+.decision-history-scroll { flex: 1; min-height: 0; overflow: auto; padding: 16px; overscroll-behavior: contain; }
+.decision-history-scroll .decision-item p { white-space: pre-wrap; overflow-wrap: anywhere; }
+.decision-runs { width: min(420px, calc(100vw - 28px)); max-height: min(520px, 70dvh); overflow: auto; }
+.decision-runs h3 { font-size: 12px; margin-bottom: 8px; }
+.decision-runs > div { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; border-top: 1px solid var(--factory-line); padding: 7px 0; font-size: 11px; }
+.decision-runs > div > strong { text-transform: capitalize; }
 .artifact-task-link { display: block; text-align: left; font-size: 10px; text-decoration: underline; margin-top: 3px; }
 .goals-index { width: 100%; }
 .goal-table { border: 1px solid var(--factory-line); }
