@@ -201,6 +201,11 @@ export class FactoryCoordinator {
     const goal = this.goal(goalId);
     if (terminalGoals.has(goal.status)) throw new Error("A terminal goal cannot be resumed. Create a new goal to continue it.");
     const control = this.control(goalId);
+    const inspectionWaiting = control.waitingFor === "inspection-evidence" || this.tasks(goalId).some(task => {
+      if (task.status !== "review" || !task.currentAttemptId) return false;
+      const attempt = this.attempt(task.currentAttemptId), detail = this.attemptDetail(attempt.id);
+      return attempt.status === "succeeded" && this.isCurrent(attempt) && !!detail.candidate && detail.phase === "checking" && detail.verificationWait?.condition === "inspection-evidence";
+    });
     this.options.store.transaction(() => {
       this.options.store.set(TABLE.control, { ...control, waitingFor: undefined, waitReason: undefined, wakeAt: undefined, controllerFailures: undefined, stage: control.stage === "wait" ? this.nextStage(goalId) : control.stage });
       this.writeGoal(goalId, { status: control.stage === "plan" ? "planning" : "running", error: undefined, nextAction: "Resume from current durable state" });
@@ -211,7 +216,10 @@ export class FactoryCoordinator {
       const detail = this.attemptDetail(attempt.id);
       if (detail.recoveryObservation) this.options.store.set(TABLE.attemptDetails, { ...detail, recoveryObservation: undefined });
     }
-    this.changed();
+    // Explicit resume retries settled inspection preparation against the retained
+    // source. Restart alone remains quiescent and never reopens an author.
+    if (inspectionWaiting) this.notifyCondition("inspection-evidence", goalId);
+    else this.changed();
   }
 
   requestPlan(goalId: string): void {
@@ -355,11 +363,11 @@ export class FactoryCoordinator {
       const goal = this.goal(task.goalId), detail = this.taskDetail(task.id);
       const attempt = task.currentAttemptId ? this.options.store.get<Attempt>(TABLE.attempts, task.currentAttemptId) : undefined;
       const attemptDetail = attempt && this.options.store.get<AttemptDetail>(TABLE.attemptDetails, attempt.id);
-      if (!terminalGoals.has(goal.status) && task.status === "review" && attempt && this.isCurrent(attempt) && attemptDetail?.verificationWait?.condition === condition) {
+      if (!terminalGoals.has(goal.status) && task.status === "review" && attempt?.status === "succeeded" && this.isCurrent(attempt) && attemptDetail?.candidate && attemptDetail.phase === "checking" && attemptDetail.verificationWait?.condition === condition) {
         this.options.store.set(TABLE.attemptDetails, { ...attemptDetail, verificationWait: undefined });
         this.decision(goal.id, "verification-woken", `Inspection evidence changed for ${task.title}; continue the same retained author attempt.`, { taskId: task.id, attemptId: attempt.id, condition });
       }
-      if (terminalGoals.has(goal.status) || detail.waitingFor !== condition || task.status !== "failed") continue;
+      if (condition === "inspection-evidence" || terminalGoals.has(goal.status) || detail.waitingFor !== condition || task.status !== "failed") continue;
       if (taskCheckInputBlocker(detail) || taskCapabilityBlocker(effectiveTaskExecution(task, goal), this.options.devices(), undefined, goal.workspaceProvider ?? "git", goal.runtime)) continue;
       this.options.store.transaction(() => {
         this.writeTask(task.id, { status: "queued", currentAttemptId: undefined });

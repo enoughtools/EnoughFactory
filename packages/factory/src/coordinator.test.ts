@@ -351,6 +351,72 @@ test("pending UI receipts retain the author through restart while independent wo
   assert.equal(factory.store.get<AttemptDetail>("factory-attempt-details", attempt.id)!.verificationWait, undefined);
 });
 
+test("explicit public resume wakes a retained inspection wait after restart without replacing its author or waking another goal", async t => {
+  const worker: Device = { ...device, executionTargets: [{ id: "container", kind: "container", protocolVersion: 1, readiness: "ready",
+    capabilities: [{ kind: "linux-shell", readiness: "ready" }, { kind: "chromium-inspection", readiness: "ready" }] }] };
+  const factory = harness([worker]); factory.workspaces.qualityChecks = true;
+  factory.planning(async () => ({ ...plan, tasks: [{ ...plan.tasks[0]!, writePaths: ["apps/mail"], quality: { platforms: ["web"], workflows: [], referenceIds: [] } }] }));
+  let ready = false;
+  const originalCheck = factory.workspaces.check;
+  factory.workspaces.check = async (project, candidate, commands, verification) => (await originalCheck(project, candidate, commands, verification)).map(check =>
+    check.command === UI_QUALITY_CHECK_COMMAND && !ready ? { ...check, passed: false, recovery: { condition: "inspection-evidence" as const, reason: "The previous service instance is stopping." } }
+      : { ...check, checkedCommit: candidate.commit });
+  const goal = await planGoal(factory);
+  await factory.coordinator.tick(); await factory.coordinator.waitForIdle();
+  const task = factory.store.list<FactoryTask>("tasks")[0]!, attempt = factory.store.get<Attempt>("attempts", task.currentAttemptId!)!;
+  const detail = factory.store.get<AttemptDetail>("factory-attempt-details", attempt.id)!;
+  factory.coordinator.pause(goal.id);
+  const otherGoal = factory.goal(); factory.coordinator.pause(otherGoal.id);
+  const otherTask = { ...task, id: "other-goal-task", goalId: otherGoal.id, currentAttemptId: "other-goal-author" };
+  factory.store.set("tasks", otherTask);
+  factory.store.set("factory-task-details", { ...factory.store.get<TaskDetail>("factory-task-details", task.id)!, id: otherTask.id });
+  factory.store.set("attempts", { ...attempt, id: otherTask.currentAttemptId, taskId: otherTask.id });
+  factory.store.set("factory-attempt-details", { ...detail, id: otherTask.currentAttemptId, goalId: otherGoal.id, goalRevision: otherGoal.revision });
+  const recovered = factory.recover(); t.after(() => recovered.stop());
+  await recovered.start(); await recovered.waitForIdle();
+  for (let index = 0; index < 3; index++) { await recovered.tick(); await recovered.waitForIdle(); }
+  assert.equal(factory.calls.check, 1, "Restart preserves a known inspection wait without polling its source.");
+  assert.equal(factory.calls.execute, 1); assert.equal(factory.calls.capture, 1);
+  ready = true;
+  recovered.resume(goal.id);
+  const resumedTask = factory.store.get<FactoryTask>("tasks", task.id)!;
+  const resumedDetail = factory.store.get<AttemptDetail>("factory-attempt-details", attempt.id)!;
+  assert.equal(resumedTask.status, "review"); assert.equal(resumedTask.currentAttemptId, attempt.id);
+  assert.deepEqual(resumedTask.writePaths, ["apps/mail"]);
+  assert.deepEqual(resumedDetail.candidate, detail.candidate); assert.deepEqual(resumedDetail.contract, detail.contract);
+  assert.equal(resumedDetail.verificationWait, undefined);
+  assert.deepEqual(factory.store.get<AttemptDetail>("factory-attempt-details", otherTask.currentAttemptId)!.verificationWait, detail.verificationWait);
+  assert.equal(factory.store.get<Goal>("goals", otherGoal.id)!.status, "paused");
+  await recovered.tick(); await recovered.waitForIdle();
+  assert.equal(factory.calls.execute, 1); assert.equal(factory.calls.capture, 1); assert.equal(factory.calls.check, 2);
+  assert.equal(factory.store.get<FactoryTask>("tasks", task.id)!.status, "completed");
+  assert.equal(factory.store.get<Attempt>("attempts", attempt.id)!.generation, attempt.generation);
+  assert.equal(factory.store.list<Attempt>("attempts").length, 2, "Only the original authors exist, including the separately paused goal.");
+});
+
+test("inspection notification during public resume never requeues failed or unknown author outcomes", async () => {
+  const factory = harness(), goal = await planGoal(factory);
+  const base = factory.store.list<FactoryTask>("tasks")[0]!;
+  factory.coordinator.pause(goal.id);
+  for (const status of ["succeeded", "failed", "unknown"] as const) {
+    const id = `${status}-author`, task = { ...base, id: `${status}-task`, currentAttemptId: id, status: status === "failed" ? "failed" as const : "review" as const };
+    factory.store.set("tasks", task);
+    factory.store.set("factory-task-details", { ...factory.store.get<TaskDetail>("factory-task-details", base.id)!, id: task.id, ...(status === "failed" ? { waitingFor: "inspection-evidence" } : {}) });
+    factory.store.set<Attempt>("attempts", { id, taskId: task.id, generation: 1, deviceId: device.id, status, startedAt: device.lastSeen });
+    factory.store.set<AttemptDetail>("factory-attempt-details", { id, goalId: goal.id, goalRevision: goal.revision, phase: "checking", cancellation: "none", candidate: { id: "retained", commit: "C", baseCommit: "B" }, verificationWait: { condition: "inspection-evidence", reason: "Waiting", since: device.lastSeen } });
+  }
+  factory.coordinator.resume(goal.id);
+  assert.equal(factory.store.get<AttemptDetail>("factory-attempt-details", "succeeded-author")!.verificationWait, undefined);
+  for (const status of ["failed", "unknown"] as const) {
+    assert.equal(factory.store.get<Attempt>("attempts", `${status}-author`)!.status, status);
+    assert.equal(factory.store.get<FactoryTask>("tasks", `${status}-task`)!.currentAttemptId, `${status}-author`);
+    assert.equal(factory.store.get<AttemptDetail>("factory-attempt-details", `${status}-author`)!.verificationWait!.condition, "inspection-evidence");
+  }
+  assert.equal(factory.store.get<FactoryTask>("tasks", "failed-task")!.status, "failed");
+  assert.equal(factory.store.get<TaskDetail>("factory-task-details", "failed-task")!.waitingFor, "inspection-evidence");
+  assert.equal(factory.calls.execute, 0);
+});
+
 test("a confirmed pre-write combined-source inspection wait resumes the same candidate", async () => {
   const worker: Device = { ...device, executionTargets: [
     { id: "container", kind: "container", protocolVersion: 1, readiness: "ready",
