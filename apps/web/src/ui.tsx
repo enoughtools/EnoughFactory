@@ -1,4 +1,4 @@
-import type { ReactNode } from 'react';
+import { useRef, type ReactNode } from 'react';
 import { Button, Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle, Input, Spinner } from '@enoughtools/ui-react';
 import { ArrowUpRight, X } from 'lucide-react';
 
@@ -18,7 +18,8 @@ export function Loading({ children = 'Connecting to your workspace…' }: { chil
   return <div className="empty-state" role="status"><Spinner className="factory-spinner" style={{ width: 24, height: 24 }} aria-hidden="true" /><div className="empty-description">{children}</div></div>;
 }
 export function Modal({ open, onClose, title, description, children, className }: { open: boolean; onClose: () => void; title: string; description: string; children: ReactNode; className?: string }) {
-  return <Dialog open={open} onOpenChange={(value: boolean) => !value && onClose()}><DialogContent className={className}><DialogHeader><DialogTitle>{title}</DialogTitle><DialogDescription>{description}</DialogDescription></DialogHeader>{children}</DialogContent></Dialog>;
+  const titleRef = useRef<HTMLHeadingElement>(null);
+  return <Dialog open={open} onOpenChange={(value: boolean) => !value && onClose()}><DialogContent className={className} onOpenAutoFocus={event => { event.preventDefault(); titleRef.current?.focus({ preventScroll: true }); }}><DialogHeader className="modal-heading"><DialogTitle ref={titleRef} tabIndex={-1}>{title}</DialogTitle><DialogDescription>{description}</DialogDescription></DialogHeader>{children}</DialogContent></Dialog>;
 }
 export function Field({ label, hint, children }: { label: string; hint?: string; children: ReactNode }) {
   return <label className="form-field"><span>{label}</span>{children}{hint && <span className="field-hint">{hint}</span>}</label>;

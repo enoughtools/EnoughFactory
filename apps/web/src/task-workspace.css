@@ -68,9 +68,10 @@
 .task-runtime-pane .page-header, .task-runtime-pane .session-tabs { margin-bottom: 8px; }
 .task-service-notice { font-size: 11px; line-height: 1.5; padding: 7px 9px; border: 1px solid var(--factory-line); color: var(--factory-secondary); margin-bottom: 8px; }
 .task-service-notice details { font-size: 10px; margin-top: 4px; }
-.goal-details-modal { max-width: 760px; max-height: calc(100dvh - 64px); display: flex; flex-direction: column; }
-.goal-details-content { min-height: 0; overflow: auto; font-size: 12px; line-height: 1.6; padding-right: 8px; }
-.goal-details-content > section { margin-bottom: 18px; }
+[data-slot="dialog-content"].goal-details-modal { max-width: 760px; max-height: calc(100dvh - 32px); display: flex; flex-direction: column; overflow: hidden; padding: 0; gap: 0; }
+.goal-details-modal > .modal-heading { padding: 18px 52px 18px 20px; border-bottom: 1px solid var(--factory-line); }
+.goal-details-content { min-height: 0; overflow-y: auto; overscroll-behavior: contain; scrollbar-gutter: stable; font-size: 12px; line-height: 1.6; padding: 20px; }
+.goal-details-content > section { margin-bottom: 20px; }
 .goal-details-content h3 { font-size: 11px; font-weight: 600; margin-bottom: 7px; }
 .goal-details-content p { white-space: pre-wrap; overflow-wrap: anywhere; }
 .goal-details-content ul { list-style: disc; padding-left: 18px; }
@@ -82,11 +83,12 @@
 .goal-plan-details summary { cursor: pointer; font-weight: 500; }
 .goal-plan-details p { white-space: pre-wrap; margin: 8px 0; }
 .goal-plan-details code { overflow-wrap: anywhere; }
-.goal-details-content .goal-steering { margin-top: 18px; padding: 0; }
+.goal-details-content .goal-steering { margin: 20px 0; padding: 0; border: 0; background: transparent; }
 .goal-details-content .goal-steering .form-field { display: flex; flex-direction: column; align-items: stretch; gap: 7px; }
 .goal-details-content .steering-input { display: flex; gap: 8px; }
 .goal-details-content .steering-input input { min-width: 0; flex: 1; }
 .goal-details-danger { display: flex; flex-wrap: wrap; align-items: center; gap: 9px; padding-top: 10px; border-top: 1px solid var(--factory-line); font-size: 10px; color: var(--factory-secondary); }
+.goal-details-danger > [data-slot="button"] { color: var(--factory-danger); }
 .decision-actions { display: flex; gap: 5px; }
 .decision-item details { font-size: 10px; margin-top: 7px; }
 .decision-item pre { max-height: 260px; overflow: auto; }
