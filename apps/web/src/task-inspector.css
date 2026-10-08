@@ -144,3 +144,6 @@
 .ti-task-wait summary { cursor: pointer; color: var(--factory-secondary); }
 .ti-task-wait details p { margin-top: 8px; }
 @media (max-width: 700px) { .ti-task-wait { padding-inline: 16px; } }
+@media (min-width: 761px) and (min-height: 640px) {
+  .task-inspector[data-sticky-header="true"] > .ti-header { position: sticky; top: 0; z-index: 2; background: var(--factory-surface); box-shadow: 0 1px 0 var(--factory-line); }
+}

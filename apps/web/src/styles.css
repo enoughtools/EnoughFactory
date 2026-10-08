@@ -117,7 +117,14 @@ pre { margin: 0; }
 .breadcrumb strong { font-weight: 500; color: var(--factory-ink); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .workspace-return { flex-shrink: 0; padding: 4px var(--factory-workspace-gutter); border-bottom: 1px solid var(--factory-line); }
 .workspace-content { flex: 1; min-width: 0; min-height: 0; width: 100%; padding: var(--factory-workspace-gutter); margin: 0; overflow: auto; }
-.workspace-content.has-session { display: flex; flex-direction: column; overflow: hidden; }
+/* Fixed workspace panes own their content gutters, so their scrollbars reach the window edges. */
+.workspace-content.has-session { display: flex; flex-direction: column; overflow: hidden; padding-right: 0; padding-bottom: 0; }
+.workspace-content.has-session > .session-workspace > .page-header,
+.workspace-content.has-session > .session-workspace > .session-tabs { margin-right: var(--factory-workspace-gutter); }
+.workspace-content.has-session > .session-workspace > .notice,
+.workspace-content.has-session > .session-workspace > .error-banner,
+.workspace-content.has-session > .session-workspace > .connection-banner,
+.workspace-content.has-session > .session-workspace > .runtime-panel { margin-right: var(--factory-workspace-gutter); }
 .workspace-content > .page-header { padding: 0 0 16px; margin-bottom: 0; }
 .page-header { display: flex; justify-content: space-between; align-items: center; flex-shrink: 0; gap: 16px; margin-bottom: 18px; min-width: 0; }
 .page-header > div:first-child { min-width: 0; }

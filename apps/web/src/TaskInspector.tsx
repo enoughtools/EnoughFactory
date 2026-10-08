@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import type { Artifact, AttemptInspection, FactoryState, FactoryTask, Goal, TaskCheck, TaskInspection } from '@enoughfactory/contracts';
 import { criticalPathMinutes } from '@enoughfactory/factory/scheduler';
 import { ArrowRight, ArrowUpRight, Clock3, Download, FileText, History, ListChecks, MessageSquare, Play, RotateCcw, ShieldOff } from 'lucide-react';
@@ -168,6 +168,28 @@ export function TaskInspector({ inspection, state, goal, selectedAttemptId, disp
   const [retryOpen, setRetryOpen] = useState(false);
   const [retryDraft, setRetryDraft] = useState<RetryDraft | null>(null);
   const [retryError, setRetryError] = useState<string | null>(null);
+  const inspectorElement = useRef<HTMLElement>(null);
+  useEffect(() => {
+    const inspector = inspectorElement.current;
+    const header = inspector?.querySelector<HTMLElement>('.ti-header');
+    const viewport = inspector?.closest<HTMLElement>('.task-inspection-pane');
+    if (!inspector || !header || !viewport) return;
+    const media = window.matchMedia('(min-width: 761px) and (min-height: 640px)');
+    const update = () => {
+      const height = header.offsetHeight;
+      const sticky = media.matches && height <= viewport.clientHeight * .45;
+      inspector.dataset.stickyHeader = String(sticky);
+      viewport.style.setProperty('--task-header-offset', sticky ? `${height + 12}px` : '12px');
+    };
+    const observer = new ResizeObserver(update);
+    observer.observe(header); observer.observe(viewport);
+    media.addEventListener('change', update); update();
+    return () => {
+      observer.disconnect(); media.removeEventListener('change', update);
+      viewport.style.removeProperty('--task-header-offset');
+      delete inspector.dataset.stickyHeader;
+    };
+  }, [inspection.task.id]);
   useEffect(() => { setTab('overview'); setRetryOpen(false); setRetryDraft(null); setRetryError(null); }, [inspection.task.id]);
   const { task } = inspection;
   const criticalMinutes = useMemo(() => {
@@ -217,7 +239,7 @@ export function TaskInspector({ inspection, state, goal, selectedAttemptId, disp
     });
   }
   const selectAttempt = (id: string) => onSelectAttempt(id);
-  return <section className="task-inspector" aria-label={`Inspect ${task.title}`} aria-busy={busy !== null}>
+  return <section className="task-inspector" ref={inspectorElement} aria-label={`Inspect ${task.title}`} aria-busy={busy !== null}>
     <header className="ti-header"><div><p className="ti-eyebrow">{task.kind ?? 'Task'}{inspection.planRevision !== undefined ? ` · Plan ${inspection.planRevision}` : ''}</p><h2>{task.title}</h2><div className="ti-header-meta"><Status state={inspection.state} label={task.status === 'canceled' ? 'Canceled task' : undefined} /><span>{device?.name ?? 'Unassigned'}{device?.online === false ? ' · offline' : ''}</span>{attempt && <span>Attempt {attempt.generation}{historical ? ' · previous' : ''}</span>}</div></div>
       <div className="ti-actions">{canRun && <Button size="sm" disabled={busy !== null} onClick={() => void act('run', () => client.post(`/api/tasks/${encodeURIComponent(task.id)}/run`, { expectedGoalRevision: goal.revision }))}><Play size={13} />{busy === 'run' ? 'Starting…' : 'Run task'}</Button>}{canRetry && <Button size="sm" variant="outline" disabled={busy !== null} onClick={openRetry}><RotateCcw size={13} />Retry task with instructions</Button>}{sessionId && <Button size="sm" variant="ghost" onClick={() => openSession(sessionId)}><ArrowUpRight size={13} />Workspace</Button>}{chatId && chatSessionId && onOpenChat && <Button size="sm" variant="ghost" onClick={() => onOpenChat(chatSessionId, chatId)}><MessageSquare size={13} />Agent chat</Button>}</div>
     </header>
