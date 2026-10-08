@@ -2,7 +2,8 @@ import { copyFile, cp, mkdir, rm, writeFile } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import path from 'node:path';
 import type { Attempt, DevelopmentToolchain, FactoryTask, Goal, Project } from '@enoughfactory/contracts';
-import type { AttemptDetail, CandidateRef, CheckResult, ControlRecord, FactoryRuntimePort, FactoryStore, GoalCheckRecord, RepositoryEvidence, TaskDetail } from '@enoughfactory/factory';
+import { controllerTaskContract, controllerAttemptContract, controllerContractReference, FactoryControllerError } from '@enoughfactory/factory';
+import type { AttemptDetail, CandidateRef, CheckResult, ControlRecord, ControllerRecordRequirement, FactoryRuntimePort, FactoryStore, GoalCheckRecord, RepositoryEvidence, TaskDetail } from '@enoughfactory/factory';
 import type { WorkingDirectoryManager, WorkingDirectorySnapshot, WorkingDirectorySource, WorkspaceManager } from '@enoughfactory/workspaces';
 import { exec } from './util.ts';
 
@@ -33,6 +34,7 @@ interface ContextManifest {
   records?: Array<{
     record: string; path: string; sha256: string; size: number; taskId?: string; attemptId?: string; generation?: number;
     goalRevision?: number; repositoryHead?: string; matchesGoalRevision?: boolean;
+    contract?: ControllerRecordRequirement;
     candidate?: { id: string; commit: string; baseCommit: string };
     checks: Array<{ record: string; command: string; passed: boolean; exitCode?: number; candidateCommit: string; checkedCommit?: string; outputSha256: string; outputSize: number }>;
   }>;
@@ -54,6 +56,7 @@ export async function prepareControllerContext(input: {
   operation: string; goalId: string; role: ControllerRole | 'worker'; project: Project; store: FactoryStore;
   workspaces: WorkspaceManager; directoryManager: WorkingDirectoryManager; dataDir: string;
   selected?: SelectedCandidate[]; contextName?: string; bundlesOnly?: boolean; maxBundleBytes?: number;
+  recordRequirements?: ControllerRecordRequirement[];
   assignment?: ContextManifest['assignment']; assertCurrent?: () => void;
 }): Promise<{ workingDirectorySources: WorkingDirectorySource[]; instructions: string }> {
   if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,100}$/.test(input.operation)) throw new Error('Invalid controller context identity.');
@@ -72,6 +75,13 @@ export async function prepareControllerContext(input: {
   // Materialize allowlisted JSON synchronously so subsequent awaits cannot turn
   // one evidence snapshot into a mixture of differently timed journal records.
   const records = input.role === 'worker' ? [] : controllerRecords(input.store, input.goalId, goal?.revision);
+  for (const requirement of input.recordRequirements ?? []) {
+    const record = records.find(record => record.record === requirement.record);
+    const contract = record && JSON.parse(record.bytes).contract;
+    if (requirement.field !== '.contract' || contract === undefined) throw new FactoryControllerError(`The required controller contract ${requirement.record} is unavailable in the current evidence snapshot.`, 'controller-retry-required');
+    const actual = controllerContractReference(requirement.record, contract);
+    if (actual.sha256 !== requirement.sha256 || actual.size !== requirement.size) throw new FactoryControllerError(`The required controller contract ${requirement.record} changed before its evidence snapshot was prepared. Retry from the current contract.`, 'controller-retry-required');
+  }
   const selected = input.selected ?? (input.role === 'worker' ? [] : controllerCandidates(input.store, input.goalId, input.role));
   const roots = input.project.workingDirectories?.length
     ? await input.directoryManager.prepare({ identity: `${input.operation}-project-context`, sources: input.project.workingDirectories }) : [];
@@ -199,7 +209,9 @@ function controllerRecords(store: FactoryStore, goalId: string, revision?: numbe
   const records: Array<Omit<NonNullable<ContextManifest['records']>[number], 'path'> & { bytes: string }> = [];
   const add = (record: string, value: unknown, identity: Omit<NonNullable<ContextManifest['records']>[number], 'record' | 'path' | 'sha256' | 'size' | 'checks'>, checks: NonNullable<ContextManifest['records']>[number]['checks'] = []) => {
     const bytes = `${JSON.stringify(value)}\n`;
-    records.push({ record, ...identity, checks, bytes, sha256: createHash('sha256').update(bytes).digest('hex'), size: Buffer.byteLength(bytes) });
+    const contract = value && typeof value === 'object' && 'contract' in value ? value.contract : undefined;
+    records.push({ record, ...identity, checks, bytes, sha256: createHash('sha256').update(bytes).digest('hex'), size: Buffer.byteLength(bytes),
+      ...(contract === undefined ? {} : { contract: controllerContractReference(record, contract) }) });
   };
   const checkIdentities = (checks: CheckResult[] | undefined, record: string) => (checks ?? []).map((check, index) => ({
     record: `${record}[${index}]`, command: check.command, passed: check.passed, exitCode: check.exitCode,
@@ -214,6 +226,8 @@ function controllerRecords(store: FactoryStore, goalId: string, revision?: numbe
   for (const owner of [...tasks.values()].sort((left, right) => left.id.localeCompare(right.id))) {
     const detail = store.get<TaskDetail>('factory-task-details', owner.id);
     if (!detail) continue;
+    add(`tasks/${owner.id}`, { id: owner.id, goalId, key: detail.key, status: owner.status, deviceId: owner.deviceId,
+      currentAttemptId: owner.currentAttemptId, contract: controllerTaskContract(owner, detail) }, { taskId: owner.id, goalRevision: revision });
     add(`factory-task-details/${owner.id}`, { id: owner.id, goalId, key: detail.key, planRevision: detail.planRevision,
       checks: detail.checks, planChecks: detail.planChecks, lastError: detail.lastError,
       lastCandidate: candidateEvidence(detail.lastCandidate), repairInstructions: detail.repairInstructions, replanInstructions: detail.replanInstructions,
@@ -235,7 +249,7 @@ function controllerRecords(store: FactoryStore, goalId: string, revision?: numbe
     const record = `factory-attempt-details/${detail.id}`;
     const candidate = detail.candidate ? { id: detail.candidate.id, commit: detail.candidate.commit, baseCommit: detail.candidate.baseCommit } : undefined;
     add(record, { id: detail.id, goalId: detail.goalId, goalRevision: detail.goalRevision, assignmentGoalRevision: detail.assignmentGoalRevision,
-      phase: detail.phase, cancellation: detail.cancellation, contract: contractEvidence(detail.contract),
+      phase: detail.phase, cancellation: detail.cancellation, contract: controllerAttemptContract(detail.contract),
       candidate: candidateEvidence(detail.candidate),
       workspace: detail.workspace ? { id: detail.workspace.id, baseCommit: detail.workspace.baseCommit, provider: detail.workspace.provider,
         sessionId: detail.workspace.sessionId, deviceId: detail.workspace.deviceId,
@@ -259,12 +273,6 @@ function controllerRecords(store: FactoryStore, goalId: string, revision?: numbe
 function toolchainEvidence(value?: DevelopmentToolchain) {
   return value ? { id: value.id, recipeSha256: value.recipeSha256, image: value.image, baseImage: value.baseImage,
     platform: value.platform, swiftVersion: value.swiftVersion, nodeVersion: value.nodeVersion } : undefined;
-}
-function contractEvidence(value: AttemptDetail['contract']) {
-  return value ? { title: value.title, description: value.description, kind: value.kind, acceptanceCriteria: value.acceptanceCriteria,
-    expectedOutputs: value.expectedOutputs, estimatedMinutes: value.estimatedMinutes, writePaths: value.writePaths,
-    resources: value.resources ? { cpus: value.resources.cpus, memoryGiB: value.resources.memoryGiB } : undefined,
-    dependsOn: value.dependsOn, checks: value.checks, planRevision: value.planRevision } : undefined;
 }
 function artifactEvidence(value: unknown) {
   if (!value || typeof value !== 'object') return undefined;

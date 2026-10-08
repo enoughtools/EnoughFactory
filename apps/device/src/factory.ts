@@ -643,11 +643,15 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
     },
   };
   const runtime: FactoryRuntimePort = {
-    async complete({ goal, role, prompt, project, signal }) {
+    controllerRecordReferences: true,
+    async complete({ goal, role, prompt, project, signal, recordRequirements }) {
       let providerInvoked = false;
       let releaseDisk=()=>{};
       return app.withRuntimeOperation(async runtimeSignal=>{
-      releaseDisk=hostDisk.reserve(`controller:${goal.id}:${role}`,preparationArtifactBytes(preparationArtifacts(controllerCandidates(app.store,goal.id,role).map(item=>item.candidate))));
+      // Completion audits inspect the integrated tree and stored evidence;
+      // duplicating every historical candidate would scale with all past work.
+      const sourceCandidates = role === 'evaluator' ? [] : controllerCandidates(app.store, goal.id, role);
+      releaseDisk=hostDisk.reserve(`controller:${goal.id}:${role}`,preparationArtifactBytes(preparationArtifacts(sourceCandidates.map(item=>item.candidate))));
       signal=signal?AbortSignal.any([signal,runtimeSignal]):runtimeSignal;
       if (signal?.aborted) throw new Error('The controller decision was revoked.');
       await app.ensureRuntimeReady();
@@ -670,7 +674,7 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
         const workspace = await workspaces.create({ projectPath: project.path, goalId: goal.id, taskId: `control-${role}`, attemptId: operation,developmentToolchain:developmentToolchain==='default'?undefined:developmentToolchain });
         await configureHandoff(workspace);
         const context = await prepareControllerContext({ operation, goalId: goal.id, role, project, store: app.store,
-          workspaces, directoryManager: app.sessions.directoryManager, dataDir: app.dataDir });
+          workspaces, directoryManager: app.sessions.directoryManager, dataDir: app.dataDir, recordRequirements, selected: sourceCandidates });
         if (signal?.aborted) throw new Error('The controller decision was revoked.');
         hostDisk.assert();
         const owned = internalProject({...project,runtime:goal.runtime}, workspace, `${goal.title} · ${role}`);
@@ -687,7 +691,7 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
         app.store.set('factory-controller-runs', { ...record, chatId: chat.id, status: 'running', updatedAt: now() });
         providerInvoked = true;
         const result = await chats.run(chat.id, prompt, { autonomous: goal.autonomy === 'autonomous',
-          systemInstructions: [`You are the EnoughFactory ${role}. This container contains an isolated snapshot of the current project repository. Inspect the actual source and relevant runtime evidence to make your decision. You have full container permissions under ${goal.approvalMode} policy. Your role is to decide the next factory action; implementation belongs to assigned worker tasks. Do not modify product source as part of this decision. Return the structured JSON requested in the prompt. Goal: ${goal.objective}`, validationInstructions(), toolchainInstructions(app.sessions.record(session.id).developmentToolchain), context.instructions].filter(Boolean).join('\n\n') });
+          systemInstructions: [`You are the EnoughFactory ${role}. This container contains an isolated snapshot of the current project repository. Inspect the actual source and relevant runtime evidence to make your decision. You have full container permissions under ${goal.approvalMode} policy. Your role is to decide the next factory action; implementation belongs to assigned worker tasks. Do not modify product source as part of this decision. Return the structured JSON requested in the prompt. Goal: ${goal.objective}`, role === 'evaluator' ? 'Audit current behavior in the integrated primary repository. Historical candidate source bundles are not duplicated into this audit; full stored task/attempt contracts, checks and integration records remain available through the evidence manifest. Historical artifact references do not promise their bodies are present and cannot be claimed inspected.' : '', validationInstructions(), toolchainInstructions(app.sessions.record(session.id).developmentToolchain), context.instructions].filter(Boolean).join('\n\n') });
         app.store.set('factory-controller-runs', { ...record, chatId: chat.id, status: 'completed', updatedAt: now(), result: result.text });
         return { text: result.text, chatId: chat.id, spend: spend(result) };
       } catch (error) {

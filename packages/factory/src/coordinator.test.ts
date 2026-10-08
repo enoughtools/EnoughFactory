@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import test from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
 import type { Attempt, Decision, Device, FactoryTask, Goal, Project } from "@enoughfactory/contracts";
 import { FactoryCoordinator } from "./coordinator.js";
 import { FactoryControllerError } from "./errors.js";
 import { readPlan } from "./protocol.js";
+import { CONTROLLER_PROMPT_LIMIT, controllerTaskContract, controllerAttemptContract } from "./controller-evidence.js";
 import type {
   AttemptDetail, CandidateRef, ControlRecord, EvaluationRecord, EvaluationResponse, ExecutionResult, FactoryRuntimePort,
   FactoryStore, FactoryWorkspacePort, PlanRecord, PlanResponse, TaskDetail,
@@ -65,6 +67,7 @@ function harness(devices: Device[] = [device], now?: () => Date) {
   let executing: () => Promise<ExecutionResult> = async () => ({ status: "succeeded", text: "Implementation complete" });
   let diagnosing = async () => ({ action: "retry", reason: "The expected route was missing", instructions: "Add the missing route and verify the response" });
   const diagnosisPrompts: string[] = [];
+  const controllerInputs: Parameters<FactoryRuntimePort["complete"]>[0][] = [];
   let reconciling: FactoryRuntimePort["reconcile"] = async () => ({ status: "unknown" });
   let beforeIntegrationWrite: () => Promise<void> = async () => {};
   let afterIntegrationWrite: () => Promise<void> = async () => {};
@@ -77,6 +80,7 @@ function harness(devices: Device[] = [device], now?: () => Date) {
   };
   const runtime: FactoryRuntimePort = {
     async complete(input) {
+      controllerInputs.push(structuredClone({ ...input, signal: undefined }));
       if (input.role === "planner") { calls.planner++; planningPrompts.push(input.prompt); return { text: JSON.stringify(await planning()) }; }
       if (input.role === "evaluator") { calls.evaluator++; evaluationPrompts.push(input.prompt); return { text: JSON.stringify(await evaluating()) }; }
       calls.diagnosis++;
@@ -120,7 +124,7 @@ function harness(devices: Device[] = [device], now?: () => Date) {
   const coordinator = new FactoryCoordinator(options);
   const goal = () => coordinator.create({ projectId: project.id, objective: "Build the feature and publish its release", criteria, autonomy: "autonomous", approvalMode: "approve-all", concurrency: 1 });
   return {
-    store, calls, coordinator, goal, planningPrompts, executionPrompts, evaluationPrompts, diagnosisPrompts, candidateCommands, integrationCommands, goalCommands, workspaces, recover: () => new FactoryCoordinator(options),
+    store, calls, coordinator, goal, planningPrompts, executionPrompts, evaluationPrompts, diagnosisPrompts, candidateCommands, integrationCommands, goalCommands, workspaces, runtime, controllerInputs, recover: () => new FactoryCoordinator(options),
     planning(fn: typeof planning) { planning = fn; },
     evaluating(fn: typeof evaluating) { evaluating = fn; },
     executing(fn: typeof executing) { executing = fn; },
@@ -240,6 +244,72 @@ test("controllers retain every contract and exact evidence identity without embe
   const receipt = factory.store.list<import("./types.js").GoalCheckRecord>("factory-goal-checks")[0]!;
   assert.equal(receipt.checks[0]!.output, output, "the whole-goal receipt preserves the full failure");
   assert.ok(factory.store.get<ControlRecord>("factory-control", goal.id)!.replanReason!.length < 100_000, "future replans do not re-embed the full check log");
+  assert.deepEqual(factory.store.get<Goal>("goals", goal.id)!.criteria, originalCriteria);
+});
+
+test("a 57-task evaluation uses verified full contract references and reuses its failed final-check receipt", async () => {
+  const factory = harness(), created = factory.goal();
+  const originalCriteria = Array.from({ length: 9 }, (_, index) => `Exact original criterion ${index}: deliver the complete native behavior`);
+  const goal: Goal = { ...created, revision: 25, status: "running", criteria: originalCriteria };
+  const repository = { head: "exact-final-source", branch: "main", status: "", fingerprint: "exact-final-tree" };
+  const command = "bash scripts/final-internal-acceptance.sh";
+  factory.store.set("goals", goal);
+  factory.store.set<ControlRecord>("factory-control", { ...factory.store.get<ControlRecord>("factory-control", goal.id)!, stage: "evaluate", steering: ["Preserve every original requirement and all accepted implementation."] });
+  factory.store.set<PlanRecord>("factory-plans", { id: goal.id, goalId: goal.id, revision: 25, summary: "Whole product acceptance", checks: [command], checkScope: "goal", taskKeys: {}, createdAt: device.lastSeen });
+  const contracts = new Map<string, unknown>();
+  for (let index = 0; index < 57; index++) {
+    const task: FactoryTask = { id: `accepted-${index}`, goalId: goal.id, title: `Accepted behavior ${index}`,
+      description: `Complete contract ${index}: ${"Preserve the full product behavior, integration, recovery and delivery requirements. ".repeat(120)}`,
+      kind: "feature", acceptanceCriteria: [`Unique required behavior ${index}`], expectedOutputs: [`Unique required deliverable ${index}`],
+      dependsOn: [], status: "completed", currentAttemptId: `attempt-${index}`, createdAt: device.lastSeen, updatedAt: device.lastSeen };
+    const detail: TaskDetail = { id: task.id, key: `accepted-key-${index}`, checks: [`check-feature-${index}`], planChecks: [], planRevision: 24, selected: false, failureSignatures: [] };
+    const historical = { title: task.title, description: task.description, kind: task.kind, acceptanceCriteria: task.acceptanceCriteria,
+      expectedOutputs: task.expectedOutputs, dependsOn: task.dependsOn, checks: detail.checks, planRevision: 24 };
+    factory.store.set("tasks", task); factory.store.set("factory-task-details", detail);
+    factory.store.set<Attempt>("attempts", { id: task.currentAttemptId!, taskId: task.id, generation: 1, deviceId: device.id, status: "succeeded", startedAt: device.lastSeen });
+    factory.store.set<AttemptDetail>("factory-attempt-details", { id: task.currentAttemptId!, goalId: goal.id, goalRevision: 24, phase: "done", cancellation: "none", contract: historical,
+      candidate: { id: `candidate-${index}`, commit: `source-${index}`, baseCommit: "base" },
+      result: { status: "succeeded", text: `Worker claims completion ${index}` },
+      checks: [{ command: detail.checks[0]!, passed: true, exitCode: 0, output: "Focused check passed", candidateCommit: `source-${index}` }],
+      integration: { commit: `integrated-${index}`, previousHead: "base", candidateCommit: `source-${index}`, checks: [] } });
+    contracts.set(`tasks/${task.id}`, controllerTaskContract(task, detail));
+    contracts.set(`factory-attempt-details/${task.currentAttemptId}`, controllerAttemptContract(historical));
+  }
+  const attemptsBefore = factory.store.list<AttemptDetail>("factory-attempt-details");
+  factory.inspect(async () => repository);
+  factory.goalChecking(async () => ({ repository, checks: [{ command, passed: false, output: "Missing native.AccountServices account-provisioning mapping", exitCode: 1, candidateCommit: repository.head, checkedCommit: repository.head }] }));
+  factory.evaluating(async () => ({ complete: false, summary: "Repair the actual account provisioning boundary", criteria: originalCriteria.map(criterion => ({ criterion, satisfied: false, evidence: [] })),
+    additionalTasks: [{ key: "repair-provisioning", title: "Repair account provisioning", description: "Wire the missing native account provisioning boundary", dependsOn: [], checks: ["check-provisioning"] }] }));
+  await factory.coordinator.tick(); await factory.coordinator.waitForIdle();
+  assert.equal(factory.calls.evaluator, 0, "a runtime without mounted record support cannot silently omit the contracts");
+  assert.equal(factory.calls.goalCheck, 1);
+  assert.equal(factory.store.get<Goal>("goals", goal.id)!.status, "waiting");
+  assert.deepEqual(factory.store.get<Goal>("goals", goal.id)!.criteria, originalCriteria);
+  const receiptBefore = factory.store.list<import("./types.js").GoalCheckRecord>("factory-goal-checks");
+  factory.runtime.controllerRecordReferences = true;
+  factory.coordinator.resume(goal.id);
+  await factory.coordinator.tick(); await factory.coordinator.waitForIdle();
+  assert.equal(factory.calls.evaluator, 1, "the entire goal reaches evaluation without manual splitting");
+  assert.equal(factory.calls.goalCheck, 1, "the unchanged failed final snapshot receipt is reused after context recovery");
+  assert.deepEqual(factory.store.list("factory-goal-checks"), receiptBefore);
+  const input = factory.controllerInputs[0]!;
+  assert.ok(Buffer.byteLength(input.prompt) < CONTROLLER_PROMPT_LIMIT);
+  assert.ok(input.prompt.includes(goal.objective));
+  for (const criterion of originalCriteria) assert.ok(input.prompt.includes(criterion));
+  assert.ok(input.prompt.includes("Inspect every accepted task contract"));
+  assert.ok(input.prompt.includes("Missing native.AccountServices account-provisioning mapping"));
+  assert.equal(input.recordRequirements!.length, 114, "all current and historical contracts remain accessible");
+  for (const reference of input.recordRequirements!) {
+    const canonical = JSON.stringify(contracts.get(reference.record));
+    assert.equal(reference.field, ".contract");
+    assert.equal(reference.sha256, createHash("sha256").update(canonical).digest("hex"));
+    assert.equal(reference.size, Buffer.byteLength(canonical));
+    assert.ok(input.prompt.includes(reference.record));
+    assert.ok(input.prompt.includes(reference.sha256));
+  }
+  assert.deepEqual(factory.store.list("factory-attempt-details"), attemptsBefore, "the reference projection cannot alter historical contracts or their evidence");
+  assert.equal(factory.store.list<FactoryTask>("tasks").filter(task => task.status === "completed").length, 57);
+  assert.equal(factory.store.list<FactoryTask>("tasks").filter(task => task.status === "queued").length, 1);
   assert.deepEqual(factory.store.get<Goal>("goals", goal.id)!.criteria, originalCriteria);
 });
 

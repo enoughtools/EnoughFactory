@@ -54,11 +54,18 @@ export interface ExecutionResult {
   agentStarted?: false;
 }
 export interface FactoryRuntimePort {
-  complete(input: { goal: Goal; role: "planner" | "evaluator" | "diagnosis"; prompt: string; project: Project; signal?: AbortSignal }): Promise<{ text: string; chatId?: string; spend?: number }>;
+  /** Promises immutable mounted JSON records, verified against complete() requirements. */
+  controllerRecordReferences?: true;
+  complete(input: { goal: Goal; role: "planner" | "evaluator" | "diagnosis"; prompt: string; project: Project; signal?: AbortSignal; recordRequirements?: ControllerRecordRequirement[] }): Promise<{ text: string; chatId?: string; spend?: number }>;
   execute(input: { goal: Goal; task: FactoryTask; attempt: Attempt; workspace: WorkspaceRef; prompt: string; project: Project; assignmentGoalRevision?: number }): Promise<ExecutionResult>;
   reconcile(attempt: Attempt): Promise<{ status: "prepared" | "running" | "succeeded" | "failed" | "unknown"; result?: ExecutionResult; workspace?: WorkspaceRef }>;
   /** Returns after the owner acknowledges cancellation; rejection leaves termination unknown. */
   cancel(attempt: Attempt): Promise<void>;
+}
+
+/** Digest of the canonical contract subobject, distinct from the enclosing record file digest. */
+export interface ControllerRecordRequirement {
+  record: string; field: ".contract"; sha256: string; size: number;
 }
 
 export interface PlannedTask {

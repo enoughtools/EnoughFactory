@@ -7,7 +7,8 @@ import path from 'node:path';
 import { promisify } from 'node:util';
 import test, { type TestContext } from 'node:test';
 import type { Attempt, FactoryTask, Project } from '@enoughfactory/contracts';
-import type { AttemptDetail, CandidateRef, FactoryStore, GoalCheckRecord } from '@enoughfactory/factory';
+import { controllerTaskContract, controllerAttemptContract, controllerContractReference } from '@enoughfactory/factory';
+import type { AttemptDetail, CandidateRef, ControllerRecordRequirement, FactoryStore, GoalCheckRecord, TaskDetail } from '@enoughfactory/factory';
 import { WorkingDirectoryManager, WorkspaceManager } from '@enoughfactory/workspaces';
 import { controllerCandidates, prepareControllerContext } from './controller-context.ts';
 
@@ -108,8 +109,10 @@ test('controllers receive complete isolated same-goal execution/check JSON even 
   store.set('factory-control', { id: 'goal', stage: 'plan', steering: ['Keep the original criteria'], replanReason: output,
     replanInstructions: 'Use retained evidence', token: secret });
   const details: AttemptDetail[] = [];
+  const requirements: ControllerRecordRequirement[] = [];
   for (const [id, status, revision] of [['accepted', 'completed', 12], ['repair', 'failed', 13]] as const) {
-    const owner = { ...task(id, status), currentAttemptId: `${id}-attempt` };
+    const owner = { ...task(id, status), description: `${id}: ${'Complete requirement café 📬\n'.repeat(1000)}`,
+      acceptanceCriteria: ['Preserve the exact native workflow'], expectedOutputs: ['Working client behavior'], currentAttemptId: `${id}-attempt` };
     store.set('tasks', owner);
     const attempt: Attempt = { id: owner.currentAttemptId, taskId: owner.id, generation: 2, deviceId: 'device', status: status === 'completed' ? 'succeeded' : 'failed', startedAt: owner.createdAt, error: output };
     store.set('attempts', { ...attempt, token: secret });
@@ -122,8 +125,11 @@ test('controllers receive complete isolated same-goal execution/check JSON even 
       workspace: { id: `${id}-workspace`, path: '/private/live-worker', provider: 'git', baseCommit: 'base', providerState: { token: secret } },
       integration: { commit: `${id}-integrated`, previousHead: 'base', candidateCommit: candidate.commit, checks } };
     details.push(detail); store.set('factory-attempt-details', { ...detail, settings: { token: secret } });
-    store.set('factory-task-details', { id: owner.id, key: id, planRevision: revision, checks: [checks[0]!.command],
-      lastError: output, lastCandidate: detail.candidate, repairInstructions: 'Keep useful work', token: secret });
+    const taskDetail = { id: owner.id, key: id, planRevision: revision, checks: [checks[0]!.command], selected: false, failureSignatures: [],
+      lastError: output, lastCandidate: detail.candidate, repairInstructions: 'Keep useful work', token: secret };
+    store.set('factory-task-details', taskDetail);
+    requirements.push(controllerContractReference(`tasks/${owner.id}`, controllerTaskContract(owner, taskDetail)),
+      controllerContractReference(`factory-attempt-details/${attempt.id}`, controllerAttemptContract(detail.contract)));
   }
   store.set('tasks', { ...task('foreign'), goalId: 'other' });
   store.set('attempts', { id: 'foreign-attempt', taskId: 'foreign', generation: 1, startedAt: '', token: secret });
@@ -138,14 +144,22 @@ test('controllers receive complete isolated same-goal execution/check JSON even 
   store.set('factory-goal-checks', { ...receipt, id: 'foreign-checks', goalId: 'other', checks: [{ ...receipt.checks[0]!, output: secret }] });
 
   assert.deepEqual(controllerCandidates(store, 'goal', 'planner'), [], 'Accepted/current stored evidence needs no reconstructable source candidate');
+  assert.equal(controllerCandidates(store, 'goal', 'evaluator').length, 1, 'Historical source remains discoverable without copying it into the completion audit');
   const before = JSON.stringify(details), retainedBefore = JSON.stringify(store.list('factory-attempt-details'));
-  const context = await prepareControllerContext({ ...f, store, project, operation: 'records-only', goalId: 'goal', role: 'planner' });
+  for (const [operation, requirement] of [
+    ['missing-contract', { ...requirements[0]!, record: 'tasks/foreign' }],
+    ['changed-contract', { ...requirements[0]!, sha256: '0'.repeat(64) }],
+    ['wrong-contract-size', { ...requirements[0]!, size: requirements[0]!.size + 1 }],
+  ] as const) await assert.rejects(prepareControllerContext({ ...f, store, project, operation, goalId: 'goal', role: 'planner', recordRequirements: [requirement] }), /required controller contract.*unavailable|contract.*changed/i);
+  const acceptedTask = store.get<FactoryTask>('tasks', 'accepted')!;
+  store.set('tasks', { ...acceptedTask, updatedAt: 'Later runtime observation' });
+  const context = await prepareControllerContext({ ...f, store, project, operation: 'records-only', goalId: 'goal', role: 'evaluator', selected: [], recordRequirements: requirements });
   assert.equal(context.workingDirectorySources.length, 1);
   assert.match(context.instructions, /Full stored execution\/check evidence is available/);
   assert.match(context.instructions, /external report\/log artifact bodies were not copied/);
   const [snapshot] = await f.directoryManager.prepare({ identity: 'records-session', transferred: context.workingDirectorySources });
   const manifest = JSON.parse(await readFile(path.join(snapshot!.path, 'manifest.json'), 'utf8'));
-  assert.equal(manifest.goalRevision, 13); assert.deepEqual(manifest.candidates, []); assert.equal(manifest.records.length, 9);
+  assert.equal(manifest.goalRevision, 13); assert.deepEqual(manifest.candidates, []); assert.equal(manifest.records.length, 11);
   assert.ok(!JSON.stringify(manifest).includes(secret));
   const files = new Map<string, { filename: string; value: AttemptDetail | GoalCheckRecord }>();
   for (const record of manifest.records) {
@@ -167,6 +181,14 @@ test('controllers receive complete isolated same-goal execution/check JSON even 
     const mapping = manifest.records.find((record: { record: string }) => record.record === `factory-attempt-details/${detail.id}`);
     assert.equal(mapping.attemptId, detail.id); assert.equal(mapping.generation, 2); assert.equal(mapping.candidate?.commit, detail.candidate?.commit);
   }
+  for (const requirement of requirements) {
+    const entry = manifest.records.find((record: { record: string }) => record.record === requirement.record);
+    assert.deepEqual(entry.contract, requirement);
+    const value = files.get(requirement.record)!.value as unknown as { contract: unknown };
+    assert.deepEqual(controllerContractReference(requirement.record, value.contract), requirement);
+  }
+  assert.equal(JSON.stringify((files.get('tasks/accepted')!.value as unknown as { contract: unknown }).contract),
+    JSON.stringify(controllerTaskContract(acceptedTask, store.get<TaskDetail>('factory-task-details', 'accepted')!)));
   assert.equal((files.get('factory-goal-checks/current-checks')!.value as GoalCheckRecord).checks[0]!.output, output);
   const older = manifest.records.find((record: { record: string }) => record.record === 'factory-goal-checks/older-checks');
   assert.equal(older.goalRevision, 12); assert.equal(older.matchesGoalRevision, false); assert.equal(older.repositoryHead, 'older-checked-head');

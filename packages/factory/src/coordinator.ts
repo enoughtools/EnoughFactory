@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { Attempt, Decision, FactoryTask, Goal, Project } from "@enoughfactory/contracts";
 import type {
-  AttemptDetail, CandidateRef, ConfigureGoalInput, ControlRecord, CoordinatorOptions, CreateGoalInput,
+  AttemptDetail, CandidateRef, ConfigureGoalInput, ControlRecord, ControllerRecordRequirement, CoordinatorOptions, CreateGoalInput,
   EvaluationRecord, ExecutionResult, GoalCheckRecord, PlanRecord, PlannedTask, RepositoryEvidence, TaskDetail,
 } from "./types.js";
 import { readCheckCommands, readEvaluation, readJsonObject, readPlan, readTasks, validateDependencies } from "./protocol.js";
@@ -383,6 +383,7 @@ export class FactoryCoordinator {
     const completed = this.tasks(goal.id).filter(task => task.status === "completed");
     const preserved = scope ? this.tasks(goal.id).filter(task => !scope.includes(task.id) && task.status !== "canceled") : completed;
     try {
+      const recordRequirements: ControllerRecordRequirement[] = [];
       const prompt = controllerPrompt(evidence => {
         // Prioritize current failures before allocating excerpts to historical accepted work.
         const retained = this.tasks(goal.id).filter(task => task.status !== "completed" && (!scope || scope.includes(task.id))).map(task => {
@@ -411,8 +412,8 @@ export class FactoryCoordinator {
           "Do not repeat completed tasks. Their keys may be referenced as dependencies.",
           "Reuse a retained unfinished task's stable key when continuing the same work. Its isolated candidate can seed a replacement workspace; use a new key when the task's purpose changes.",
         ];
-      });
-      const response = await this.options.runtime.complete({ goal, role: "planner", prompt, project, signal: this.operationControllers.get(goal.id)?.signal });
+      }, { recordReferences: this.options.runtime.controllerRecordReferences, recordRequirements });
+      const response = await this.options.runtime.complete({ goal, role: "planner", prompt, project, signal: this.operationControllers.get(goal.id)?.signal, recordRequirements });
       if (!this.operationCurrent(goal.id, operation)) return;
       this.recordSpend(goal.id, response.spend);
       const plan = readPlan(response.text);
@@ -697,14 +698,15 @@ export class FactoryCoordinator {
       if (!diagnosisCurrent()) return;
       const detail = this.taskDetail(taskId);
       const repeated = detail.failureSignatures.length >= 3 && new Set(detail.failureSignatures.slice(-3)).size === 1;
+      const recordRequirements: ControllerRecordRequirement[] = [];
       const prompt = controllerPrompt(evidence => [
         "You are the EnoughFactory repair supervisor. Decide the next concrete action after a confirmed failure. Return JSON {action:'retry'|'replan'|'wait',reason:string,instructions?:string,waitReason?:string,wakeCondition?:string}.",
         "Retry must change the implementation approach or address the observed failure. Replan changes task decomposition or dependencies. Wait only for an identified external condition; do not ask for human permission already granted by project policy.",
         "If a configured check is prose rather than an executable command, or requires future task outputs unrelated to this task's contract, replan to correct the verification scope. Do not make a worker fabricate missing future application layers or repeat unchanged invalid commands. Retain useful candidate work and keep checks proportionate to the task's actual deliverables.",
         repeated ? "Three equivalent failures occurred. Choose a changed decomposition or external wait rather than repeating the same attempt." : "Make a proportionate repair decision and continue.",
         this.context(goal, evidence), `Failed task: ${JSON.stringify(evidence.task(task, detail))}`, `Failure: ${JSON.stringify(evidence.text(detail.lastError, `${TABLE.taskDetails}/${task.id}.lastError`, 8192))}`, `Retained work: ${JSON.stringify(evidence.candidate(detail.lastCandidate))}`, `Attempt evidence: ${JSON.stringify(evidence.attempt(attempt, attempt ? this.attemptDetail(attempt.id) : undefined))}`,
-      ]);
-      const response = await this.options.runtime.complete({ goal, role: "diagnosis", prompt, project: this.project(goal), signal: this.operationControllers.get(goal.id)?.signal });
+      ], { recordReferences: this.options.runtime.controllerRecordReferences, recordRequirements });
+      const response = await this.options.runtime.complete({ goal, role: "diagnosis", prompt, project: this.project(goal), signal: this.operationControllers.get(goal.id)?.signal, recordRequirements });
       if (!diagnosisCurrent()) return;
       this.recordSpend(goal.id, response.spend);
       const decision = readJsonObject(response.text);
@@ -788,19 +790,21 @@ export class FactoryCoordinator {
         }
       }
       const goalChecksPassed = !goalChecks || goalChecks.checks.every(check => check.passed);
+      const recordRequirements: ControllerRecordRequirement[] = [];
       const prompt = controllerPrompt(evidence => [
         "You are the EnoughFactory completion evaluator. Audit the entire original objective against the actual repository and retained execution evidence. A worker's final response, green unrelated tests or partial implementation do not prove completion.",
         "Inspect/run only meaningful checks needed for uncertain criteria. Return JSON {complete:boolean,summary:string,criteria:[{criterion:string,satisfied:boolean,evidence:string[]}],additionalTasks?:[{key,title,description,kind:'feature'|'unit'|'architecture'|'test',acceptanceCriteria:string[],expectedOutputs:string[],dependsOn:string[],checks:string[]}],waitReason?:string,wakeCondition?:string}. Use task kinds for concrete delivery outcomes, not mandatory role ceremonies.",
         "Use each criterion's exact original text. Every satisfied criterion requires concrete current-state evidence such as files, runtime outcomes, exact commit check records or published URLs. If something remains, add actionable tasks. Never weaken the objective to declare completion. No mandatory human gate applies to autonomous plus approve-all.",
         "Also inspect the accepted tasks' acceptance criteria and expected deliverables. Integration records prove accepted source, not that every requested behavior or deliverable exists. Add concrete follow-up work for any unmet contract that matters to the original objective.",
+        "The current integrated primary repository and attached current project folders are the sources for the final product audit. Historical candidate IDs and CAS references identify retained source; their bodies are optional evidence and are not automatically transferred for evaluation. Use the mounted manifest to determine actual available files. Never claim to have inspected a historical candidate body merely from its identity or integration record.",
         "Configured whole-goal checks have already run against the exact integrated snapshot. Do not repeat them merely to restate the evidence. A failed configured check prevents completion: use its concrete command/output to propose focused repair tasks. Checks on a future repaired snapshot will run once after that work integrates. Every additional task check must be an executable shell command scoped to outputs available at that task's completion, never prose or an unrelated whole-product gate.",
         `Whole-goal check evidence: ${JSON.stringify(evidence.goalChecks(goalChecks))}`,
         this.context(goal, evidence), `Repository snapshot: ${JSON.stringify(evidence.repository(repository, `goal/${goal.id}/repository/${repository.head}`))}`,
         `Integrated work and check records: ${JSON.stringify(this.tasks(goal.id).filter(task => task.status === "completed").map(task => ({
           ...evidence.task(task, this.taskDetail(task.id)), attempt: evidence.attempt(this.options.store.get<Attempt>(TABLE.attempts, task.currentAttemptId ?? ""), task.currentAttemptId ? this.attemptDetail(task.currentAttemptId) : undefined),
         })))}`,
-      ]);
-      const response = await this.options.runtime.complete({ goal, role: "evaluator", prompt, project, signal: this.operationControllers.get(goal.id)?.signal });
+      ], { recordReferences: this.options.runtime.controllerRecordReferences, recordRequirements });
+      const response = await this.options.runtime.complete({ goal, role: "evaluator", prompt, project, signal: this.operationControllers.get(goal.id)?.signal, recordRequirements });
       if (!this.operationCurrent(goal.id, operation)) return;
       this.recordSpend(goal.id, response.spend);
       const evaluation = readEvaluation(response.text);
