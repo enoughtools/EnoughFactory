@@ -29,8 +29,8 @@
 .task-cancellation-summary [data-slot="button"] { height: 24px; min-height: 24px; font-size: 10px; }
 .task-work-layout.full-work-area { display: flex; flex: 1; flex-direction: column; min-width: 0; min-height: 0; overflow: hidden; }
 .task-index { display: flex; flex: 1; gap: 10px; min-height: 0; overflow-x: auto; overflow-y: hidden; align-items: stretch; }
-.task-state-group { flex: 1 0 210px; min-width: 210px; min-height: 0; margin: 0; overflow-y: auto; border: 1px solid var(--factory-line); background: var(--factory-paper); padding: 0 7px 7px; }
-.task-state-group:only-child { flex: 0 0 340px; max-width: 340px; }
+.task-state-group { flex: 1 0 140px; min-width: 140px; min-height: 0; margin: 0; overflow-y: auto; border: 1px solid var(--factory-line); background: var(--factory-paper); padding: 0 7px 7px; }
+.task-state-group.has-work { flex: 2 0 260px; min-width: 240px; }
 .task-state-group h2 { display: flex; justify-content: space-between; position: sticky; top: 0; z-index: 1; padding: 9px 1px 8px; font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: .04em; color: var(--factory-secondary); background: var(--factory-paper); }
 .task-index-card { display: flex; flex-direction: column; text-align: left; width: 100%; gap: 6px; border: 1px solid var(--factory-line); background: var(--factory-surface); padding: 9px; margin-bottom: 6px; }
 .task-index-card:hover { background: var(--factory-paper); border-color: var(--factory-ink); }
@@ -40,6 +40,8 @@
 .task-index-owner, .task-index-reason { font-size: 10px; line-height: 1.45; color: var(--factory-secondary); }
 .task-index-reason { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
 .task-column-empty { min-height: 50px; padding: 9px 2px; color: var(--factory-secondary); font-size: 10px; }
+.task-column-hidden { display: flex; flex-direction: column; align-items: flex-start; gap: 8px; padding: 9px 2px; color: var(--factory-secondary); font-size: 10px; }
+.task-column-hidden button { color: var(--factory-accent); text-decoration: underline; text-underline-offset: 3px; }
 .task-empty-filter { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; padding: 12px; font-size: 11px; color: var(--factory-secondary); }
 .task-table-scroll { flex: 1; min-height: 0; overflow: auto; border: 1px solid var(--factory-line); }
 .task-work-table { width: 100%; border-collapse: separate; border-spacing: 0; text-align: left; font-size: 11px; }
@@ -68,9 +70,9 @@
 .task-runtime-pane .page-header, .task-runtime-pane .session-tabs { margin-bottom: 8px; }
 .task-service-notice { font-size: 11px; line-height: 1.5; padding: 7px 9px; border: 1px solid var(--factory-line); color: var(--factory-secondary); margin-bottom: 8px; }
 .task-service-notice details { font-size: 10px; margin-top: 4px; }
-[data-slot="dialog-content"].goal-details-modal { max-width: 760px; max-height: calc(100dvh - 32px); display: flex; flex-direction: column; overflow: hidden; padding: 0; gap: 0; }
-.goal-details-modal > .modal-heading { padding: 18px 52px 18px 20px; border-bottom: 1px solid var(--factory-line); }
-.goal-details-content { min-height: 0; overflow-y: auto; overscroll-behavior: contain; scrollbar-gutter: stable; font-size: 12px; line-height: 1.6; padding: 20px; }
+[data-slot="dialog-content"].goal-details-modal { max-width: 760px; max-height: calc(100dvh - 48px); display: flex; flex-direction: column; overflow: hidden; padding: 0; gap: 0; }
+.goal-details-modal > .modal-heading { padding: 24px 60px 22px 28px; border-bottom: 1px solid var(--factory-line); }
+.goal-details-content { min-height: 0; overflow-y: auto; overscroll-behavior: contain; scrollbar-gutter: stable; font-size: 12px; line-height: 1.6; padding: 24px 28px 28px; }
 .goal-details-content > section { margin-bottom: 20px; }
 .goal-details-content h3 { font-size: 11px; font-weight: 600; margin-bottom: 7px; }
 .goal-details-content p { white-space: pre-wrap; overflow-wrap: anywhere; }
@@ -131,6 +133,8 @@
   .task-work-table td:first-child { min-width: 220px; }
   .goal-action-summary { min-width: 100%; }
   .goal-details-facts { grid-template-columns: 110px minmax(0, 1fr); }
+  .goal-details-modal > .modal-heading { padding: 20px 52px 20px 20px; }
+  .goal-details-content { padding: 20px; }
   .goal-table-row { grid-template-columns: minmax(0, 1fr) 90px; gap: 8px; }
   .goal-table-row > span:not(.badge-status), .goal-table-row > svg { display: none; }
 }

@@ -335,7 +335,7 @@ export class FactoryCoordinator {
       if (terminalGoals.has(goal.status) || detail.waitingFor !== condition || task.status !== "failed") continue;
       this.options.store.transaction(() => {
         this.writeTask(task.id, { status: "queued", currentAttemptId: undefined });
-        this.options.store.set(TABLE.taskDetails, { ...detail, waitingFor: undefined, waitReason: undefined });
+        this.options.store.set(TABLE.taskDetails, { ...detail, waitingFor: undefined, waitReason: undefined, waitSince: undefined });
         this.decision(goal.id, "task-woken", `Condition satisfied for ${task.title}: ${condition}`, { taskId: task.id });
       });
     }
@@ -719,7 +719,7 @@ export class FactoryCoordinator {
       this.decision(goal.id, "repair", decision.reason, { action: decision.action, taskId, chatId: response.chatId, ...(typeof decision.instructions === "string" ? { instructions: decision.instructions } : {}) });
       if (decision.action === "wait") {
         this.options.store.transaction(() => {
-          this.options.store.set(TABLE.taskDetails, { ...this.taskDetail(taskId), waitingFor: typeof decision.wakeCondition === "string" ? decision.wakeCondition : "external-condition", waitReason: typeof decision.waitReason === "string" ? decision.waitReason : decision.reason });
+          this.options.store.set(TABLE.taskDetails, { ...this.taskDetail(taskId), waitingFor: typeof decision.wakeCondition === "string" ? decision.wakeCondition : "external-condition", waitReason: typeof decision.waitReason === "string" ? decision.waitReason : decision.reason, waitSince: this.now() });
           this.options.store.set(TABLE.control, { ...this.control(goal.id), stage: "dispatch", operation: undefined, diagnosisTaskId: undefined });
           this.writeGoal(goal.id, { nextAction: `Waiting for ${task.title}; independent work can continue` });
         });
@@ -881,7 +881,7 @@ export class FactoryCoordinator {
         ...(task.estimatedMinutes ?? previous?.estimatedMinutes ? { estimatedMinutes: task.estimatedMinutes ?? previous?.estimatedMinutes } : {}),
         ...(task.writePaths ?? previous?.writePaths ? { writePaths: task.writePaths ?? previous?.writePaths } : {}),
         ...(task.resources ?? previous?.resources ? { resources: task.resources ?? previous?.resources } : {}) });
-      this.options.store.set<TaskDetail>(TABLE.taskDetails, { ...previousDetail, id, key: task.key, checks: task.checks, planChecks: [], planRevision: goal.revision, waitingFor: undefined, waitReason: undefined, repairInstructions: supersededRepair ? undefined : previousDetail?.repairInstructions, priorRepairInstructions, replanInstructions, selected: goal.autonomy === "autonomous", failureSignatures: previousDetail?.failureSignatures ?? [] });
+      this.options.store.set<TaskDetail>(TABLE.taskDetails, { ...previousDetail, id, key: task.key, checks: task.checks, planChecks: [], planRevision: goal.revision, waitingFor: undefined, waitReason: undefined, waitSince: undefined, repairInstructions: supersededRepair ? undefined : previousDetail?.repairInstructions, priorRepairInstructions, replanInstructions, selected: goal.autonomy === "autonomous", failureSignatures: previousDetail?.failureSignatures ?? [] });
     }
     this.options.store.set<PlanRecord>(TABLE.plans, { id: goalId, goalId, revision: goal.revision, summary, checks, checkScope: "goal", taskKeys, createdAt: at });
   }

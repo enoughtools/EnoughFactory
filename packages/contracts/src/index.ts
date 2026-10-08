@@ -110,6 +110,7 @@ export interface AttemptInspection {
 export interface TaskOverview { task: FactoryTask; state: TaskWorkState; reason?: string; phase?: AttemptPhase; attemptId?: string; }
 export interface TaskInspection extends TaskOverview {
   detailsAvailable?: boolean;
+  wait?: { condition: string; reason: string; since?: string };
   checks: string[]; planRevision?: number; repairInstructions?: string; lastError?: string;
   dependencies: FactoryTask[]; dependents: FactoryTask[]; attempts: AttemptInspection[]; artifacts: Artifact[];
 }

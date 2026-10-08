@@ -2,10 +2,10 @@ import { randomUUID } from "node:crypto";
 import { mkdir, mkdtemp, readFile, writeFile, copyFile, rm, access, readdir } from "node:fs/promises";
 import { join, resolve, dirname, isAbsolute } from "node:path";
 import { ArtifactStore, writeAtomic } from "./artifacts.ts";
-import { candidateDevelopmentToolchain, dockerCheckExecutor, frozenDevelopmentToolchain, sameDevelopmentRecipe } from "./checks.ts";
+import { candidateCheckInputs, candidateDevelopmentToolchain, dockerCheckExecutor, frozenDevelopmentToolchain, sameDevelopmentRecipe, validateCheckInputs } from "./checks.ts";
 import { git, run, safeId } from "./process.ts";
 import { WorkingDirectoryManager, workingDirectoryEmptyDirectories } from "./working-directories.ts";
-import type { ArtifactManifest, Candidate, CheckContext, CheckExecutor, CheckReport, DevelopmentToolchain, IntegrationResult, ManagedWorkspaceProvider, WorkingDirectoryCapture, WorkspaceProvider, WorkspaceRecord } from "./types.ts";
+import type { ArtifactManifest, Candidate, CheckContext, CheckExecutor, CheckReport, DevelopmentToolchain, FrozenCheckInputs, IntegrationResult, ManagedWorkspaceProvider, WorkingDirectoryCapture, WorkspaceProvider, WorkspaceRecord } from "./types.ts";
 
 const sourceExports = new Map<string, Promise<ArtifactManifest>>();
 
@@ -31,8 +31,9 @@ export class WorkspaceManager {
     this.workingDirectories = new WorkingDirectoryManager({ dataDir: this.root, artifacts: this.artifacts });
   }
 
-  async create(input: { projectPath: string; goalId: string; taskId: string; attemptId: string; baseCommit?: string; provider?: WorkspaceProvider; fallbackToGit?: boolean; sessionName?: string; workspaceBranch?: string; developmentToolchain?: DevelopmentToolchain }): Promise<WorkspaceRecord> {
+  async create(input: { projectPath: string; goalId: string; taskId: string; attemptId: string; baseCommit?: string; provider?: WorkspaceProvider; fallbackToGit?: boolean; sessionName?: string; workspaceBranch?: string; developmentToolchain?: DevelopmentToolchain; checkInputs?: FrozenCheckInputs }): Promise<WorkspaceRecord> {
     const developmentToolchain = frozenDevelopmentToolchain(input.developmentToolchain);
+    const checkInputs = validateCheckInputs(input.checkInputs);
     for (const id of [input.goalId, input.taskId, input.attemptId]) safeId(id);
     const projectPath = await git(resolve(input.projectPath), "rev-parse", "--show-toplevel");
     const baseCommit = await git(projectPath, "rev-parse", "--verify", `${input.baseCommit ?? "HEAD"}^{commit}`);
@@ -43,6 +44,7 @@ export class WorkspaceManager {
       const existing = await this.workspace(workspaceId);
       if (existing.goalId !== input.goalId || existing.taskId !== input.taskId || existing.baseCommit !== baseCommit) throw new Error("Attempt identity already belongs to a different workspace");
       if (JSON.stringify(existing.developmentToolchain) !== JSON.stringify(developmentToolchain)) throw new Error("Attempt identity already has a different frozen development toolchain");
+      if (JSON.stringify(existing.checkInputs) !== JSON.stringify(checkInputs)) throw new Error("Attempt identity already has different frozen check inputs");
       return existing;
     } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
 
@@ -59,7 +61,7 @@ export class WorkspaceManager {
       // Configuration can be local/untracked; the new repository gets only this explicit runtime config.
       const config = join(projectPath, ".envmux.json");
       if (await exists(config)) await copyFile(config, join(path, ".envmux.json"));
-      const record: WorkspaceRecord = { id: workspaceId, goalId: input.goalId, taskId: input.taskId, attemptId: input.attemptId, deviceId: this.options.deviceId, projectPath, path, provider: "git", baseCommit, branch, developmentToolchain, createdAt: new Date().toISOString() };
+      const record: WorkspaceRecord = { id: workspaceId, goalId: input.goalId, taskId: input.taskId, attemptId: input.attemptId, deviceId: this.options.deviceId, projectPath, path, provider: "git", baseCommit, branch, developmentToolchain, checkInputs, createdAt: new Date().toISOString() };
       if (input.provider === "artifactfs") {
         try {
           if (!this.options.artifactFs) throw new Error("ArtifactFS manager is not installed on this device");
@@ -79,6 +81,8 @@ export class WorkspaceManager {
   async workspace(id: string): Promise<WorkspaceRecord> {
     const workspace = JSON.parse(await readFile(join(this.root, "workspaces", safeId(id), "workspace.json"), "utf8")) as WorkspaceRecord;
     workspace.developmentToolchain = frozenDevelopmentToolchain(workspace.developmentToolchain);
+    const checkInputs = validateCheckInputs(workspace.checkInputs);
+    if (workspace.checkInputs !== undefined) workspace.checkInputs = checkInputs;
     return workspace;
   }
 
@@ -91,6 +95,7 @@ export class WorkspaceManager {
   /** Call after writers stop and envmux harvests. Providers may create an explicit preservation commit in their private attempt. */
   async capture(input: { workspaceId: string; repositoryPath?: string; reference?: string; workingDirectories?: WorkingDirectoryCapture[] }): Promise<Candidate> {
     const workspace = await this.workspace(input.workspaceId);
+    const checkInputs = validateCheckInputs(workspace.checkInputs, input.workingDirectories ?? []);
     const provided = workspace.provider === "artifactfs" ? await this.options.artifactFs?.capture?.(workspace) : undefined;
     const path = input.repositoryPath ?? provided?.repositoryPath ?? workspace.path;
     let reference = input.reference ?? provided?.reference ?? workspace.branch;
@@ -115,10 +120,10 @@ export class WorkspaceManager {
     try {
       await git(path, "bundle", "create", bundlePath, ref);
       const metadata = { goalId: workspace.goalId, taskId: workspace.taskId, attemptId: workspace.attemptId };
-      const bundleArtifact = await this.artifacts.putFile(bundlePath, { ...metadata, name: `candidate-${id}.bundle`, mime: "application/x-git-bundle", metadata: { commit, ref, baseCommit: workspace.baseCommit, developmentToolchain: workspace.developmentToolchain } });
+      const bundleArtifact = await this.artifacts.putFile(bundlePath, { ...metadata, name: `candidate-${id}.bundle`, mime: "application/x-git-bundle", metadata: { commit, ref, baseCommit: workspace.baseCommit, developmentToolchain: workspace.developmentToolchain, checkInputs } });
       const diff = await git(path, "diff", "--binary", workspace.baseCommit, commit);
-      const diffArtifact = await this.artifacts.put(diff, { ...metadata, name: `candidate-${id}.patch`, mime: "text/x-diff", metadata: { commit, baseCommit: workspace.baseCommit, developmentToolchain: workspace.developmentToolchain } });
-      const candidate: Candidate = { id, workspaceId: workspace.id, ...metadata, deviceId: this.options.deviceId, baseCommit: workspace.baseCommit, commit, branch: reference, bundleArtifact, diffArtifact, repairConflicts: workspace.repairConflicts, workingDirectories: input.workingDirectories, developmentToolchain: workspace.developmentToolchain, createdAt: new Date().toISOString() };
+      const diffArtifact = await this.artifacts.put(diff, { ...metadata, name: `candidate-${id}.patch`, mime: "text/x-diff", metadata: { commit, baseCommit: workspace.baseCommit, developmentToolchain: workspace.developmentToolchain, checkInputs } });
+      const candidate: Candidate = { id, workspaceId: workspace.id, ...metadata, deviceId: this.options.deviceId, baseCommit: workspace.baseCommit, commit, branch: reference, bundleArtifact, diffArtifact, repairConflicts: workspace.repairConflicts, workingDirectories: input.workingDirectories, developmentToolchain: workspace.developmentToolchain, checkInputs, createdAt: new Date().toISOString() };
       validateCandidate(candidate);
       await mkdir(join(this.root, "candidates"), { recursive: true });
       await writeFile(join(this.root, "candidates", `${id}.json`), JSON.stringify(candidate), { flag: "wx", mode: 0o600 });
@@ -507,6 +512,8 @@ function validateCandidate(candidate: Candidate): void {
     rootIds.add(root.id.toLowerCase());
     destinations.add(root.containerPath.toLowerCase());
   }
+  const checkInputs = candidateCheckInputs(candidate);
+  if (candidate.checkInputs !== undefined) candidate.checkInputs = checkInputs;
 }
 async function copyIdentity(source: string, target: string): Promise<void> {
   for (const [key, fallback] of [["user.name", "EnoughFactory"], ["user.email", "factory@enoughtools.com"]]) {

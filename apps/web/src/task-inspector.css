@@ -134,3 +134,13 @@
   .ti-retire > div { flex-direction: column; }
   .ti-contract-revision { padding-inline: 16px; }
 }
+
+.ti-task-wait { padding: 16px 20px; border-top: 1px solid var(--factory-line); background: var(--factory-paper); color: var(--factory-ink); }
+.ti-task-wait-heading { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-bottom: 9px; }
+.ti-task-wait-heading strong { font-size: 12px; font-weight: 600; }
+.ti-task-wait-heading time, .ti-task-wait-heading > span { font-size: 11px; color: var(--factory-secondary); }
+.ti-task-wait p { margin: 0 0 9px; font-size: 12px; line-height: 1.7; }
+.ti-task-wait details { margin: 0 0 9px; font-size: 11px; }
+.ti-task-wait summary { cursor: pointer; color: var(--factory-secondary); }
+.ti-task-wait details p { margin-top: 8px; }
+@media (max-width: 700px) { .ti-task-wait { padding-inline: 16px; } }

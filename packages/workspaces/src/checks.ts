@@ -4,7 +4,57 @@ import { prepareToolchain, validatePreparedToolchain, verifyPreparedToolchain } 
 import { resolveDockerRuntime, runManagedDocker, type DockerRuntimeEndpoint } from "./docker.ts";
 import { discoverSwiftBuildCaches, prepareSwiftBuildMountpoint, removeSwiftBuildMountpoints, type SwiftBuildCache, type SwiftBuildMountpoint } from "./swift-check-cache.ts";
 import { captureSwiftCheckCompatibility, swiftCheckCompatibilityBootstrap } from "./swift-check-compatibility.ts";
-import type { Candidate, CheckExecutor, CommandResult, DevelopmentToolchain } from "./types.ts";
+import type { Candidate, CheckExecutor, CommandResult, DevelopmentToolchain, FrozenCheckInputs, WorkingDirectoryCapture } from "./types.ts";
+
+const checkPathEnvironment = new Set(["ENOUGH_EVIDENCE_ROOT", "ENOUGH_NATIVE_UI_RECEIPT_DESCRIPTOR"]);
+const checkDigestEnvironment = new Set(["ENOUGH_NATIVE_INDEX_SHA256", "ENOUGH_ACCEPTANCE_INDEX_SHA256"]);
+const checkMountPattern = /^\/workspaces\/[a-zA-Z0-9][a-zA-Z0-9._-]{0,47}$/;
+
+function plainRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value) && [Object.prototype, null].includes(Object.getPrototypeOf(value));
+}
+
+/** Validate a copied check contract; capture/checking additionally binds paths to selected roots. */
+export function validateCheckInputs(value: unknown, workingDirectories?: readonly Pick<WorkingDirectoryCapture, "id" | "containerPath">[]): FrozenCheckInputs | undefined {
+  if (value === undefined) return;
+  if (!plainRecord(value) || Object.keys(value).some(key => !["configurationRevision", "workingDirectoryIds", "environment"].includes(key)) || !Number.isSafeInteger(value.configurationRevision) || (value.configurationRevision as number) < 0) throw new Error("Invalid frozen check-input configuration");
+  if (!Array.isArray(value.workingDirectoryIds) || value.workingDirectoryIds.length > 8 || value.workingDirectoryIds.some(id => typeof id !== "string" || !/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,159}$/.test(id))) throw new Error("Invalid frozen check-input working-directory identifiers");
+  const workingDirectoryIds = value.workingDirectoryIds as string[];
+  if (new Set(workingDirectoryIds.map(id => id.toLowerCase())).size !== workingDirectoryIds.length) throw new Error("Frozen check inputs repeat a working-directory identifier");
+  if (!plainRecord(value.environment)) throw new Error("Invalid frozen check-input environment");
+  const selectedRoots = new Map<string, string>();
+  if (workingDirectories !== undefined) {
+    if (!Array.isArray(workingDirectories) || workingDirectories.length > 8) throw new Error("Invalid captured check-input working directories");
+    for (const id of workingDirectoryIds) {
+      const matches = workingDirectories.filter(root => root.id === id);
+      if (matches.length !== 1 || typeof matches[0]!.containerPath !== "string" || !checkMountPattern.test(matches[0]!.containerPath)) throw new Error("Frozen check inputs require their selected captured working directories");
+      selectedRoots.set(id, matches[0]!.containerPath);
+    }
+  }
+  const environment: Record<string, string> = {};
+  for (const name of Object.keys(value.environment).sort()) {
+    const entry = value.environment[name];
+    if (typeof entry !== "string") throw new Error(`Invalid frozen check-input environment value: ${name}`);
+    if (checkDigestEnvironment.has(name)) {
+      if (!/^[a-f0-9]{64}$/.test(entry)) throw new Error(`Frozen check-input digest must be an exact SHA-256: ${name}`);
+    } else if (checkPathEnvironment.has(name)) {
+      const parts = entry.split("/");
+      if (entry.length > 4096 || /[\u0000-\u001f\u007f\\]/.test(entry) || !checkMountPattern.test(parts.slice(0, 3).join("/")) || parts.slice(1).some(part => !part || part === "." || part === "..")) throw new Error(`Frozen check-input path must be a canonical container working-directory path: ${name}`);
+      if (workingDirectories !== undefined && ![...selectedRoots.values()].some(root => entry === root || entry.startsWith(`${root}/`))) throw new Error(`Frozen check-input path is outside its selected captured working directories: ${name}`);
+    } else throw new Error(`Unsupported frozen check-input environment name: ${name}`);
+    environment[name] = entry;
+  }
+  return { configurationRevision: value.configurationRevision as number, workingDirectoryIds: [...workingDirectoryIds], environment };
+}
+
+export function candidateCheckInputs(candidate: Pick<Candidate, "checkInputs" | "bundleArtifact" | "diffArtifact" | "workingDirectories">): FrozenCheckInputs | undefined {
+  const inputs = validateCheckInputs(candidate.checkInputs, candidate.workingDirectories ?? []);
+  for (const artifact of [candidate.bundleArtifact, candidate.diffArtifact]) {
+    const evidence = validateCheckInputs(artifact.metadata?.checkInputs, candidate.workingDirectories ?? []);
+    if (JSON.stringify(evidence) !== JSON.stringify(inputs)) throw new Error("Candidate check inputs do not match their immutable source evidence");
+  }
+  return inputs;
+}
 
 export function frozenDevelopmentToolchain(value?: DevelopmentToolchain): DevelopmentToolchain | undefined {
   if (value === undefined) return;
@@ -67,6 +117,12 @@ export function dockerCheckExecutor(options: { image?: string; dockerRuntime?: D
   const execute: CheckExecutor = async (context) => {
     try {
       const authorToolchain = candidateDevelopmentToolchain(context.candidate);
+      const checkInputs = candidateCheckInputs(context.candidate);
+      for (const id of checkInputs?.workingDirectoryIds ?? []) {
+        const capture = context.candidate.workingDirectories!.find(root => root.id === id)!;
+        const mounted = context.workingDirectories?.filter(root => root.containerPath === capture.containerPath);
+        if (mounted?.length !== 1 || mounted[0]!.commit !== capture.commit) throw new Error("Frozen check inputs require the exact captured working-directory mounts");
+      }
       const dockerRuntime = resolveDockerRuntime(options.dockerRuntime);
       let toolchain: DevelopmentToolchain | undefined;
       if (authorToolchain) {
@@ -106,6 +162,7 @@ export function dockerCheckExecutor(options: { image?: string; dockerRuntime?: D
         const emptyDirectoryChecks: string[] = [];
         const emptyDirectoryRestorations: string[] = [];
         const environment = ["--env", `GIT_CONFIG_COUNT=${roots.length}`];
+        for (const [key, value] of Object.entries(checkInputs?.environment ?? {})) environment.push(`--env=${key}=${value}`);
         let caches = buildCaches.get(context.path);
         if (!caches) {
           caches = (await discoverSwiftBuildCaches(roots)).map(cache => ({ ...cache, volume: `enough-check-swift-${randomUUID()}` }));

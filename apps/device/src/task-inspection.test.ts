@@ -462,3 +462,48 @@ test('retry acknowledges its authorized successor dispatched before cancellation
     await factory.coordinator.waitForIdle();
   } finally { finishExecution?.({ status: 'unknown', text: '' }); await app.close(); }
 });
+
+test('task-local prerequisite waits expose their actual age without changing failed outcomes or retained history', async t => {
+  const { FactoryCoordinator } = await import('@enoughfactory/factory');
+  const { Store } = await import('./store.ts');
+  const { inspectTask } = await import('./task-inspection.ts');
+  const directory = mkdtempSync(path.join(tmpdir(), 'enoughfactory-task-wait-'));
+  const store = new Store(directory);
+  t.after(() => { store.close(); rmSync(directory, { recursive: true, force: true }); });
+  const failureAt = '2026-10-05T00:00:00.000Z', waitAt = '2026-10-05T00:20:00.000Z';
+  const goal: Goal = { id: 'goal', projectId: 'project', coordinatorId: 'owner', title: 'Deliver', objective: 'Deliver the actual behavior', criteria: ['Behavior works'],
+    status: 'running', autonomy: 'autonomous', approvalMode: 'approve-all', runtime: 'codex', concurrency: 2, revision: 1, createdAt: failureAt, updatedAt: failureAt };
+  const task: FactoryTask = { id: 'waiting-task', goalId: goal.id, title: 'Validate native evidence', description: 'Consume coordinator-owned native evidence', dependsOn: [],
+    status: 'failed', currentAttemptId: 'failed-attempt', createdAt: failureAt, updatedAt: failureAt };
+  const attempt: Attempt = { id: 'failed-attempt', taskId: task.id, generation: 1, deviceId: 'owner', status: 'failed', startedAt: failureAt, endedAt: failureAt, error: 'Required evidence was absent' };
+  const detail: TaskDetail = { id: task.id, key: 'native-evidence', checks: [], planRevision: 1, selected: true, failureSignatures: [], lastError: attempt.error };
+  const result: AttemptDetail = { id: attempt.id, goalId: goal.id, goalRevision: 1, phase: 'checking', cancellation: 'none', result: { status: 'succeeded', text: 'Provider turn completed' } };
+  const project: Project = { id: 'project', name: 'Product', path: '/isolated/project', deviceId: 'owner', runtime: 'codex', approvalMode: 'approve-all', rules: [], createdAt: failureAt };
+  store.set('goals', goal); store.set('tasks', task); store.set('attempts', attempt); store.set('factory-task-details', detail); store.set('factory-attempt-details', result);
+  store.set<ControlRecord>('factory-control', { id: goal.id, stage: 'diagnose', diagnosisTaskId: task.id, startedAt: failureAt, steering: [] });
+  const coordinator = new FactoryCoordinator({ store, deviceId: 'owner', devices: () => [], project: () => project, now: () => new Date(waitAt),
+    workspaces: {} as FactoryWorkspacePort,
+    runtime: { complete: async () => ({ text: JSON.stringify({ action: 'wait', reason: 'Authenticated native evidence is required.', waitReason: 'The coordinator must supply the original native export.', wakeCondition: 'native-export-ready' }) }),
+      execute: async () => assert.fail('A waiting task cannot execute'), reconcile: async () => assert.fail('A confirmed failure cannot reconcile'), cancel: async () => assert.fail('Recording a wait cannot cancel its attempt') } });
+  await coordinator.tick(); await coordinator.waitForIdle();
+  assert.equal(store.get<TaskDetail>('factory-task-details', task.id)!.waitSince, waitAt);
+  assert.deepEqual(store.get<Attempt>('attempts', attempt.id), attempt);
+  assert.equal(store.get<FactoryTask>('tasks', task.id)!.status, 'failed');
+  assert.equal(store.get<Goal>('goals', goal.id)!.status, 'running');
+  const expected = { condition: 'native-export-ready', reason: 'The coordinator must supply the original native export.', since: waitAt };
+  assert.deepEqual(inspectTask(store, [], task).wait, expected, 'Task waits are independent of global goal status and provider result');
+
+  // Upgrade an existing wait: its immutable repair decision supplies the later timestamp.
+  const current = store.get<TaskDetail>('factory-task-details', task.id)!;
+  store.set('factory-task-details', { ...current, waitSince: undefined });
+  const buckets = ['goals', 'tasks', 'attempts', 'factory-task-details', 'factory-attempt-details', 'factory-control', 'decisions'];
+  const before = buckets.map(bucket => store.list(bucket));
+  const view = inspectTask(store, [], task);
+  assert.deepEqual(view.wait, expected);
+  assert.equal(view.state, 'waiting');
+  assert.equal(view.task.updatedAt, failureAt, 'Inspection does not replace historical failure timing');
+  assert.deepEqual(JSON.parse(JSON.stringify(view.attempts[0]!.result)), result.result);
+  assert.deepEqual(buckets.map(bucket => store.list(bucket)), before, 'Legacy fallback is a read-only projection');
+  store.set('factory-task-details', { ...current, waitSince: undefined, waitingFor: undefined });
+  assert.equal(inspectTask(store, [], task).wait, undefined, 'A cleared condition cannot expose a stale wake action');
+});

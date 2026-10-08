@@ -85,19 +85,28 @@ export interface PlanRecord {
 }
 export interface TaskDetail {
   id: string; key: string; checks: string[]; planRevision: number;
-  planChecks?: string[]; waitingFor?: string; waitReason?: string;
+  planChecks?: string[]; waitingFor?: string; waitReason?: string; waitSince?: string;
   lastError?: string; lastCandidate?: CandidateRef; repairInstructions?: string;
   /** A replacement plan archives prior retry guidance instead of treating it as current. */
   priorRepairInstructions?: Array<{ instructions: string; planRevision?: number; recordedAt?: string; retainedCandidateId?: string; retainedCandidateCommit?: string }>;
   /** Diagnosis guidance accepted with this replacement task's plan. */
   replanInstructions?: string;
   selected: boolean; failureSignatures: string[];
+  /** Coordinator-authenticated verification inputs; applied only to new attempts. */
+  checkInputs?: TaskCheckInputsConfiguration;
+}
+export interface FrozenTaskCheckInputs {
+  configurationRevision: number; workingDirectoryIds: string[]; environment: Record<string, string>;
+}
+export interface TaskCheckInputsConfiguration extends FrozenTaskCheckInputs {
+  goalRevision: number; configuredAgainstAttemptId: string | null; configuredAt: string; configuredByDeviceId: string;
 }
 export interface AttemptDetail {
   id: string; goalId: string; goalRevision: number; workspace?: WorkspaceRef;
   /** Worker assignment binding remains fixed when unrelated work survives a repair revision. */
   assignmentGoalRevision?: number;
   contract?: AttemptInspection['contract'];
+  checkInputs?: FrozenTaskCheckInputs;
   candidate?: CandidateRef; result?: ExecutionResult; checks?: CheckResult[];
   integration?: IntegrationResult; cancellation: "none" | "requested" | "acknowledged";
   phase: "preparing" | "executing" | "capturing" | "checking" | "integrating" | "done";

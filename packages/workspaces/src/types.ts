@@ -3,6 +3,13 @@ import type { PreparedToolchain } from "@enoughfactory/runtime";
 export type WorkspaceProvider = "git" | "artifactfs";
 export type DevelopmentToolchain = PreparedToolchain;
 
+/** Coordinator-selected check configuration frozen before the attempt starts. */
+export interface FrozenCheckInputs {
+  configurationRevision: number;
+  workingDirectoryIds: string[];
+  environment: Record<string, string>;
+}
+
 export interface ArtifactManifest {
   id: string;
   name: string;
@@ -66,6 +73,7 @@ export interface WorkspaceRecord {
   fallbackReason?: string;
   repairConflicts?: string[];
   developmentToolchain?: DevelopmentToolchain;
+  checkInputs?: FrozenCheckInputs;
 }
 
 export interface Candidate {
@@ -84,6 +92,7 @@ export interface Candidate {
   repairConflicts?: string[];
   workingDirectories?: WorkingDirectoryCapture[];
   developmentToolchain?: DevelopmentToolchain;
+  checkInputs?: FrozenCheckInputs;
 }
 
 export interface CommandResult {

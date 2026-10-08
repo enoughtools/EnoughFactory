@@ -1,4 +1,4 @@
-import type { Artifact, Attempt, AttemptInspection, ControllerRun, Device, FactoryTask, Goal, GoalInspection, Project, TaskCheck, TaskInspection, TaskOverview, DevelopmentToolchain } from '@enoughfactory/contracts';
+import type { Artifact, Attempt, AttemptInspection, Decision, ControllerRun, Device, FactoryTask, Goal, GoalInspection, Project, TaskCheck, TaskInspection, TaskOverview, DevelopmentToolchain } from '@enoughfactory/contracts';
 import type { AttemptDetail, ControlRecord, FactoryStore, PlanRecord, TaskDetail } from '@enoughfactory/factory';
 import { activeExecutionTasks, taskSchedulingBlocker } from '@enoughfactory/factory';
 import type { WorkingDirectoryCapture } from '@enoughfactory/workspaces';
@@ -82,12 +82,26 @@ export function inspectTaskOverview(store: FactoryStore, devices: Device[], task
   return { ...base, state: 'ready', reason: 'Dependencies satisfied; eligible for dispatch.' };
 }
 
+/** Legacy waits recover their age from an existing decision without rewriting history. */
+function inspectTaskWait(store: FactoryStore, task: FactoryTask, detail: TaskDetail | undefined): TaskInspection['wait'] {
+  if (task.status !== 'failed' || !detail?.waitingFor?.trim()) return undefined;
+  const validTime = (value: string | undefined) => value && Number.isFinite(Date.parse(value)) ? value : undefined;
+  let since = validTime(detail.waitSince);
+  if (!since) {
+    const latest = store.list<Decision>('decisions').filter(decision => decision.goalId === task.goalId && decision.kind === 'repair'
+      && (decision.data as { taskId?: string } | undefined)?.taskId === task.id)
+      .sort((left, right) => Date.parse(right.at) - Date.parse(left.at))[0];
+    if ((latest?.data as { action?: string } | undefined)?.action === 'wait') since = validTime(latest?.at);
+  }
+  return { condition: detail.waitingFor, reason: detail.waitReason?.trim() || detail.waitingFor, ...(since ? { since } : {}) };
+}
+
 export function inspectTask(store: FactoryStore, devices: Device[], task: FactoryTask): TaskInspection {
   const detail = store.get<TaskDetail>('factory-task-details', task.id);
   const plan = store.get<PlanRecord>('factory-plans', task.goalId);
   const tasks = store.list<FactoryTask>('tasks');
   return { ...inspectTaskOverview(store, devices, task), detailsAvailable: !!detail, checks: [...new Set([...(detail?.planChecks ?? plan?.checks ?? []), ...(detail?.checks ?? [])])],
-    planRevision: detail?.planRevision, repairInstructions: detail?.repairInstructions, lastError: detail?.lastError,
+    wait: inspectTaskWait(store, task, detail), planRevision: detail?.planRevision, repairInstructions: detail?.repairInstructions, lastError: detail?.lastError,
     dependencies: task.dependsOn.flatMap(id => { const dependency = tasks.find(item => item.id === id); return dependency ? [dependency] : []; }),
     dependents: tasks.filter(item => item.dependsOn.includes(task.id)),
     attempts: store.list<Attempt>('attempts').filter(attempt => attempt.taskId === task.id).sort((a, b) => b.generation - a.generation).map(attempt => inspectAttempt(store, attempt)),
