@@ -29,8 +29,8 @@
 .task-cancellation-summary [data-slot="button"] { height: 24px; min-height: 24px; font-size: 10px; }
 .task-work-layout.full-work-area { display: flex; flex: 1; flex-direction: column; min-width: 0; min-height: 0; overflow: hidden; }
 .task-index { display: flex; flex: 1; gap: 10px; min-height: 0; overflow-x: auto; overflow-y: hidden; align-items: stretch; }
-.task-state-group { flex: 1 0 140px; min-width: 140px; min-height: 0; margin: 0; overflow-y: auto; border: 1px solid var(--factory-line); background: var(--factory-paper); padding: 0 7px 7px; }
-.task-state-group.has-work { flex: 2 0 260px; min-width: 240px; }
+.task-state-group { flex: 1 1 140px; min-width: 128px; min-height: 0; margin: 0; overflow-y: auto; border: 1px solid var(--factory-line); background: var(--factory-paper); padding: 0 7px 7px; }
+.task-state-group.has-work { flex: 2 1 260px; min-width: 240px; }
 .task-state-group h2 { display: flex; justify-content: space-between; position: sticky; top: 0; z-index: 1; padding: 9px 1px 8px; font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: .04em; color: var(--factory-secondary); background: var(--factory-paper); }
 .task-index-card { display: flex; flex-direction: column; text-align: left; width: 100%; gap: 6px; border: 1px solid var(--factory-line); background: var(--factory-surface); padding: 9px; margin-bottom: 6px; }
 .task-index-card:hover { background: var(--factory-paper); border-color: var(--factory-ink); }
