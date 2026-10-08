@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { Attempt, AttemptInspection, Device, FactoryTask, Goal } from "@enoughfactory/contracts";
-import { activeExecutionTasks, criticalPathMinutes, descendants, placementConstraint, sortReadyTasks, taskSchedulingBlocker, tasksConflict } from "./scheduler.js";
+import { activeExecutionTasks, criticalPathMinutes, descendants, placementConstraint, sortReadyTasks, taskSchedulingBlocker, taskCheckInputBlocker, tasksConflict } from "./scheduler.js";
+import type { TaskCheckInputsConfiguration } from "./types.js";
 
 function task(id: string, patch: Partial<FactoryTask> = {}): FactoryTask {
   return { id, goalId: "goal", title: id, description: id, dependsOn: [], status: "queued",
@@ -11,6 +12,20 @@ function device(patch: Partial<Device> = {}): Device {
   return { id: "worker", name: "Worker", platform: "linux", arch: "x64", online: true, local: true,
     lastSeen: "2026-10-05T00:00:00.000Z", ...patch };
 }
+
+test("verification gating uses configured nonempty values and never infers requirements from source or checks", () => {
+  const requiredCheckEnvironment = ["ENOUGH_EVIDENCE_ROOT", "ENOUGH_NATIVE_INDEX_SHA256"];
+  const configured: TaskCheckInputsConfiguration = { configurationRevision: 1, workingDirectoryIds: [], environment: {}, goalRevision: 1, configuredAgainstAttemptId: null, configuredAt: "2026-10-08T00:00:00Z", configuredByDeviceId: "worker" };
+  assert.equal(taskCheckInputBlocker({}), undefined);
+  assert.equal(taskCheckInputBlocker({ requiredCheckEnvironment: [] }), undefined);
+  assert.deepEqual(taskCheckInputBlocker({ requiredCheckEnvironment })?.missingEnvironment, requiredCheckEnvironment);
+  const partial = { ...configured, environment: { ENOUGH_EVIDENCE_ROOT: "/workspaces/evidence", ENOUGH_NATIVE_INDEX_SHA256: "  " } };
+  assert.deepEqual(taskCheckInputBlocker({ requiredCheckEnvironment, checkInputs: partial }), {
+    kind: "verification-inputs", missingEnvironment: ["ENOUGH_NATIVE_INDEX_SHA256"], reason: "Waiting for verification evidence from the coordinator.",
+  });
+  assert.equal(taskCheckInputBlocker({ requiredCheckEnvironment, checkInputs: { ...partial, environment: { ...partial.environment, ENOUGH_NATIVE_INDEX_SHA256: "a".repeat(64) } } }), undefined);
+  assert.deepEqual(partial.environment.ENOUGH_NATIVE_INDEX_SHA256, "  ", "eligibility never rewrites configuration or frozen attempt inputs");
+});
 
 test("ready work prioritizes the weighted critical path without dispatching blocked tasks", () => {
   const tasks = [

@@ -82,6 +82,17 @@ function writePaths(value: unknown, name: string): string[] {
   return [...new Set(normalized)];
 }
 
+const checkEnvironmentKeys = new Set(["ENOUGH_EVIDENCE_ROOT", "ENOUGH_NATIVE_UI_RECEIPT_DESCRIPTOR", "ENOUGH_NATIVE_INDEX_SHA256", "ENOUGH_ACCEPTANCE_INDEX_SHA256"]);
+
+/** These non-secret names match the workspace's supported coordinator check-input API. */
+export function validateRequiredCheckEnvironment(value: unknown): string[] | undefined {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value) || value.length > checkEnvironmentKeys.size || value.some(key => typeof key !== "string" || !checkEnvironmentKeys.has(key)) || new Set(value).size !== value.length) {
+    throw new FactoryDecisionError(`requiredCheckEnvironment must contain unique supported verification input names: ${[...checkEnvironmentKeys].join(", ")}.`);
+  }
+  return [...value] as string[];
+}
+
 export function readTasks(value: unknown): PlannedTask[] {
   if (!Array.isArray(value)) throw new FactoryDecisionError("The plan must contain a tasks array.");
   const seen = new Set<string>();
@@ -99,6 +110,7 @@ export function readTasks(value: unknown): PlannedTask[] {
       ...(item.expectedOutputs === undefined ? {} : { expectedOutputs: strings(item.expectedOutputs, `${item.key}.expectedOutputs`) }),
       ...(item.estimatedMinutes === undefined ? {} : { estimatedMinutes: positiveNumber(item.estimatedMinutes, `${item.key}.estimatedMinutes`, 10080) }),
       ...(item.resources === undefined ? {} : { resources: resources(item.resources, `${item.key}.resources`) }),
+      ...(item.requiredCheckEnvironment === undefined ? {} : { requiredCheckEnvironment: validateRequiredCheckEnvironment(item.requiredCheckEnvironment) }),
       ...(item.writePaths === undefined ? {} : { writePaths: writePaths(item.writePaths, `${item.key}.writePaths`) }) };
   });
 }

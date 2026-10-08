@@ -111,6 +111,8 @@ export interface TaskOverview { task: FactoryTask; state: TaskWorkState; reason?
 export interface TaskInspection extends TaskOverview {
   detailsAvailable?: boolean;
   wait?: { condition: string; reason: string; since?: string };
+  /** Required verifier input names only; coordinator configuration values remain private. */
+  verificationInputs?: { missingEnvironment: string[] };
   checks: string[]; planRevision?: number; repairInstructions?: string; lastError?: string;
   dependencies: FactoryTask[]; dependents: FactoryTask[]; attempts: AttemptInspection[]; artifacts: Artifact[];
 }

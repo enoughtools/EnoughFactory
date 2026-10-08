@@ -14,6 +14,7 @@ export function controllerTaskContract(task: FactoryTask, detail: TaskDetail) {
   return { title: task.title, description: task.description, kind: task.kind,
     acceptanceCriteria: task.acceptanceCriteria, expectedOutputs: task.expectedOutputs, dependsOn: task.dependsOn,
     checks: detail.checks, planChecks: detail.planChecks, planRevision: detail.planRevision,
+    ...(detail.requiredCheckEnvironment === undefined ? {} : { requiredCheckEnvironment: detail.requiredCheckEnvironment }),
     writePaths: task.writePaths, resources: task.resources ? { cpus: task.resources.cpus, memoryGiB: task.resources.memoryGiB } : undefined,
     estimatedMinutes: task.estimatedMinutes };
 }

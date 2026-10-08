@@ -5,6 +5,7 @@ import path from 'node:path';
 import test from 'node:test';
 import type { Attempt, FactoryTask, Goal, Project } from '@enoughfactory/contracts';
 import type { AttemptDetail, FactoryStore, TaskDetail } from '@enoughfactory/factory';
+import { taskCheckInputBlocker } from '@enoughfactory/factory';
 import { ArtifactStore, WorkingDirectoryManager } from '@enoughfactory/workspaces';
 import { configureTaskCheckInputs, freezeTaskCheckInputs } from './factory-check-inputs.ts';
 import { factoryAttemptWorkingDirectorySources } from './factory.ts';
@@ -56,6 +57,8 @@ test('stale authority, active execution, secret environment and unselected paths
     { environment: { ENOUGH_EVIDENCE_ROOT: '/workspaces/support/index.json' } },
     { environment: { ENOUGH_EVIDENCE_ROOT: '/workspaces/verification-inputs/../support' } },
     { environment: { ENOUGH_NATIVE_INDEX_SHA256: 'not-a-digest' } },
+    { requiredCheckEnvironment: ['API_TOKEN'] }, { requiredCheckEnvironment: 'ENOUGH_EVIDENCE_ROOT' },
+    { requiredCheckEnvironment: ['ENOUGH_EVIDENCE_ROOT', 'ENOUGH_EVIDENCE_ROOT'] },
   ]) {
     const f = fixture(), before = JSON.stringify(f.store.list('factory-task-details'));
     assert.throws(() => configureTaskCheckInputs(f.task.id, { ...f.input, ...change }, f.deps));
@@ -69,6 +72,24 @@ test('stale authority, active execution, secret environment and unselected paths
     if (state === 'revoked') f.store.set('factory-attempt-details', { ...f.store.get<AttemptDetail>('factory-attempt-details', f.attempt.id)!, cancellation: 'requested' });
     assert.throws(() => configureTaskCheckInputs(f.task.id, f.input, f.deps)); assert.equal(f.store.list('decisions').length, 0);
   }
+});
+
+test('verification prerequisites can be recorded without waking or rewriting a failed attempt', () => {
+  const f = fixture();
+  const preserved = ['goals', 'tasks', 'attempts', 'factory-attempt-details', 'factory-control'].map(table => JSON.stringify(f.store.list(table)));
+  const requiredCheckEnvironment = ['ENOUGH_EVIDENCE_ROOT', 'ENOUGH_NATIVE_INDEX_SHA256', 'ENOUGH_NATIVE_UI_RECEIPT_DESCRIPTOR'];
+  configureTaskCheckInputs(f.task.id, { ...f.input, requiredCheckEnvironment }, f.deps);
+  const detail = () => f.store.get<TaskDetail>('factory-task-details', f.task.id)!;
+  assert.deepEqual(detail().requiredCheckEnvironment, requiredCheckEnvironment);
+  assert.deepEqual(taskCheckInputBlocker(detail())?.missingEnvironment, ['ENOUGH_NATIVE_UI_RECEIPT_DESCRIPTOR']);
+  assert.equal(detail().waitingFor, 'native-evidence-ready');
+  assert.deepEqual(['goals', 'tasks', 'attempts', 'factory-attempt-details', 'factory-control'].map(table => JSON.stringify(f.store.list(table))), preserved);
+  configureTaskCheckInputs(f.task.id, { ...f.input, environment: { ...f.input.environment, ENOUGH_NATIVE_UI_RECEIPT_DESCRIPTOR: '/workspaces/verification-inputs/native-ui/receipt.json' } }, f.deps);
+  assert.deepEqual(detail().requiredCheckEnvironment, requiredCheckEnvironment);
+  assert.equal(taskCheckInputBlocker(detail()), undefined);
+  assert.equal(detail().waitingFor, 'native-evidence-ready');
+  configureTaskCheckInputs(f.task.id, { ...f.input, requiredCheckEnvironment: [] }, f.deps);
+  assert.deepEqual(detail().requiredCheckEnvironment, []);
 });
 
 test('explicit refresh replaces only the selected prior root in a new immutable attempt snapshot', async () => {

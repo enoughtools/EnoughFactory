@@ -279,6 +279,41 @@ test('stale inspector commands preserve newer attempts, pause and replanning con
       assert.equal(response.status, 200); return await response.json() as TaskInspection;
     }
 
+    // Missing coordinator evidence blocks both manual dispatch and the read projection,
+    // while keeping failed attempt receipts and configured values private.
+    for (const status of ['queued', 'ready', 'failed'] as const) {
+      seed({}, { status, ...(status === 'failed' ? { currentAttemptId: first.id } : {}) });
+      const detail = app.store.get<TaskDetail>('factory-task-details', task.id)!;
+      app.store.set<TaskDetail>('factory-task-details', { ...detail,
+        requiredCheckEnvironment: ['EVIDENCE_ROOT', 'EVIDENCE_DESCRIPTOR'],
+        ...(status === 'failed' ? { waitingFor: 'verified-export', waitReason: 'The coordinator must supply the verification export.', waitSince: at } : {}),
+        checkInputs: { configurationRevision: 1, workingDirectoryIds: [], environment: { EVIDENCE_ROOT: '/private/coordinator-evidence' },
+          goalRevision: goal.revision, configuredAgainstAttemptId: status === 'failed' ? first.id : null, configuredAt: at, configuredByDeviceId: app.device.id } });
+      const before = snapshot(), view = await viewTask();
+      assert.equal(view.state, 'waiting');
+      assert.deepEqual(view.verificationInputs, { missingEnvironment: ['EVIDENCE_DESCRIPTOR'] });
+      assert.match(view.reason!, /EVIDENCE_DESCRIPTOR/);
+      assert.equal(JSON.stringify(view).includes('/private/coordinator-evidence'), false);
+      assert.deepEqual(snapshot(), before, 'Reading prerequisite metadata cannot change task or attempt state');
+      if (status === 'failed') {
+        assert.deepEqual(view.wait, { condition: 'verified-export', reason: 'The coordinator must supply the verification export.', since: at });
+        assert.equal(app.store.get<Attempt>('attempts', first.id)!.status, 'failed');
+        await rejectWithoutEffects(retry, { ...expected, expectedAttemptId: first.id });
+      } else {
+        await rejectWithoutEffects(run, expected);
+        app.store.set<ControlRecord>('factory-control', { id: goal.id, stage: 'plan', startedAt: at, steering: [] });
+        assert.equal((await viewTask()).state, 'waiting', 'Controller activity cannot disguise a missing verification prerequisite as queued work');
+      }
+    }
+    seed();
+    const configured = app.store.get<TaskDetail>('factory-task-details', task.id)!;
+    app.store.set<TaskDetail>('factory-task-details', { ...configured, requiredCheckEnvironment: ['EVIDENCE_DESCRIPTOR'],
+      checkInputs: { configurationRevision: 2, workingDirectoryIds: [], environment: { EVIDENCE_DESCRIPTOR: '/private/verified/export.json' },
+        goalRevision: goal.revision, configuredAgainstAttemptId: null, configuredAt: at, configuredByDeviceId: app.device.id } });
+    const configuredView = await viewTask();
+    assert.equal(configuredView.verificationInputs, undefined);
+    assert.equal(configuredView.state, 'queued', 'A configured prerequisite returns to the normal manual authorization rule');
+
     // A manual command follows the same footprint, resource and slot reservations as the board.
     seed({ concurrency: 4 }, { writePaths: ['src/shared/ui/'] });
     reserve('unknown', ['src/elsewhere/'], ['src/shared/']);

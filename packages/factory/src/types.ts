@@ -71,6 +71,8 @@ export interface ControllerRecordRequirement {
 export interface PlannedTask {
   key: string; title: string; description: string; dependsOn: string[];
   checks: string[]; deviceId?: string;
+  /** Names of coordinator-configured verification inputs required before dispatch. */
+  requiredCheckEnvironment?: string[];
   kind?: TaskKind; acceptanceCriteria?: string[]; expectedOutputs?: string[];
   estimatedMinutes?: number; writePaths?: string[]; resources?: { cpus?: number; memoryGiB?: number };
 }
@@ -94,6 +96,7 @@ export interface TaskDetail {
   selected: boolean; failureSignatures: string[];
   /** Coordinator-authenticated verification inputs; applied only to new attempts. */
   checkInputs?: TaskCheckInputsConfiguration;
+  requiredCheckEnvironment?: string[];
 }
 export interface FrozenTaskCheckInputs {
   configurationRevision: number; workingDirectoryIds: string[]; environment: Record<string, string>;

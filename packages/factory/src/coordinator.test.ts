@@ -9,7 +9,7 @@ import { readPlan } from "./protocol.js";
 import { CONTROLLER_PROMPT_LIMIT, controllerTaskContract, controllerAttemptContract } from "./controller-evidence.js";
 import type {
   AttemptDetail, CandidateRef, ControlRecord, EvaluationRecord, EvaluationResponse, ExecutionResult, FactoryRuntimePort,
-  FactoryStore, FactoryWorkspacePort, PlanRecord, PlanResponse, TaskDetail,
+  FactoryStore, FactoryWorkspacePort, PlanRecord, PlanResponse, TaskDetail, TaskCheckInputsConfiguration,
 } from "./types.js";
 
 /** Reads cannot mutate committed records and a failed transaction cannot leave half a transition. */
@@ -159,6 +159,101 @@ async function finishTask(factory: ReturnType<typeof harness>): Promise<Goal> {
   assert.equal(factory.store.list<FactoryTask>("tasks")[0]!.status, "completed");
   return goal;
 }
+
+const nativeInputNames = ["ENOUGH_EVIDENCE_ROOT", "ENOUGH_NATIVE_INDEX_SHA256", "ENOUGH_NATIVE_UI_RECEIPT_DESCRIPTOR"];
+function configuredNativeInputs(goal: Goal, environment: Record<string, string>, attemptId: string | null = null): TaskCheckInputsConfiguration {
+  return { configurationRevision: 1, workingDirectoryIds: [], environment, goalRevision: goal.revision,
+    configuredAgainstAttemptId: attemptId, configuredAt: device.lastSeen, configuredByDeviceId: device.id };
+}
+const nativeInputValues = { ENOUGH_EVIDENCE_ROOT: "/workspaces/evidence", ENOUGH_NATIVE_INDEX_SHA256: "a".repeat(64), ENOUGH_NATIVE_UI_RECEIPT_DESCRIPTOR: "/workspaces/evidence/native-ui.json" };
+
+test("native verification waits before allocation while independent work runs, including after restart", async t => {
+  const factory = harness();
+  factory.planning(async () => ({ ...plan, tasks: [
+    { ...plan.tasks[0]!, requiredCheckEnvironment: nativeInputNames },
+    { key: "independent", title: "Independent implementation", description: "Ship useful work without native evidence", dependsOn: [], checks: [] },
+  ] }));
+  const goal = factory.goal();
+  await factory.coordinator.tick(); await factory.coordinator.waitForIdle();
+  await factory.coordinator.tick(); await factory.coordinator.waitForIdle();
+  const native = factory.store.list<FactoryTask>("tasks").find(task => task.title === plan.tasks[0]!.title)!;
+  const independent = factory.store.list<FactoryTask>("tasks").find(task => task.id !== native.id)!;
+  assert.equal(independent.status, "completed");
+  assert.equal(factory.calls.execute, 1);
+  assert.equal(factory.store.list<Attempt>("attempts").some(attempt => attempt.taskId === native.id), false);
+  assert.equal(factory.store.get<FactoryTask>("tasks", native.id)!.status, "queued");
+  const detail = factory.store.get<TaskDetail>("factory-task-details", native.id)!;
+  factory.store.set("factory-task-details", { ...detail, checkInputs: configuredNativeInputs(goal, { ...nativeInputValues, ENOUGH_NATIVE_INDEX_SHA256: " " }) });
+  const recovered = factory.recover();
+  t.after(() => recovered.stop());
+  await recovered.start();
+  for (let i = 0; i < 4; i++) { await recovered.tick(); await recovered.waitForIdle(); }
+  assert.equal(factory.calls.execute, 1, "neither repeated ticks nor a service restart allocates an unconfigured attempt");
+  assert.match(factory.store.get<Goal>("goals", goal.id)!.nextAction!, /Waiting for verification evidence from the coordinator/);
+  assert.equal(factory.calls.diagnosis, 0, "missing coordinator input is not a source failure");
+  factory.store.set("factory-task-details", { ...factory.store.get<TaskDetail>("factory-task-details", native.id)!, checkInputs: configuredNativeInputs(goal, nativeInputValues) });
+  await recovered.tick(); await recovered.waitForIdle();
+  assert.equal(factory.calls.execute, 2);
+  assert.equal(factory.store.get<FactoryTask>("tasks", native.id)!.status, "completed");
+  assert.equal(factory.store.list<Attempt>("attempts").find(attempt => attempt.taskId === native.id)!.generation, 1, "waiting never consumes an attempt generation");
+});
+
+test("stable task replans preserve native prerequisite waits and failed evidence until authenticated inputs arrive", async t => {
+  const factory = harness();
+  factory.executing(async () => ({ status: "failed", text: "No authenticated native evidence was supplied" }));
+  factory.diagnosing(async () => ({ action: "wait", reason: "Coordinator native evidence required", instructions: "Keep the exact retained source" }));
+  const goal = await planGoal(factory);
+  await factory.coordinator.tick(); await factory.coordinator.waitForIdle();
+  await factory.coordinator.tick(); await factory.coordinator.waitForIdle();
+  await factory.coordinator.tick(); await factory.coordinator.waitForIdle();
+  const originalTask = factory.store.list<FactoryTask>("tasks")[0]!, originalDetail = factory.store.get<TaskDetail>("factory-task-details", originalTask.id)!;
+  assert.equal(originalDetail.waitingFor, "external-condition");
+  const failed = factory.store.get<Attempt>("attempts", originalTask.currentAttemptId!)!;
+  const failedDetail = factory.store.get<AttemptDetail>("factory-attempt-details", failed.id)!;
+  factory.planning(async () => ({ ...plan, tasks: [
+    { ...plan.tasks[0]!, description: "Verify the improved native app", requiredCheckEnvironment: nativeInputNames },
+    { key: "independent", title: "Independent repair", description: "Fix another in-scope issue", dependsOn: [], checks: [] },
+  ] }));
+  factory.coordinator.requestPlan(goal.id);
+  await factory.coordinator.tick(); await factory.coordinator.waitForIdle();
+  const replanned = factory.store.get<FactoryTask>("tasks", originalTask.id)!;
+  const replannedDetail = factory.store.get<TaskDetail>("factory-task-details", originalTask.id)!;
+  assert.equal(replanned.description, "Verify the improved native app", "current contracts can improve without claiming the external prerequisite arrived");
+  assert.equal(replanned.status, "failed");
+  assert.equal(replanned.currentAttemptId, failed.id);
+  assert.equal(replannedDetail.waitingFor, originalDetail.waitingFor);
+  assert.equal(replannedDetail.waitReason, originalDetail.waitReason);
+  assert.equal(replannedDetail.waitSince, originalDetail.waitSince);
+  factory.coordinator.notifyCondition("external-condition", goal.id);
+  assert.equal(factory.store.get<FactoryTask>("tasks", originalTask.id)!.currentAttemptId, failed.id, "an unfulfilled manual wake retains failed attempt identity");
+  assert.equal(factory.store.get<TaskDetail>("factory-task-details", originalTask.id)!.waitingFor, "external-condition");
+  factory.executing(async () => ({ status: "succeeded", text: "Independent implementation complete" }));
+  await factory.coordinator.tick(); await factory.coordinator.waitForIdle();
+  const accepted = factory.store.list<FactoryTask>("tasks").find(task => task.id !== originalTask.id)!;
+  assert.equal(accepted.status, "completed");
+  const acceptedDetail = factory.store.get<TaskDetail>("factory-task-details", accepted.id)!;
+  factory.planning(async () => ({ ...plan, tasks: [{ ...plan.tasks[0]!, description: "Verify the final integrated source" }] }));
+  factory.coordinator.requestPlan(goal.id);
+  await factory.coordinator.tick(); await factory.coordinator.waitForIdle();
+  assert.deepEqual(factory.store.get<TaskDetail>("factory-task-details", originalTask.id)!.requiredCheckEnvironment, nativeInputNames, "omitting a prerequisite on a stable-key replan preserves it");
+  assert.deepEqual(factory.store.get<FactoryTask>("tasks", accepted.id), accepted);
+  assert.deepEqual(factory.store.get<TaskDetail>("factory-task-details", accepted.id), acceptedDetail);
+  const recovered = factory.recover();
+  t.after(() => recovered.stop());
+  await recovered.start();
+  for (let i = 0; i < 3; i++) { await recovered.tick(); await recovered.waitForIdle(); }
+  assert.equal(factory.calls.execute, 2);
+  assert.deepEqual(factory.store.get<Attempt>("attempts", failed.id), failed);
+  assert.deepEqual(factory.store.get<AttemptDetail>("factory-attempt-details", failed.id), failedDetail, "replans and restart do not relabel old failed evidence");
+  const currentGoal = factory.store.get<Goal>("goals", goal.id)!;
+  factory.store.set("factory-task-details", { ...factory.store.get<TaskDetail>("factory-task-details", originalTask.id)!, checkInputs: configuredNativeInputs(currentGoal, nativeInputValues, failed.id) });
+  recovered.notifyCondition("external-condition", goal.id);
+  await recovered.tick(); await recovered.waitForIdle();
+  assert.equal(factory.store.get<FactoryTask>("tasks", originalTask.id)!.status, "completed");
+  assert.equal(factory.store.list<Attempt>("attempts").filter(attempt => attempt.taskId === originalTask.id).length, 2);
+  assert.deepEqual(factory.store.get<Attempt>("attempts", failed.id), failed);
+  assert.deepEqual(factory.store.get<AttemptDetail>("factory-attempt-details", failed.id), failedDetail);
+});
 
 test("controllers retain every contract and exact evidence identity without embedding a large accepted history", async () => {
   const factory = harness(), created = factory.goal();

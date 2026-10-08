@@ -6,7 +6,7 @@ import type {
 } from "./types.js";
 import { readCheckCommands, readEvaluation, readJsonObject, readPlan, readTasks, validateDependencies } from "./protocol.js";
 import { FactoryOperationError, FactoryDecisionError, FactoryControllerError, FactoryCapacityError } from "./errors.js";
-import { activeExecutionTasks, descendants, placementConstraint, sortReadyTasks, taskSchedulingBlocker } from "./scheduler.js";
+import { activeExecutionTasks, descendants, placementConstraint, sortReadyTasks, taskSchedulingBlocker, taskCheckInputBlocker } from "./scheduler.js";
 import { ControllerEvidence, controllerPrompt } from "./controller-evidence.js";
 
 const TABLE = {
@@ -333,6 +333,7 @@ export class FactoryCoordinator {
       if (goalId && task.goalId !== goalId) continue;
       const goal = this.goal(task.goalId), detail = this.taskDetail(task.id);
       if (terminalGoals.has(goal.status) || detail.waitingFor !== condition || task.status !== "failed") continue;
+      if (taskCheckInputBlocker(detail)) continue;
       this.options.store.transaction(() => {
         this.writeTask(task.id, { status: "queued", currentAttemptId: undefined });
         this.options.store.set(TABLE.taskDetails, { ...detail, waitingFor: undefined, waitReason: undefined, waitSince: undefined });
@@ -401,7 +402,8 @@ export class FactoryCoordinator {
             this.options.store.get<AttemptDetail>(TABLE.attemptDetails, task.currentAttemptId ?? "")) }));
         return [
           "You are the EnoughFactory planner. Build the entire objective, preserving all explicit requirements. Make routine implementation decisions yourself.",
-          "Return one JSON object: {summary,criteria:string[],checks:string[],tasks:[{key,title,description,kind:'feature'|'unit'|'architecture'|'test',acceptanceCriteria:string[],expectedOutputs:string[],dependsOn:string[],checks:string[],estimatedMinutes?:number,writePaths?:string[],resources?:{cpus?:number,memoryGiB?:number},deviceId?:string}]}. Stable task keys must be unique, dependencies acyclic, checks focused and executable inside the isolated runtime.",
+          "Return one JSON object: {summary,criteria:string[],checks:string[],tasks:[{key,title,description,kind:'feature'|'unit'|'architecture'|'test',acceptanceCriteria:string[],expectedOutputs:string[],dependsOn:string[],checks:string[],requiredCheckEnvironment?:string[],estimatedMinutes?:number,writePaths?:string[],resources?:{cpus?:number,memoryGiB?:number},deviceId?:string}]}. Stable task keys must be unique, dependencies acyclic, checks focused and executable inside the isolated runtime.",
+          "If a task requires independently supplied verification inputs, declare their names in requiredCheckEnvironment. Supported names are ENOUGH_EVIDENCE_ROOT, ENOUGH_NATIVE_UI_RECEIPT_DESCRIPTOR, ENOUGH_NATIVE_INDEX_SHA256 and ENOUGH_ACCEPTANCE_INDEX_SHA256. The coordinator will wait before dispatch until its authenticated check-input configuration contains every named value. Plan descriptions and checks cannot provision these values. Existing task-local external waits survive a stable-key replan; changing a plan is not evidence that their prerequisites arrived.",
           "Choose task kinds by outcome: feature delivers observable product behavior; unit implements a bounded component or change; architecture resolves a structural decision and preserves its rationale and handoff; test supplies focused verification for an identified uncertainty. Give each task concrete acceptance criteria and expected deliverables. Do not invent extra architecture/test tasks or mandatory reviews when the work does not need them.",
           "Every ordinary checks entry is a shell command, never an instruction or explanation. A structured validation profile explicitly advertised by the runtime is also a valid check; preserve its exact prefix and JSON rather than wrapping it in a shell command. For example use 'sh scripts/check-foundation.sh', not 'Run scripts/check-foundation.sh to validate the foundation'. Task checks verify only outputs available when that task and its actual prerequisites finish. An architecture or interface task should verify its deliverables without requiring the future application, packages or tests to exist. Plan-level checks are final whole-goal checks, run once on the integrated result after all tasks finish; do not copy them into every task or require expensive full-product verification at every layer. Empty task checks are acceptable when concrete deliverable evidence is the appropriate verification.",
           "Maximize useful parallel work: establish shared interfaces/contracts in small prerequisite tasks, then give independent implementations disjoint ownership. DependsOn is for actual required outputs, not preferred chronology or artificial phases. Avoid making every task depend on a broad setup task. Declare repository-relative writePaths (files, directories or globs) for likely writes, estimatedMinutes for effort and resources for meaningful CPU/memory needs. Estimates guide scheduling; do not invent precision. Keep verification proportionate; do not require human approval or ceremonies unless the goal's actual policy requires them.",
@@ -463,6 +465,7 @@ export class FactoryCoordinator {
     const running = this.activeWork().filter(task => task.goalId === goal.id).length;
     let capacity = Math.max(0, goal.concurrency - running);
     let eligible = 0, placed = 0;
+    const verificationWaits: string[] = [];
     const stableKeys = new Map(tasks.map(task => [task.id, this.taskDetail(task.id).key]));
     for (const task of sortReadyTasks(tasks, stableKeys)) {
       if (capacity === 0) break;
@@ -472,6 +475,9 @@ export class FactoryCoordinator {
       const detail = this.taskDetail(task.id);
       if (goal.autonomy !== "autonomous" && !detail.selected) continue;
       if (this.control(goal.id).replanTaskIds?.includes(task.id)) continue;
+      if (detail.waitingFor) continue;
+      const inputBlocker = taskCheckInputBlocker(detail);
+      if (inputBlocker) { verificationWaits.push(task.title); continue; }
       const active = this.activeWork();
       const repository = this.options.project(goal.projectId)?.path ?? goal.projectId;
       const conflicts = active.filter(other => {
@@ -500,6 +506,10 @@ export class FactoryCoordinator {
       this.track(this.execute(attempt).finally(() => this.busyAttempts.delete(attempt.id)));
     }
     if (placed) this.changed();
+    else if (verificationWaits.length && !running && !failed) {
+      const reason = `Waiting for verification evidence from the coordinator for ${verificationWaits.join("; ")}.`;
+      if (this.goal(goal.id).nextAction !== reason) { this.writeGoal(goal.id, { nextAction: reason }); this.changed(); }
+    }
     else if (manageController && !failed && eligible && !running) this.wait(goal.id, goal.workspaceProvider === "artifactfs" ? "Waiting for an online worker with ArtifactFS support and capacity." : "Waiting for an online worker with capacity.", "device-online");
     else if (!running && goal.autonomy !== "autonomous") this.writeGoal(goal.id, { nextAction: "Select the next tasks to execute" });
   }
@@ -796,7 +806,7 @@ export class FactoryCoordinator {
       const recordRequirements: ControllerRecordRequirement[] = [];
       const prompt = controllerPrompt(evidence => [
         "You are the EnoughFactory completion evaluator. Audit the entire original objective against the actual repository and retained execution evidence. A worker's final response, green unrelated tests or partial implementation do not prove completion.",
-        "Inspect/run only meaningful checks needed for uncertain criteria. Return JSON {complete:boolean,summary:string,criteria:[{criterion:string,satisfied:boolean,evidence:string[]}],additionalTasks?:[{key,title,description,kind:'feature'|'unit'|'architecture'|'test',acceptanceCriteria:string[],expectedOutputs:string[],dependsOn:string[],checks:string[]}],waitReason?:string,wakeCondition?:string}. Use task kinds for concrete delivery outcomes, not mandatory role ceremonies.",
+        "Inspect/run only meaningful checks needed for uncertain criteria. Return JSON {complete:boolean,summary:string,criteria:[{criterion:string,satisfied:boolean,evidence:string[]}],additionalTasks?:[{key,title,description,kind:'feature'|'unit'|'architecture'|'test',acceptanceCriteria:string[],expectedOutputs:string[],dependsOn:string[],checks:string[],requiredCheckEnvironment?:string[]}],waitReason?:string,wakeCondition?:string}. Use task kinds for concrete delivery outcomes, not mandatory role ceremonies. Tasks needing independently supplied verification inputs must declare the supported requiredCheckEnvironment names; a prose prerequisite does not gate dispatch.",
         "Use each criterion's exact original text. Every satisfied criterion requires concrete current-state evidence such as files, runtime outcomes, exact commit check records or published URLs. If something remains, add actionable tasks. Never weaken the objective to declare completion. No mandatory human gate applies to autonomous plus approve-all.",
         "Also inspect the accepted tasks' acceptance criteria and expected deliverables. Integration records prove accepted source, not that every requested behavior or deliverable exists. Add concrete follow-up work for any unmet contract that matters to the original objective.",
         "The current integrated primary repository and attached current project folders are the sources for the final product audit. Historical candidate IDs and CAS references identify retained source; their bodies are optional evidence and are not automatically transferred for evaluation. Use the mounted manifest to determine actual available files. Never claim to have inspected a historical candidate body merely from its identity or integration record.",
@@ -869,19 +879,23 @@ export class FactoryCoordinator {
     for (const task of tasks) taskKeys[task.key] = retained.get(task.key)?.id ?? randomUUID();
     for (const task of tasks) {
       const id = taskKeys[task.key]!, previous = retained.get(task.key), previousDetail = previous ? this.taskDetail(previous.id) : undefined;
+      const waiting = !!previousDetail?.waitingFor;
       const supersededRepair = previousDetail?.repairInstructions && previousDetail.planRevision !== goal.revision;
       const priorRepairInstructions = supersededRepair ? [...previousDetail.priorRepairInstructions ?? [], {
         instructions: previousDetail.repairInstructions!, planRevision: previousDetail.planRevision,
         ...(previousDetail.lastCandidate ? { retainedCandidateId: previousDetail.lastCandidate.id, retainedCandidateCommit: previousDetail.lastCandidate.commit } : {}),
       }] : previousDetail?.priorRepairInstructions;
-      this.options.store.set<FactoryTask>(TABLE.tasks, { id, goalId, title: task.title, description: task.description, dependsOn: task.dependsOn.map(key => taskKeys[key]!), status: "queued", createdAt: previous?.createdAt ?? at, updatedAt: at, ...(task.deviceId ? { deviceId: task.deviceId } : {}),
+      this.options.store.set<FactoryTask>(TABLE.tasks, { id, goalId, title: task.title, description: task.description, dependsOn: task.dependsOn.map(key => taskKeys[key]!), status: waiting ? "failed" : "queued", createdAt: previous?.createdAt ?? at, updatedAt: at, ...(task.deviceId ? { deviceId: task.deviceId } : {}),
+        ...(waiting && previous ? { currentAttemptId: previous.currentAttemptId, sessionId: previous.sessionId, deviceId: previous.deviceId } : {}),
         ...(task.kind ?? previous?.kind ? { kind: task.kind ?? previous?.kind } : {}),
         ...(task.acceptanceCriteria ?? previous?.acceptanceCriteria ? { acceptanceCriteria: task.acceptanceCriteria ?? previous?.acceptanceCriteria } : {}),
         ...(task.expectedOutputs ?? previous?.expectedOutputs ? { expectedOutputs: task.expectedOutputs ?? previous?.expectedOutputs } : {}),
         ...(task.estimatedMinutes ?? previous?.estimatedMinutes ? { estimatedMinutes: task.estimatedMinutes ?? previous?.estimatedMinutes } : {}),
         ...(task.writePaths ?? previous?.writePaths ? { writePaths: task.writePaths ?? previous?.writePaths } : {}),
         ...(task.resources ?? previous?.resources ? { resources: task.resources ?? previous?.resources } : {}) });
-      this.options.store.set<TaskDetail>(TABLE.taskDetails, { ...previousDetail, id, key: task.key, checks: task.checks, planChecks: [], planRevision: goal.revision, waitingFor: undefined, waitReason: undefined, waitSince: undefined, repairInstructions: supersededRepair ? undefined : previousDetail?.repairInstructions, priorRepairInstructions, replanInstructions, selected: goal.autonomy === "autonomous", failureSignatures: previousDetail?.failureSignatures ?? [] });
+      this.options.store.set<TaskDetail>(TABLE.taskDetails, { ...previousDetail, id, key: task.key, checks: task.checks, planChecks: [], planRevision: goal.revision, waitingFor: waiting ? previousDetail.waitingFor : undefined, waitReason: waiting ? previousDetail.waitReason : undefined, waitSince: waiting ? previousDetail.waitSince : undefined,
+        requiredCheckEnvironment: task.requiredCheckEnvironment ?? previousDetail?.requiredCheckEnvironment,
+        repairInstructions: supersededRepair ? undefined : previousDetail?.repairInstructions, priorRepairInstructions, replanInstructions, selected: goal.autonomy === "autonomous", failureSignatures: previousDetail?.failureSignatures ?? [] });
     }
     this.options.store.set<PlanRecord>(TABLE.plans, { id: goalId, goalId, revision: goal.revision, summary, checks, checkScope: "goal", taskKeys, createdAt: at });
   }

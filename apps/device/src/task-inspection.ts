@@ -1,11 +1,14 @@
 import type { Artifact, Attempt, AttemptInspection, Decision, ControllerRun, Device, FactoryTask, Goal, GoalInspection, Project, TaskCheck, TaskInspection, TaskOverview, DevelopmentToolchain } from '@enoughfactory/contracts';
 import type { AttemptDetail, ControlRecord, FactoryStore, PlanRecord, TaskDetail } from '@enoughfactory/factory';
-import { activeExecutionTasks, taskSchedulingBlocker } from '@enoughfactory/factory';
+import { activeExecutionTasks, taskCheckInputBlocker, taskSchedulingBlocker } from '@enoughfactory/factory';
 import type { WorkingDirectoryCapture } from '@enoughfactory/workspaces';
 import type { WorkingDirectoryMount } from '@enoughfactory/contracts';
 
 /** Shared by read inspection and manual dispatch. Current execution contracts own reservations. */
 export function taskDispatchBlocker(store: FactoryStore, devices: Device[], task: FactoryTask, goal: Goal) {
+  const detail = store.get<TaskDetail>('factory-task-details', task.id);
+  const verificationInputs = detail && taskCheckInputBlocker(detail);
+  if (verificationInputs) return verificationInputs;
   const tasks = store.list<FactoryTask>('tasks').map(item => item.id === task.id ? task : item);
   const attempts = store.list<Attempt>('attempts');
   const details = store.list<AttemptDetail>('factory-attempt-details');
@@ -61,6 +64,8 @@ export function inspectTaskOverview(store: FactoryStore, devices: Device[], task
   if (task.status === 'completed') return { ...base, state: 'accepted' };
   if (task.status === 'canceled') return { ...base, state: 'canceled', reason: attemptDetail?.cancellation === 'requested' ? 'Authority revoked; runtime termination has not been acknowledged.' : undefined };
   if (task.status === 'failed') {
+    const verificationInputs = detail && taskCheckInputBlocker(detail);
+    if (verificationInputs && attempt?.status !== 'unknown') return { ...base, state: 'waiting', reason: verificationInputs.reason };
     const controllerWait = control?.stage === 'diagnose' && control.diagnosisTaskId === task.id && !!control.waitingFor;
     return { ...base, state: detail?.waitingFor || controllerWait ? 'waiting' : 'failed', reason: detail?.waitReason || (controllerWait ? control?.waitReason : undefined) || detail?.lastError || attempt?.error };
   }
@@ -73,6 +78,8 @@ export function inspectTaskOverview(store: FactoryStore, devices: Device[], task
   if (!goal) return { ...base, state: 'waiting', reason: 'The coordinating goal is unavailable.' };
   if (goal.status === 'paused') return { ...base, state: 'waiting', reason: 'Goal paused.' };
   if (['canceled', 'failed', 'completed'].includes(goal.status)) return { ...base, state: 'waiting', reason: `Goal ${goal.status}; no new work will be dispatched.` };
+  const verificationInputs = detail && taskCheckInputBlocker(detail);
+  if (verificationInputs) return { ...base, state: 'waiting', reason: verificationInputs.reason };
   if (goal.status === 'waiting') return { ...base, state: 'waiting', reason: control?.waitReason || goal.nextAction };
   const coordinating = taskControlReason(task, control);
   if (coordinating) return { ...base, state: 'queued', reason: coordinating };
@@ -100,7 +107,9 @@ export function inspectTask(store: FactoryStore, devices: Device[], task: Factor
   const detail = store.get<TaskDetail>('factory-task-details', task.id);
   const plan = store.get<PlanRecord>('factory-plans', task.goalId);
   const tasks = store.list<FactoryTask>('tasks');
+  const verificationInputs = ['queued', 'ready', 'failed'].includes(task.status) && detail ? taskCheckInputBlocker(detail) : undefined;
   return { ...inspectTaskOverview(store, devices, task), detailsAvailable: !!detail, checks: [...new Set([...(detail?.planChecks ?? plan?.checks ?? []), ...(detail?.checks ?? [])])],
+    ...(verificationInputs ? { verificationInputs: { missingEnvironment: verificationInputs.missingEnvironment } } : {}),
     wait: inspectTaskWait(store, task, detail), planRevision: detail?.planRevision, repairInstructions: detail?.repairInstructions, lastError: detail?.lastError,
     dependencies: task.dependsOn.flatMap(id => { const dependency = tasks.find(item => item.id === id); return dependency ? [dependency] : []; }),
     dependents: tasks.filter(item => item.dependsOn.includes(task.id)),

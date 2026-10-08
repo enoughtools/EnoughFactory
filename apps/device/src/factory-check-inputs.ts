@@ -1,11 +1,12 @@
 import { randomUUID } from 'node:crypto';
 import type { Attempt, Chat, Decision, FactoryTask, Goal, Project } from '@enoughfactory/contracts';
 import type { AttemptDetail, ControlRecord, FactoryStore, FrozenTaskCheckInputs, TaskCheckInputsConfiguration, TaskDetail } from '@enoughfactory/factory';
+import { validateRequiredCheckEnvironment } from '@enoughfactory/factory';
 import { validateCheckInputs } from '@enoughfactory/workspaces';
 import { HttpError } from './util.ts';
 
 interface CheckInputRequest {
-  expectedGoalRevision?: unknown; expectedAttemptId?: unknown; workingDirectoryIds?: unknown; environment?: unknown;
+  expectedGoalRevision?: unknown; expectedAttemptId?: unknown; workingDirectoryIds?: unknown; environment?: unknown; requiredCheckEnvironment?: unknown;
 }
 interface Dependencies {
   store: FactoryStore; deviceId: string; workerBusy(attemptId: string): boolean; chatIsRunning(chatId: string): boolean;
@@ -39,7 +40,9 @@ export function configureTaskCheckInputs(taskId: string, input: CheckInputReques
     const project = store.get<Project>('projects', goal.projectId);
     if (!project || project.deviceId !== deps.deviceId) conflict('The configured check inputs must belong to this local project.');
     let frozen: FrozenTaskCheckInputs;
+    let requiredCheckEnvironment = detail.requiredCheckEnvironment;
     try {
+      if (input.requiredCheckEnvironment !== undefined) requiredCheckEnvironment = validateRequiredCheckEnvironment(input.requiredCheckEnvironment);
       frozen = validateCheckInputs({ configurationRevision: (detail.checkInputs?.configurationRevision ?? 0) + 1,
         workingDirectoryIds: input.workingDirectoryIds, environment: input.environment },
       (project.workingDirectories ?? []).map(root => ({ id: root.id, containerPath: `/workspaces/${root.name}` })))!;
@@ -47,10 +50,10 @@ export function configureTaskCheckInputs(taskId: string, input: CheckInputReques
     const at = deps.now?.() ?? new Date().toISOString();
     const configuration: TaskCheckInputsConfiguration = { ...frozen, goalRevision: goal.revision,
       configuredAgainstAttemptId: task.currentAttemptId ?? null, configuredAt: at, configuredByDeviceId: deps.deviceId };
-    store.set('factory-task-details', { ...detail, checkInputs: configuration });
+    store.set('factory-task-details', { ...detail, ...(requiredCheckEnvironment === undefined ? {} : { requiredCheckEnvironment }), checkInputs: configuration });
     store.set<Decision>('decisions', { id: randomUUID(), goalId: goal.id, at, kind: 'task-check-inputs',
       text: `Configured verification inputs for ${task.title}; existing attempts and waiting state are unchanged.`,
-      data: { taskId: task.id, ...configuration } });
+      data: { taskId: task.id, ...configuration, requiredCheckEnvironment } });
     return configuration;
   });
 }

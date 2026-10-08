@@ -1,9 +1,23 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { FactoryDecisionError } from "./errors.js";
-import { readCheckCommands, readEvaluation, readPlan, readTasks, validateDependencies } from "./protocol.js";
+import { readCheckCommands, readEvaluation, readPlan, readTasks, validateDependencies, validateRequiredCheckEnvironment } from "./protocol.js";
 
 const task = { key: "implementation", title: "Implement feature", description: "Deliver the requested behavior", dependsOn: [], checks: [] };
+
+test("verification prerequisites accept only supported unique input names and preserve explicit clearing", () => {
+  const keys = ["ENOUGH_EVIDENCE_ROOT", "ENOUGH_NATIVE_INDEX_SHA256", "ENOUGH_NATIVE_UI_RECEIPT_DESCRIPTOR", "ENOUGH_ACCEPTANCE_INDEX_SHA256"];
+  assert.equal(validateRequiredCheckEnvironment(undefined), undefined);
+  assert.deepEqual(validateRequiredCheckEnvironment([]), []);
+  assert.deepEqual(validateRequiredCheckEnvironment(keys), keys);
+  assert.deepEqual(readTasks([{ ...task, requiredCheckEnvironment: keys }])[0]!.requiredCheckEnvironment, keys);
+  assert.deepEqual(readTasks([{ ...task, requiredCheckEnvironment: [] }])[0]!.requiredCheckEnvironment, []);
+  assert.equal(Object.hasOwn(readTasks([task])[0]!, "requiredCheckEnvironment"), false);
+  for (const value of [null, "ENOUGH_EVIDENCE_ROOT", {}, [1], [""], [" ENOUGH_EVIDENCE_ROOT"], ["API_TOKEN"], ["invalid-key"], ["A".repeat(129)], [keys[0], keys[0]], [...keys, "EXTRA"]]) {
+    assert.throws(() => validateRequiredCheckEnvironment(value), FactoryDecisionError);
+    assert.throws(() => readTasks([{ ...task, requiredCheckEnvironment: value }]), FactoryDecisionError);
+  }
+});
 
 test("planning preserves scheduling hints, normalizes path globs and keeps legacy hints absent", () => {
   assert.deepEqual(readTasks([task]), [task]);

@@ -1,4 +1,5 @@
 import type { Attempt, AttemptInspection, Device, FactoryTask, Goal } from "@enoughfactory/contracts";
+import type { TaskDetail } from "./types.js";
 
 const lexical = (left: string, right: string): number => left < right ? -1 : left > right ? 1 : 0;
 
@@ -92,6 +93,22 @@ export interface SchedulingBlocker {
   reason: string;
   taskIds?: string[];
   deviceIds?: string[];
+}
+
+export interface CheckInputBlocker {
+  kind: "verification-inputs";
+  reason: string;
+  missingEnvironment: string[];
+}
+
+/** Only authenticated coordinator configuration can satisfy a planned verification prerequisite. */
+export function taskCheckInputBlocker(detail: Pick<TaskDetail, "requiredCheckEnvironment" | "checkInputs">): CheckInputBlocker | undefined {
+  const missingEnvironment = [...new Set(detail.requiredCheckEnvironment ?? [])].filter(key => {
+    const value = detail.checkInputs?.environment?.[key];
+    return typeof value !== "string" || !value.trim();
+  });
+  return missingEnvironment.length ? { kind: "verification-inputs", missingEnvironment,
+    reason: "Waiting for verification evidence from the coordinator." } : undefined;
 }
 
 /** Shared dispatch/inspection explanation. Repository ownership and unresolved attempts are supplied by the caller. */
