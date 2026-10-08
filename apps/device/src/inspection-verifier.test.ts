@@ -1,0 +1,697 @@
+import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
+import { chmod, cp, lstat, mkdir, mkdtemp, readFile, readlink, realpath, rename, rm, symlink, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import test, { type TestContext } from 'node:test';
+import type { Chat, ExecutionTargetAdvertisement, Goal, InspectionAuthority, InspectionSourceIdentity, InspectionVerificationRun, Project, Session, TaskQualityRequirements } from '@enoughfactory/contracts';
+import { ArtifactStore, InspectionSnapshotManager, importInspectionSnapshot, type InspectionSnapshot, type InspectionSnapshotTransfer } from '@enoughfactory/workspaces';
+import type { DeviceApp } from './app.ts';
+import type { AgentToolBridgeContext, ChatController, RunOptions } from './chats.ts';
+import { InspectionVerifier, INSPECTION_VERIFIER_RUNS, inspectionQualityPolicySha256, inspectionVerificationKey, type InspectionVerifierOptions, type VerificationInput, type VerificationPreparation } from './inspection-verifier.ts';
+import { SessionController } from './sessions.ts';
+import { Store } from './store.ts';
+
+const authority: InspectionAuthority = { goalId: 'goal', goalRevision: 12, taskId: 'task', attemptId: 'author-attempt', authorityGeneration: 3, policyRevision: 12 };
+const quality: TaskQualityRequirements = { platforms: ['macos'], workflows: [{ id: 'close-draft', platform: 'macos' }], referenceIds: ['enough-ui'] };
+const ready: ExecutionTargetAdvertisement[] = [{
+  id: 'mac-host', kind: 'host-macos', protocolVersion: 1, readiness: 'ready', runtimes: ['codex'], capacity: 1,
+  capabilities: [
+    { kind: 'mac-shell', readiness: 'ready' }, { kind: 'apple-compilation', readiness: 'ready' },
+    { kind: 'macos-app-inspection', readiness: 'ready' }, { kind: 'ios-simulator-inspection', readiness: 'ready' },
+  ],
+}];
+type ProviderCall = { chatId: string; prompt: string; options: RunOptions };
+function deferred<T>() {
+  let resolve!: (value: T) => void, reject!: (error: Error) => void;
+  const promise = new Promise<T>((accept, decline) => { resolve = accept; reject = decline; });
+  return { promise, resolve, reject };
+}
+async function eventually(condition: () => boolean): Promise<void> {
+  const deadline = Date.now() + 30_000;
+  while (!condition()) {
+    assert.ok(Date.now() < deadline, 'Timed out waiting for verifier ownership transition');
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+}
+
+/** Real multi-root source/artifact transfer and SQLite ownership, with provider/OS effects injected. */
+async function fixture(t: TestContext, extraFileMode = 0o644) {
+  const directory = await realpath(await mkdtemp(path.join(tmpdir(), 'ef-independent-verifier-')));
+  const dataDir = path.join(directory, 'device'), main = path.join(directory, 'author-main'), design = path.join(directory, 'author-design');
+  await mkdir(main); await mkdir(path.join(design, 'empty'), { recursive: true });
+  await writeFile(path.join(main, 'Main.swift'), 'let heading = "Baseline"\n');
+  const git = (...args: string[]) => execFileSync('git', ['-c', 'core.hooksPath=/dev/null', '-c', 'init.templateDir=', '-C', main, ...args], {
+    encoding: 'utf8', env: { PATH: process.env.PATH, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_COUNT: '0' },
+  }).trim();
+  git('init', '--quiet'); git('add', '.');
+  git('-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '--quiet', '-m', 'Original author baseline');
+  const originalCommit = git('rev-parse', 'HEAD');
+  await writeFile(path.join(main, 'Main.swift'), 'let heading = "Exact dirty source"\r\n', { mode: 0o640 });
+  await chmod(path.join(main, 'Main.swift'), 0o640);
+  await writeFile(path.join(main, 'Untracked.swift'), 'let draft = "Untracked captured source"\n');
+  await writeFile(path.join(design, 'Tokens.swift'), 'let spacing = 12\n', { mode: extraFileMode });
+  await chmod(path.join(design, 'Tokens.swift'), extraFileMode);
+  await chmod(path.join(design, 'empty'), 0o750);
+  await symlink('Tokens.swift', path.join(design, 'token-link'));
+  const store = new Store(dataDir), artifacts = new ArtifactStore(path.join(dataDir, 'workspace-data', 'artifacts'), 'mac');
+  const snapshotManager = new InspectionSnapshotManager({ dataDir: path.join(directory, 'checked'), artifacts });
+  const snapshot = await snapshotManager.create({ roots: [
+    { id: 'primary', name: 'primary', path: main, sourceCommit: originalCommit, kind: 'git', originalPath: '/workspaces/mail', manifestSha256: 'a'.repeat(64) },
+    { id: 'enough-ui', name: 'enough-ui', path: design, kind: 'folder', originalPath: '/workspaces/enough-ui', manifestSha256: 'b'.repeat(64) },
+  ], context: authority });
+  const source: InspectionSourceIdentity = {
+    snapshotId: snapshot.id, sha256: snapshot.sourceDigest, candidateId: 'candidate-C', candidateCommit: 'c'.repeat(40), checkedCommit: 'c'.repeat(40),
+    roots: snapshot.roots.map(root => ({ id: root.id, sha256: root.sourceDigest, ...(root.sourceCommit ? { commit: root.sourceCommit } : {}) })),
+  };
+  const project: Project = { id: 'mail-project', name: 'EnoughMail', path: main, deviceId: 'mac', createdAt: new Date().toISOString(), runtime: 'codex', approvalMode: 'approve-all', rules: [] };
+  const sessions = new Map<string, Session>(), calls: ProviderCall[] = [], preparations: VerificationPreparation[] = [], stopped: string[] = [], interrupted: string[] = [];
+  const preparedSources = new Map<string, InspectionSnapshot>();
+  const retiredHostSessions: Array<{ sessionId: string; cwd: string }> = [];
+  let current = true, providerMode: 'success' | 'hold' | 'unknown' = 'success', passed = false, available = true;
+  let providerPending: ReturnType<typeof deferred<{ text: string }>> | undefined;
+  let stopFails = false, checks = 0;
+  let hostProcesses: Array<{ sessionId: string; state: 'active' | 'unknown' | 'exited' }> = [];
+  let preparationHook: ((input: VerificationPreparation) => Promise<void>) | undefined;
+  const app = {
+    dataDir, device: { id: 'mac' }, store, emit() {}, changed() {},
+    sessions: {
+      record: (id: string) => { const session = store.get<Session>('sessions', id) ?? sessions.get(id); assert.ok(session); return session; },
+      owns: (id: string) => sessions.has(id) && store.get<Session>('sessions', id)?.deviceId === 'mac',
+      waitExecutionReady: async (id: string) => {
+        assert.ok(sessions.has(id));
+        return { kind: 'host-macos', targetId: 'mac-host', workdir: preparedSources.get(id)!.roots[0]!.path };
+      },
+      execution: (id: string) => {
+        assert.ok(sessions.has(id));
+        return { kind: 'host-macos', targetId: 'mac-host', workdir: preparedSources.get(id)!.roots[0]!.path };
+      },
+      stop: async (id: string) => {
+        stopped.push(id);
+        if (stopFails) throw new Error('Owned verifier process termination could not be confirmed');
+        const session = store.get<Session>('sessions', id)!;
+        store.set('sessions', { ...session, status: 'stopped' });
+      },
+    },
+  } as unknown as DeviceApp;
+  const chats = {
+    isRunning: (chatId: string) => store.get<Chat>('chats', chatId)?.status === 'running',
+    manager: {
+      hostProcesses: async () => hostProcesses,
+      retireHostSession: async (sessionId: string, cwd: string) => { retiredHostSessions.push({ sessionId, cwd }); },
+    },
+    create: (input: { sessionId: string; verificationRunId?: string; title?: string }) => {
+      const at = new Date().toISOString();
+      const chat: Chat = { id: 'verifier-chat-' + (store.list<Chat>('chats').length + 1), sessionId: input.sessionId, deviceId: 'mac', runtime: 'codex', approvalMode: 'approve-all', status: 'idle', title: input.title ?? 'Verify', createdAt: at, updatedAt: at, verificationRunId: input.verificationRunId };
+      store.set('chats', chat); return chat;
+    },
+    run: async (chatId: string, prompt: string, options: RunOptions = {}) => {
+      calls.push({ chatId, prompt, options });
+      const chat = store.get<Chat>('chats', chatId)!; store.set('chats', { ...chat, status: 'running' });
+      if (providerMode === 'unknown') throw Object.assign(new Error('Transport disappeared after verifier dispatch'), { agentStarted: true, executionEnded: false });
+      try {
+        if (providerMode === 'hold') { providerPending = deferred<{ text: string }>(); return await providerPending.promise; }
+        return { text: 'Everything looks perfect and every workflow passed.' };
+      } finally { store.set('chats', { ...chat, status: 'idle' }); }
+    },
+    interrupt: async (chatId: string) => {
+      interrupted.push(chatId);
+      providerPending?.reject(Object.assign(new Error('Verifier transport interrupted after dispatch'), { agentStarted: true, executionEnded: false }));
+    },
+  } as unknown as ChatController;
+  const options: InspectionVerifierOptions = {
+    app, chats, authorityCurrent: selected => current && JSON.stringify(selected) === JSON.stringify(authority),
+    readiness: async () => available ? ready : [{ ...ready[0]!, readiness: 'setup-required', capabilities: ready[0]!.capabilities.map(item => ({ ...item, readiness: 'setup-required' })) }],
+    quality: {
+      context: async () => 'Original reference and screenshot evidence context.',
+      check: async input => {
+        checks++;
+        return { command: 'enoughfactory:ui-quality', candidateCommit: input.candidateCommit, checkedCommit: input.checkedCommit, passed, exitCode: passed ? 0 : 1,
+          output: passed ? 'Original workflow and image receipts verified.' : 'Current-source screenshot/workflow assertion receipts are missing.',
+          ...(!passed ? { recovery: { condition: 'inspection-evidence' as const, reason: 'Missing actual inspection receipts' } } : {}) };
+      },
+    },
+    timeoutMs: 30_000,
+    prepareExecution: async input => {
+      preparations.push(input); input.assertCurrent();
+      const at = new Date().toISOString();
+      const session: Session = { id: 'verifier-session-' + (sessions.size + 1), projectId: project.id, deviceId: 'mac', name: 'verification-' + sessions.size,
+        status: 'ready', executionTargetKind: input.run.executionTargetKind, executionTargetId: input.run.executionTargetId,
+        createdAt: at, updatedAt: at, services: [], workingDirectories: input.snapshot.roots.slice(1).map(root => ({ id: root.id, name: root.name, path: root.path, kind: root.kind, baseCommit: root.commit, status: 'ready' })) };
+      sessions.set(session.id, session); preparedSources.set(session.id, input.snapshot); input.onSession(session);
+      await preparationHook?.(input);
+      return session;
+    },
+  };
+  const verifiers: InspectionVerifier[] = [];
+  const verifier = new InspectionVerifier(options); verifiers.push(verifier);
+  t.after(async () => { for (const service of verifiers) await service.close(); store.close(); await rm(directory, { recursive: true, force: true }); });
+  const input: VerificationInput = { authority, source, snapshot, quality, project };
+  return {
+    directory, dataDir, main, design, store, artifacts, snapshotManager, snapshot, source, originalCommit, input, verifier, options,
+    calls, preparations, stopped, interrupted, retiredHostSessions, sessions, checks: () => checks,
+    setCurrent: (value: boolean) => { current = value; }, setPassed: (value: boolean) => { passed = value; },
+    setAvailable: (value: boolean) => { available = value; }, setProvider: (value: typeof providerMode) => { providerMode = value; },
+    setStopFails: (value: boolean) => { stopFails = value; }, setPreparationHook: (hook: typeof preparationHook) => { preparationHook = hook; },
+    setHostProcesses: (value: typeof hostProcesses) => { hostProcesses = value; },
+    finishProvider: () => { assert.ok(providerPending); providerPending.resolve({ text: 'Provider finished.' }); },
+    anotherVerifier: (overrides: Partial<InspectionVerifierOptions> = {}) => { const service = new InspectionVerifier({ ...options, ...overrides }); verifiers.push(service); return service; },
+    context(run: InspectionVerificationRun): AgentToolBridgeContext {
+      return { chat: store.get<Chat>('chats', run.chatId!)!, session: store.get<Session>('sessions', run.sessionId!)!,
+        execution: { kind: run.executionTargetKind, targetId: run.executionTargetId, workdir: preparations.find(item => item.run.id === run.id)!.snapshot.roots[0]!.path },
+        attemptId: authority.attemptId, verificationRunId: run.id, signal: new AbortController().signal };
+    },
+  };
+}
+
+/** Real native ownership/capture/disposal without starting any provider, GUI or Docker process. */
+async function nativeFixture(t: TestContext) {
+  const f = await fixture(t, 0o640), forbiddenCalls: string[] = [];
+  const sessions = new SessionController(f.store, 'mac', () => {}, () => {}, {
+    endpoint: { host: 'unix:///unused-verifier-fixture.sock', configDirectory: path.join(f.directory, 'runtime', 'docker'), cliPath: '/must-not-run-docker' },
+    ensureReady: async () => { forbiddenCalls.push('container runtime'); throw new Error('Native verification must not start a container'); },
+    bridgeHostAddress: () => undefined,
+  }, path.join(f.dataDir, 'workspace-data'));
+  Object.defineProperty(sessions, 'engine', { value: new Proxy({}, {
+    get(_target, method) { return () => { forbiddenCalls.push(`envmux.${String(method)}`); throw new Error('Native verification must not use envmux'); }; },
+  }) });
+  f.store.set('projects', f.input.project);
+  const verifier = f.anotherVerifier({ app: { ...f.options.app, sessions } as DeviceApp, prepareExecution: undefined });
+  t.after(() => { sessions.close(); assert.deepEqual(forbiddenCalls, []); });
+  return { ...f, sessions, verifier, forbiddenCalls };
+}
+
+type RetainedInputs = { id: string; transfer: InspectionSnapshotTransfer; snapshot?: InspectionSnapshot; retiredAt?: string; retirement?: { primarySource?: InspectionSnapshotTransfer; [key: string]: unknown } };
+function retained(f: { store: Store }, run: InspectionVerificationRun): RetainedInputs {
+  const inputs = f.store.get<RetainedInputs>('inspection-verifier-inputs', run.id); assert.ok(inputs); return inputs;
+}
+async function absent(filename: string): Promise<void> { await assert.rejects(lstat(filename), { code: 'ENOENT' }); }
+
+test('verifier identity and quality policy hashes survive durable JSON omission of undefined optional fields', () => {
+  const optionalQuality = { ...quality, optionalEvaluation: undefined, workflows: quality.workflows.map(workflow => ({ ...workflow, optionalGuidance: undefined })) };
+  const input = {
+    authority,
+    source: { snapshotId: 'saved-snapshot', sha256: '1'.repeat(64), roots: [{ id: 'primary', sha256: '2'.repeat(64), commit: undefined }] },
+    quality: optionalQuality,
+  };
+  const persisted = JSON.parse(JSON.stringify(input)) as typeof input;
+  assert.equal(inspectionVerificationKey(input), inspectionVerificationKey(persisted));
+  assert.equal(inspectionQualityPolicySha256(input.quality), inspectionQualityPolicySha256(persisted.quality));
+  assert.notEqual(inspectionQualityPolicySha256(input.quality), inspectionQualityPolicySha256({ ...persisted.quality, referenceIds: ['different-required-reference'] }));
+});
+
+test('final goal verification has a distinct owner from task review and from another canonical goal revision', () => {
+  const input = { authority, quality, source: { snapshotId: 'checked-source', sha256: '1'.repeat(64), roots: [{ id: 'primary', sha256: '2'.repeat(64) }] } };
+  const taskKey = inspectionVerificationKey(input);
+  assert.equal(inspectionVerificationKey({ ...input, purpose: 'task' }), taskKey);
+  const finalKey = inspectionVerificationKey({ ...input, purpose: 'goal-final', goalRevision: 41 });
+  assert.notEqual(finalKey, taskKey);
+  assert.notEqual(inspectionVerificationKey({ ...input, purpose: 'goal-final', goalRevision: 42 }), finalKey);
+  assert.equal(inspectionVerificationKey(JSON.parse(JSON.stringify({ ...input, purpose: 'goal-final', goalRevision: 41 }))), finalKey);
+});
+
+test('final verification requires a valid canonical goal revision before retaining or dispatching any owner', async t => {
+  const f = await fixture(t);
+  for (const goalRevision of [undefined, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+    assert.throws(() => f.verifier.ensure({ ...f.input, purpose: 'goal-final', goalRevision }), /current canonical goal revision/);
+  }
+  assert.throws(() => f.verifier.ensure({ ...f.input, purpose: 'task', goalRevision: 41 }), /frozen author assignment revision/);
+  assert.deepEqual(f.store.list(INSPECTION_VERIFIER_RUNS), []);
+  assert.deepEqual(f.store.list('inspection-verifier-inputs'), []);
+  assert.equal(f.calls.length, 0); assert.equal(f.preparations.length, 0);
+});
+
+test('a known setup failure waits and retries the same independent owner without rerunning its author', async t => {
+  const f = await fixture(t), originalSource = structuredClone(f.source);
+  let setupUnavailable = true;
+  f.setPreparationHook(async () => {
+    if (setupUnavailable) throw Object.assign(new Error('Independent source export transport is temporarily unavailable'), { agentStarted: false, executionEnded: true });
+  });
+  const waiting = await f.verifier.ensure(f.input);
+  assert.equal(waiting.status, 'waiting'); assert.match(waiting.reason!, /export transport/);
+  assert.equal(f.calls.length, 0); assert.equal(waiting.chatId, undefined);
+  assert.equal(f.preparations.length, 1); assert.equal(f.stopped.length, 0);
+  const session = f.store.get<Session>('sessions', waiting.sessionId!)!;
+  assert.equal(session.status, 'ready'); assert.equal(session.verificationRunId, waiting.id);
+  setupUnavailable = false;
+  const retried = await f.verifier.ensure(f.input);
+  assert.equal(retried.id, waiting.id); assert.equal(retried.sessionId, waiting.sessionId);
+  assert.equal(f.preparations.length, 1, 'Retry reuses its recorded private owner instead of allocating another environment');
+  assert.equal(f.calls.length, 1); assert.equal(f.calls[0]!.options.verificationRunId, waiting.id);
+  assert.equal(retried.status, 'failed', 'A dispatched verifier still requires genuine passing receipts');
+  assert.deepEqual(retried.source, originalSource); assert.deepEqual(f.source, originalSource);
+  assert.equal(f.store.get<Chat>('chats', retried.chatId!)!.attemptId, undefined);
+  assert.equal(f.stopped.length, 1);
+});
+
+test('an unconfirmed setup process remains unknown and cannot allocate or dispatch a replacement', async t => {
+  for (const code of ['HOST_PROCESS_UNKNOWN', 'PROCESS_TEARDOWN_UNCONFIRMED']) {
+    await t.test(code, async inner => {
+      const f = await fixture(inner);
+      f.setPreparationHook(async () => { throw Object.assign(new Error('Independent source copier termination was not confirmed'), { code, executionEnded: false }); });
+      const unknown = await f.verifier.ensure(f.input);
+      assert.equal(unknown.status, 'unknown'); assert.equal(unknown.completedAt, undefined);
+      assert.equal(unknown.chatId, undefined); assert.equal(f.calls.length, 0); assert.equal(f.stopped.length, 0);
+      assert.equal(f.store.get<Session>('sessions', unknown.sessionId!)!.status, 'ready');
+      assert.ok(retained(f, unknown).snapshot);
+      assert.equal((await f.verifier.ensure(f.input)).id, unknown.id);
+      assert.equal(f.preparations.length, 1); assert.equal(f.calls.length, 0);
+    });
+  }
+});
+
+test('changing the current goal revision fences a running final verifier while preserving frozen author authority', async t => {
+  const f = await fixture(t); f.setProvider('hold'); f.setPassed(true);
+  const goal = { id: authority.goalId, revision: 41, approvalMode: 'approve-all' } as Goal;
+  f.store.set('goals', goal);
+  const input: VerificationInput = { ...f.input, purpose: 'goal-final', goalRevision: goal.revision };
+  const result = f.verifier.ensure(input); await eventually(() => f.calls.length === 1);
+  const running = f.store.list<InspectionVerificationRun>(INSPECTION_VERIFIER_RUNS)[0]!;
+  assert.equal(running.purpose, 'goal-final'); assert.equal(running.goalRevision, 41);
+  assert.equal(running.authority.goalRevision, 12, 'Canonical goal revision must not rewrite the author assignment');
+  assert.ok(await f.verifier.verificationSource(f.context(running)));
+  f.store.set('goals', { ...goal, revision: 42 });
+  await assert.rejects(f.verifier.verificationSource(f.context(running)), /goal revision was retired/);
+  f.finishProvider();
+  const retired = await result;
+  assert.equal(retired.status, 'canceled'); assert.match(retired.reason!, /goal revision was retired/);
+  assert.equal(f.checks(), 0, 'An older final owner cannot publish a passing quality result');
+  assert.equal(f.stopped.length, 1);
+  assert.equal((await f.verifier.ensure(input)).id, retired.id); assert.equal(f.calls.length, 1);
+  f.setProvider('success');
+  const current = await f.verifier.ensure({ ...input, goalRevision: 42 });
+  assert.notEqual(current.id, retired.id); assert.equal(current.status, 'succeeded');
+  assert.equal(current.goalRevision, 42); assert.equal(current.authority.goalRevision, 12);
+});
+
+test('independent verifier clones all frozen roots without replacing original commit provenance or reopening the author', async t => {
+  const f = await fixture(t); f.setProvider('hold');
+  const result = f.verifier.ensure(f.input);
+  await eventually(() => f.calls.length === 1);
+  const run = f.store.list<InspectionVerificationRun>(INSPECTION_VERIFIER_RUNS)[0]!, context = f.context(run);
+  const binding = await f.verifier.verificationSource(context); assert.ok(binding);
+  assert.notEqual(binding.snapshot.path, f.snapshot.path);
+  assert.deepEqual(binding.snapshot.manifest, JSON.parse(JSON.stringify(f.snapshot.manifest)));
+  assert.equal(binding.snapshot.id, f.snapshot.id); assert.equal(binding.snapshot.sourceDigest, f.snapshot.sourceDigest);
+  assert.deepEqual(binding.snapshot.roots.map(root => ({ id: root.id, name: root.name, commit: root.commit, sourceCommit: root.sourceCommit, originalPath: root.originalPath, manifestSha256: root.manifestSha256 })), f.snapshot.roots.map(root => ({ id: root.id, name: root.name, commit: root.commit, sourceCommit: root.sourceCommit, originalPath: root.originalPath, manifestSha256: root.manifestSha256 })));
+  assert.equal(binding.snapshot.roots[0]!.sourceCommit, f.originalCommit);
+  assert.notEqual(binding.snapshot.roots[0]!.commit, f.originalCommit);
+  await writeFile(path.join(f.main, 'Main.swift'), 'Changed after author capture\n');
+  await writeFile(path.join(f.design, 'Tokens.swift'), 'let spacing = 999\n');
+  assert.equal(await readFile(path.join(binding.snapshot.roots[0]!.path, 'Main.swift'), 'utf8'), 'let heading = "Exact dirty source"\r\n');
+  assert.equal(await readFile(path.join(binding.snapshot.roots[0]!.path, 'Untracked.swift'), 'utf8'), 'let draft = "Untracked captured source"\n');
+  assert.equal((await lstat(path.join(binding.snapshot.roots[0]!.path, 'Main.swift'))).mode & 0o777, 0o640);
+  assert.equal((await lstat(path.join(binding.snapshot.roots[1]!.path, 'empty'))).mode & 0o777, 0o750);
+  assert.equal(await readlink(path.join(binding.snapshot.roots[1]!.path, 'token-link')), 'Tokens.swift');
+  assert.equal(await readFile(path.join(binding.snapshot.roots[1]!.path, 'Tokens.swift'), 'utf8'), 'let spacing = 12\n');
+  assert.equal(context.chat.attemptId, undefined, 'Verifier chat is a new owner, not an author continuation');
+  assert.equal(f.calls[0]!.options.verificationRunId, run.id);
+  assert.match(f.calls[0]!.prompt, /must not resume, repair, commit or integrate/);
+  f.finishProvider(); await result;
+  await f.snapshotManager.verify(f.snapshot);
+});
+
+test('default Mac preparation privately materializes the exact multi-root snapshot and binds its own session', { skip: process.platform !== 'darwin' }, async t => {
+  const f = await nativeFixture(t); f.setProvider('hold');
+  const { sessions, verifier, forbiddenCalls } = f;
+  try {
+    const result = verifier.ensure(f.input);
+    await eventually(() => f.calls.length === 1 || f.store.list<InspectionVerificationRun>(INSPECTION_VERIFIER_RUNS).some(run => ['failed', 'unknown'].includes(run.status)));
+    const run = f.store.list<InspectionVerificationRun>(INSPECTION_VERIFIER_RUNS)[0]!;
+    if (run.status !== 'running' && run.sessionId) {
+      const diagnosticSession = sessions.record(run.sessionId), diagnosticExecution = sessions.execution(run.sessionId);
+      const diagnosticManager = new InspectionSnapshotManager({ dataDir: path.join(f.directory, 'diagnostic-execution') });
+      const paths = [diagnosticExecution.workdir, ...(diagnosticSession.workingDirectories ?? []).map(root => root.path)];
+      assert.equal((await lstat(path.join(paths[1]!, 'empty'))).mode & 0o777, 0o750, 'Physical additional-root directory survives materialization');
+      const diagnostic = await diagnosticManager.create({ roots: f.snapshot.roots.map((root, index) => ({ id: root.id, name: root.name, path: paths[index]!, originalPath: root.originalPath, manifestSha256: root.manifestSha256 })) });
+      assert.deepEqual(diagnostic.manifest.roots.map(root => root.entries), f.snapshot.manifest.roots.map(root => root.entries), run.reason);
+    }
+    assert.equal(run.status, 'running', run.reason);
+    assert.equal(f.preparations.length, 0, 'The injected preparation seam was not used');
+    const session = sessions.record(run.sessionId!), execution = await sessions.waitExecutionReady(session.id, 1000);
+    assert.equal(session.verificationRunId, run.id);
+    assert.equal(session.executionTargetKind, 'host-macos');
+    assert.equal(session.executionTargetId, 'mac-host');
+    assert.equal(sessions.owns(session.id), true);
+    assert.notEqual(execution.workdir, f.main);
+    assert.equal(execution.workdir, path.join(f.dataDir, 'workspace-data', 'workspaces', run.id, 'repository'));
+    const chat = f.store.get<Chat>('chats', run.chatId!)!;
+    assert.equal(chat.sessionId, session.id); assert.equal(chat.attemptId, undefined);
+    const context: AgentToolBridgeContext = { chat, session, execution, attemptId: authority.attemptId, verificationRunId: run.id, signal: new AbortController().signal };
+    const binding = await verifier.verificationSource(context); assert.ok(binding);
+    assert.equal(binding.snapshot.roots[0]!.sourceCommit, f.originalCommit);
+    assert.equal(binding.snapshot.id, f.snapshot.id);
+    assert.notEqual(execution.workdir, binding.snapshot.roots[0]!.path);
+    assert.equal(await readFile(path.join(execution.workdir, 'Main.swift'), 'utf8'), 'let heading = "Exact dirty source"\r\n');
+    assert.equal(await readFile(path.join(execution.workdir, 'Untracked.swift'), 'utf8'), 'let draft = "Untracked captured source"\n');
+    assert.equal((await lstat(path.join(execution.workdir, 'Main.swift'))).mode & 0o777, 0o640);
+    const extra = session.workingDirectories!.find(root => root.id === 'enough-ui')!;
+    assert.ok(extra.path.startsWith(path.join(f.dataDir, 'workspace-data', 'host-sessions', session.id, 'roots')));
+    assert.notEqual(extra.path, f.design); assert.notEqual(extra.path, binding.snapshot.roots[1]!.path);
+    assert.equal(await readFile(path.join(extra.path, 'Tokens.swift'), 'utf8'), 'let spacing = 12\n');
+    assert.equal((await lstat(path.join(extra.path, 'Tokens.swift'))).mode & 0o777, 0o640);
+    assert.equal((await lstat(path.join(extra.path, 'empty'))).mode & 0o777, 0o750);
+    assert.equal(await readlink(path.join(extra.path, 'token-link')), 'Tokens.swift');
+    const manager = new InspectionSnapshotManager({ dataDir: path.join(f.directory, 'actual-execution') });
+    const actual = await manager.create({ roots: [
+      { id: 'primary', name: 'primary', path: execution.workdir, originalPath: f.snapshot.roots[0]!.originalPath, manifestSha256: f.snapshot.roots[0]!.manifestSha256 },
+      { id: extra.id, name: extra.name, path: extra.path, originalPath: f.snapshot.roots[1]!.originalPath, manifestSha256: f.snapshot.roots[1]!.manifestSha256 },
+    ] });
+    assert.equal(actual.sourceDigest, f.snapshot.sourceDigest, 'The real session source must equal every pinned root, beyond its Git tree');
+    assert.deepEqual(actual.roots.map(root => root.sourceDigest), f.snapshot.roots.map(root => root.sourceDigest));
+    await manager.remove(actual);
+    await writeFile(path.join(f.main, 'Main.swift'), 'Later author edit\n');
+    await writeFile(path.join(f.design, 'Tokens.swift'), 'let spacing = 999\n');
+    assert.equal(await readFile(path.join(execution.workdir, 'Main.swift'), 'utf8'), 'let heading = "Exact dirty source"\r\n');
+    assert.equal(await readFile(path.join(extra.path, 'Tokens.swift'), 'utf8'), 'let spacing = 12\n');
+    f.finishProvider();
+    assert.equal((await result).status, 'failed', 'A real prepared session still cannot pass missing quality receipts');
+    assert.equal(sessions.record(session.id).status, 'stopped');
+    assert.deepEqual(forbiddenCalls, []);
+  } finally { await verifier.close(); sessions.close(); }
+});
+
+test('completed verifier sweeper retains durable CAS, chats and source identity while retiring only owned stopped copies', { skip: process.platform !== 'darwin' }, async t => {
+  const f = await nativeFixture(t); f.setPassed(true);
+  const run = await f.verifier.ensure(f.input), inputs = retained(f, run);
+  const session = f.sessions.record(run.sessionId!), frozenPath = inputs.snapshot!.path;
+  const workspaceRoot = path.join(f.dataDir, 'workspace-data', 'workspaces', run.id);
+  const cacheRoot = path.join(f.dataDir, 'workspace-data', 'working-directories', `${run.id}-inputs`);
+  const sourceArtifacts = [inputs.transfer.sourceManifest, ...inputs.transfer.sourceArtifacts.map(root => root.manifest)];
+  const originalArtifacts = await Promise.all(sourceArtifacts.map(artifact => f.artifacts.read(artifact)));
+  assert.equal(session.status, 'stopped');
+  f.setHostProcesses([{ sessionId: 'unrelated-live-session', state: 'active' }, { sessionId: `${session.id}-decision-1`, state: 'exited' }]);
+  await writeFile(path.join(workspaceRoot, 'repository', '.gitignore'), 'generated/\n');
+  await mkdir(path.join(workspaceRoot, 'repository', 'generated', 'empty'), { recursive: true });
+  await chmod(path.join(workspaceRoot, 'repository', 'generated', 'empty'), 0o710);
+  await writeFile(path.join(workspaceRoot, 'repository', 'generated', 'useful-proof.txt'), 'Retain verifier-created ignored source\n', { mode: 0o640 });
+  const first = f.verifier.sweepCompleted(() => true), second = f.verifier.sweepCompleted(() => true);
+  assert.equal(first, second, 'Concurrent sweepers share one owned cleanup');
+  assert.deepEqual(await first, { retiredRunIds: [run.id], errors: [] });
+  await absent(frozenPath); await absent(workspaceRoot); await absent(cacheRoot);
+  await absent(session.workingDirectories![0]!.path);
+  const retired = retained(f, run);
+  assert.ok(retired.retiredAt); assert.equal(retired.snapshot, undefined);
+  assert.deepEqual(retired.transfer, inputs.transfer, 'The exact reconstruction manifest remains durable');
+  assert.ok(retired.retirement?.primarySource, 'Verifier-created primary files also receive durable reconstruction artifacts');
+  const primarySource = retired.retirement.primarySource;
+  const recoveryDirectory = path.join(f.directory, 'retired-primary-recovery');
+  const recovered = await importInspectionSnapshot({ dataDir: recoveryDirectory, artifacts: f.artifacts, sourceManifest: primarySource.sourceManifest, sourceArtifacts: primarySource.sourceArtifacts, expectedSource: { snapshotId: primarySource.snapshotId, sourceDigest: primarySource.sourceDigest }, context: authority });
+  assert.equal(await readFile(path.join(recovered.roots[0]!.path, 'generated', 'useful-proof.txt'), 'utf8'), 'Retain verifier-created ignored source\n');
+  assert.equal((await lstat(path.join(recovered.roots[0]!.path, 'generated', 'useful-proof.txt'))).mode & 0o777, 0o640);
+  assert.equal((await lstat(path.join(recovered.roots[0]!.path, 'generated', 'empty'))).mode & 0o777, 0o710);
+  await new InspectionSnapshotManager({ dataDir: recoveryDirectory }).remove(recovered);
+  assert.deepEqual(f.store.get(INSPECTION_VERIFIER_RUNS, run.id), run);
+  assert.equal(f.store.get<Chat>('chats', run.chatId!)!.sessionId, session.id);
+  assert.equal(f.sessions.record(session.id).status, 'stopped', 'Cleanup never deletes its session history');
+  assert.deepEqual(f.retiredHostSessions, [session.id, `${session.id}-decision-1`].map(sessionId => ({ sessionId, cwd: path.join(workspaceRoot, 'repository') })), 'Only this verifier and its ended decision owner retire; unrelated live owners remain untouched');
+  assert.deepEqual(await Promise.all(sourceArtifacts.map(artifact => f.artifacts.read(artifact))), originalArtifacts);
+  assert.equal(await readFile(path.join(f.main, 'Main.swift'), 'utf8'), 'let heading = "Exact dirty source"\r\n');
+  await f.snapshotManager.verify(f.snapshot);
+  assert.deepEqual(await f.verifier.sweepCompleted(() => true), { retiredRunIds: [], errors: [] });
+});
+
+test('verifier sweeper fences active, unknown, foreign and caller-protected owners without deleting live sessions', { skip: process.platform !== 'darwin' }, async t => {
+  const f = await nativeFixture(t); f.setPassed(true);
+  const run = await f.verifier.ensure(f.input), originalSession = f.sessions.record(run.sessionId!), inputs = retained(f, run);
+  const intact = async () => {
+    assert.ok(await lstat(inputs.snapshot!.path)); assert.ok(await lstat(path.join(f.dataDir, 'workspace-data', 'workspaces', run.id, 'repository')));
+    assert.ok(await lstat(originalSession.workingDirectories![0]!.path)); assert.equal(retained(f, run).retiredAt, undefined);
+    assert.deepEqual(f.retiredHostSessions, []);
+  };
+  await t.test('inspection caller refuses retirement', async () => { assert.deepEqual(await f.verifier.sweepCompleted(() => false), { retiredRunIds: [], errors: [] }); await intact(); });
+  for (const fields of [{ status: 'unknown' as const }, { status: 'running' as const }, { ownerDeviceId: 'another-mac' }, { authority: { ...run.authority, goalRevision: run.authority.goalRevision + 1 } }]) {
+    await t.test(`run fence ${JSON.stringify(fields)}`, async () => {
+      f.store.set(INSPECTION_VERIFIER_RUNS, { ...run, ...fields });
+      assert.deepEqual(await f.verifier.sweepCompleted(() => true), { retiredRunIds: [], errors: [] }); await intact();
+      f.store.set(INSPECTION_VERIFIER_RUNS, run);
+    });
+  }
+  for (const fields of [{ verificationRunId: 'another-verifier' }, { deviceId: 'another-mac' }, { status: 'ready' as const }, { status: 'unknown' as const }]) {
+    await t.test(`session fence ${JSON.stringify(fields)}`, async () => {
+      f.store.set('sessions', { ...originalSession, ...fields });
+      assert.deepEqual(await f.verifier.sweepCompleted(() => true), { retiredRunIds: [], errors: [] }); await intact();
+      f.store.set('sessions', originalSession);
+    });
+  }
+  await t.test('live chat remains protected', async () => {
+    const chat = f.store.get<Chat>('chats', run.chatId!)!; f.store.set('chats', { ...chat, status: 'running' });
+    assert.deepEqual(await f.verifier.sweepCompleted(() => true), { retiredRunIds: [], errors: [] }); await intact();
+    f.store.set('chats', chat);
+  });
+  for (const owner of [{ sessionId: originalSession.id, state: 'unknown' as const }, { sessionId: `${originalSession.id}-decision-1`, state: 'active' as const }]) {
+    await t.test(`host owner remains ${owner.state}`, async () => {
+      f.setHostProcesses([owner]);
+      const result = await f.verifier.sweepCompleted(() => true);
+      assert.deepEqual(result.retiredRunIds, []); assert.match(result.errors[0]!.reason, /active or unknown ownership/); await intact();
+      f.setHostProcesses([]);
+    });
+  }
+  await t.test('caller withdraws permission inside the owned lease', async () => {
+    let predicateCalls = 0;
+    const result = await f.verifier.sweepCompleted(() => ++predicateCalls === 1);
+    assert.deepEqual(result.retiredRunIds, []); assert.match(result.errors[0]!.reason, /lost its confirmed terminal owner/); await intact();
+  });
+});
+
+test('an in-memory verifier owner stays protected even if its persisted status is incorrectly terminal', { skip: process.platform !== 'darwin' }, async t => {
+  const f = await nativeFixture(t); f.setProvider('hold');
+  const result = f.verifier.ensure(f.input); await eventually(() => f.calls.length === 1);
+  const running = f.store.list<InspectionVerificationRun>(INSPECTION_VERIFIER_RUNS)[0]!, inputs = retained(f, running);
+  f.store.set(INSPECTION_VERIFIER_RUNS, { ...running, status: 'succeeded' });
+  assert.deepEqual(await f.verifier.sweepCompleted(() => true), { retiredRunIds: [], errors: [] });
+  assert.ok(await lstat(inputs.snapshot!.path));
+  assert.equal(f.sessions.record(running.sessionId!).status, 'ready');
+  assert.equal(f.calls.length, 1);
+  f.store.set(INSPECTION_VERIFIER_RUNS, running); f.finishProvider(); await result;
+});
+
+test('verifier sweeper requires authentic reconstructible CAS and an owned workspace marker before deletion', { skip: process.platform !== 'darwin' }, async t => {
+  const f = await nativeFixture(t); const run = await f.verifier.ensure(f.input), inputs = retained(f, run);
+  const workspaceRoot = path.join(f.dataDir, 'workspace-data', 'workspaces', run.id), marker = path.join(workspaceRoot, 'workspace.json');
+  const protectedCopies = async () => { assert.ok(await lstat(inputs.snapshot!.path)); assert.ok(await lstat(path.join(workspaceRoot, 'repository'))); assert.equal(retained(f, run).retiredAt, undefined); };
+  await t.test('forged source manifest', async () => {
+    f.store.set('inspection-verifier-inputs', { ...inputs, transfer: { ...inputs.transfer, sourceManifest: { ...inputs.transfer.sourceManifest, mime: 'application/forged' } } });
+    const result = await f.verifier.sweepCompleted(() => true);
+    assert.deepEqual(result.retiredRunIds, []); assert.match(result.errors[0]!.reason, /manifest changed/); await protectedCopies();
+    f.store.set('inspection-verifier-inputs', inputs);
+  });
+  await t.test('missing durable object', async () => {
+    const artifact = inputs.transfer.sourceArtifacts[0]!.manifest, filename = await f.artifacts.path(artifact), bytes = await readFile(filename);
+    await rm(filename);
+    try { const result = await f.verifier.sweepCompleted(() => true); assert.deepEqual(result.retiredRunIds, []); assert.equal(result.errors.length, 1); await protectedCopies(); }
+    finally { await writeFile(filename, bytes, { flag: 'wx', mode: 0o600 }); }
+  });
+  await t.test('forged workspace authority', async () => {
+    const original = await readFile(marker, 'utf8'); await writeFile(marker, JSON.stringify({ ...JSON.parse(original), attemptId: 'author-attempt' }));
+    try { const result = await f.verifier.sweepCompleted(() => true); assert.deepEqual(result.retiredRunIds, []); assert.equal(result.errors.length, 1); await protectedCopies(); }
+    finally { await writeFile(marker, original); }
+  });
+  await t.test('missing workspace marker with remaining files has no retirement authority', async () => {
+    const original = await readFile(marker); await rm(marker);
+    try { const result = await f.verifier.sweepCompleted(() => true); assert.deepEqual(result.retiredRunIds, []); assert.equal(result.errors.length, 1); await protectedCopies(); }
+    finally { await writeFile(marker, original); }
+  });
+});
+
+test('verifier sweeper resumes a durable scoped deletion after partial filesystem cleanup', { skip: process.platform !== 'darwin' }, async t => {
+  const f = await nativeFixture(t), run = await f.verifier.ensure(f.input), originalSet = f.store.set.bind(f.store);
+  let interrupt = true;
+  f.store.set = ((bucket: string, record: { id: string; retirement?: unknown }) => {
+    originalSet(bucket, record);
+    if (interrupt && bucket === 'inspection-verifier-inputs' && record.id === run.id && record.retirement) { interrupt = false; throw new Error('Service stopped after durable retirement intent'); }
+  }) as Store['set'];
+  try {
+    const first = await f.verifier.sweepCompleted(() => true);
+    assert.deepEqual(first.retiredRunIds, []); assert.match(first.errors[0]!.reason, /durable retirement intent/);
+    assert.ok(retained(f, run).retirement);
+    const workspaceRoot = path.join(f.dataDir, 'workspace-data', 'workspaces', run.id);
+    // Reproduce the sweeper's completed host-disposal phase before an interrupted
+    // recursive primary removal loses its marker but leaves source behind.
+    await f.sessions.withStoppedInputs(run.sessionId!, () => f.sessions.disposeHostWorkspace(run.sessionId!));
+    await rm(path.join(workspaceRoot, 'workspace.json')); await rm(path.join(workspaceRoot, 'repository', 'Main.swift'));
+    const resumed = await f.verifier.sweepCompleted(() => true);
+    assert.deepEqual(resumed, { retiredRunIds: [run.id], errors: [] }); await absent(workspaceRoot);
+    assert.ok(retained(f, run).retiredAt); assert.equal(f.sessions.record(run.sessionId!).status, 'stopped');
+    await f.artifacts.path(retained(f, run).transfer.sourceManifest);
+  } finally { f.store.set = originalSet; }
+});
+
+test('verifier sweeper reconciles a crash after copy removal before publishing retiredAt', { skip: process.platform !== 'darwin' }, async t => {
+  const f = await nativeFixture(t), run = await f.verifier.ensure(f.input), originalSet = f.store.set.bind(f.store);
+  let interrupt = true;
+  f.store.set = ((bucket: string, record: { id: string; retiredAt?: string }) => {
+    if (interrupt && bucket === 'inspection-verifier-inputs' && record.id === run.id && record.retiredAt) { interrupt = false; throw new Error('Service stopped before retirement publication'); }
+    originalSet(bucket, record);
+  }) as Store['set'];
+  try {
+    const first = await f.verifier.sweepCompleted(() => true);
+    assert.deepEqual(first.retiredRunIds, []); assert.match(first.errors[0]!.reason, /retirement publication/);
+    assert.equal(retained(f, run).retiredAt, undefined);
+    await absent(path.join(f.dataDir, 'workspace-data', 'workspaces', run.id));
+    assert.deepEqual(await f.verifier.sweepCompleted(() => true), { retiredRunIds: [run.id], errors: [] });
+    assert.ok(retained(f, run).retiredAt); assert.ok(f.store.get('chats', run.chatId!));
+  } finally { f.store.set = originalSet; }
+});
+
+test('a recreated workspace path cannot inherit a durable verifier deletion intent', { skip: process.platform !== 'darwin' }, async t => {
+  const f = await nativeFixture(t), run = await f.verifier.ensure(f.input), originalSet = f.store.set.bind(f.store);
+  let interrupt = true;
+  f.store.set = ((bucket: string, record: { id: string; retirement?: unknown }) => {
+    originalSet(bucket, record);
+    if (interrupt && bucket === 'inspection-verifier-inputs' && record.id === run.id && record.retirement) { interrupt = false; throw new Error('Pause after owned deletion intent'); }
+  }) as Store['set'];
+  const workspaceRoot = path.join(f.dataDir, 'workspace-data', 'workspaces', run.id), displaced = path.join(f.directory, 'displaced-owned-workspace');
+  try {
+    const first = await f.verifier.sweepCompleted(() => true);
+    assert.deepEqual(first.retiredRunIds, []); assert.match(first.errors[0]!.reason, /owned deletion intent/);
+    const original = await lstat(workspaceRoot, { bigint: true });
+    await rename(workspaceRoot, displaced);
+    await cp(displaced, workspaceRoot, { recursive: true, dereference: false, verbatimSymlinks: true, force: false, errorOnExist: true });
+    assert.notEqual((await lstat(workspaceRoot, { bigint: true })).ino, original.ino);
+    const result = await f.verifier.sweepCompleted(() => true);
+    assert.deepEqual(result.retiredRunIds, []); assert.equal(result.errors.length, 1);
+    assert.match(result.errors[0]!.reason, /identity|replaced|ownership/);
+    assert.ok(await lstat(path.join(workspaceRoot, 'repository', 'Main.swift')));
+    assert.ok(await lstat(path.join(displaced, 'repository', 'Main.swift')));
+    assert.equal(retained(f, run).retiredAt, undefined); assert.deepEqual(f.retiredHostSessions, []);
+    assert.equal(f.sessions.record(run.sessionId!).status, 'stopped');
+  } finally { f.store.set = originalSet; }
+});
+
+test('concurrent requests and byte-equivalent candidate/integration commits share one bounded verifier', async t => {
+  const f = await fixture(t); f.setProvider('hold'); f.setPassed(true);
+  const merged = { ...f.input, source: { ...f.source, checkedCommit: 'd'.repeat(40) } };
+  assert.equal(inspectionVerificationKey(f.input), inspectionVerificationKey(merged));
+  const first = f.verifier.ensure(f.input), second = f.verifier.ensure(merged);
+  assert.equal(first, second);
+  await eventually(() => f.calls.length === 1);
+  f.finishProvider();
+  const run = await first;
+  assert.equal(run.status, 'succeeded');
+  assert.equal(f.preparations.length, 1); assert.equal(f.checks(), 1);
+  assert.deepEqual(run.source, f.source, 'Original tested C identity is retained; M is content equivalence, not a renamed commit');
+  assert.equal((await f.verifier.ensure(merged)).id, run.id);
+  assert.equal(f.calls.length, 1, 'A terminal verifier never silently starts another provider turn');
+});
+
+test('changed quality policy or secondary-root content receives a distinct verifier owner', async t => {
+  const f = await fixture(t);
+  const first = await f.verifier.ensure(f.input);
+  const policy = { ...quality, referenceIds: ['enough-ui', 'enough-mail-web'] };
+  const second = await f.verifier.ensure({ ...f.input, quality: policy });
+  assert.notEqual(first.id, second.id);
+  await writeFile(path.join(f.design, 'Tokens.swift'), 'let spacing = 16\n');
+  const snapshot = await f.snapshotManager.create({ roots: [
+    { id: 'primary', name: 'primary', path: f.main }, { id: 'enough-ui', name: 'enough-ui', path: f.design },
+  ], context: authority });
+  const source = { ...f.source, snapshotId: snapshot.id, sha256: snapshot.sourceDigest, roots: snapshot.roots.map(root => ({ id: root.id, sha256: root.sourceDigest })) };
+  const third = await f.verifier.ensure({ ...f.input, snapshot, source });
+  assert.notEqual(third.id, first.id); assert.notEqual(third.source.sha256, first.source.sha256);
+  assert.equal(f.calls.length, 3);
+});
+
+test('a model success claim cannot pass verification without original inspection receipts', async t => {
+  const f = await fixture(t);
+  const run = await f.verifier.ensure(f.input);
+  assert.equal(run.status, 'failed');
+  assert.match(run.reason!, /receipts are missing/);
+  assert.equal(f.checks(), 1);
+  assert.equal((await f.verifier.ensure(f.input)).status, 'failed');
+  assert.equal(f.calls.length, 1);
+});
+
+test('waiting for capability setup retains exact source but dispatches no author or verifier turn', async t => {
+  const f = await fixture(t); f.setAvailable(false);
+  const waiting = await f.verifier.ensure(f.input);
+  assert.equal(waiting.status, 'waiting'); assert.equal(f.calls.length, 0); assert.equal(f.preparations.length, 0);
+  const retained = f.store.get<{ snapshot?: InspectionSnapshot }>('inspection-verifier-inputs', waiting.id);
+  assert.equal(retained?.snapshot?.sourceDigest, f.snapshot.sourceDigest);
+  await f.snapshotManager.remove(f.snapshot);
+  f.setAvailable(true);
+  const resumed = await f.verifier.ensure(f.input);
+  assert.equal(resumed.id, waiting.id); assert.equal(f.calls.length, 1);
+});
+
+test('verifier source bindings reject another chat/session, stale authority and edited private source', async t => {
+  const f = await fixture(t); f.setProvider('hold');
+  const result = f.verifier.ensure(f.input); await eventually(() => f.calls.length === 1);
+  const run = f.store.list<InspectionVerificationRun>(INSPECTION_VERIFIER_RUNS)[0]!, context = f.context(run);
+  assert.equal(await f.verifier.verificationSource({ ...context, chat: { ...context.chat, verificationRunId: undefined } }), undefined);
+  await assert.rejects(f.verifier.verificationSource({ ...context, chat: { ...context.chat, id: 'author-chat' } }), /does not own/);
+  await assert.rejects(f.verifier.verificationSource({ ...context, session: { ...context.session, id: 'author-session' } }), /does not own/);
+  await assert.rejects(f.verifier.verificationSource({ ...context, verificationRunId: 'another-run' }), /does not own/);
+  await assert.rejects(f.verifier.verificationSource({ ...context, attemptId: 'another-attempt' }), /does not own/);
+  const bound = await f.verifier.verificationSource(context); assert.ok(bound);
+  await writeFile(path.join(bound.snapshot.roots[0]!.path, 'Main.swift'), 'Verifier altered source\n');
+  await assert.rejects(f.verifier.verificationSource(context), /source changed/);
+  f.finishProvider(); assert.equal((await result).status, 'failed'); assert.equal(f.checks(), 0);
+});
+
+test('retired authority cannot publish a successful result after provider completion', async t => {
+  const f = await fixture(t); f.setProvider('hold'); f.setPassed(true);
+  const result = f.verifier.ensure(f.input); await eventually(() => f.calls.length === 1);
+  const run = f.store.list<InspectionVerificationRun>(INSPECTION_VERIFIER_RUNS)[0]!;
+  f.setCurrent(false);
+  await assert.rejects(f.verifier.verificationSource(f.context(run)), /retired|stale/);
+  f.finishProvider();
+  assert.equal((await result).status, 'canceled');
+  assert.equal(f.checks(), 0, 'Retired authority never validates or publishes a passing quality gate');
+  assert.equal(f.stopped.length, 1);
+});
+
+test('canceling preparation stops the published independent session without dispatching a provider', async t => {
+  const f = await fixture(t), abort = new AbortController();
+  f.setPreparationHook(async () => { abort.abort(new Error('Canceled before verifier dispatch')); });
+  const run = await f.verifier.ensure({ ...f.input, signal: abort.signal });
+  assert.equal(run.status, 'canceled'); assert.equal(f.calls.length, 0);
+  assert.ok(run.sessionId); assert.deepEqual(f.stopped, [run.sessionId]);
+});
+
+test('interrupted or restarted unknown verifier owners stay fenced and keep their source', async t => {
+  await t.test('transport lost after dispatch', async t => {
+    const f = await fixture(t); f.setProvider('unknown');
+    const run = await f.verifier.ensure(f.input);
+    assert.equal(run.status, 'unknown'); assert.equal(f.stopped.length, 0);
+    const resumed = await f.anotherVerifier().ensure(f.input);
+    assert.equal(resumed.status, 'unknown'); assert.equal(f.calls.length, 1);
+    assert.ok(f.store.get<{ snapshot?: InspectionSnapshot }>('inspection-verifier-inputs', run.id)?.snapshot);
+  });
+  await t.test('service restart during a recorded run', async t => {
+    const f = await fixture(t), prior = await f.verifier.ensure(f.input);
+    f.store.set(INSPECTION_VERIFIER_RUNS, { ...prior, status: 'running' });
+    const recovered = f.anotherVerifier(); recovered.recover();
+    assert.equal(f.store.get<InspectionVerificationRun>(INSPECTION_VERIFIER_RUNS, prior.id)!.status, 'unknown');
+    assert.equal((await recovered.ensure(f.input)).status, 'unknown');
+    assert.equal(f.calls.length, 1);
+  });
+  await t.test('service close interrupts active verifier and preserves unknown outcome', async t => {
+    const f = await fixture(t); f.setProvider('hold');
+    const result = f.verifier.ensure(f.input); await eventually(() => f.calls.length === 1);
+    await f.verifier.close();
+    const run = await result;
+    assert.equal(run.status, 'unknown'); assert.equal(f.interrupted.length, 1);
+    assert.equal(f.stopped.length, 0);
+    assert.equal((await f.anotherVerifier().ensure(f.input)).status, 'unknown'); assert.equal(f.calls.length, 1);
+  });
+});
+
+test('an unconfirmed execution stop overrides a passing gate with unknown ownership', async t => {
+  const f = await fixture(t); f.setPassed(true); f.setStopFails(true);
+  const run = await f.verifier.ensure(f.input);
+  assert.equal(run.status, 'unknown');
+  assert.match(run.reason!, /termination is unconfirmed/);
+  assert.equal(f.store.get<InspectionVerificationRun>(INSPECTION_VERIFIER_RUNS, run.id)!.status, 'unknown');
+  assert.equal((await f.verifier.ensure(f.input)).status, 'unknown'); assert.equal(f.calls.length, 1);
+});
+
+test('a verifier deadline interrupts its provider once and cannot start a replacement for the same source', async t => {
+  const f = await fixture(t); f.setProvider('hold');
+  const verifier = f.anotherVerifier({ timeoutMs: 1000 });
+  const run = await verifier.ensure(f.input);
+  assert.equal(run.status, 'unknown');
+  assert.equal(f.calls.length, 1); assert.equal(f.interrupted.length, 1);
+  assert.equal((await verifier.ensure(f.input)).status, 'unknown');
+  assert.equal(f.calls.length, 1);
+  assert.equal(f.stopped.length, 0, 'Uncertain effects retain their owner for reconciliation');
+});

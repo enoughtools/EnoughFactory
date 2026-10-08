@@ -4,13 +4,14 @@ import test from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
 import type { Attempt, Decision, Device, FactoryTask, Goal, Project } from "@enoughfactory/contracts";
 import { FactoryCoordinator } from "./coordinator.js";
-import { FactoryControllerError } from "./errors.js";
+import { FactoryControllerError, FactoryVerificationWaitError } from "./errors.js";
 import { readPlan } from "./protocol.js";
 import { CONTROLLER_PROMPT_LIMIT, controllerTaskContract, controllerAttemptContract } from "./controller-evidence.js";
 import type {
   AttemptDetail, CandidateRef, ControlRecord, EvaluationRecord, EvaluationResponse, ExecutionResult, FactoryRuntimePort,
   FactoryStore, FactoryWorkspacePort, PlanRecord, PlanResponse, TaskDetail, TaskCheckInputsConfiguration,
 } from "./types.js";
+import { UI_QUALITY_CHECK_COMMAND } from "./types.js";
 
 /** Reads cannot mutate committed records and a failed transaction cannot leave half a transition. */
 class MemoryStore implements FactoryStore {
@@ -166,6 +167,322 @@ function configuredNativeInputs(goal: Goal, environment: Record<string, string>,
     configuredAgainstAttemptId: attemptId, configuredAt: device.lastSeen, configuredByDeviceId: device.id };
 }
 const nativeInputValues = { ENOUGH_EVIDENCE_ROOT: "/workspaces/evidence", ENOUGH_NATIVE_INDEX_SHA256: "a".repeat(64), ENOUGH_NATIVE_UI_RECEIPT_DESCRIPTOR: "/workspaces/evidence/native-ui.json" };
+
+test("missing native capability waits through restart without consuming author attempts, then freezes host placement", async t => {
+  const worker: Device = { ...device, platform: "darwin", capacity: 0, executionTargets: [
+    { id: "container", kind: "container", protocolVersion: 1, readiness: "ready", capacity: 1, capabilities: [{ kind: "linux-shell", readiness: "ready" }] },
+    { id: "mac-host", kind: "host-macos", protocolVersion: 1, readiness: "setup-required", reason: "Install the configured Mac author runtime.", capacity: 1, capabilities: [{ kind: "mac-shell", readiness: "setup-required" }] },
+  ] };
+  const factory = harness([worker]);
+  factory.planning(async () => ({ ...plan, tasks: [
+    { ...plan.tasks[0]!, execution: { target: "auto", requiredCapabilities: ["mac-shell"] } },
+    { key: "independent", title: "Portable work", description: "Continue useful work", dependsOn: [], checks: [] },
+  ] }));
+  const goal = factory.goal();
+  await factory.coordinator.tick(); await factory.coordinator.waitForIdle();
+  await factory.coordinator.tick(); await factory.coordinator.waitForIdle();
+  await factory.coordinator.tick(); await factory.coordinator.waitForIdle();
+  const native = factory.store.list<FactoryTask>("tasks").find(task => task.title === plan.tasks[0]!.title)!;
+  assert.equal(factory.calls.execute, 1, "Independent portable work uses its separate container pool");
+  assert.equal(factory.store.list<Attempt>("attempts").some(attempt => attempt.taskId === native.id), false);
+  assert.equal(factory.store.get<ControlRecord>("factory-control", goal.id)!.waitingFor, "execution-capability");
+  assert.match(factory.store.get<Goal>("goals", goal.id)!.nextAction!, /Install the configured Mac author runtime/);
+  const recovered = factory.recover();
+  t.after(() => recovered.stop());
+  await recovered.start();
+  for (let index = 0; index < 3; index++) { await recovered.tick(); await recovered.waitForIdle(); }
+  assert.equal(factory.calls.execute, 1);
+  assert.equal(factory.calls.diagnosis, 0);
+  worker.executionTargets![1]!.readiness = "ready";
+  worker.executionTargets![1]!.capabilities[0]!.readiness = "ready";
+  recovered.notifyCondition("execution-capability");
+  await recovered.tick(); await recovered.waitForIdle();
+  assert.equal(factory.calls.execute, 2);
+  const attempt = factory.store.list<Attempt>("attempts").find(attempt => attempt.taskId === native.id)!;
+  assert.equal(attempt.generation, 1);
+  assert.equal(attempt.executionTargetId, "mac-host");
+  assert.equal(attempt.executionTargetKind, "host-macos");
+  assert.deepEqual(factory.store.get<AttemptDetail>("factory-attempt-details", attempt.id)!.contract!.execution, native.execution);
+  assert.match(factory.executionPrompts[1]!, /on the configured Mac host/);
+  assert.match(factory.planningPrompts[0]!, /Execution inventory/);
+});
+
+test("an explicit goal execution default bootstraps planning and freezes omitted task requirements", async () => {
+  const worker: Device = { ...device, executionTargets: [
+    { id: "container", kind: "container", protocolVersion: 1, readiness: "setup-required", capabilities: [{ kind: "linux-shell", readiness: "setup-required" }] },
+    { id: "mac-host", kind: "host-macos", protocolVersion: 1, readiness: "ready", capacity: 1, workspaceProviders: ["git"], runtimes: ["codex"], capabilities: [{ kind: "mac-shell", readiness: "ready" }] },
+  ] };
+  const factory = harness([worker]);
+  const execution = { target: "host-macos" as const, requiredCapabilities: ["mac-shell" as const] };
+  const goal = factory.coordinator.create({ projectId: project.id, objective: "Build a native utility", criteria, execution, concurrency: 1 });
+  await factory.coordinator.tick(); await factory.coordinator.waitForIdle();
+  assert.deepEqual(factory.controllerInputs[0]!.goal.execution, execution, "The initial controller receives explicit placement before any tasks exist");
+  assert.match(factory.planningPrompts[0]!, /Goal execution default/);
+  const preparing = deferred<void>(), originalPrepare = factory.workspaces.prepare, originalExecute = factory.runtime.execute;
+  factory.workspaces.prepare = async input => {
+    assert.deepEqual(input.task.execution, execution);
+    await preparing.promise;
+    return originalPrepare(input);
+  };
+  factory.runtime.execute = async input => {
+    assert.deepEqual(input.task.execution, execution, "Later default changes cannot alter an allocated author's contract");
+    return originalExecute(input);
+  };
+  await factory.coordinator.tick();
+  const attempt = factory.store.list<Attempt>("attempts")[0]!;
+  factory.coordinator.configure(goal.id, { execution: { target: "container" } });
+  preparing.resolve(); await factory.coordinator.waitForIdle();
+  assert.equal(attempt.executionTargetKind, "host-macos");
+  assert.equal(factory.store.list<FactoryTask>("tasks")[0]!.execution, undefined, "The stored task remains an explicit override only when the planner supplied one");
+  assert.deepEqual(factory.store.get<AttemptDetail>("factory-attempt-details", attempt.id)!.contract!.execution, execution);
+  assert.equal(factory.store.list<FactoryTask>("tasks")[0]!.status, "completed");
+  assert.equal(factory.calls.execute, 1);
+});
+
+test("goal execution input is validated and steering retains the chosen default", async () => {
+  const factory = harness();
+  assert.throws(() => factory.coordinator.create({ projectId: project.id, objective: "Native work", execution: { target: "host-linux" as never } }), /execution/i);
+  assert.equal(factory.store.list<Goal>("goals").length, 0);
+  const execution = { target: "host-macos" as const, requiredCapabilities: ["mac-shell" as const] };
+  const goal = factory.coordinator.create({ projectId: project.id, objective: "Native work", execution });
+  assert.throws(() => factory.coordinator.configure(goal.id, { execution: { requiredCapabilities: ["fake-capability" as never] } }), /capabilit/i);
+  await factory.coordinator.steer(goal.id, { context: "Keep the original native target." });
+  assert.deepEqual(factory.store.get<Goal>("goals", goal.id)!.execution, execution);
+  await factory.coordinator.steer(goal.id, { execution: { target: "container" } });
+  assert.deepEqual(factory.store.get<Goal>("goals", goal.id)!.execution, { target: "container" });
+});
+
+test("explicit UI quality survives authoring and cannot be accepted without exact candidate and combined-source checks", async t => {
+  const quality = { platforms: ["macos" as const], workflows: [{ id: "compose-close", platform: "macos" as const }], referenceIds: ["mail-reference"] };
+  const native: Device = { ...device, executionTargets: [
+    { id: "container", kind: "container", protocolVersion: 1, readiness: "ready", capabilities: [{ kind: "linux-shell", readiness: "ready" }] },
+    { id: "mac-ui", kind: "host-macos", protocolVersion: 1, readiness: "ready", capabilities: [{ kind: "macos-app-inspection", readiness: "ready" }] },
+  ] };
+  for (const scenario of ["adapter-missing", "candidate-stale", "combined-stale", "valid"] as const) await t.test(scenario, async () => {
+    const factory = harness([native]);
+    factory.planning(async () => ({ ...plan, tasks: [{ ...plan.tasks[0]!, quality }] }));
+    if (scenario !== "adapter-missing") factory.workspaces.qualityChecks = true;
+    factory.workspaces.check = async (_project, candidate, commands, verification) => {
+      assert.deepEqual(verification!.quality, quality);
+      assert.ok(commands.includes(UI_QUALITY_CHECK_COMMAND));
+      return commands.map(command => ({ command, passed: true, output: "Verified original inspection receipts", exitCode: 0, candidateCommit: candidate.commit, checkedCommit: scenario === "candidate-stale" ? "old-preview" : candidate.commit }));
+    };
+    const originalIntegration = factory.workspaces.integrate;
+    factory.workspaces.integrate = async (project, candidate, input) => {
+      assert.deepEqual(input.verification!.quality, quality);
+      const integration = await originalIntegration(project, candidate, input);
+      if (scenario === "combined-stale") integration.checks = integration.checks.map(check => check.command === UI_QUALITY_CHECK_COMMAND ? { ...check, checkedCommit: candidate.commit } : check);
+      return integration;
+    };
+    await planGoal(factory);
+    await factory.coordinator.tick(); await factory.coordinator.waitForIdle();
+    const task = factory.store.list<FactoryTask>("tasks")[0]!, attempt = factory.store.get<Attempt>("attempts", task.currentAttemptId!)!;
+    assert.deepEqual(factory.store.get<AttemptDetail>("factory-attempt-details", attempt.id)!.contract!.quality, quality);
+    if (scenario === "valid") {
+      assert.equal(task.status, "completed");
+      assert.equal(factory.calls.integrate, 1);
+    } else {
+      assert.notEqual(task.status, "completed");
+      assert.equal(factory.calls.integrate, scenario === "combined-stale" ? 1 : 0);
+      assert.equal(attempt.status, scenario === "combined-stale" ? "unknown" : "failed", "A potentially written combined result stays uncertain rather than permitting a blind retry");
+    }
+  });
+});
+
+test("an explicit native quality policy requires its inspection capability before allocation", async () => {
+  const factory = harness();
+  factory.planning(async () => ({ ...plan, tasks: [{ ...plan.tasks[0]!, quality: { platforms: ["macos"], workflows: [], referenceIds: [] } }] }));
+  const goal = await planGoal(factory);
+  await factory.coordinator.tick(); await factory.coordinator.waitForIdle();
+  assert.equal(factory.calls.execute, 0);
+  assert.equal(factory.store.list<Attempt>("attempts").length, 0);
+  assert.equal(factory.store.get<ControlRecord>("factory-control", goal.id)!.waitingFor, "execution-capability");
+  assert.match(factory.store.get<Goal>("goals", goal.id)!.nextAction!, /macos-app-inspection/);
+});
+
+test("pending UI receipts retain the author through restart while independent work uses the released slot", async t => {
+  const worker: Device = { ...device, capacity: 1, executionTargets: [
+    { id: "container", kind: "container", protocolVersion: 1, readiness: "ready", capacity: 1,
+      capabilities: [{ kind: "linux-shell", readiness: "ready" }, { kind: "chromium-inspection", readiness: "ready" }] },
+  ] };
+  const factory = harness([worker]);
+  factory.workspaces.qualityChecks = true;
+  factory.planning(async () => ({ ...plan, tasks: [
+    { ...plan.tasks[0]!, estimatedMinutes: 100, writePaths: ["apps/mail"], quality: { platforms: ["web"], workflows: [], referenceIds: [] } },
+    { key: "independent", title: "Independent implementation", description: "Ship unrelated work", dependsOn: [], checks: [], estimatedMinutes: 1, writePaths: ["docs"] },
+  ] }));
+  let receiptsReady = false;
+  const originalCheck = factory.workspaces.check;
+  factory.workspaces.check = async (project, candidate, commands, verification) => {
+    const checks = await originalCheck(project, candidate, commands, verification);
+    return checks.map(check => check.command === UI_QUALITY_CHECK_COMMAND && !receiptsReady ? {
+      ...check, passed: false, output: "Waiting for the exact source screenshot receipt", recovery: { condition: "inspection-evidence" as const, reason: "Capture and review this saved source." },
+    } : { ...check, checkedCommit: candidate.commit });
+  };
+  const goal = factory.goal();
+  await factory.coordinator.tick(); await factory.coordinator.waitForIdle();
+  await factory.coordinator.tick(); await factory.coordinator.waitForIdle();
+  const task = factory.store.list<FactoryTask>("tasks").find(task => task.title === plan.tasks[0]!.title)!;
+  const attempt = factory.store.get<Attempt>("attempts", task.currentAttemptId!)!;
+  const retained = factory.store.get<AttemptDetail>("factory-attempt-details", attempt.id)!;
+  assert.equal(task.status, "review");
+  assert.equal(attempt.status, "succeeded");
+  assert.equal(retained.verificationWait!.condition, "inspection-evidence");
+  assert.equal(retained.candidate!.commit, "candidate-commit");
+  assert.equal(factory.calls.integrate, 0);
+  const recovered = factory.recover();
+  t.after(() => recovered.stop());
+  await recovered.start(); await recovered.waitForIdle();
+  for (let index = 0; index < 3; index++) { await recovered.tick(); await recovered.waitForIdle(); }
+  assert.equal(factory.calls.execute, 2, "The unrelated task uses the one released author slot");
+  assert.equal(factory.calls.check, 2, "The waiting source is not polled; only the unrelated task adds a check");
+  assert.equal(factory.calls.diagnosis, 0);
+  assert.equal(factory.calls.reconcile, 0, "A settled author does not become unknown on restart");
+  assert.equal(factory.store.get<FactoryTask>("tasks", task.id)!.currentAttemptId, attempt.id);
+  assert.equal(factory.store.list<FactoryTask>("tasks").find(item => item.id !== task.id)!.status, "completed");
+  receiptsReady = true;
+  recovered.notifyCondition("inspection-evidence", goal.id);
+  await recovered.tick(); await recovered.waitForIdle();
+  assert.equal(factory.calls.execute, 2, "Verifier continuation cannot burn another author attempt");
+  assert.equal(factory.calls.capture, 2, "The original source remains retained");
+  assert.equal(factory.calls.check, 3);
+  assert.equal(factory.store.get<FactoryTask>("tasks", task.id)!.status, "completed");
+  assert.equal(factory.store.get<Attempt>("attempts", attempt.id)!.generation, 1);
+  assert.equal(factory.store.get<AttemptDetail>("factory-attempt-details", attempt.id)!.verificationWait, undefined);
+});
+
+test("a confirmed pre-write combined-source inspection wait resumes the same candidate", async () => {
+  const worker: Device = { ...device, executionTargets: [
+    { id: "container", kind: "container", protocolVersion: 1, readiness: "ready",
+      capabilities: [{ kind: "linux-shell", readiness: "ready" }, { kind: "chromium-inspection", readiness: "ready" }] },
+  ] };
+  const factory = harness([worker]);
+  factory.workspaces.qualityChecks = true;
+  factory.planning(async () => ({ ...plan, tasks: [{ ...plan.tasks[0]!, quality: { platforms: ["web"], workflows: [], referenceIds: [] } }] }));
+  const originalCheck = factory.workspaces.check, originalIntegrate = factory.workspaces.integrate;
+  factory.workspaces.check = async (project, candidate, commands, verification) => (await originalCheck(project, candidate, commands, verification)).map(check => ({ ...check, checkedCommit: candidate.commit }));
+  let combinedReady = false;
+  factory.workspaces.integrate = async (project, candidate, input) => {
+    if (!combinedReady) throw new FactoryVerificationWaitError("Review the combined source before integration writes.");
+    return originalIntegrate(project, candidate, input);
+  };
+  const goal = await planGoal(factory);
+  await factory.coordinator.tick(); await factory.coordinator.waitForIdle();
+  const task = factory.store.list<FactoryTask>("tasks")[0]!, attemptId = task.currentAttemptId!;
+  assert.equal(task.status, "review");
+  assert.equal(factory.store.get<Attempt>("attempts", attemptId)!.status, "succeeded");
+  assert.equal(factory.calls.integrate, 0, "No repository write occurred");
+  assert.equal(factory.store.get<AttemptDetail>("factory-attempt-details", attemptId)!.verificationWait!.condition, "inspection-evidence");
+  combinedReady = true;
+  factory.coordinator.notifyCondition("inspection-evidence", goal.id);
+  await factory.coordinator.tick(); await factory.coordinator.waitForIdle();
+  assert.equal(factory.calls.execute, 1);
+  assert.equal(factory.calls.capture, 1);
+  assert.equal(factory.calls.check, 1, "The exact candidate check was already settled");
+  assert.equal(factory.calls.integrate, 1);
+  assert.equal(factory.store.get<FactoryTask>("tasks", task.id)!.status, "completed");
+  assert.equal(factory.store.get<FactoryTask>("tasks", task.id)!.currentAttemptId, attemptId);
+});
+
+test("inspection receipts arriving before the wait is persisted cannot lose their wakeup", async t => {
+  for (const phase of ["candidate", "combined"] as const) await t.test(phase, async () => {
+    const worker: Device = { ...device, executionTargets: [
+      { id: "container", kind: "container", protocolVersion: 1, readiness: "ready",
+        capabilities: [{ kind: "linux-shell", readiness: "ready" }, { kind: "chromium-inspection", readiness: "ready" }] },
+    ] };
+    const factory = harness([worker]);
+    factory.workspaces.qualityChecks = true;
+    factory.planning(async () => ({ ...plan, tasks: [{ ...plan.tasks[0]!, quality: { platforms: ["web"], workflows: [], referenceIds: [] } }] }));
+    let pending = true;
+    const originalCheck = factory.workspaces.check, originalIntegrate = factory.workspaces.integrate;
+    factory.workspaces.check = async (project, candidate, commands, verification) => {
+      const checks = (await originalCheck(project, candidate, commands, verification)).map(check => ({ ...check, checkedCommit: candidate.commit }));
+      if (phase === "candidate" && pending) {
+        pending = false;
+        factory.coordinator.notifyCondition("inspection-evidence");
+        return checks.map(check => check.command === UI_QUALITY_CHECK_COMMAND ? { ...check, passed: false, recovery: { condition: "inspection-evidence" as const, reason: "A receipt arrived while the pending response was returning." } } : check);
+      }
+      return checks;
+    };
+    factory.workspaces.integrate = async (project, candidate, input) => {
+      if (phase === "combined" && pending) {
+        pending = false;
+        factory.coordinator.notifyCondition("inspection-evidence");
+        throw new FactoryVerificationWaitError("The combined receipt arrived before this response.");
+      }
+      return originalIntegrate(project, candidate, input);
+    };
+    await planGoal(factory);
+    await factory.coordinator.tick(); await factory.coordinator.waitForIdle();
+    const attemptId = factory.store.list<Attempt>("attempts")[0]!.id;
+    assert.equal(factory.store.get<AttemptDetail>("factory-attempt-details", attemptId)!.verificationWait, undefined, "A recorded event must cause one retained-source recheck");
+    await factory.coordinator.tick(); await factory.coordinator.waitForIdle();
+    assert.equal(factory.store.list<FactoryTask>("tasks")[0]!.status, "completed");
+    assert.equal(factory.calls.execute, 1);
+    assert.equal(factory.calls.capture, 1);
+    assert.equal(factory.calls.check, phase === "candidate" ? 2 : 1);
+    assert.equal(factory.calls.integrate, 1);
+  });
+});
+
+test("an unavailable branch cannot globally suspend progress unlocked by inspection evidence", async () => {
+  const worker: Device = { ...device, executionTargets: [
+    { id: "container", kind: "container", protocolVersion: 1, readiness: "ready",
+      capabilities: [{ kind: "linux-shell", readiness: "ready" }, { kind: "chromium-inspection", readiness: "ready" }] },
+  ] };
+  const factory = harness([worker]);
+  factory.workspaces.qualityChecks = true;
+  factory.planning(async () => ({ ...plan, tasks: [
+    { ...plan.tasks[0]!, estimatedMinutes: 100, quality: { platforms: ["web"], workflows: [], referenceIds: [] } },
+    { key: "unsupported", title: "Mac-only branch", description: "Needs a Mac shell", dependsOn: [], checks: [], execution: { target: "host-macos", requiredCapabilities: ["mac-shell"] }, estimatedMinutes: 10 },
+    { key: "dependent", title: "Follow-up work", description: "Use the reviewed implementation", dependsOn: ["implement"], checks: [], estimatedMinutes: 1 },
+  ] }));
+  let receiptsReady = false;
+  const originalCheck = factory.workspaces.check;
+  factory.workspaces.check = async (project, candidate, commands, verification) => (await originalCheck(project, candidate, commands, verification)).map(check => check.command === UI_QUALITY_CHECK_COMMAND && !receiptsReady ? {
+    ...check, passed: false, recovery: { condition: "inspection-evidence" as const, reason: "Review this saved source." },
+  } : { ...check, checkedCommit: candidate.commit });
+  const goal = factory.goal();
+  for (let index = 0; index < 3; index++) { await factory.coordinator.tick(); await factory.coordinator.waitForIdle(); }
+  assert.equal(factory.store.get<Goal>("goals", goal.id)!.status, "running", "A pending verifier still has a possible progress event");
+  receiptsReady = true;
+  factory.coordinator.notifyCondition("inspection-evidence", goal.id);
+  for (let index = 0; index < 2; index++) { await factory.coordinator.tick(); await factory.coordinator.waitForIdle(); }
+  assert.equal(factory.store.list<FactoryTask>("tasks").find(task => task.title === "Follow-up work")!.status, "completed");
+  assert.equal(factory.calls.execute, 2);
+  assert.equal(factory.store.list<Attempt>("attempts").some(attempt => attempt.taskId === factory.store.list<FactoryTask>("tasks").find(task => task.title === "Mac-only branch")!.id), false);
+});
+
+test("missing UI receipts cannot hide an observed shell check failure", async () => {
+  const worker: Device = { ...device, executionTargets: [
+    { id: "container", kind: "container", protocolVersion: 1, readiness: "ready",
+      capabilities: [{ kind: "linux-shell", readiness: "ready" }, { kind: "chromium-inspection", readiness: "ready" }] },
+  ] };
+  const factory = harness([worker]);
+  factory.workspaces.qualityChecks = true;
+  factory.planning(async () => ({ ...plan, tasks: [{ ...plan.tasks[0]!, quality: { platforms: ["web"], workflows: [], referenceIds: [] } }] }));
+  factory.workspaces.check = async (_project, candidate, commands) => commands.map(command => ({ command, passed: false, candidateCommit: candidate.commit,
+    output: command === UI_QUALITY_CHECK_COMMAND ? "Receipt not submitted" : "The implementation does not compile",
+    ...(command === UI_QUALITY_CHECK_COMMAND ? { recovery: { condition: "inspection-evidence" as const, reason: "Submit the receipt" } } : {}) }));
+  await planGoal(factory);
+  await factory.coordinator.tick(); await factory.coordinator.waitForIdle();
+  const attempt = factory.store.list<Attempt>("attempts")[0]!;
+  assert.equal(attempt.status, "failed");
+  assert.match(attempt.error!, /does not compile/);
+  assert.equal(factory.store.get<AttemptDetail>("factory-attempt-details", attempt.id)!.verificationWait, undefined);
+});
+
+test("completion audits retain legacy accepted contracts when their task detail record is absent", async () => {
+  const factory = harness();
+  const goal = await finishTask(factory);
+  const task = factory.store.list<FactoryTask>("tasks")[0]!;
+  factory.store.delete("factory-task-details", task.id);
+  await factory.coordinator.tick(); await factory.coordinator.waitForIdle();
+  assert.equal(factory.store.get<Goal>("goals", goal.id)!.status, "completed");
+  assert.equal(factory.calls.execute, 1);
+  assert.match(factory.evaluationPrompts[0]!, /Build and release the feature/);
+  assert.equal(factory.store.get<TaskDetail>("factory-task-details", task.id), undefined, "Audits must not rewrite missing legacy history");
+});
 
 test("native verification waits before allocation while independent work runs, including after restart", async t => {
   const factory = harness();
@@ -644,6 +961,49 @@ test("service recovery observes the previous running attempt without busy pollin
   }
 });
 
+test("an unchanged capture failure stays quiescent across ticks and restart without repeating the author", async t => {
+  let clock = new Date("2026-10-08T12:00:00.000Z"), captureReady = false;
+  const factory = harness([device], () => clock);
+  factory.capturing(async () => {
+    if (!captureReady) throw new Error("An ignored build directory prevented source capture");
+    return { id: "retained-native-source", commit: "candidate-commit", baseCommit: "initial-head" };
+  });
+  const goal = await planGoal(factory);
+  await factory.coordinator.start(); await factory.coordinator.waitForIdle();
+  t.after(() => factory.coordinator.stop());
+  const attempt = factory.store.list<Attempt>("attempts")[0]!;
+  const unknownDecisions = () => factory.store.list<Decision>("decisions").filter(decision => decision.kind === "execution-unknown");
+  assert.equal(attempt.status, "unknown");
+  assert.equal(factory.calls.execute, 1);
+  assert.equal(factory.calls.capture, 1);
+  for (let index = 0; index < 20; index++) { await factory.coordinator.tick(); await factory.coordinator.waitForIdle(); }
+  await delay(25);
+  assert.equal(factory.calls.capture, 1, "Review recovery cannot bypass the uncertain-effect reconciliation lane");
+  assert.equal(unknownDecisions().length, 1);
+  factory.coordinator.stop();
+  const recovered = factory.recover();
+  t.after(() => recovered.stop());
+  await recovered.start(); await recovered.waitForIdle();
+  assert.equal(factory.calls.capture, 1, "Service restart preserves the retry deadline");
+  clock = new Date(clock.getTime() + 31_000);
+  await recovered.tick(); await recovered.waitForIdle();
+  assert.equal(factory.calls.capture, 2, "The same preserved capture may be retried after backoff");
+  assert.equal(unknownDecisions().length, 1, "An unchanged outcome cannot grow the decision history");
+  assert.equal(factory.store.get<AttemptDetail>("factory-attempt-details", attempt.id)!.recoveryObservation!.failures, 2);
+  for (let index = 0; index < 20; index++) { await recovered.tick(); await recovered.waitForIdle(); }
+  assert.equal(factory.calls.capture, 2);
+  captureReady = true;
+  recovered.resume(goal.id);
+  await recovered.tick(); await recovered.waitForIdle();
+  assert.equal(factory.calls.capture, 3);
+  assert.equal(factory.calls.execute, 1);
+  assert.equal(factory.calls.integrate, 1);
+  assert.equal(factory.store.list<Attempt>("attempts").length, 1);
+  assert.equal(factory.store.get<Attempt>("attempts", attempt.id)!.generation, 1);
+  assert.equal(factory.store.get<FactoryTask>("tasks", attempt.taskId)!.status, "completed");
+  assert.equal(factory.store.get<AttemptDetail>("factory-attempt-details", attempt.id)!.recoveryObservation, undefined);
+});
+
 test("restart preserves failed repair history and recovers only the current successful candidate", async () => {
   const factory = harness();
   const goal = await planGoal(factory);
@@ -1098,6 +1458,55 @@ test("unknown controller outcomes and external waits never acquire an automatic 
     await factory.coordinator.tick(); await factory.coordinator.waitForIdle();
     assert.equal(factory.calls.planner, 1, "runtime refresh does not substitute for authentication, quota or a reconciled outcome");
   }
+});
+
+test("manual completion inspection waits survive restart without consuming controller retries or losing evaluation intent", async t => {
+  const factory = harness(), goal = await finishTask(factory);
+  factory.coordinator.configure(goal.id, { autonomy: "manual" });
+  let ready = false;
+  factory.evaluating(async () => {
+    if (!ready) throw new FactoryControllerError("The retained completion chat must view the source's screenshots.", "inspection-evidence");
+    return completeEvaluation;
+  });
+  factory.coordinator.requestEvaluation(goal.id);
+  await factory.coordinator.tick(); await factory.coordinator.waitForIdle();
+  const waiting = factory.store.get<ControlRecord>("factory-control", goal.id)!;
+  assert.equal(waiting.waitingFor, "inspection-evidence");
+  assert.equal(waiting.wakeAt, undefined);
+  assert.equal(waiting.controllerFailures, undefined);
+  assert.equal(waiting.manualAction, "evaluate");
+  assert.equal(waiting.stage, "evaluate");
+  const recovered = factory.recover();
+  t.after(() => recovered.stop());
+  await recovered.start(); await recovered.waitForIdle();
+  for (let index = 0; index < 3; index++) { await recovered.tick(); await recovered.waitForIdle(); }
+  assert.equal(factory.calls.evaluator, 1, "Waiting for inspected pixels cannot repeatedly restart the evaluator");
+  ready = true;
+  recovered.notifyCondition("inspection-evidence", goal.id);
+  await recovered.tick(); await recovered.waitForIdle();
+  assert.equal(factory.calls.evaluator, 2);
+  assert.equal(factory.store.get<Goal>("goals", goal.id)!.status, "completed");
+  assert.equal(factory.calls.execute, 1);
+  assert.equal(factory.store.list<Attempt>("attempts").length, 1);
+  assert.equal(factory.store.list<Decision>("decisions").some(decision => decision.kind === "controller-error"), false);
+});
+
+test("controller inspection evidence arriving during the wait response cannot strand completion", async () => {
+  const factory = harness(), goal = await finishTask(factory);
+  factory.evaluating(async () => {
+    if (factory.calls.evaluator === 1) {
+      factory.coordinator.notifyCondition("inspection-evidence", goal.id);
+      throw new FactoryControllerError("The image delivery arrived while the pending response returned.", "inspection-evidence");
+    }
+    return completeEvaluation;
+  });
+  await factory.coordinator.tick(); await factory.coordinator.waitForIdle();
+  assert.equal(factory.store.get<ControlRecord>("factory-control", goal.id)!.waitingFor, undefined);
+  assert.equal(factory.store.get<ControlRecord>("factory-control", goal.id)!.controllerFailures, undefined);
+  await factory.coordinator.tick(); await factory.coordinator.waitForIdle();
+  assert.equal(factory.store.get<Goal>("goals", goal.id)!.status, "completed");
+  assert.equal(factory.calls.evaluator, 2);
+  assert.equal(factory.calls.execute, 1);
 });
 
 test("pausing, cancellation and changed goal authority fence scheduled controller retries", async () => {

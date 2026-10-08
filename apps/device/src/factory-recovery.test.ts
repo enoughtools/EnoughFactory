@@ -244,11 +244,13 @@ test('ordinary chats and answers to an already pending factory question retain t
   const engine = { ready: { instance: 'fake-container', workdir: '/workspace/existing' } } as ReturnType<DeviceApp['sessions']['get']>;
   t.mock.method(fixture.app.sessions, 'get', () => engine);
   let state = fixture.seed('running');
-  fixture.app.store.delete('factory-workers', state.attempt.id);
+  const ordinarySession = { ...fixture.app.sessions.record(state.chat.sessionId), id: 'ordinary-session', name: 'ordinary-work' };
+  fixture.app.store.set('sessions', ordinarySession);
+  const ordinaryChat = chats.create({ sessionId: ordinarySession.id, title: 'Ordinary conversation' });
   t.mock.method(chats.manager, 'runTurn', async (input: TurnInput) => ({ threadId: 'normal-thread', text: input.prompt }));
-  const normal = await chats.run(state.chat.id, 'Ordinary conversation');
+  const normal = await chats.run(ordinaryChat.id, 'Ordinary conversation');
   assert.equal(normal.text, 'Ordinary conversation');
-  assert.equal(fixture.app.store.get<CompletionReceipt>('chat-results', state.chat.id)!.attemptId, undefined);
+  assert.equal(fixture.app.store.get<CompletionReceipt>('chat-results', ordinaryChat.id)!.attemptId, undefined);
 
   state = fixture.seed('running');
   let questionEntered!: () => void;

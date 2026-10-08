@@ -3,12 +3,12 @@ import { Duplex } from 'node:stream';
 import WebSocket from 'ws';
 import { PeerManager, bridgePeerStreams, type PeerStream, type StreamOptions, type IceServer } from '@enoughfactory/peers';
 import { PreviewGateway, connectSessionProxy, type PreviewTarget } from '@enoughfactory/previews';
-import type { Approval, Attempt, Chat, Device, FactoryState, FactoryTask, Goal, Project, RpcRequest, RpcResponse, Session, Settings } from '@enoughfactory/contracts';
+import { EXECUTION_CAPABILITIES, type Approval, type Attempt, type Chat, type Device, type ExecutionCapabilityAdvertisement, type ExecutionReadiness, type ExecutionTargetAdvertisement, type FactoryState, type FactoryTask, type Goal, type Project, type RpcRequest, type RpcResponse, type Session, type Settings } from '@enoughfactory/contracts';
 import { DeviceApp, type ApiCall } from './app.ts';
 import { HttpError, now } from './util.ts';
 import { parseWorkerResources } from './worker-capacity.ts';
 
-type Catalog = Pick<FactoryState,'projects'|'sessions'|'chats'|'goals'|'tasks'|'attempts'> & { id: string; updatedAt: string; capacity?: number; workerResources?: Device['workerResources']; workspaceProviders?: Device['workspaceProviders'] };
+type Catalog = Pick<FactoryState,'projects'|'sessions'|'chats'|'goals'|'tasks'|'attempts'> & { id: string; updatedAt: string; capacity?: number; workerResources?: Device['workerResources']; workspaceProviders?: Device['workspaceProviders']; executionTargets?: Device['executionTargets'] };
 type Packet = Record<string,unknown>;
 const maxStreamBuffer = 1024 * 1024;
 
@@ -18,16 +18,68 @@ function object(value: unknown): Record<string,unknown> {
 function records<T>(value: unknown, predicate: (item: Record<string,unknown>)=>boolean): T[] {
   return Array.isArray(value) ? value.filter(item=>predicate(object(item))).slice(0,10000) as T[] : [];
 }
+const readiness = new Set<ExecutionReadiness>(['ready', 'preparing', 'busy', 'offline', 'setup-required', 'unsupported']);
+const capabilityKinds = new Set<string>(EXECUTION_CAPABILITIES);
+const displayText = (value: unknown, limit: number): string | undefined => typeof value === 'string' && value.trim() ? value.trim().slice(0, limit) : undefined;
+
+/** Negotiate only a known protocol. Old or malformed peers never gain implicit host capabilities. */
+export function parseExecutionTargets(value: unknown): ExecutionTargetAdvertisement[] | undefined {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value)) return [];
+  if (value.length > 16) return [];
+  const targets = new Map<string, ExecutionTargetAdvertisement>(), duplicates = new Set<string>();
+  for (const item of value) {
+    const target = object(item);
+    if (typeof target.id !== 'string' || !/^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,127}$/.test(target.id)
+      || (target.kind !== 'container' && target.kind !== 'host-macos') || target.protocolVersion !== 1
+      || !readiness.has(target.readiness as ExecutionReadiness) || !Array.isArray(target.capabilities)
+      || target.capabilities.length > EXECUTION_CAPABILITIES.length) continue;
+    const capabilities: ExecutionCapabilityAdvertisement[] = [], seen = new Set<string>();
+    let valid = true;
+    for (const item of target.capabilities) {
+      const capability = object(item);
+      if (typeof capability.kind !== 'string' || !capabilityKinds.has(capability.kind) || seen.has(capability.kind)
+        || !readiness.has(capability.readiness as ExecutionReadiness)) { valid = false; break; }
+      seen.add(capability.kind);
+      capabilities.push({ kind: capability.kind as ExecutionCapabilityAdvertisement['kind'], readiness: capability.readiness as ExecutionReadiness,
+        ...(displayText(capability.version, 128) ? { version: displayText(capability.version, 128) } : {}),
+        ...(displayText(capability.reason, 1000) ? { reason: displayText(capability.reason, 1000) } : {}),
+        ...(displayText(capability.setupAction, 1000) ? { setupAction: displayText(capability.setupAction, 1000) } : {}) });
+    }
+    if (!valid) continue;
+    if (target.workspaceProviders !== undefined && (!Array.isArray(target.workspaceProviders) || target.workspaceProviders.length > 2
+      || !target.workspaceProviders.every(provider => provider === 'git' || provider === 'artifactfs'))) continue;
+    if (target.runtimes !== undefined && (!Array.isArray(target.runtimes) || target.runtimes.length > 3
+      || !target.runtimes.every(runtime => runtime === 'codex' || runtime === 'antigravity' || runtime === 'claude'))) continue;
+    if (targets.has(target.id) || duplicates.has(target.id)) { targets.delete(target.id); duplicates.add(target.id); continue; }
+    const resources = parseWorkerResources(target.resources);
+    const workspaceProviders = Array.isArray(target.workspaceProviders) ? [...new Set(target.workspaceProviders)] as Device['workspaceProviders'] : undefined;
+    const runtimes = Array.isArray(target.runtimes) ? [...new Set(target.runtimes)] as ExecutionTargetAdvertisement['runtimes'] : undefined;
+    targets.set(target.id, { id: target.id, kind: target.kind, protocolVersion: 1, readiness: target.readiness as ExecutionReadiness, capabilities,
+      ...(Number.isInteger(target.capacity) && Number(target.capacity) >= 0 && Number(target.capacity) <= 64 ? { capacity: Number(target.capacity) } : {}),
+      ...(resources ? { resources } : {}),
+      ...(workspaceProviders ? { workspaceProviders } : {}),
+      ...(runtimes ? { runtimes } : {}),
+      ...(displayText(target.reason, 1000) ? { reason: displayText(target.reason, 1000) } : {}),
+      ...(displayText(target.setupAction, 1000) ? { setupAction: displayText(target.setupAction, 1000) } : {}) });
+  }
+  return [...targets.values()];
+}
+
+/** A saved readiness probe is history until this connection has negotiated the current protocol. */
+export function negotiatedExecutionTargets(targets: Device['executionTargets'], online: boolean, negotiated: boolean): Device['executionTargets'] {
+  return online && !negotiated && targets !== undefined ? [] : targets;
+}
 function publicCatalog(app: DeviceApp): Catalog {
   // Keep removed identities in peer metadata for owner-aware restore and historical reads.
   // DeviceApp.state filters the merged catalog only after this raw catalog is collected.
-  return { id:app.device.id,updatedAt:now(),capacity:app.device.capacity,workerResources:app.device.workerResources,workspaceProviders:app.device.workspaceProviders,projects:app.store.list<Project>('projects').filter(project=>!project.internal),
+  return { id:app.device.id,updatedAt:now(),capacity:app.device.capacity,workerResources:app.device.workerResources,workspaceProviders:app.device.workspaceProviders,executionTargets:app.device.executionTargets,projects:app.store.list<Project>('projects').filter(project=>!project.internal),
     sessions:app.store.list<Session>('sessions').map(({enginePid,...session})=>session),
     chats:app.store.list<Chat>('chats').map(({threadId,...chat})=>chat),
     goals:app.store.list<Goal>('goals').filter(goal=>goal.coordinatorId===app.device.id),
     tasks:app.store.list<FactoryTask>('tasks'),attempts:app.store.list<Attempt>('attempts') };
 }
-function receiveCatalog(peerId: string, value: unknown): Catalog {
+export function receiveCatalog(peerId: string, value: unknown): Catalog {
   const data=object(value);const local=(item:Record<string,unknown>)=>typeof item.id==='string'&&item.deviceId===peerId;
   const projects=records<Project>(data.projects,local);
   const sessions=records<Session>(data.sessions,item=>local(item)&&typeof item.projectId==='string')
@@ -44,7 +96,8 @@ function receiveCatalog(peerId: string, value: unknown): Catalog {
   const workerResources=parseWorkerResources(data.workerResources??object(data.device).workerResources);
   const providers=data.workspaceProviders??object(data.device).workspaceProviders;
   const workspaceProviders=Array.isArray(providers)?providers.filter((provider):provider is 'git'|'artifactfs'=>provider==='git'||provider==='artifactfs'):undefined;
-  return {id:peerId,updatedAt:now(),...(Number.isInteger(capacity)&&capacity>=0&&capacity<=64?{capacity}:{}),workerResources,workspaceProviders,projects,sessions,chats,goals,tasks,attempts};
+  const executionTargets=parseExecutionTargets(Object.hasOwn(data,'executionTargets')?data.executionTargets:object(data.device).executionTargets);
+  return {id:peerId,updatedAt:now(),...(Number.isInteger(capacity)&&capacity>=0&&capacity<=64?{capacity}:{}),workerResources,workspaceProviders,executionTargets,projects,sessions,chats,goals,tasks,attempts};
 }
 function iceServers(settings: Settings): IceServer[] {
   return settings.turnUrls?.length ? [{urls:settings.turnUrls,username:settings.turnUsername,credential:settings.turnCredential}] : [];
@@ -120,16 +173,21 @@ export async function initializeNetwork(app: DeviceApp): Promise<{
   peers: PeerManager; gateway: PreviewGateway;
   connectTerminal(sessionId:string,url:URL,client:WebSocket):Promise<boolean>;
 }> {
-  const remoteCatalogs=new Map(app.store.list<Catalog>('remote-catalog').map(catalog=>[catalog.id,catalog]));
+  const remoteCatalogs=new Map(app.store.list<Catalog>('remote-catalog').map(catalog=>[catalog.id,receiveCatalog(catalog.id,catalog)]));
+  const negotiatedPeers=new Set<string>();
   const liveApprovals=new Map<string,Approval[]>();
   let peers!: PeerManager;let remoteEvent=false;let closed=false;let lastPublished='';let lastApprovals='';
   const localState=():FactoryState=>({product:'EnoughFactory',version:'0.1.5',device:app.device,devices:[app.device],
     ...publicCatalog(app),approvals:app.store.list('approvals'),diagnostics:app.diagnostics,
     settings:{...app.settings,turnCredential:undefined}});
   const saveCatalog=(peerId:string,value:unknown)=>{
+    const before=JSON.stringify(app.devices.find(device=>device.id===peerId)?.executionTargets);
     const catalog=receiveCatalog(peerId,value);remoteCatalogs.set(peerId,catalog);app.store.set('remote-catalog',catalog);
-    app.devices=app.devices.map(device=>device.id===peerId?{...device,capacity:device.platform==='browser'?0:catalog.capacity??device.capacity,workerResources:device.platform==='browser'?undefined:catalog.workerResources,workspaceProviders:catalog.workspaceProviders}:device);app.changed();
+    negotiatedPeers.add(peerId);
+    app.devices=app.devices.map(device=>device.id===peerId?{...device,capacity:device.platform==='browser'?0:catalog.capacity??device.capacity,workerResources:device.platform==='browser'?undefined:catalog.workerResources,workspaceProviders:catalog.workspaceProviders,executionTargets:device.platform==='browser'?undefined:catalog.executionTargets}:device);app.changed();
+    if(before!==JSON.stringify(app.devices.find(device=>device.id===peerId)?.executionTargets))capabilitiesChanged(peerId);
   };
+  const capabilitiesChanged=(deviceId:string)=>{remoteEvent=true;try{app.emit('execution-capabilities',{deviceId});}finally{remoteEvent=false;}};
   const browserEvent=(topic:string,data:unknown,cursor?:number)=>{for(const device of app.devices)if(device.platform==='browser'&&device.online)void peers.publishTo(device.id,topic,data,cursor).catch(()=>{});};
   const refreshPeer=async(peerId:string)=>{
     try{const state=rpcBody(await peers.request(peerId,{method:'GET',path:'/api/state?local=1'}));saveCatalog(peerId,state);
@@ -147,7 +205,7 @@ export async function initializeNetwork(app: DeviceApp): Promise<{
   };
   const owner=(call:ApiCall):string|undefined=>{
     const route=call.url.pathname;
-    if(route==='/api/health'&&call.url.searchParams.has('deviceId'))return call.url.searchParams.get('deviceId')||undefined;
+    if((route==='/api/health'||route==='/api/inspection/readiness')&&call.url.searchParams.has('deviceId'))return call.url.searchParams.get('deviceId')||undefined;
     if(route.startsWith('/api/factory/worker/'))return undefined;
     if(/^\/api\/artifacts\/[^/]+(?:\/(?:content|chunk))?$/.test(route)&&call.url.searchParams.has('deviceId'))return call.url.searchParams.get('deviceId')||undefined;
     // A preview grant belongs to the viewing service even when its session is remote.
@@ -179,7 +237,7 @@ export async function initializeNetwork(app: DeviceApp): Promise<{
       if(rpc.method==='GET'&&url.pathname==='/api/state')return {v:1,id:rpc.id,status:200,body:url.searchParams.get('local')==='1'?localState():app.state()};
       const controller=peers.devices().find(device=>device.id===peerId)?.platform==='browser';
       const controllerRoute=controller&&(/^\/api\/(settings|devices|previews|runtime)(?:\/|$)/.test(url.pathname)||url.pathname==='/api/service/shutdown');
-      if(!controllerRoute&&!/^\/api\/(health|diagnostics|projects|sessions|chats|approvals|goals|tasks|attempts|artifacts)(?:\/|$)/.test(url.pathname)&&!url.pathname.startsWith('/api/factory/worker/'))throw new HttpError(403,'This operation is private to its device.');
+      if(!controllerRoute&&!/^\/api\/(health|diagnostics|projects|sessions|chats|approvals|goals|tasks|attempts|artifacts|inspection)(?:\/|$)/.test(url.pathname)&&!url.pathname.startsWith('/api/factory/worker/'))throw new HttpError(403,'This operation is private to its device.');
       if(url.pathname.endsWith('/preview')||url.pathname.endsWith('/desktop-preview'))throw new HttpError(403,'Preview grants are issued by the viewing device.');
       const call:ApiCall={method:rpc.method,url,body:object(rpc.body),peerId};
       if(rpc.method==='POST'&&url.pathname.endsWith('/browser-preview'))return {v:1,id:rpc.id,status:200,body:await createPreview(call)};
@@ -191,14 +249,17 @@ export async function initializeNetwork(app: DeviceApp): Promise<{
     iceServers:iceServers(app.settings),relayFallback:true,onRequest:request,
     onDevices(devices){
       const old=new Map(app.devices.map(device=>[device.id,device.online]));
-      app.devices=devices.map(device=>device.local?{...app.device,...device,capacity:app.device.capacity,workerResources:app.device.workerResources,workspaceProviders:app.device.workspaceProviders}:device.platform==='browser'?{...device,capacity:0,workerResources:undefined}:{...device,capacity:remoteCatalogs.get(device.id)?.capacity??device.capacity,workerResources:remoteCatalogs.get(device.id)?.workerResources,workspaceProviders:remoteCatalogs.get(device.id)?.workspaceProviders});
+      for(const device of devices)if(!device.local&&(!device.online||!old.get(device.id)))negotiatedPeers.delete(device.id);
+      app.devices=devices.map(device=>device.local?{...app.device,...device,capacity:app.device.capacity,workerResources:app.device.workerResources,workspaceProviders:app.device.workspaceProviders,executionTargets:app.device.executionTargets}:device.platform==='browser'?{...device,capacity:0,workerResources:undefined,executionTargets:undefined}:{...device,capacity:remoteCatalogs.get(device.id)?.capacity??device.capacity,workerResources:remoteCatalogs.get(device.id)?.workerResources,workspaceProviders:remoteCatalogs.get(device.id)?.workspaceProviders,executionTargets:negotiatedExecutionTargets(remoteCatalogs.get(device.id)?.executionTargets,device.online,negotiatedPeers.has(device.id))});
       const paired=new Set(devices.filter(device=>!device.local).map(device=>device.id));
-      for(const peerId of remoteCatalogs.keys())if(!paired.has(peerId)){remoteCatalogs.delete(peerId);app.store.delete('remote-catalog',peerId);liveApprovals.delete(peerId);}
+      for(const peerId of remoteCatalogs.keys())if(!paired.has(peerId)){remoteCatalogs.delete(peerId);negotiatedPeers.delete(peerId);app.store.delete('remote-catalog',peerId);liveApprovals.delete(peerId);}
       for(const device of devices){if(!device.online)liveApprovals.delete(device.id);else if(!device.local&&device.platform!=='browser'&&!old.get(device.id))void refreshPeer(device.id);}
       app.changed();
+      for(const device of devices)if(!device.local&&device.platform!=='browser'&&old.get(device.id)!==device.online)capabilitiesChanged(device.id);
     },
     onEvent(peerId,event){
       if(event.topic==='catalog'){saveCatalog(peerId,event.data);void refreshPeer(peerId);return;}
+      if(event.topic==='execution-capabilities'){void refreshPeer(peerId);return;}
       // Live messages are delivered to subscribers, never copied into this device's transcript store.
       if(['state','network-error','peer-artifact'].includes(event.topic))return;
       const data={...object(event.data),deviceId:peerId,peerCursor:event.cursor};
@@ -231,12 +292,12 @@ export async function initializeNetwork(app: DeviceApp): Promise<{
   app.serviceHandoffHooks.push(()=>peers.beginServiceHandoff());
   // Replace the provisional install ID before creating any environments and migrate
   // existing owner references once. The signing identity survives window/service restarts.
-  const previousId=app.device.id;const device={...peers.localDevice,capacity:app.device.capacity??2,workerResources:app.device.workerResources};
+  const previousId=app.device.id;const device={...peers.localDevice,capacity:app.device.capacity??2,workerResources:app.device.workerResources,workspaceProviders:app.device.workspaceProviders,executionTargets:app.device.executionTargets};
   if(previousId!==device.id)app.store.transaction(()=>{
     for(const bucket of ['projects','sessions','chats','tasks','attempts'])for(const saved of app.store.list<Record<string,unknown>&{id:string}>(bucket))if(saved.deviceId===previousId)app.store.set(bucket,{...saved,deviceId:device.id});
     for(const goal of app.store.list<Goal>('goals'))if(goal.coordinatorId===previousId)app.store.set('goals',{...goal,coordinatorId:device.id});
   });
-  app.setDevice(device);app.devices=peers.devices().map(item=>item.local?app.device:item.platform==='browser'?{...item,capacity:0,workerResources:undefined}:item);
+  app.setDevice(device);app.devices=peers.devices().map(item=>item.local?app.device:item.platform==='browser'?{...item,capacity:0,workerResources:undefined,executionTargets:undefined}:{...item,executionTargets:negotiatedExecutionTargets(remoteCatalogs.get(item.id)?.executionTargets,item.online,negotiatedPeers.has(item.id))});
   const catalogBefore=app.catalog;
   app.catalog=()=>{
     const prior=catalogBefore?.()||{};const local=publicCatalog(app);

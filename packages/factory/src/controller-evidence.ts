@@ -16,7 +16,8 @@ export function controllerTaskContract(task: FactoryTask, detail: TaskDetail) {
     checks: detail.checks, planChecks: detail.planChecks, planRevision: detail.planRevision,
     ...(detail.requiredCheckEnvironment === undefined ? {} : { requiredCheckEnvironment: detail.requiredCheckEnvironment }),
     writePaths: task.writePaths, resources: task.resources ? { cpus: task.resources.cpus, memoryGiB: task.resources.memoryGiB } : undefined,
-    estimatedMinutes: task.estimatedMinutes };
+    estimatedMinutes: task.estimatedMinutes, ...(task.execution === undefined ? {} : { execution: task.execution }),
+    ...(task.quality === undefined ? {} : { quality: task.quality }) };
 }
 
 export function controllerAttemptContract(value: AttemptDetail["contract"]) {
@@ -24,7 +25,8 @@ export function controllerAttemptContract(value: AttemptDetail["contract"]) {
     acceptanceCriteria: value.acceptanceCriteria, expectedOutputs: value.expectedOutputs,
     estimatedMinutes: value.estimatedMinutes, writePaths: value.writePaths,
     resources: value.resources ? { cpus: value.resources.cpus, memoryGiB: value.resources.memoryGiB } : undefined,
-    dependsOn: value.dependsOn, checks: value.checks, planRevision: value.planRevision } : undefined;
+    dependsOn: value.dependsOn, checks: value.checks, planRevision: value.planRevision,
+    ...(value.execution === undefined ? {} : { execution: value.execution }), ...(value.quality === undefined ? {} : { quality: value.quality }) } : undefined;
 }
 
 export function controllerContractReference(record: string, contract: unknown): ControllerRecordRequirement {
@@ -95,6 +97,12 @@ export class ControllerEvidence {
       .map(({ check, index }) => [index, this.text(check.output, `${record}[${index}].output`, check.passed ? 1024 : 8192)]));
     return checks.map((check, index) => ({ command: check.command, passed: check.passed, exitCode: check.exitCode,
       candidateCommit: check.candidateCommit, checkedCommit: check.checkedCommit, developmentToolchain: this.toolchain(check.developmentToolchain),
+      executionTargetKind: check.executionTargetKind, hostPermissions: check.hostPermissions,
+      recovery: check.recovery,
+      ...(check.appleValidation ? { appleValidation: { version: check.appleValidation.version, candidateId: check.appleValidation.candidateId,
+        candidateCommit: check.appleValidation.candidateCommit, checkedCommit: check.appleValidation.checkedCommit, profile: check.appleValidation.profile,
+        sandbox: check.appleValidation.sandbox, developerDirectory: check.appleValidation.developerDirectory, workingDirectories: check.appleValidation.workingDirectories,
+        artifact: this.artifact(check.appleValidation.artifact), products: check.appleValidation.products.map(product => this.artifact(product)) } } : {}),
       output: outputs.get(index) }));
   }
 
@@ -102,8 +110,9 @@ export class ControllerEvidence {
     if (!detail) return undefined;
     const record = `factory-attempt-details/${detail.id}`;
     return { record, id: detail.id, taskId: attempt?.taskId, generation: attempt?.generation, status: attempt?.status,
-      deviceId: attempt?.deviceId, goalId: detail.goalId, goalRevision: detail.goalRevision, assignmentGoalRevision: detail.assignmentGoalRevision,
-      phase: detail.phase, cancellation: detail.cancellation,
+      deviceId: attempt?.deviceId, executionTargetId: attempt?.executionTargetId, executionTargetKind: attempt?.executionTargetKind,
+      goalId: detail.goalId, goalRevision: detail.goalRevision, assignmentGoalRevision: detail.assignmentGoalRevision,
+      phase: detail.phase, cancellation: detail.cancellation, verificationWait: detail.verificationWait,
       contract: detail.contract && (this.contractReferences ? this.contract(record, controllerAttemptContract(detail.contract)) : controllerAttemptContract(detail.contract)),
       candidate: this.candidate(detail.candidate),
       checks: this.checks(detail.checks, `${record}.checks`),

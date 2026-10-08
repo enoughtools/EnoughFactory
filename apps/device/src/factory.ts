@@ -2,13 +2,13 @@ import { randomUUID, createHash } from 'node:crypto';
 import { createReadStream } from 'node:fs';
 import { mkdir, readFile, writeFile, lstat, readlink, open } from 'node:fs/promises';
 import path from 'node:path';
-import type { Attempt, FactoryTask, Goal, Project, Decision, ControllerRun, ContainerRuntimeStatus, DevelopmentToolchain, DevelopmentToolchainId } from '@enoughfactory/contracts';
+import type { Attempt, FactoryTask, Goal, Project, Decision, ControllerRun, ContainerRuntimeStatus, DevelopmentToolchain, DevelopmentToolchainId, TaskQualityRequirements } from '@enoughfactory/contracts';
 import {
-  FactoryCoordinator, FactoryOperationError, FactoryCapacityError, type FactoryWorkspacePort, type FactoryRuntimePort, type WorkspaceRef,
+  FactoryCoordinator, FactoryOperationError, FactoryCapacityError, FactoryControllerError, FactoryVerificationWaitError, selectExecutionTarget, validateTaskExecution, UI_QUALITY_CHECK_COMMAND, type FactoryVerificationContext, type FactoryWorkspacePort, type FactoryRuntimePort, type WorkspaceRef,
   type CandidateRef, type ExecutionResult, type CheckResult, type CreateGoalInput,
   type RepositoryEvidence, type EvaluationRecord, type ControlRecord, type TaskDetail, type AttemptDetail, type FactoryStore, type FrozenTaskCheckInputs,
 } from '@enoughfactory/factory';
-import { WorkspaceManager, ArtifactFsWorkspaceProvider, dockerCheckExecutor, appleCheckExecutor, isAppleCheckCommand, appleCheckArtifacts, fingerprintWorkingDirectories, stageCapturedSource, validateCheckInputs, type WorkingDirectorySource, type WorkingDirectoryCapture, type ArtifactManifest, type Candidate, type CheckReport, type WorkspaceRecord } from '@enoughfactory/workspaces';
+import { WorkspaceManager, ArtifactFsWorkspaceProvider, dockerCheckExecutor, appleCheckExecutor, isAppleCheckCommand, appleCheckArtifacts, fingerprintWorkingDirectories, stageCapturedSource, validateCheckInputs, type WorkingDirectorySource, type WorkingDirectoryCapture, type ArtifactManifest, type Candidate, type CheckReport, type WorkspaceRecord, type AppleCheckResult } from '@enoughfactory/workspaces';
 import type { PeerManager } from '@enoughfactory/peers';
 import type { TurnResult } from '@enoughfactory/agents';
 import { dockerInvocation, SWIFT_TOOLCHAIN, validatePreparedToolchain } from '@enoughfactory/runtime';
@@ -29,6 +29,8 @@ import { retainManualContinuation, type ManualContinuationInput } from './manual
 import { HostDiskAdmission, HostDiskHeadroomError, PREPARATION_HEADROOM_BYTES, preparationArtifactBytes } from './host-disk-admission.ts';
 import { TerminalSessionCleanup } from './terminal-session-cleanup.ts';
 import { importFactoryEnvironmentArchives } from './factory-archive-imports.ts';
+import { hostCheckExecutor } from './host-checks.ts';
+import { factoryQualityInstructions } from './factory-quality.ts';
 import { configureTaskCheckInputs, freezeTaskCheckInputs } from './factory-check-inputs.ts';
 
 interface WorkerRecord {
@@ -93,8 +95,14 @@ export async function factoryAttemptWorkingDirectorySources(dataDir: string, ses
   return sessions.workingDirectorySources(attemptId, { ...project, workingDirectories: sources });
 }
 
+interface ControllerReviewContinuation {id:string;goalId:string;goalRevision:number;runtime:Goal['runtime'];execution:string;sessionId:string;chatId:string;repository:RepositoryEvidence;resultText:string;systemInstructions:string;status:'waiting';reason?:string;updatedAt:string}
+
 /** The service owns execution and the supervisor; no open window is required. */
-export async function initializeFactory(app: DeviceApp, chats: ChatController, network?: { peers: PeerManager }) {
+export interface FactoryInspectionPorts {
+  reviewController?: (input:{goal:Goal;run:ControllerRun;resultText:string;signal?:AbortSignal})=>Promise<{ready:boolean;reason?:string;evidenceIds:string[]}>;
+  qualityCheck?: (input:FactoryVerificationContext & {candidate:Candidate;quality:TaskQualityRequirements;path:string;workingDirectories?:Array<{path:string;containerPath:string;commit:string}>;checkedCommit:string;signal?:AbortSignal})=>Promise<CheckResult>;
+}
+export async function initializeFactory(app: DeviceApp, chats: ChatController, network?: { peers: PeerManager }, inspection:FactoryInspectionPorts={}) {
   const hostDisk = new HostDiskAdmission(() => [app.dataDir, ...(app.diagnostics.containerRuntime?.dataDirectory ? [app.diagnostics.containerRuntime.dataDirectory] : [])], () => app.device.name);
   function reserveDisk(identity: string, bytes = 0): () => void {
     try { return hostDisk.reserve(identity, bytes); }
@@ -120,23 +128,36 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
   }
   app.sessions.afterCaptureBeforeStop.push(sessionId => releaseFactoryCodexPayload({ store: app.store, sessions: app.sessions, chats, manager: chats.manager }, sessionId));
   for (const run of app.store.list<ControllerRun>('factory-controller-runs')) {
+    const review=app.store.get<ControllerReviewContinuation>('factory-controller-reviews',run.id);
+    if(review?.status==='waiting'&&run.status==='running') { app.store.set('factory-controller-runs',{...run,status:'waiting',updatedAt:now()}); continue; }
     if (run.status === 'starting' || run.status === 'running') app.store.set('factory-controller-runs', { ...run, status: 'interrupted', error: 'The device service restarted before this decision completed. Its conversation and environment remain inspectable.', updatedAt: now() });
   }
   const checkExecutor=dockerCheckExecutor({ image:process.env.ENOUGHFACTORY_CHECK_IMAGE,dockerRuntime:app.runtime.endpoint });
+  const hostChecks=hostCheckExecutor({checksRoot:path.join(app.dataDir,'workspace-data','checks'),integrationRoot:path.join(app.dataDir,'workspace-data','integration')});
   const workspaces: WorkspaceManager = new WorkspaceManager({
     dataDir: path.join(app.dataDir, 'workspace-data'), deviceId: app.device.id,
-    checkExecutor: Object.assign((context: Parameters<typeof checkExecutor>[0]) => app.withRuntimeOperation(async signal => {
-      const check = { ...context, signal: context.signal ? AbortSignal.any([signal, context.signal]) : signal };
-      if (isAppleCheckCommand(context.command)) {
-        const result = await appleCheckExecutor({ checksRoot: path.join(app.dataDir, 'workspace-data', 'checks'), artifacts: workspaces.artifacts })(check);
-        rememberArtifacts(...appleCheckArtifacts(result));
-        return result;
-      }
-      await app.ensureRuntimeReady();
-      await app.runtime.prepareWorkspace(context.path);
-      for (const root of context.workingDirectories || []) await app.runtime.prepareWorkspace(root.path);
-      return await checkExecutor(check);
-    }), { release: checkExecutor.release }),
+    checkExecutor: Object.assign((context: Parameters<typeof checkExecutor>[0]) => {
+      if(context.command===UI_QUALITY_CHECK_COMMAND)return app.withServiceOperation(async serviceSignal=>{
+        const signal=context.signal?AbortSignal.any([serviceSignal,context.signal]):serviceSignal;if(signal.aborted)throw new Error('UI quality verification was canceled.');
+        const startedAt=now(),verification=context.verification as FactoryVerificationContext|undefined;
+        const result:CheckResult=verification?.quality&&inspection.qualityCheck
+          ?await inspection.qualityCheck({...verification,quality:verification.quality,candidate:context.candidate,path:context.path,workingDirectories:context.workingDirectories,checkedCommit:context.commit,signal})
+          :{command:UI_QUALITY_CHECK_COMMAND,passed:false,output:'UI quality policy requires the configured inspection service and the frozen attempt verification context.',exitCode:1,candidateCommit:context.candidate.commit,checkedCommit:context.commit};
+        if(result.command!==UI_QUALITY_CHECK_COMMAND||result.candidateCommit!==context.candidate.commit||result.checkedCommit!==context.commit)throw new Error('UI quality evidence does not identify the exact candidate and checked source.');
+        return {command:context.command,exitCode:result.passed?0:1,stdout:result.output||'',stderr:'',startedAt,endedAt:now(),factoryQuality:result};
+      });
+      if(isAppleCheckCommand(context.command))return app.withServiceOperation(async signal=>{
+        const result=await appleCheckExecutor({checksRoot:path.join(app.dataDir,'workspace-data',path.dirname(context.path)===path.join(app.dataDir,'workspace-data','integration')?'integration':'checks'),artifacts:workspaces.artifacts})({...context,signal:context.signal?AbortSignal.any([signal,context.signal]):signal});
+        rememberArtifacts(...appleCheckArtifacts(result));return result;
+      });
+      if(context.executionTargetKind==='host-macos')return app.withServiceOperation(signal=>hostChecks({...context,signal:context.signal?AbortSignal.any([signal,context.signal]):signal}));
+      return app.withRuntimeOperation(async signal=>{
+        const check={...context,signal:context.signal?AbortSignal.any([signal,context.signal]):signal};
+        await app.ensureRuntimeReady();await app.runtime.prepareWorkspace(context.path);
+        for(const root of context.workingDirectories||[])await app.runtime.prepareWorkspace(root.path);
+        return checkExecutor(check);
+      });
+    }, { release: async(checkPath:string)=>{await hostChecks.release?.(checkPath);await checkExecutor.release?.(checkPath);} }),
     artifactFs: new ArtifactFsWorkspaceProvider({
       rootDirectory: path.join(app.dataDir, 'workspace-data'),
       dockerRuntime:app.runtime.endpoint,
@@ -198,12 +219,37 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
   function rememberArtifacts(...manifests: ArtifactManifest[]) {
     for (const manifest of manifests) app.store.set('artifacts', manifest); app.changed();
   }
-  function validationInstructions(): string {
-    const common = 'Authoring agents and ordinary shell checks run in Linux containers, including on a Mac device. Do not claim Xcode, simulator or native build evidence from a Linux shell. Choose checks that actually match each task and its available inputs; never require later implementation files to accept earlier architecture work. For tasks requiring coordinator-supplied verification evidence, declare requiredCheckEnvironment in the task plan using the needed supported input names: ENOUGH_EVIDENCE_ROOT, ENOUGH_NATIVE_INDEX_SHA256, ENOUGH_NATIVE_UI_RECEIPT_DESCRIPTOR, ENOUGH_ACCEPTANCE_INDEX_SHA256. This is an enforced dispatch prerequisite; prose alone does not prevent dispatch. Native UI interaction evidence must come from a capable native execution owner, separately from compilation. Keep repository paths portable across operating systems: do not create files or directories that differ only by letter case.';
+  function validationInstructions(target:'container'|'host-macos'='container'): string {
+    const common = (target==='host-macos'?'This author and its ordinary checks run natively on the configured Mac host in private project snapshots. This is full same-user host access, not a container security sandbox. Use actual supplied host paths; Apple SDK commands are available only when their prerequisites are verified. Browser/native UI interaction still requires the advertised inspection tools. ':'Authoring agents and ordinary shell checks run in Linux containers, including on a Mac device. ')+ ' Keep compilation, real native UI interaction and live-service evidence distinct. Do not claim Apple execution from a Linux shell or UI success from compilation. Choose checks that actually match each task and its available inputs; never require later implementation files to accept earlier architecture work. For tasks requiring coordinator-supplied verification evidence, declare requiredCheckEnvironment in the task plan using the needed supported input names: ENOUGH_EVIDENCE_ROOT, ENOUGH_NATIVE_INDEX_SHA256, ENOUGH_NATIVE_UI_RECEIPT_DESCRIPTOR, ENOUGH_ACCEPTANCE_INDEX_SHA256. This is an enforced dispatch prerequisite; prose alone does not prevent dispatch. Native UI interaction evidence must come from a capable native execution owner, separately from compilation. Keep repository paths portable across operating systems: do not create files or directories that differ only by letter case.';
     if (process.platform !== 'darwin') return common;
     return `${common} The coordinator can run fixed Apple validation profiles on exact saved candidates. Use a check string such as enoughfactory:apple-build {"tool":"swift","package":".","action":"build"} or enoughfactory:apple-build {"tool":"xcodebuild","project":"EnoughMail.xcodeproj","scheme":"EnoughMail","platform":"macos","configuration":"Debug"}; ios-simulator is also supported. These are structured check profiles, not container shell commands. Native validation has private build output, no network, personal files, keychain, signing or simulator launch. Vendor required dependencies inside the primary repository and use portable relative paths. A passing Xcode build retains unsigned app products as artifacts. Only the recorded check result is build evidence; a profile in a plan is not proof that it passed. Credential-dependent or signed distribution checks must remain explicitly unresolved until their real inputs exist.`;
   }
   function toolchainInstructions(toolchain?:DevelopmentToolchain):string{return toolchain?`This environment has the fixed Swift ${toolchain.swiftVersion} and Node ${toolchain.nodeVersion} toolchain. Both are available through bash -lc. Use that toolchain directly; the factory checks the saved candidate with the same pinned recipe. Native Apple validation remains a separate recorded check.`:'';}
+  const isHostAttempt=(attempt:Pick<Attempt,'executionTargetKind'>)=>attempt.executionTargetKind==='host-macos';
+  function withAttemptOperation<T>(attempt:Pick<Attempt,'executionTargetKind'>,operation:(signal:AbortSignal)=>Promise<T>):Promise<T>{return isHostAttempt(attempt)?app.withServiceOperation(operation):app.withRuntimeOperation(operation);}
+  function goalAuthorizesHost(goal:Goal):boolean {
+    if(goal.execution)return ['host-macos','auto'].includes(goal.execution.target??'container');
+    return app.store.list<FactoryTask>('tasks').some(task=>task.goalId===goal.id&&(task.execution?.target==='host-macos'||task.execution?.requiredCapabilities?.includes('mac-shell')));
+  }
+  function readyHostTarget(){return app.device.executionTargets?.find(target=>target.kind==='host-macos'&&target.protocolVersion===1&&target.readiness==='ready'&&target.capabilities.some(cap=>cap.kind==='mac-shell'&&cap.readiness==='ready'));}
+  function containerAvailable():boolean {
+    try{app.assertRuntimeCanRun();return app.diagnostics.containerRuntime?.state==='ready';}catch{return false;}
+  }
+  function configuredControllerTarget(goal:Goal) {
+    if(!goal.execution)return undefined;
+    let containerAllowed=true;try{app.assertRuntimeCanRun();}catch{containerAllowed=false;}
+    const device={...app.device,executionTargets:(app.device.executionTargets??[]).filter(target=>target.kind!=='container'||containerAllowed)};
+    return selectExecutionTarget({execution:goal.execution},device,'git',goal.runtime);
+  }
+  function controllerHostTarget(goal:Goal) {
+    if(goal.execution){const selected=configuredControllerTarget(goal);return selected?.kind==='host-macos'?selected:undefined;}
+    return goal.runtime==='codex'&&goalAuthorizesHost(goal)&&!containerAvailable()?readyHostTarget():undefined;
+  }
+  function assertHostAssignment(attempt:Attempt,runtime:Goal['runtime'],task:FactoryTask):void{
+    if(!isHostAttempt(attempt))return;const target=app.device.executionTargets?.find(item=>item.id===attempt.executionTargetId&&item.kind==='host-macos');
+    if(runtime!=='codex'||process.platform!=='darwin'||!target||target.protocolVersion!==1||target.readiness!=='ready'||selectExecutionTarget(task,{...app.device,executionTargets:[target]},'git',runtime)?.id!==target.id)throw new HttpError(409,'The assigned native Mac execution target is not ready or does not support this provider.','EXECUTION_CAPABILITY_UNAVAILABLE');
+  }
+  function executionInstructions(text:string,sessionId:string):string{const execution=app.sessions.execution(sessionId);if(execution.kind!=='host-macos')return text;const mappings=(app.sessions.record(sessionId).workingDirectories||[]).map(root=>[`/workspaces/${root.name}`,root.path]);if(execution.referenceContainerPath&&execution.referencePath)mappings.push([execution.referenceContainerPath,execution.referencePath]);for(const[from,to]of mappings.sort((a,b)=>b[0]!.length-a[0]!.length))text=text.split(from!).join(to!);return text;}
   async function artifactPath(manifest: ArtifactManifest): Promise<string> {
     const prior = verifiedArtifacts.get(manifest.sha256);
     if (prior) {
@@ -259,6 +305,7 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
       retireContainer: async (sessionId,assertCurrent) => {
         const conversations=app.store.list<import('@enoughfactory/contracts').Chat>('chats').filter(chat=>chat.sessionId===sessionId);
         if(conversations.some(chat=>chats.isRunning(chat.id)))throw new HttpError(409,'Wait for the worker conversations to finish before retiring its container.');
+        if(app.sessions.record(sessionId).executionTargetKind==='host-macos'){assertCurrent();await app.sessions.disposeHostWorkspace(sessionId);return;}
         const releaseDisk=hostDisk.reserve(`retire:${sessionId}`);
         try{await chats.manager.withIdleContainer(app.sessions.retirementContainerName(sessionId),()=>app.sessions.retireWorkerContainer(sessionId,app.dataDir,assertCurrent,()=>hostDisk.assert()));}
         finally{releaseDisk();}
@@ -279,7 +326,8 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
     return factoryAttemptWorkingDirectorySources(app.dataDir,app.sessions,attemptId,project,previous?.workingDirectories as WorkingDirectoryCapture[]|undefined,checkInputs?.workingDirectoryIds);
   }
   async function prepareLocal(record: WorkerRecord, project = record.project, previousCandidate?: CandidateRef): Promise<void> {
-    return app.withRuntimeOperation(async signal=>{
+    return withAttemptOperation(record.attempt,async signal=>{
+    const host=isHostAttempt(record.attempt);
     const assertCurrent = () => {
       const current = worker(record.id);
       if(signal.aborted||current.status==='canceled'||current.attempt.generation!==record.attempt.generation||current.task.id!==record.task.id||current.goal.id!==record.goal.id||current.goal.revision!==record.goal.revision)throw new Error('Worker preparation was canceled or its assignment changed.');
@@ -288,18 +336,19 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
     try {
     assertCurrent();
     hostDisk.assert();
-    await app.ensureRuntimeReady();
+    assertHostAssignment(record.attempt,record.goal.runtime,record.task);
+    if(host)await chats.manager.provisionHost(signal);else await app.ensureRuntimeReady();
     assertCurrent();
-    // Docker readiness does not prove either host or guest storage is writable.
+    // Runtime readiness does not prove either host or guest storage is writable.
     hostDisk.assert();
-    const developmentToolchain=await resolveToolchain(project,signal,record.developmentToolchain);
+    const developmentToolchain=host?'default':await resolveToolchain(project,signal,record.developmentToolchain);
     assertCurrent();
     hostDisk.assert();
     patchWorker(record.id,{developmentToolchain});
     const name = sessionName(record.id);
     const config = await projectConfig(project);
     let workspace = await workspaces.create({ projectPath: project.path, goalId: record.goal.id,
-      taskId: record.task.id, attemptId: record.id, provider: sourceProvider(record.goal), fallbackToGit: true, sessionName: name,
+      taskId: record.task.id, attemptId: record.id, provider: host?'git':sourceProvider(record.goal), fallbackToGit: true, executionTargetKind:host?'host-macos':'container',sessionName: name,
       workspaceBranch: `${config ? envmuxBranchPrefix(config) : 'envmux/'}${name}`,developmentToolchain:developmentToolchain==='default'?undefined:developmentToolchain,checkInputs:record.checkInputs });
     assertCurrent();
     if (previousCandidate) {
@@ -308,7 +357,7 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
       workspace = await workspaces.workspace(workspace.id);
     }
     assertCurrent();
-    await configureHandoff(workspace);
+    if(!host)await configureHandoff(workspace);
     hostDisk.assert();
     const workingDirectorySources=record.workingDirectorySources||await sourceRootsForAttempt(record.id,project,previousCandidate,record.checkInputs);
     assertCurrent();
@@ -320,10 +369,10 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
     const owned = internalProject({...project,runtime:record.goal.runtime}, workspace, record.task.title);
     const state = workspace.providerState;
     hostDisk.assert();
-    const session = await app.sessions.create(owned, name,{workingDirectorySources,referenceContext:referenceContext?.source,assertCurrent,developmentToolchain,...(state && typeof state.bindSource === 'string' && typeof state.stateVolume === 'string'
+    const session = host?await app.sessions.createHost(owned,name,{workspace,workingDirectorySources,referenceContext:referenceContext?.source,assertCurrent,executionTargetId:record.attempt.executionTargetId,onCreated:session=>patchWorker(record.id,{workspace:ref(workspace,session.id),sessionId:session.id})}):await app.sessions.create(owned, name,{workingDirectorySources,referenceContext:referenceContext?.source,assertCurrent,developmentToolchain,...(state && typeof state.bindSource === 'string' && typeof state.stateVolume === 'string'
       ? { workspace: { bindSource: state.bindSource, stateVolume: state.stateVolume } } : {})});
     patchWorker(record.id, { workspace: ref(workspace, session.id), sessionId: session.id });
-    await app.sessions.waitReady(session.id);
+    await app.sessions.waitExecutionReady(session.id);
     assertCurrent();
     patchWorker(record.id,{workspace:{...ref(workspace,session.id),workingDirectories:app.sessions.record(session.id).workingDirectories}});
     if (worker(record.id).status === 'canceled') { await app.sessions.stop(session.id); return; }
@@ -345,6 +394,7 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
       if (previous.coordinatorId !== input.coordinatorId || previous.attempt.generation !== input.attempt.generation
         || previous.goal.id !== input.goal.id || previous.goal.revision !== input.goal.revision || previous.task.id !== input.task.id
         || JSON.stringify(previous.checkInputs)!==JSON.stringify(input.checkInputs)
+        || previous.attempt.executionTargetKind!==input.attempt.executionTargetKind||previous.attempt.executionTargetId!==input.attempt.executionTargetId
         || previous.preparationIdentity && input.preparationIdentity && previous.preparationIdentity !== input.preparationIdentity
         || input.coordinatorId!==app.device.id&&previous.referenceContext?.source.sourceArtifact.sha256 !== input.referenceContext?.source.sourceArtifact.sha256)
         throw new HttpError(409, 'Attempt identity is already bound to a different assignment.');
@@ -379,10 +429,10 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
     // turn promise, so retain conservative capacity ownership through that turn.
     const releaseDisk = hostDisk.reserve(`provider:${record.id}`);
     try {
-    if (!record.sessionId) throw new Error('The prepared attempt has no container session.');
+    if (!record.sessionId) throw new Error('The prepared attempt has no execution workspace.');
     if (worker(record.id).status === 'canceled') return;
     if(app.sessions.archivedEnvironment(record.sessionId))await app.sessions.restart(record.sessionId);
-    await app.sessions.waitReady(record.sessionId);
+    await app.sessions.waitExecutionReady(record.sessionId);
     if (worker(record.id).status === 'canceled') return;
     assertExecutionAssignment(record);
     hostDisk.assert();
@@ -394,9 +444,9 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
     const attempt = app.store.get<Attempt>('attempts', record.id);
     if (attempt) app.store.set('attempts', { ...attempt, sessionId: record.sessionId, chatId: chat.id });
     const repair = app.store.get<{ id: string; conflicts: string[]; message?: string }>('factory-repair-input', record.id);
-    const executionPrompt=[repair ? `${prompt}\n\nRetained work was merged as repair input. Resolve conflict markers in these files before completing: ${repair.conflicts.join(', ')}. ${repair.message || ''}` : prompt,record.referenceContext?.instructions,record.checkInputs?`Coordinator-configured verification inputs are frozen for this attempt: ${JSON.stringify(record.checkInputs)}. Factory checks receive exactly this environment. Use these mounted evidence paths and expected digests when inspecting the supplied inputs; missing or invalid evidence remains a check failure.`:undefined].filter(Boolean).join('\n\n');
+    const executionPrompt=executionInstructions([repair ? `${prompt}\n\nRetained work was merged as repair input. Resolve conflict markers in these files before completing: ${repair.conflicts.join(', ')}. ${repair.message || ''}` : prompt,record.referenceContext?.instructions,record.checkInputs?`Coordinator-configured verification inputs are frozen for this attempt: ${JSON.stringify(record.checkInputs)}. Factory checks receive exactly this environment. Use these mounted evidence paths and expected digests when inspecting the supplied inputs; missing or invalid evidence remains a check failure.`:undefined].filter(Boolean).join('\n\n'),record.sessionId);
     const result = await chats.run(chat.id, executionPrompt, { attemptId: record.id, autonomous: record.goal.autonomy === 'autonomous',
-      systemInstructions: `You are implementing an assigned EnoughFactory task toward this goal:\n${record.goal.objective}\n\nYou have full permissions inside this container. Enough owns the configured ${record.goal.approvalMode} policy. Make routine implementation decisions and execute the task completely. Do not stop at a plan or ask for permission already granted. Keep verification proportionate. Preserve changes and describe concrete evidence and any remaining work. The factory will independently capture, check, integrate and evaluate your result.\n\n${validationInstructions()}\n\n${toolchainInstructions(app.sessions.record(record.sessionId).developmentToolchain)}\n\n${record.referenceContext?.instructions??''}` });
+      systemInstructions: executionInstructions(`You are implementing an assigned EnoughFactory task toward this goal:\n${record.goal.objective}\n\n${isHostAttempt(record.attempt)?'You run natively on the configured Mac with full same-user host permissions in a private attempt workspace; this is not a security sandbox.':'You have full permissions inside this container.'} Enough owns the configured ${record.goal.approvalMode} policy. Make routine implementation decisions and execute the task completely. Do not stop at a plan or ask for permission already granted. Keep verification proportionate. Preserve changes and describe concrete evidence and any remaining work. The factory will independently capture, check, integrate and evaluate your result.\n\n${validationInstructions(isHostAttempt(record.attempt)?'host-macos':'container')}\n\n${factoryQualityInstructions('worker')}\n\n${toolchainInstructions(app.sessions.record(record.sessionId).developmentToolchain)}\n\n${record.referenceContext?.instructions??''}`,record.sessionId) });
     if (worker(record.id).status === 'canceled') return;
     patchWorker(record.id, { status: 'succeeded', result: { status: 'succeeded', text: result.text, sessionId: record.sessionId, chatId: chat.id } });
     } finally { releaseDisk(); }
@@ -456,32 +506,26 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
     if (record.candidate) return record.candidate;
     if (!['succeeded', 'failed'].includes(record.status) || !record.workspace || !record.sessionId) throw new Error('Capture requires a confirmed ended execution and workspace.');
     const existing = captureJobs.get(id); if (existing) return existing;
-    const operation = app.withRuntimeOperation(async () => {
+    const operation = withAttemptOperation(record.attempt,async () => {
       if(app.sessions.archivedEnvironment(record.sessionId!)){
         await app.sessions.restart(record.sessionId!);
-        await app.sessions.waitReady(record.sessionId!);
+        await app.sessions.waitExecutionReady(record.sessionId!);
       }
       const session = app.sessions.record(record.sessionId!);
       let commit = app.store.get<{ id: string; commit: string }>('factory-capture-input', id)?.commit;
-      if (session.status !== 'stopped') {
+      if (session.status !== 'stopped'||isHostAttempt(record.attempt)) {
         if (record.workspace!.provider === 'git') {
           // The application owns preservation; a provider final answer need not have committed its work.
-          const engine = app.sessions.get(session.id);
-          const containerGit = async (...args: string[]) => {
-            const invocation=dockerInvocation(app.runtime.endpoint,['exec',engine.ready.instance,'git','-c','safe.directory=*','-c','core.hooksPath=/dev/null','-C',engine.ready.workdir,...args]);
-            return (await exec(invocation.command,invocation.args,{env:invocation.env,maxBuffer:16*1024*1024})).stdout;
-          };
-          await stageCapturedSource(containerGit, { isRegularFile: async relativePath => {
-            const invocation=dockerInvocation(app.runtime.endpoint,['exec',engine.ready.instance,'sh','-c','test -f "$1" && test ! -L "$1"','capture-source',path.posix.join(engine.ready.workdir,relativePath)]);
-            try { await exec(invocation.command,invocation.args,{env:invocation.env}); return true; }
-            catch(error) { if((error as {code?:unknown}).code===1)return false; throw error; }
-          } });
-          const staged = await containerGit('diff', '--cached', '--name-only');
-          if (staged) await containerGit('-c', 'user.name=EnoughFactory', '-c', 'user.email=factory@enoughtools.com', 'commit', '-m', `Preserve EnoughFactory attempt ${id}`);
-          commit = (await containerGit('rev-parse', 'HEAD')).trim();
+          const execution=app.sessions.execution(session.id);await app.sessions.assertHostExecutionCurrent(session.id);
+          const captureGit=async(...args:string[])=>{if(execution.kind==='host-macos')return (await exec('git',['-c','core.hooksPath=/dev/null','-C',execution.workdir,...args],{maxBuffer:16*1024*1024})).stdout;const invocation=dockerInvocation(app.runtime.endpoint,['exec',execution.containerId!,'git','-c','safe.directory=*','-c','core.hooksPath=/dev/null','-C',execution.workdir,...args]);return (await exec(invocation.command,invocation.args,{env:invocation.env,maxBuffer:16*1024*1024})).stdout;};
+          if(session.status==='stopped'&&commit&&((await captureGit('rev-parse','HEAD')).trim()!==commit||(await captureGit('status','--porcelain')).trim()))throw new HttpError(409,'The stopped native workspace changed after its recorded source capture. Its files remain retained; inspect them before preserving a continuation.','CAPTURE_SOURCE_CHANGED');
+          await stageCapturedSource(captureGit,{isRegularFile:async relativePath=>{if(execution.kind==='host-macos'){try{const entry=await lstat(path.join(execution.workdir,relativePath));return entry.isFile()&&!entry.isSymbolicLink();}catch(error){if((error as NodeJS.ErrnoException).code==='ENOENT')return false;throw error;}}const invocation=dockerInvocation(app.runtime.endpoint,['exec',execution.containerId!,'sh','-c','test -f "$1" && test ! -L "$1"','capture-source',path.posix.join(execution.workdir,relativePath)]);try{await exec(invocation.command,invocation.args,{env:invocation.env});return true;}catch(error){if((error as{code?:unknown}).code===1)return false;throw error;}}});
+          const staged=await captureGit('diff','--cached','--name-only');
+          if(staged)await captureGit('-c','user.name=EnoughFactory','-c','user.email=factory@enoughtools.com','commit','-m',`Preserve EnoughFactory attempt ${id}`);
+          commit=(await captureGit('rev-parse','HEAD')).trim();
           app.store.set('factory-capture-input', { id, commit });
         }
-        await app.sessions.stop(session.id);
+        if(session.status!=='stopped')await app.sessions.stop(session.id);
       }
       await app.sessions.waitStopped(session.id);
       const workingDirectories=await app.sessions.captureWorkingDirectories(session.id);
@@ -505,6 +549,7 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
     rememberArtifacts(...candidateArtifacts(value));
   }
   const workspacePort: FactoryWorkspacePort = {
+    qualityChecks:inspection.qualityCheck?true:undefined,
     async prepare({ goal, task, attempt, project, previousCandidate }) {
       goal={...goal,revision:app.store.get<AttemptDetail>('factory-attempt-details',attempt.id)?.assignmentGoalRevision??goal.revision};
       const assertCurrent=()=>assertCurrentWorkerAssignment(app.store,{goal,task,attempt});
@@ -512,7 +557,8 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
       const checkInputs=freezeTaskCheckInputs(app.store,task.id,attempt.id,project);
       const releaseDisk=reserveDisk(`attempt:${attempt.id}`,workerPreparationBytes(goal,task,attempt,previousCandidate));
       try {
-      const toolchainProfile=await developmentToolchainChoice(project);
+      const host=isHostAttempt(attempt);
+      const toolchainProfile=host?'default':await developmentToolchainChoice(project);
       assertCurrent();
       project={...project,developmentToolchain:toolchainProfile};
       if (local(attempt.deviceId)) {
@@ -539,13 +585,14 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
         assertCurrent();
         await rpc(attempt.deviceId, 'POST', '/api/factory/worker/prepare', { goal, task, attempt,
           project: publicWorkerProject(project), source, workingDirectorySources, referenceContext, config, previousCandidate,
-          workspaceProvider: sourceProvider(goal),checkInputs,toolchainRecipe:toolchainProfile==='default'?undefined:{id:SWIFT_TOOLCHAIN.id,recipeSha256:SWIFT_TOOLCHAIN.recipeSha256} });
+          workspaceProvider: host?'git':sourceProvider(goal),checkInputs,toolchainRecipe:toolchainProfile==='default'?undefined:{id:SWIFT_TOOLCHAIN.id,recipeSha256:SWIFT_TOOLCHAIN.recipeSha256} });
         } finally {await disposeWorkerContext(app.dataDir,attempt.id,attempt.generation);}
       }
       const record = await waitWorker(attempt.deviceId, attempt.id, 'prepared');
       assertCurrent();
       if (record.capacityWait) throw new FactoryCapacityError(record.capacityWait);
       if (!record.workspace || !['prepared', 'running', 'succeeded'].includes(record.status)) throw new Error(record.error || 'Worker preparation did not complete.');
+      if(record.attempt.executionTargetKind!==attempt.executionTargetKind||record.attempt.executionTargetId!==attempt.executionTargetId)throw new Error('The worker did not honor its frozen execution target.');
       if(toolchainProfile!=='default')validatePreparedToolchain(record.workspace.developmentToolchain);
       else if(record.workspace.developmentToolchain)throw new Error('The worker did not honor the selected default development environment.');
       if(JSON.stringify(record.workspace.checkInputs)!==JSON.stringify(checkInputs))throw new Error('The worker did not confirm the frozen coordinator check inputs.');
@@ -553,7 +600,7 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
       if(frozen?.source.sourceArtifact.sha256!==record.referenceContext?.source.sourceArtifact.sha256)throw new Error('The worker did not confirm its exact frozen retained reference evidence.');
       const sources=local(attempt.deviceId)?worker(attempt.id).workingDirectorySources||[]:await app.sessions.directoryManager.sourceSnapshots(attempt.id);
       const mounts=record.workspace.workingDirectories as import('@enoughfactory/contracts').WorkingDirectoryMount[]|undefined;
-      if(sources.length&&(!mounts||mounts.length!==sources.length||sources.some(source=>!mounts.some(root=>root.id===source.id&&root.name===source.name&&root.path===source.containerPath&&root.baseCommit===source.baseCommit&&root.kind===source.kind))))throw new Error('The worker did not confirm the exact additional working folder snapshots. No task execution was authorized.');
+      if(sources.length&&(!mounts||mounts.length!==sources.length||sources.some(source=>!mounts.some(root=>root.id===source.id&&root.name===source.name&&root.path===(host?path.join(path.dirname(path.dirname(path.dirname(record.workspace!.path))),'host-sessions',record.sessionId!,'roots',source.id,'repository'):source.containerPath)&&root.baseCommit===source.baseCommit&&root.kind===source.kind))))throw new Error('The worker did not confirm the exact additional working folder snapshots. No task execution was authorized.');
       return record.workspace;
       } finally { releaseDisk(); }
     },
@@ -575,16 +622,20 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
         await sleep(1500);
       }
     },
-    async check(_project, candidate, commands) {
+    async check(_project, candidate, commands,verification) {
       return withCheckCapacity(async () => {
-      const report = await workspaces.verify({ candidateId: candidate.id, commands }); rememberArtifacts(report.logArtifact);
+      const report = await workspaces.verify({ candidateId: candidate.id, commands,verification }); rememberArtifacts(report.logArtifact);
       return checkResults(report, candidate.commit);
       }, candidate);
     },
     async integrate(project, candidate, input) {
       return withCheckCapacity(async () => {
-      const result = await workspaces.integrate({ candidateId: candidate.id, projectPath: project.path, commands: input.checks, isCurrent: input.isCurrent });
+      const result = await workspaces.integrate({ candidateId: candidate.id, projectPath: project.path, commands: input.checks, isCurrent: input.isCurrent,verification:input.verification });
       if (result.report) rememberArtifacts(result.report.logArtifact);
+      if(result.status==='checks-failed'&&result.report){
+        const pending=checkResults(result.report,candidate.commit).find(check=>!check.passed&&check.recovery?.condition==='inspection-evidence');
+        if(pending?.recovery)throw new FactoryVerificationWaitError(pending.recovery.reason);
+      }
       if (result.status !== 'integrated' || !result.commit) {
         const kind = result.status === 'conflict' ? 'conflict' : result.status === 'checks-failed' ? 'checks-failed' : 'stale';
         throw new FactoryOperationError(kind, result.message || `Integration ${result.status}${result.conflicts?.length ? `: ${result.conflicts.join(', ')}` : ''}.`);
@@ -615,10 +666,11 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
     },
     async checkGoal(project,commands,goal){
       return withCheckCapacity(async () => {
-      const developmentToolchain=await app.withRuntimeOperation(async signal=>{await app.ensureRuntimeReady();return resolveToolchain(project,signal);});
+      const host=!!controllerHostTarget(goal);
+      const developmentToolchain=host||commands.every(isAppleCheckCommand)?'default':await app.withRuntimeOperation(async signal=>{await app.ensureRuntimeReady();return resolveToolchain(project,signal);});
       const repository=await workspacePort.inspect(project),operation=randomUUID();
       if(repository.status.trim())throw new Error('Goal checks require a clean primary working tree so they can verify the integrated commit. Commit or preserve the remaining primary edits before evaluating.');
-      const workspace=await workspaces.create({projectPath:project.path,goalId:goal.id,taskId:'goal-check',attemptId:operation,baseCommit:repository.head,developmentToolchain:developmentToolchain==='default'?undefined:developmentToolchain});
+      const workspace=await workspaces.create({projectPath:project.path,goalId:goal.id,taskId:'goal-check',attemptId:operation,baseCommit:repository.head,executionTargetKind:host?'host-macos':'container',developmentToolchain:developmentToolchain==='default'?undefined:developmentToolchain});
       let candidate:Candidate|undefined,report:CheckReport|undefined;
       try{
         const roots=await app.sessions.directoryManager.prepare({identity:operation,sources:project.workingDirectories||[]});
@@ -650,21 +702,87 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
       } catch(error) { app.store.set('factory-worker-cleanup',{id:workspace.id,error:(error as Error).message,updatedAt:now()}); throw error; }
     },
   };
+  function needsControllerReview(goal:Goal):boolean {
+    return app.store.list<FactoryTask>('tasks').some(task=>task.goalId===goal.id&&task.status!=='canceled'&&!!task.quality);
+  }
+  const controllerReleases=new Map<string,Promise<void>>();
+  async function releaseController(operation:string,sessionId:string|undefined,runtime:Goal['runtime']):Promise<void> {
+    const existing=controllerReleases.get(operation);if(existing)return existing;
+    const job=(async()=>{
+    try {
+      await releaseControllerInputs({operation,sessionId,dataDir:app.dataDir,store:app.store,sessions:app.sessions,directoryManager:app.sessions.directoryManager,artifacts:workspaces.artifacts,
+        retireContainer:async(sid,assertCurrent)=>{if(app.sessions.record(sid).executionTargetKind==='host-macos'){assertCurrent();await app.sessions.disposeHostWorkspace(sid);return;}return app.sessions.withRetirementLease(sid,()=>chats.manager.withIdleContainer(app.sessions.retirementContainerName(sid),()=>app.sessions.retireEphemeralEnvironment(sid,app.dataDir,{assertCurrent,assertSpace:()=>hostDisk.assert(),runtimeKinds:[runtime]})));}});
+    } catch(error) { app.store.set('factory-controller-cleanup',{id:operation,sessionId,error:(error as Error).message,updatedAt:now()}); }
+    finally { activeControllerOperations.delete(operation);if(sessionId)terminalCleanup?.request(sessionId); }
+    })();controllerReleases.set(operation,job);try{await job;}finally{if(controllerReleases.get(operation)===job)controllerReleases.delete(operation);}
+  }
+  async function reviewController(goal:Goal,run:ControllerRun,resultText:string,systemInstructions:string,repository:RepositoryEvidence,signal?:AbortSignal):Promise<string> {
+    const assertCurrent=()=>{
+      const current=app.store.get<Goal>('goals',goal.id);
+      if(signal?.aborted||!current||current.revision!==goal.revision||['paused','completed','failed','canceled'].includes(current.status)||current.runtime!==goal.runtime||JSON.stringify(current.execution??null)!==JSON.stringify(goal.execution??null))throw new Error('The controller decision was revoked.');
+    };
+    assertCurrent();
+    const check=()=>inspection.reviewController?.({goal,run:{...run,status:'running'},resultText,signal})??Promise.resolve({ready:false,reason:'Completion requires the configured visual inspection service.',evidenceIds:[]});
+    let review=await check();
+    assertCurrent();
+    if(!review.ready){
+      if(signal?.aborted)throw new Error('The controller decision was revoked.');
+      const followup=await chats.run(run.chatId!,`Completion review needs more evidence: ${review.reason??'Inspect the current product screens and references.'}\nUse the inspection tools to view the actual current integrated product and relevant references. Return the full evaluator JSON again, including visualReview with the current source and concrete comparisons. If behavior or design is deficient, return a specific follow-up plan instead of marking the goal complete.`,{autonomous:goal.autonomy==='autonomous',systemInstructions});
+      resultText=followup.text;review=await check();
+      assertCurrent();
+    }
+    if(review.ready){app.store.delete('factory-controller-reviews',run.id);return resultText;}
+    app.store.set<ControllerReviewContinuation>('factory-controller-reviews',{id:run.id,goalId:goal.id,goalRevision:goal.revision,runtime:goal.runtime,execution:JSON.stringify(goal.execution??null),sessionId:run.sessionId!,chatId:run.chatId!,repository,resultText,systemInstructions,status:'waiting',reason:review.reason,updatedAt:now()});
+    app.store.set('factory-controller-runs',{...run,status:'waiting',result:resultText,error:review.reason,updatedAt:now()});
+    throw new FactoryControllerError(review.reason??'Completion is waiting for current product screen and reference evidence.','inspection-evidence');
+  }
+  async function resumeControllerReview(goal:Goal,continuation:ControllerReviewContinuation,signal?:AbortSignal):Promise<{text:string;chatId:string}> {
+    const operation=continuation.id,run=app.store.get<ControllerRun>('factory-controller-runs',operation);
+    if(!run||run.chatId!==continuation.chatId||run.sessionId!==continuation.sessionId||app.sessions.record(continuation.sessionId).status!=='ready')throw new FactoryControllerError('The retained completion review environment is unavailable; its source and conversation remain saved.','controller-retry-required');
+    activeControllerOperations.add(operation);
+    let waiting=false;
+    const cancel=()=>{void chats.interrupt(continuation.chatId).catch(()=>{});};signal?.addEventListener('abort',cancel,{once:true});
+    app.store.set('factory-controller-runs',{...run,status:'running',error:undefined,updatedAt:now()});
+    const chat=app.store.get<import('@enoughfactory/contracts').Chat>('chats',continuation.chatId);
+    if(chat)app.store.set('chats',{...chat,approvalMode:goal.approvalMode});
+    try {
+      const text=await reviewController(goal,{...run,status:'running'},continuation.resultText,continuation.systemInstructions,continuation.repository,signal);
+      app.store.set('factory-controller-runs',{...run,status:'completed',error:undefined,result:text,updatedAt:now()});
+      return {text,chatId:continuation.chatId};
+    } catch(error){
+      waiting=error instanceof FactoryControllerError&&error.recovery==='inspection-evidence';
+      if(!waiting){app.store.delete('factory-controller-reviews',operation);app.store.set('factory-controller-runs',{...run,status:signal?.aborted?'interrupted':'failed',error:(error as Error).message,updatedAt:now()});}
+      throw error;
+    } finally {signal?.removeEventListener('abort',cancel);if(waiting)activeControllerOperations.delete(operation);else await releaseController(operation,continuation.sessionId,continuation.runtime);}
+  }
   const runtime: FactoryRuntimePort = {
     controllerRecordReferences: true,
     async complete({ goal, role, prompt, project, signal, recordRequirements }) {
+      if(role==='evaluator'){
+        const retained=app.store.list<ControllerReviewContinuation>('factory-controller-reviews').filter(item=>item.goalId===goal.id&&item.status==='waiting');
+        const currentRepository=retained.length?await workspacePort.inspect(project):undefined;
+        for(const continuation of retained){
+          if(continuation.goalRevision===goal.revision&&continuation.runtime===goal.runtime&&continuation.execution===JSON.stringify(goal.execution??null)&&continuation.repository?.head===currentRepository?.head&&continuation.repository?.fingerprint===currentRepository?.fingerprint)return app.withServiceOperation(serviceSignal=>resumeControllerReview(goal,continuation,signal?AbortSignal.any([signal,serviceSignal]):serviceSignal));
+          app.store.delete('factory-controller-reviews',continuation.id);
+          const staleRun=app.store.get<ControllerRun>('factory-controller-runs',continuation.id);if(staleRun)app.store.set('factory-controller-runs',{...staleRun,status:'interrupted',error:'The goal changed before this completion review finished.',updatedAt:now()});
+          await releaseController(continuation.id,continuation.sessionId,continuation.runtime);
+        }
+      }
+      const hostTarget=controllerHostTarget(goal),host=!!hostTarget;
+      if(goal.execution&&!configuredControllerTarget(goal))throw new FactoryControllerError('The controller is waiting for an execution target matching the configured goal capabilities and provider.','execution-capability');
+      if(!goal.execution&&!host&&goalAuthorizesHost(goal)&&goal.runtime==='codex'&&!containerAvailable())throw new FactoryControllerError('The controller is waiting for its configured native Mac execution capability.','execution-capability');
       let providerInvoked = false;
       let releaseDisk=()=>{};
-      return app.withRuntimeOperation(async runtimeSignal=>{
+      return (host?app.withServiceOperation.bind(app):app.withRuntimeOperation.bind(app))(async runtimeSignal=>{
       // Completion audits inspect the integrated tree and stored evidence;
       // duplicating every historical candidate would scale with all past work.
       const sourceCandidates = role === 'evaluator' ? [] : controllerCandidates(app.store, goal.id, role);
       releaseDisk=hostDisk.reserve(`controller:${goal.id}:${role}`,preparationArtifactBytes(preparationArtifacts(sourceCandidates.map(item=>item.candidate))));
       signal=signal?AbortSignal.any([signal,runtimeSignal]):runtimeSignal;
       if (signal?.aborted) throw new Error('The controller decision was revoked.');
-      await app.ensureRuntimeReady();
+      if(host)await chats.manager.provisionHost(signal);else await app.ensureRuntimeReady();
       hostDisk.assert();
-      const developmentToolchain=await resolveToolchain(project,signal);
+      const developmentToolchain=host?'default':await resolveToolchain(project,signal);
       hostDisk.assert();
       const operation = randomUUID();
       activeControllerOperations.add(operation);
@@ -672,6 +790,7 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
       let sessionId: string | undefined;
       let record: ControllerRun | undefined;
       let chatId: string | undefined;
+      let reviewWaiting = false;
       const cancel = () => {
         if (chatId) void chats.interrupt(chatId).catch(() => {});
         else if (sessionId) void app.sessions.stop(sessionId).catch(() => {});
@@ -679,47 +798,42 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
       signal?.addEventListener('abort', cancel, { once: true });
       try {
         if (signal?.aborted) throw new Error('The controller decision was revoked.');
-        const workspace = await workspaces.create({ projectPath: project.path, goalId: goal.id, taskId: `control-${role}`, attemptId: operation,developmentToolchain:developmentToolchain==='default'?undefined:developmentToolchain });
-        await configureHandoff(workspace);
+        const controllerRepository=role==='evaluator'&&needsControllerReview(goal)?await workspacePort.inspect(project):undefined;
+        const workspace = await workspaces.create({ projectPath: project.path, goalId: goal.id, taskId: `control-${role}`, attemptId: operation,executionTargetKind:host?'host-macos':'container',developmentToolchain:developmentToolchain==='default'?undefined:developmentToolchain });
+        if(!host)await configureHandoff(workspace);
         const context = await prepareControllerContext({ operation, goalId: goal.id, role, project, store: app.store,
           workspaces, directoryManager: app.sessions.directoryManager, dataDir: app.dataDir, recordRequirements, selected: sourceCandidates });
         if (signal?.aborted) throw new Error('The controller decision was revoked.');
         hostDisk.assert();
         const owned = internalProject({...project,runtime:goal.runtime}, workspace, `${goal.title} · ${role}`);
-        const session = await app.sessions.create(owned, sessionName(operation), { workingDirectorySources: context.workingDirectorySources,developmentToolchain });
+        const session = host?await app.sessions.createHost(owned,sessionName(operation),{workspace,workingDirectorySources:context.workingDirectorySources,executionTargetId:hostTarget!.id,assertCurrent:()=>{if(signal?.aborted)throw new Error('The controller decision was revoked.');},onCreated:session=>{sessionId=session.id;record={id:operation,goalId:goal.id,role,sessionId:session.id,status:'starting',updatedAt:now()};app.store.set('factory-controller-runs',record);app.store.set('factory-controller-inputs',{id:operation,goalId:goal.id,role,sessionId:session.id,status:'preparing',updatedAt:now()});}}):await app.sessions.create(owned, sessionName(operation), { workingDirectorySources: context.workingDirectorySources,developmentToolchain });
         sessionId = session.id;
         record = { id: operation, goalId: goal.id, role, sessionId, status: 'starting', updatedAt: now() };
         app.store.set('factory-controller-runs', record);
         app.store.set('factory-controller-inputs', { id: operation, goalId: goal.id, role, sessionId, status: 'prepared', updatedAt: now() });
-        await app.sessions.waitReady(session.id);
+        await app.sessions.waitExecutionReady(session.id);
         hostDisk.assert();
         if (signal?.aborted) throw new Error('The controller decision was revoked.');
         const chat = chats.create({ sessionId: session.id, runtime: goal.runtime, approvalMode: goal.approvalMode, title: `${goal.title} · ${role}` });
         chatId = chat.id;
         app.store.set('factory-controller-runs', { ...record, chatId: chat.id, status: 'running', updatedAt: now() });
         providerInvoked = true;
-        const result = await chats.run(chat.id, prompt, { autonomous: goal.autonomy === 'autonomous',
-          systemInstructions: [`You are the EnoughFactory ${role}. This container contains an isolated snapshot of the current project repository. Inspect the actual source and relevant runtime evidence to make your decision. You have full container permissions under ${goal.approvalMode} policy. Your role is to decide the next factory action; implementation belongs to assigned worker tasks. Do not modify product source as part of this decision. Return the structured JSON requested in the prompt. Goal: ${goal.objective}`, role === 'evaluator' ? 'Audit current behavior in the integrated primary repository. Historical candidate source bundles are not duplicated into this audit; full stored task/attempt contracts, checks and integration records remain available through the evidence manifest. Historical artifact references do not promise their bodies are present and cannot be claimed inspected.' : '', validationInstructions(), toolchainInstructions(app.sessions.record(session.id).developmentToolchain), context.instructions].filter(Boolean).join('\n\n') });
-        app.store.set('factory-controller-runs', { ...record, chatId: chat.id, status: 'completed', updatedAt: now(), result: result.text });
-        return { text: result.text, chatId: chat.id };
+        const systemInstructions = [`You are the EnoughFactory ${role}. ${host?'You run on the configured Mac with full same-user host access in a private Git snapshot; this is not a container sandbox.':'This container contains an isolated snapshot of the current project repository with full container permissions.'} Inspect the actual source and relevant runtime evidence to make your decision under ${goal.approvalMode} policy. Your role is to decide the next factory action; implementation belongs to assigned worker tasks. Do not modify product source as part of this decision. Return the structured JSON requested in the prompt. Goal: ${goal.objective}`, role === 'evaluator' ? 'Audit current behavior in the integrated primary repository. Historical candidate source bundles are not duplicated into this audit; full stored task/attempt contracts, checks and integration records remain available through the evidence manifest. Historical artifact references do not promise their bodies are present and cannot be claimed inspected.' : '', validationInstructions(host?'host-macos':'container'),factoryQualityInstructions(role),toolchainInstructions(app.sessions.record(session.id).developmentToolchain),executionInstructions(context.instructions,session.id)].filter(Boolean).join('\n\n');
+        const result = await chats.run(chat.id, prompt, { autonomous: goal.autonomy === 'autonomous',systemInstructions });
+        const running={...record,chatId:chat.id,status:'running' as const};
+        const text=role==='evaluator'&&needsControllerReview(goal)?await reviewController(goal,running,result.text,systemInstructions,controllerRepository!,signal):result.text;
+        app.store.set('factory-controller-runs', { ...record, chatId: chat.id, status: 'completed', updatedAt: now(), result: text });
+        return { text, chatId: chat.id };
       } catch (error) {
-        if (record) app.store.set('factory-controller-runs', { ...record, chatId, status: signal?.aborted ? 'interrupted' : 'failed', error: (error as Error).message, updatedAt: now() });
+        reviewWaiting=error instanceof FactoryControllerError&&error.recovery==='inspection-evidence';
+        if (record&&!reviewWaiting) app.store.set('factory-controller-runs', { ...record, chatId, status: signal?.aborted ? 'interrupted' : 'failed', error: (error as Error).message, updatedAt: now() });
         throw error;
       } finally {
         signal?.removeEventListener('abort', cancel);
-        try {
-          await releaseControllerInputs({ operation, sessionId, dataDir: app.dataDir, store: app.store,
-            sessions: app.sessions, directoryManager: app.sessions.directoryManager, artifacts: workspaces.artifacts,
-            retireContainer:async(sid,assertCurrent)=>app.sessions.withRetirementLease(sid,()=>chats.manager.withIdleContainer(app.sessions.retirementContainerName(sid),()=>app.sessions.retireEphemeralEnvironment(sid,app.dataDir,{assertCurrent,assertSpace:()=>hostDisk.assert(),runtimeKinds:[goal.runtime]})))});
-        } catch (error) {
-          // Cleanup is retried durably; it cannot change an already recorded provider outcome.
-          app.store.set('factory-controller-cleanup', { id: operation, sessionId, error: (error as Error).message, updatedAt: now() });
-        } finally {
-          activeControllerOperations.delete(operation);
-          if(sessionId)terminalCleanup?.request(sessionId);
-        }
+        if(reviewWaiting)activeControllerOperations.delete(operation);
+        else await releaseController(operation,sessionId,goal.runtime);
       }
-      }).catch(error => { throw controllerError(error, { providerInvoked, runtimeReady: app.diagnostics.containerRuntime?.state === 'ready' }); }).finally(() => releaseDisk());
+      }).catch(error => { throw controllerError(error, { providerInvoked, runtimeReady:host||app.diagnostics.containerRuntime?.state === 'ready' }); }).finally(() => releaseDisk());
     },
     async execute({ attempt, goal, project, prompt, assignmentGoalRevision }) {
       const currentProject = app.store.get<Project>('projects', project.id) || project;
@@ -764,6 +878,36 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
     try { app.assertRuntimeCanRun(); } catch { return; }
     coordinator.notifyCondition('runtime-available');
   };
+  const reviewCleanupJobs=new Map<string,Promise<void>>();
+  const cleanupRevokedControllerReviews=()=>{
+    for(const continuation of app.store.list<ControllerReviewContinuation>('factory-controller-reviews')){
+      const goal=app.store.get<Goal>('goals',continuation.goalId);
+      if(goal&&!['completed','failed','canceled'].includes(goal.status)&&goal.revision===continuation.goalRevision&&goal.runtime===continuation.runtime&&JSON.stringify(goal.execution??null)===continuation.execution)continue;
+      if(reviewCleanupJobs.has(continuation.id))continue;
+      const job=(async()=>{
+        app.store.delete('factory-controller-reviews',continuation.id);
+        const run=app.store.get<ControllerRun>('factory-controller-runs',continuation.id);
+        if(run)app.store.set('factory-controller-runs',{...run,status:'interrupted',error:'The goal changed or ended before this completion review finished.',updatedAt:now()});
+        if(chats.isRunning(continuation.chatId)){await chats.interrupt(continuation.chatId);await chats.waitForIdle(continuation.chatId);}
+        await releaseController(continuation.id,continuation.sessionId,continuation.runtime);
+      })().catch(error=>{app.store.set('factory-controller-cleanup',{id:continuation.id,sessionId:continuation.sessionId,error:(error as Error).message,updatedAt:now()});}).finally(()=>{reviewCleanupJobs.delete(continuation.id);});
+      reviewCleanupJobs.set(continuation.id,job);
+    }
+  };
+  const cleanupReviewState=(topic:string)=>{if(topic==='state')cleanupRevokedControllerReviews();};
+  app.listeners.add(cleanupReviewState);cleanupRevokedControllerReviews();
+  app.closers.push(async()=>{app.listeners.delete(cleanupReviewState);await Promise.allSettled(reviewCleanupJobs.values());});
+  const executionReady=(topic:string)=>{
+    if(topic==='execution-capabilities'){
+      coordinator.notifyCondition('execution-capability');
+      // A verifier waiting for a locked/offline inspection target keeps its
+      // original succeeded author. Capability recovery resumes that same gate.
+      coordinator.notifyCondition('inspection-evidence');
+    }
+    if(topic==='inspection-evidence')coordinator.notifyCondition('inspection-evidence');
+  };
+  app.listeners.add(executionReady);
+  app.closers.push(()=>{app.listeners.delete(executionReady);});
   app.listeners.add(runtimeReady);
   app.closers.push(() => { app.listeners.delete(runtimeReady); });
   if (app.diagnostics.containerRuntime?.state === 'ready') runtimeReady('runtime', app.diagnostics.containerRuntime);
@@ -808,13 +952,15 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
       }
       if (method === 'PATCH' && !action) {
         if (body.runtime !== undefined && !['codex', 'antigravity', 'claude'].includes(String(body.runtime))) throw new HttpError(400, 'Unknown runtime.');
+        // Validate every control before changing either the goal or its provider.
+        const controls = steeringInput(body);
         if (body.workspaceProvider !== undefined) {
           if (!['git', 'artifactfs'].includes(String(body.workspaceProvider))) throw new HttpError(400, 'Unknown workspace provider.');
           const workspaceProvider = body.workspaceProvider as 'git' | 'artifactfs';
           app.store.set('goals', { ...goal, workspaceProvider }); app.store.set<GoalOptions>('factory-options', { id: goal.id, workspaceProvider });
         }
-        if (body.objective !== undefined || body.context !== undefined || body.criteria !== undefined) await coordinator.steer(goal.id, steeringInput(body));
-        coordinator.configure(goal.id, { ...steeringInput(body), runtime: body.runtime as Goal['runtime'] | undefined, concurrency: numberOption(body.concurrency),
+        if (body.objective !== undefined || body.context !== undefined || body.criteria !== undefined) await coordinator.steer(goal.id, controls);
+        coordinator.configure(goal.id, { ...controls, runtime: body.runtime as Goal['runtime'] | undefined, concurrency: numberOption(body.concurrency),
           maxAttempts: body.maxAttempts === null ? null : numberOption(body.maxAttempts),
           maxDurationMs: body.maxDurationMs === null ? null : numberOption(body.maxDurationMs) });
         return app.store.get('goals', goal.id);
@@ -845,7 +991,8 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
         attemptId: body.expectedAttemptId as string, oldCandidateId: body.expectedCandidateId as string,
         chatId: body.chatId as string, turn: turn as ManualContinuationInput['turn'],
       };
-      return app.withRuntimeOperation(() => retainManualContinuation(input, {
+      const retainedAttempt=app.store.get<Attempt>('attempts',input.attemptId);if(!retainedAttempt)throw new HttpError(404,'Attempt not found.');
+      return withAttemptOperation(retainedAttempt,() => retainManualContinuation(input, {
         store: app.store, deviceId: app.device.id,
         readChatEvents(chatId) {
           const events: ReturnType<ChatController['events']> = [];
@@ -862,28 +1009,33 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
         chatIsRunning: chatId => chats.isRunning(chatId),
         workerJobsBusy: attemptId => jobs.has(attemptId) || captureJobs.has(attemptId),
         async captureGitCommit(context) {
-          if(app.sessions.archivedEnvironment(context.sessionId)){await app.sessions.restart(context.sessionId);await app.sessions.waitReady(context.sessionId);}
-          const session = app.sessions.record(context.sessionId);
-          if (session.status !== 'ready') throw new HttpError(409, 'Reconnect the retained environment before preserving its completed manual repair.');
-          const engine = app.sessions.get(session.id);
-          const containerGit = async (...args: string[]) => {
-            const invocation = dockerInvocation(app.runtime.endpoint, ['exec', engine.ready.instance, 'git', '-c', 'safe.directory=*', '-c', 'core.hooksPath=/dev/null', '-C', engine.ready.workdir, ...args]);
-            return (await exec(invocation.command, invocation.args, { env: invocation.env, maxBuffer: 16 * 1024 * 1024 })).stdout.trim();
+          if(app.sessions.archivedEnvironment(context.sessionId)){await app.sessions.restart(context.sessionId);await app.sessions.waitExecutionReady(context.sessionId);}
+          const session=app.sessions.record(context.sessionId);
+          if(session.status!=='ready')throw new HttpError(409,'Reconnect the retained environment before preserving its completed manual repair.');
+          const execution=app.sessions.execution(session.id);await app.sessions.assertHostExecutionCurrent(session.id);
+          const captureGit=async(...args:string[])=>{
+            if(execution.kind==='host-macos')return (await exec('git',['-c','core.hooksPath=/dev/null','-C',execution.workdir,...args],{maxBuffer:16*1024*1024})).stdout;
+            const invocation=dockerInvocation(app.runtime.endpoint,['exec',execution.containerId!,'git','-c','safe.directory=*','-c','core.hooksPath=/dev/null','-C',execution.workdir,...args]);
+            return (await exec(invocation.command,invocation.args,{env:invocation.env,maxBuffer:16*1024*1024})).stdout;
           };
-          await containerGit('add', '--all');
-          if (await containerGit('diff', '--cached', '--name-only')) await containerGit('-c', 'user.name=EnoughFactory', '-c', 'user.email=factory@enoughtools.com', 'commit', '-m', `Preserve completed manual repair for EnoughFactory attempt ${context.attempt.id}`);
-          return containerGit('rev-parse', 'HEAD');
+          await stageCapturedSource(captureGit,{isRegularFile:async relativePath=>{
+            if(execution.kind==='host-macos'){try{const entry=await lstat(path.join(execution.workdir,relativePath));return entry.isFile()&&!entry.isSymbolicLink();}catch(error){if((error as NodeJS.ErrnoException).code==='ENOENT')return false;throw error;}}
+            const invocation=dockerInvocation(app.runtime.endpoint,['exec',execution.containerId!,'sh','-c','test -f "$1" && test ! -L "$1"','capture-source',path.posix.join(execution.workdir,relativePath)]);
+            try{await exec(invocation.command,invocation.args,{env:invocation.env});return true;}catch(error){if((error as {code?:unknown}).code===1)return false;throw error;}
+          }});
+          if((await captureGit('diff','--cached','--name-only')).trim())await captureGit('-c','user.name=EnoughFactory','-c','user.email=factory@enoughtools.com','commit','-m',`Preserve completed manual repair for EnoughFactory attempt ${context.attempt.id}`);
+          return (await captureGit('rev-parse','HEAD')).trim();
         },
-        captureExtras: context => app.sessions.captureWorkingDirectories(context.sessionId),
-        async validateGitCommit(context, commit) {
-          // An artifact-write retry must not stop an environment containing newer terminal edits.
-          if (app.sessions.record(context.sessionId).status === 'stopped') return;
-          const engine = app.sessions.get(context.sessionId);
-          const containerGit = async (...args: string[]) => {
-            const invocation = dockerInvocation(app.runtime.endpoint, ['exec', engine.ready.instance, 'git', '-c', 'safe.directory=*', '-c', 'core.hooksPath=/dev/null', '-C', engine.ready.workdir, ...args]);
-            return (await exec(invocation.command, invocation.args, { env: invocation.env, maxBuffer: 16 * 1024 * 1024 })).stdout.trim();
+        captureExtras:context=>app.sessions.captureWorkingDirectories(context.sessionId),
+        async validateGitCommit(context,commit) {
+          if(app.sessions.record(context.sessionId).status==='stopped')return;
+          const execution=app.sessions.execution(context.sessionId);await app.sessions.assertHostExecutionCurrent(context.sessionId);
+          const sourceGit=async(...args:string[])=>{
+            if(execution.kind==='host-macos')return (await exec('git',['-c','core.hooksPath=/dev/null','-C',execution.workdir,...args],{maxBuffer:16*1024*1024})).stdout.trim();
+            const invocation=dockerInvocation(app.runtime.endpoint,['exec',execution.containerId!,'git','-c','safe.directory=*','-c','core.hooksPath=/dev/null','-C',execution.workdir,...args]);
+            return (await exec(invocation.command,invocation.args,{env:invocation.env,maxBuffer:16*1024*1024})).stdout.trim();
           };
-          if (await containerGit('rev-parse', 'HEAD') !== commit || await containerGit('status', '--porcelain')) throw new HttpError(409, 'The retained environment has newer source changes than this repair capture. It has been left running; preserve and inspect those edits before retrying this retention.', 'MANUAL_CONTINUATION_SOURCE_CHANGED');
+          if(await sourceGit('rev-parse','HEAD')!==commit||await sourceGit('status','--porcelain'))throw new HttpError(409,'The retained environment has newer source changes than this repair capture. It has been left running; preserve and inspect those edits before retrying this retention.','MANUAL_CONTINUATION_SOURCE_CHANGED');
         },
         async stopSession(context) {
           if (app.sessions.record(context.sessionId).status !== 'stopped') await app.sessions.stop(context.sessionId);
@@ -990,10 +1142,11 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
     const peerId = (call as ApiCall & { peerId?: string }).peerId;
     if (!peerId) throw new HttpError(403, 'Factory worker commands require a paired coordinator connection.');
     if (method === 'POST' && route === '/api/factory/worker/prepare') {
-      app.assertRuntimeCanRun();
+      app.assertServiceAvailable();
       const goal = body.goal as Goal, task = body.task as FactoryTask, attempt = body.attempt as Attempt, project = body.project as Project;
       if (!goal || !task || !attempt || !project || attempt.deviceId !== app.device.id || task.goalId !== goal.id || attempt.taskId !== task.id || goal.coordinatorId !== peerId)
         throw new HttpError(400, 'The worker assignment does not match its coordinator, task and device.');
+      if(isHostAttempt(attempt))assertHostAssignment(attempt,goal.runtime,task);else app.assertRuntimeCanRun();
       const toolchainProfile=parseDevelopmentToolchain(project.developmentToolchain);
       if(toolchainProfile==='swift-6.0.3'){
         const recipe=body.toolchainRecipe as {id?:unknown;recipeSha256?:unknown}|undefined;
@@ -1007,7 +1160,7 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
       const previousCandidate = body.previousCandidate as CandidateRef | undefined;
       const referenceContext=body.referenceContext as WorkerEvidenceContext|undefined;
       if(referenceContext)assertWorkerContext(referenceContext,{goal,task,attempt});
-      const preparationIdentity=createHash('sha256').update(JSON.stringify({source:source?.sha256,roots:workingDirectorySources?.map(root=>[root.id,root.name,root.sourceArtifact.sha256]),reference:referenceContext?.source.sourceArtifact.sha256,previous:previousCandidate?.id,config:body.config,checkInputs})).digest('hex');
+      const preparationIdentity=createHash('sha256').update(JSON.stringify({source:source?.sha256,roots:workingDirectorySources?.map(root=>[root.id,root.name,root.sourceArtifact.sha256]),reference:referenceContext?.source.sourceArtifact.sha256,previous:previousCandidate?.id,config:body.config,checkInputs,executionTargetId:attempt.executionTargetId,executionTargetKind:attempt.executionTargetKind})).digest('hex');
       const existing=app.store.get<WorkerRecord>(journal,attempt.id);
       // Claim identity synchronously, before the first artifact import can yield.
       const record=beginWorker({id:attempt.id,coordinatorId:peerId,goal,task,attempt,project,workingDirectorySources,referenceContext,preparationIdentity,checkInputs});
@@ -1070,8 +1223,8 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
     return undefined;
   });
   app.runtimeStopHooks.unshift(async()=>{
-    for(const goal of app.store.list<Goal>('goals').filter(goal=>goal.coordinatorId===app.device.id&&!['completed','canceled','failed'].includes(goal.status)))coordinator.pause(goal.id);
-    for(const record of app.store.list<WorkerRecord>(journal).filter(record=>record.attempt.deviceId===app.device.id&&['preparing','prepared','running','unknown'].includes(record.status))){
+    for(const goal of app.store.list<Goal>('goals').filter(goal=>goal.coordinatorId===app.device.id&&!['completed','canceled','failed'].includes(goal.status)&&!goalAuthorizesHost(goal)))coordinator.pause(goal.id);
+    for(const record of app.store.list<WorkerRecord>(journal).filter(record=>record.attempt.deviceId===app.device.id&&!isHostAttempt(record.attempt)&&['preparing','prepared','running','unknown'].includes(record.status))){
       const attempt=app.store.get<Attempt>('attempts',record.id);
       if(attempt&&attempt.status!=='retired')await coordinator.retireAttempt(record.id);else await cancelLocal(record.id);
     }
@@ -1096,10 +1249,10 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
   };
   await importArchives();
   terminalCleanup=new TerminalSessionCleanup({store:app.store,sessions:app.sessions,
-    runtimeReady:()=>app.diagnostics.containerRuntime?.state==='ready',eligible:session=>['stopped','failed','unknown'].includes(session.status)&&!app.sessions.archivedEnvironment(session.id),
+    runtimeReady:()=>app.diagnostics.containerRuntime?.state==='ready',eligible:session=>session.executionTargetKind!=='host-macos'&&['stopped','failed','unknown'].includes(session.status)&&!app.sessions.archivedEnvironment(session.id),
     identity:session=>app.sessions.retirementIdentityKey(session.id),
     busy:sessionId=>app.store.list<WorkerRecord>(journal).some(record=>record.sessionId===sessionId&&(jobs.has(record.id)||jobs.has(`capture-${record.id}`)||captureJobs.has(record.id)))
-      ||app.store.list<ControllerRun>('factory-controller-runs').some(run=>run.sessionId===sessionId&&activeControllerOperations.has(run.id)),
+      ||app.store.list<ControllerRun>('factory-controller-runs').some(run=>run.sessionId===sessionId&&(activeControllerOperations.has(run.id)||!!app.store.get<ControllerReviewContinuation>('factory-controller-reviews',run.id))),
     retire:async(sessionId,assertCurrent)=>app.withRuntimeOperation(()=>app.sessions.withRetirementLease(sessionId,()=>chats.manager.withIdleContainer(app.sessions.retirementContainerName(sessionId),()=>{
       const runtimeKinds=[...new Set(app.store.list<import('@enoughfactory/contracts').Chat>('chats').filter(chat=>chat.sessionId===sessionId).map(chat=>chat.runtime))];
       return app.sessions.retireEphemeralEnvironment(sessionId,app.dataDir,{assertCurrent,assertSpace:()=>hostDisk.assert(),runtimeKinds});
@@ -1151,8 +1304,14 @@ async function git(repository: string, ...args: string[]): Promise<string> {
   const result = await exec('git', ['-C', repository, ...args], { maxBuffer: 16 * 1024 * 1024 }); return result.stdout.trim();
 }
 function checkResults(report: CheckReport, candidateCommit: string): CheckResult[] {
-  const results:CheckResult[] = report.commands.map(command => ({ command: command.command, passed: command.exitCode === 0 && !command.timedOut,
-    output: `${command.stdout}${command.stderr}`, exitCode: command.exitCode, candidateCommit, checkedCommit: report.commit,developmentToolchain:command.developmentToolchain }));
+  const results:CheckResult[] = report.commands.map(command => {
+    if(command.command===UI_QUALITY_CHECK_COMMAND){
+      const quality=command.factoryQuality as CheckResult|undefined;
+      if(quality&&typeof quality==='object'&&!Array.isArray(quality)&&quality.command===UI_QUALITY_CHECK_COMMAND&&quality.candidateCommit===candidateCommit&&quality.checkedCommit===report.commit)return {...quality,passed:quality.passed===true&&command.exitCode===0&&!command.timedOut};
+      return {command:command.command,passed:false,output:'Recorded UI quality evidence does not identify the exact checked source.',exitCode:1,candidateCommit,checkedCommit:report.commit};
+    }
+    return {command:command.command,passed:command.exitCode===0&&!command.timedOut,output:`${command.stdout}${command.stderr}`,exitCode:command.exitCode,candidateCommit,checkedCommit:report.commit,developmentToolchain:command.developmentToolchain,executionTargetKind:command.executionTargetKind,hostPermissions:command.hostPermissions,...((command as Partial<AppleCheckResult>).appleValidation?{appleValidation:(command as AppleCheckResult).appleValidation}:{})};
+  });
   if (['failed', 'canceled'].includes(report.status) && results.every(result => result.passed)) {
     results.push({ command: 'Repository integrity after checks', passed: false, output: 'Checks changed the tracked candidate or were canceled.', exitCode: 1, candidateCommit, checkedCommit: report.commit });
   }
@@ -1167,18 +1326,21 @@ function createGoalInput(body: Record<string, unknown>): CreateGoalInput {
   const controls = steeringInput(body);
   return { projectId: body.projectId, objective: body.objective, title: typeof body.title === 'string' ? body.title : undefined,
     criteria: controls.criteria, autonomy: controls.autonomy, approvalMode: controls.approvalMode,
-    runtime: body.runtime as Goal['runtime'] | undefined,
+    runtime: body.runtime as Goal['runtime'] | undefined,execution:controls.execution,
     concurrency: numberOption(body.concurrency), maxAttempts: numberOption(body.maxAttempts), maxDurationMs: numberOption(body.maxDurationMs) };
 }
 function numberOption(value: unknown): number | undefined {
   if (value === undefined || value === null || value === '') return undefined;
   if (typeof value !== 'number' || !Number.isFinite(value)) throw new HttpError(400, 'Budgets and concurrency must be numbers.'); return value;
 }
+function executionOption(value:unknown):Goal['execution'] {
+  try{return validateTaskExecution(value);}catch(error){throw new HttpError(400,error instanceof Error?error.message:String(error));}
+}
 function steeringInput(body: Record<string, unknown>) {
   if (body.autonomy !== undefined && !['manual', 'assisted', 'autonomous'].includes(String(body.autonomy))) throw new HttpError(400, 'Unknown autonomy mode.');
   if (body.approvalMode !== undefined && !['approve-all', 'rules', 'manual'].includes(String(body.approvalMode))) throw new HttpError(400, 'Unknown approval policy.');
   return { objective: typeof body.objective === 'string' ? body.objective : undefined,
-    context: typeof body.context === 'string' ? body.context : undefined,
+    context: typeof body.context === 'string' ? body.context : undefined,execution:executionOption(body.execution),
     criteria: body.criteria === undefined ? undefined : stringArray(body.criteria),
     autonomy: body.autonomy as Goal['autonomy'] | undefined, approvalMode: body.approvalMode as Goal['approvalMode'] | undefined };
 }

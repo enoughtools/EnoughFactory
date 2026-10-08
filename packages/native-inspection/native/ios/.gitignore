@@ -1,0 +1,4 @@
+.build/
+*.xcresult/
+*.xcuserstate
+xcuserdata/

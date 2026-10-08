@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { lstat, mkdir, mkdtemp, open, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { constants } from "node:fs";
@@ -332,7 +332,8 @@ export async function runNativeGroup(file: string, args: string[], options: { cw
   if (options.signal?.aborted) return { exitCode: 130, stdout: "", stderr: "Apple validation was canceled before execution", timedOut: false };
   return new Promise((resolve, reject) => {
     const child = spawn(file, args, { cwd: options.cwd, env: options.env, detached: true, stdio: ["ignore", "pipe", "pipe"] });
-    let stdout = "", stderr = "", timedOut = false, settled = false, canceled = false;
+    let stdout = "", stderr = "", timedOut = false, settled = false, canceled = false, closed = false;
+    const terminations = new Set<Promise<boolean>>();
     const limit = 8 * 1024 * 1024;
     child.stdout.on("data", (chunk: Buffer) => { stdout += chunk.toString().slice(0, Math.max(0, limit - stdout.length)); });
     child.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString().slice(0, Math.max(0, limit - stderr.length)); });
@@ -344,30 +345,62 @@ export async function runNativeGroup(file: string, args: string[], options: { cw
       settled = true; cleanup(); child.stdout.destroy(); child.stderr.destroy();
       reject(new NativeTeardownError("Native Apple validation could not confirm process-group termination or evidence-pipe closure; scratch was quarantined", { cause }));
     };
-    const killGroup = (signal: NodeJS.Signals): boolean => {
+    const killGroup = async (signal: NodeJS.Signals): Promise<boolean> => {
       if (!child.pid) return true;
       try { process.kill(-child.pid, signal); return true; }
-      catch (error) { if ((error as NodeJS.ErrnoException).code === "ESRCH") return true; failTeardown(error); return false; }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ESRCH") return true;
+        // Darwin can report EPERM when the group disappears during leader exit.
+        // Confirm its absence rather than masking a real permission failure.
+        if ((error as NodeJS.ErrnoException).code === "EPERM") {
+          try { if (!await nativeGroupHasLiveMembers(child.pid)) return true; }
+          catch (cause) { failTeardown(cause); return false; }
+        }
+        failTeardown(error); return false;
+      }
     };
     const waitForDrain = () => {
+      if (closed || settled) return;
       drainTimer ??= setTimeout(() => failTeardown(new Error("Native process pipes remained open after group termination")), 1_500);
     };
+    const terminate = (signal: NodeJS.Signals, drain = false) => {
+      if (settled || closed) return;
+      const operation = killGroup(signal);
+      terminations.add(operation);
+      void operation.then(stopped => { if (stopped && drain) waitForDrain(); }).finally(() => terminations.delete(operation));
+    };
     const cancel = () => {
-      if (!killGroup("SIGTERM")) return;
-      forceTimer ??= setTimeout(() => { if (killGroup("SIGKILL")) waitForDrain(); }, 1_000);
+      terminate("SIGTERM");
+      if (settled || closed) return;
+      forceTimer ??= setTimeout(() => terminate("SIGKILL", true), 1_000);
     };
     const abort = () => { canceled = true; cancel(); };
     const timer = setTimeout(() => { timedOut = true; cancel(); }, options.timeoutMs);
     options.signal?.addEventListener("abort", abort, { once: true });
     child.once("error", error => { if (!settled) { settled = true; cleanup(); reject(error); } });
     // Kill at exit even when a descendant retained stdout/stderr; keep a bounded drain.
-    child.once("exit", () => { if (!settled && killGroup("SIGKILL")) waitForDrain(); });
+    child.once("exit", () => { if (!settled) terminate("SIGKILL", true); });
     child.once("close", (code, signal) => {
       if (settled) return;
-      settled = true; cleanup();
+      closed = true; cleanup();
       canceled ||= options.signal?.aborted ?? false;
-      resolve({ exitCode: canceled ? 130 : code ?? 130, stdout, stderr: canceled ? `${stderr}\nApple validation was canceled` : signal ? `${stderr}\nApple validation terminated by ${signal}` : stderr, timedOut });
+      void Promise.all([...terminations]).then(() => {
+        if (settled) return;
+        settled = true; cleanup();
+        resolve({ exitCode: canceled ? 130 : code ?? 130, stdout, stderr: canceled ? `${stderr}\nApple validation was canceled` : signal ? `${stderr}\nApple validation terminated by ${signal}` : stderr, timedOut });
+      });
     });
     if (options.signal?.aborted) abort();
+  });
+}
+
+async function nativeGroupHasLiveMembers(groupId: number): Promise<boolean> {
+  const output = await new Promise<string>((resolve, reject) => {
+    execFile("/bin/ps", ["-axo", "pgid=,stat="], { env: { PATH: "/usr/bin:/bin" }, timeout: 1_000, maxBuffer: 4 * 1024 * 1024 }, (error, stdout) => error ? reject(error) : resolve(stdout));
+  });
+  return output.split("\n").filter(line => line.trim()).some(line => {
+    const match = /^\s*(\d+)\s+(\S+)\s*$/.exec(line);
+    if (!match) throw new Error("Could not interpret native process-group termination evidence");
+    return Number(match[1]) === groupId && !match[2].startsWith("Z");
   });
 }

@@ -14,9 +14,11 @@ function inventory(output: string): string[] {
 /** Preserve authored source without promoting newly generated SwiftPM caches into Git. */
 export async function stageCapturedSource(git: CaptureGit, options: CaptureStagingOptions): Promise<{ omittedSwiftBuildCaches: string[] }> {
   const add = ["add", "--all", ...(options.force ? ["--force"] : [])];
-  // Discover newly authored manifests too. This first pass leaves every .build
-  // subtree untouched; the final pass below still captures ordinary .build inputs.
-  await git(...add, "--", ".", ":(exclude,glob).build/**", ":(exclude,glob)**/.build/**");
+  // Update tracked inputs first without negative pathspecs. Excluding an ignored
+  // directory can make Git reject the add even when its descendants are excluded.
+  // New manifests are discovered from the untracked inventory below, before any
+  // generated files can enter the index.
+  await git("add", "--update", "--", ".");
   const indexed = inventory(await git("ls-files", "--stage", "-z")).map(value => {
     const match = /^(\d{6}) [a-f0-9]+ ([0-3])\t([\s\S]+)$/.exec(value);
     if (!match) throw new Error("Invalid capture source index inventory");
@@ -24,9 +26,13 @@ export async function stageCapturedSource(git: CaptureGit, options: CaptureStagi
   });
   const untracked = inventory(await git("ls-files", "--others", ...(options.force ? [] : ["--exclude-standard"]), "-z"));
   const paths = new Set(untracked), omittedSwiftBuildCaches: string[] = [];
-  for (const entry of indexed) {
-    if (entry.stage !== "0" || !["100644", "100755"].includes(entry.mode!) || posix.basename(entry.path) !== "Package.swift") continue;
-    const directory = posix.dirname(entry.path), cache = directory === "." ? ".build" : `${directory}/.build`;
+  const manifests = new Set([
+    ...indexed.filter(entry => entry.stage === "0" && ["100644", "100755"].includes(entry.mode!) && posix.basename(entry.path) === "Package.swift").map(entry => entry.path),
+    ...untracked.filter(file => posix.basename(file) === "Package.swift" && !file.split("/").includes(".build")),
+  ]);
+  for (const manifest of manifests) {
+    if (!(await options.isRegularFile(manifest))) continue;
+    const directory = posix.dirname(manifest), cache = directory === "." ? ".build" : `${directory}/.build`;
     // Tracked and explicitly staged build inputs remain source, regardless of names.
     if (indexed.some(other => other.path === cache || other.path.startsWith(`${cache}/`))) continue;
     const database = `${cache}/build.db`;

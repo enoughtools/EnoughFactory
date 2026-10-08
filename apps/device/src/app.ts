@@ -50,6 +50,7 @@ export class DeviceApp {
   private runtimeStopping = false;
   private runtimeSuspended = false;
   private runtimeOperations = new Map<string,{controller:AbortController;promise:Promise<unknown>}>();
+  private serviceOperations = new Map<string,{controller:AbortController;promise:Promise<unknown>}>();
   private socketServer = new WebSocketServer({noServer:true, maxPayload:1024*1024});
   settings: Settings;
 
@@ -117,6 +118,7 @@ export class DeviceApp {
     if(this.serviceUpdating||this.closing)busy.push('The device service is already updating or closing.');
     if(this.activeApiOperations)busy.push(`${this.activeApiOperations} API operation(s) are active.`);
     if(this.runtimeStarting||this.runtimeStopping||this.runtimeOperations.size)busy.push('Container runtime operations are active.');
+    if(this.serviceOperations.size)busy.push(`${this.serviceOperations.size} host or inspection operation(s) are active.`);
     const sessions=this.sessions.serviceActivity();
     if(sessions.starting)busy.push(`${sessions.starting} environment(s) are starting.`);
     if(sessions.stopping)busy.push(`${sessions.stopping} environment(s) are stopping.`);
@@ -143,6 +145,14 @@ export class DeviceApp {
     const operationId=id('runtime-op'),controller=new AbortController();
     const promise=operation(controller.signal).finally(()=>this.runtimeOperations.delete(operationId));
     this.runtimeOperations.set(operationId,{controller,promise});return promise;
+  }
+  /** Host builds, authors and inspection survive a stopped private Docker runtime. */
+  async withServiceOperation<T>(operation:(signal:AbortSignal)=>Promise<T>):Promise<T>{
+    this.assertServiceAvailable();
+    const operationId=id('service-op'),controller=new AbortController();
+    // Register before invoking user code, including synchronous completion/failure.
+    const promise=Promise.resolve().then(()=>operation(controller.signal)).finally(()=>this.serviceOperations.delete(operationId));
+    this.serviceOperations.set(operationId,{controller,promise});return promise;
   }
   state(includeArchived=false): FactoryState {
     const state:FactoryState={product:PRODUCT,version:'0.1.6',device:{...this.device,lastSeen:now()},devices:this.devices,projects:this.store.list<Project>('projects').filter(p=>!p.internal),sessions:this.store.list('sessions'),chats:this.store.list('chats'),approvals:this.store.list('approvals'),goals:this.store.list('goals'),tasks:this.store.list('tasks'),attempts:this.store.list('attempts'),diagnostics:this.diagnostics,settings:{...this.settings,turnCredential:undefined},...this.catalog?.()};
@@ -260,7 +270,7 @@ export class DeviceApp {
       if(method==='POST'&&action==='working-directories/capture')return this.withRuntimeOperation(()=>this.sessions.captureWorkingDirectories(sid));
       if(method==='GET'&&action==='output'){const task=url.searchParams.get('task');return task?this.sessions.get(sid).logs(task):this.sessions.output(sid);}
       if(method==='POST'&&action==='stop'){void this.sessions.stop(sid).catch(error=>this.emit('error',{sessionId:sid,error:error.message}));return {ok:true};}
-      if(method==='POST'&&action==='restart'){if(this.sessions.owns(sid))this.allowRuntimeStart();await this.sessions.restart(sid);return {ok:true};}
+      if(method==='POST'&&action==='restart'){const record=this.sessions.record(sid);if(record.archivedAt)this.sessions.assertWorkAvailable(sid);if(this.sessions.owns(sid)&&record.executionTargetKind!=='host-macos')this.allowRuntimeStart();await this.sessions.restart(sid);return {ok:true};}
       const service=action?.match(/^services\/([^/]+)\/(start|stop|restart)$/);
       if(method==='POST'&&service){await this.sessions.get(sid).task(decodeURIComponent(service[1]),service[2] as 'start'|'stop'|'restart');return {ok:true};}
     }
@@ -313,5 +323,9 @@ export class DeviceApp {
     writeFileSync(path.join(this.dataDir,'connection.json'),JSON.stringify({url:`http://127.0.0.1:${this.port}`,token:this.token,pid:process.pid,version:'0.1.6'},null,2),{mode:0o600});
     void this.refreshDiagnostics();await this.sessions.recover();
   }
-  async close():Promise<void>{if(this.closing)return;this.closing=true;if(this.changeTimer)clearTimeout(this.changeTimer);for(const close of this.closers)await close();this.sessions.close();for(const res of this.sse)res.end();this.socketServer.close();await new Promise<void>(resolve=>this.server.close(()=>{this.store.close();resolve();}));}
+  async close():Promise<void>{if(this.closing)return;this.closing=true;if(this.changeTimer)clearTimeout(this.changeTimer);
+    for(const operation of this.serviceOperations.values())operation.controller.abort();
+    for(const close of this.closers)await close();
+    await Promise.allSettled([...this.serviceOperations.values()].map(operation=>operation.promise));
+    this.sessions.close();for(const res of this.sse)res.end();this.socketServer.close();await new Promise<void>(resolve=>this.server.close(()=>{this.store.close();resolve();}));}
 }

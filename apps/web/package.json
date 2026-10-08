@@ -3,7 +3,13 @@
   "private": true,
   "version": "0.1.6",
   "type": "module",
-  "scripts": { "dev": "vite --host 127.0.0.1", "build": "tsc --noEmit && vite build", "typecheck": "tsc --noEmit", "preview": "vite preview --host 127.0.0.1" },
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "build": "tsc --noEmit && vite build",
+    "typecheck": "tsc --noEmit",
+    "preview": "vite preview --host 127.0.0.1",
+    "verify": "tsx --test src/artifacts.test.ts src/execution-preference.test.ts src/native-profile-summary.test.ts"
+  },
   "dependencies": {
     "@enoughfactory/contracts": "workspace:*",
     "@enoughfactory/factory": "workspace:*",
@@ -15,5 +21,11 @@
     "react": "^19.0.0",
     "react-dom": "^19.0.0"
   },
-  "devDependencies": { "@types/react": "^19.0.0", "@types/react-dom": "^19.0.0", "@vitejs/plugin-react": "^4.4.1", "typescript": "^5.9.3", "vite": "^6.3.5" }
+  "devDependencies": {
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "^4.4.1",
+    "typescript": "^5.9.3",
+    "vite": "^6.3.5"
+  }
 }

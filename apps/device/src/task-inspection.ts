@@ -1,6 +1,6 @@
 import type { Artifact, Attempt, AttemptInspection, Decision, ControllerRun, Device, FactoryTask, Goal, GoalInspection, Project, TaskCheck, TaskInspection, TaskOverview, DevelopmentToolchain } from '@enoughfactory/contracts';
 import type { AttemptDetail, ControlRecord, FactoryStore, PlanRecord, TaskDetail } from '@enoughfactory/factory';
-import { activeExecutionTasks, taskCheckInputBlocker, taskSchedulingBlocker } from '@enoughfactory/factory';
+import { activeExecutionTasks, effectiveTaskExecution, taskCapabilityBlocker, taskCheckInputBlocker, taskSchedulingBlocker } from '@enoughfactory/factory';
 import type { WorkingDirectoryCapture } from '@enoughfactory/workspaces';
 import type { WorkingDirectoryMount } from '@enoughfactory/contracts';
 
@@ -14,7 +14,8 @@ export function taskDispatchBlocker(store: FactoryStore, devices: Device[], task
   const details = store.list<AttemptDetail>('factory-attempt-details');
   const unconfirmed = new Set(details.filter(item => item.cancellation === 'requested').map(item => item.id));
   const contracts = new Map(details.map(item => [item.id, item.contract]));
-  const active = activeExecutionTasks(tasks, attempts, unconfirmed, contracts);
+  const verificationWaits = new Set(details.filter(item => item.verificationWait).map(item => item.id));
+  const active = activeExecutionTasks(tasks, attempts, unconfirmed, contracts, verificationWaits);
   const projectPath = store.get<Project>('projects', goal.projectId)?.path;
   const conflicts = active.filter(item => {
     const other = store.get<Goal>('goals', item.goalId);
@@ -39,6 +40,7 @@ export function inspectAttempt(store: FactoryStore, attempt: Attempt): AttemptIn
   const captures=candidate?.workingDirectories as WorkingDirectoryCapture[]|undefined;
   const workingDirectories=captures?.map(root=>({id:root.id,name:root.name,path:root.containerPath,kind:root.kind,baseCommit:root.baseCommit,status:'captured' as const,capture:{commit:root.commit,bundleArtifactId:root.bundleArtifact.id,diffArtifactId:root.diffArtifact.id}}))||workspace?.workingDirectories as WorkingDirectoryMount[]|undefined;
   return { attempt, phase: detail?.phase, cancellation: detail?.cancellation, contract: detail?.contract,
+    ...(detail?.verificationWait ? { verificationWait: { condition: detail.verificationWait.condition, reason: detail.verificationWait.reason, since: detail.verificationWait.since } } : {}),
     ...(workspace ? { workspace: { id: workspace.id, provider: workspace.provider, baseCommit: workspace.baseCommit, sessionId: workspace.sessionId, deviceId: workspace.deviceId,workingDirectories,developmentToolchain:workspace.developmentToolchain as DevelopmentToolchain|undefined } } : {}),
     ...(candidate ? { candidate: { id: candidate.id, commit: candidate.commit, baseCommit: candidate.baseCommit, branch: candidate.branch, tree: candidate.tree, deviceId: candidate.deviceId,developmentToolchain:candidate.developmentToolchain as DevelopmentToolchain|undefined } } : {}),
     ...(result ? { result: { status: result.status, text: result.text, error: result.error, waitReason: result.waitReason, wakeCondition: result.wakeCondition } } : {}),
@@ -49,9 +51,28 @@ export function inspectAttempt(store: FactoryStore, attempt: Attempt): AttemptIn
 function publicCheck(check: TaskCheck): TaskCheck {
   // Full logs remain immutable artifacts; keep inspection RPCs bounded for remote devices.
   const limit = 64 * 1024;
+  const native = check.appleValidation;
   return { command: check.command, passed: check.passed, output: check.output.slice(0, limit), exitCode: check.exitCode,
     candidateCommit: check.candidateCommit, checkedCommit: check.checkedCommit,developmentToolchain:check.developmentToolchain,
-    ...(check.output.length > limit ? { outputTruncated: true } : {}) };
+    executionTargetKind: check.executionTargetKind, hostPermissions: check.hostPermissions,
+    ...(check.recovery ? { recovery: { condition: check.recovery.condition, reason: check.recovery.reason } } : {}),
+    ...(native ? { appleValidation: { version: native.version, candidateId: native.candidateId, candidateCommit: native.candidateCommit, checkedCommit: native.checkedCommit,
+      profile: native.profile, sandbox: native.sandbox, developerDirectory: native.developerDirectory,
+      workingDirectories: native.workingDirectories.map(root => ({ containerPath: root.containerPath, commit: root.commit })), products: native.products.map(publicArtifact),
+      ...(native.artifact ? { artifact: publicArtifact(native.artifact) } : {}) } } : {}),
+    ...(check.output.length > limit || check.outputTruncated ? { outputTruncated: true } : {}) };
+}
+
+function executionInputBlocker(store: FactoryStore, devices: Device[], task: FactoryTask): TaskInspection['executionBlocker'] {
+  if (!['queued', 'ready', 'failed'].includes(task.status)) return undefined;
+  const goal = store.get<Goal>('goals', task.goalId);
+  if (!goal || ['completed', 'failed', 'canceled'].includes(goal.status)) return undefined;
+  task = effectiveTaskExecution(task, goal);
+  if (!task.execution && !task.quality) return undefined;
+  const attempt = task.currentAttemptId ? store.get<Attempt>('attempts', task.currentAttemptId) : undefined;
+  const detail = attempt && store.get<AttemptDetail>('factory-attempt-details', attempt.id);
+  if (attempt && (['created', 'running', 'unknown'].includes(attempt.status) || detail?.cancellation === 'requested')) return undefined;
+  return taskCapabilityBlocker(task, devices, undefined, goal.workspaceProvider ?? 'git', goal.runtime);
 }
 
 export function inspectTaskOverview(store: FactoryStore, devices: Device[], task: FactoryTask): TaskOverview {
@@ -66,11 +87,14 @@ export function inspectTaskOverview(store: FactoryStore, devices: Device[], task
   if (task.status === 'failed') {
     const verificationInputs = detail && taskCheckInputBlocker(detail);
     if (verificationInputs && attempt?.status !== 'unknown') return { ...base, state: 'waiting', reason: verificationInputs.reason };
+    const executionBlocker = executionInputBlocker(store, devices, task);
+    if (executionBlocker) return { ...base, state: 'waiting', reason: executionBlocker.reason };
     const controllerWait = control?.stage === 'diagnose' && control.diagnosisTaskId === task.id && !!control.waitingFor;
     return { ...base, state: detail?.waitingFor || controllerWait ? 'waiting' : 'failed', reason: detail?.waitReason || (controllerWait ? control?.waitReason : undefined) || detail?.lastError || attempt?.error };
   }
   if (attempt?.status === 'unknown') return { ...base, state: 'unknown', reason: attempt?.error || 'Reconcile the execution owner before authorizing a replacement.' };
   if (task.status === 'running' || task.status === 'review') {
+    if (attempt?.status === 'succeeded' && attemptDetail?.verificationWait && attemptDetail.cancellation !== 'requested') return { ...base, state: 'waiting', reason: attemptDetail.verificationWait.reason };
     const phase = attemptDetail?.phase;
     return { ...base, state: phase && phase !== 'done' ? phase : task.status,
       reason: goal?.status === 'paused' && !!attemptDetail?.candidate ? 'Candidate retained; integration waits for the goal to resume.' : undefined };
@@ -80,6 +104,8 @@ export function inspectTaskOverview(store: FactoryStore, devices: Device[], task
   if (['canceled', 'failed', 'completed'].includes(goal.status)) return { ...base, state: 'waiting', reason: `Goal ${goal.status}; no new work will be dispatched.` };
   const verificationInputs = detail && taskCheckInputBlocker(detail);
   if (verificationInputs) return { ...base, state: 'waiting', reason: verificationInputs.reason };
+  const executionBlocker = executionInputBlocker(store, devices, task);
+  if (executionBlocker) return { ...base, state: 'waiting', reason: executionBlocker.reason };
   if (goal.status === 'waiting') return { ...base, state: 'waiting', reason: control?.waitReason || goal.nextAction };
   const coordinating = taskControlReason(task, control);
   if (coordinating) return { ...base, state: 'queued', reason: coordinating };
@@ -108,8 +134,10 @@ export function inspectTask(store: FactoryStore, devices: Device[], task: Factor
   const plan = store.get<PlanRecord>('factory-plans', task.goalId);
   const tasks = store.list<FactoryTask>('tasks');
   const verificationInputs = ['queued', 'ready', 'failed'].includes(task.status) && detail ? taskCheckInputBlocker(detail) : undefined;
+  const executionBlocker = executionInputBlocker(store, devices, task);
   return { ...inspectTaskOverview(store, devices, task), detailsAvailable: !!detail, checks: [...new Set([...(detail?.planChecks ?? plan?.checks ?? []), ...(detail?.checks ?? [])])],
     ...(verificationInputs ? { verificationInputs: { missingEnvironment: verificationInputs.missingEnvironment } } : {}),
+    ...(executionBlocker ? { executionBlocker } : {}),
     wait: inspectTaskWait(store, task, detail), planRevision: detail?.planRevision, repairInstructions: detail?.repairInstructions, lastError: detail?.lastError,
     dependencies: task.dependsOn.flatMap(id => { const dependency = tasks.find(item => item.id === id); return dependency ? [dependency] : []; }),
     dependents: tasks.filter(item => item.dependsOn.includes(task.id)),

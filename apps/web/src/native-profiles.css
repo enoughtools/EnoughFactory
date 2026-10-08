@@ -1,0 +1,12 @@
+.project-native-profiles { font-size: 12px; }
+.project-native-profiles > summary { cursor: pointer; padding: 8px 0; }
+.native-profiles-heading { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px 12px; }
+.native-profiles-heading > p { flex: 1; min-width: 180px; }
+.native-profile { border: 1px solid var(--factory-line-soft); padding: 14px; margin: 12px 0; }
+.native-profile > .native-profiles-heading strong { font-size: 12px; font-weight: 600; }
+.native-profile-readiness { display: grid; gap: 8px; margin: 12px 0; }
+.native-profile-readiness > div { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px; }
+.native-profile-readiness dt { color: var(--factory-secondary); }
+.native-profile-readiness dd { margin: 0; }
+.native-profile-guidance { margin: 12px 0; }
+.native-profile-guidance p { color: var(--factory-secondary); line-height: 1.65; }

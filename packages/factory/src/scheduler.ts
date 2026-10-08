@@ -1,7 +1,12 @@
-import type { Attempt, AttemptInspection, Device, FactoryTask, Goal } from "@enoughfactory/contracts";
+import type { Attempt, AttemptInspection, Device, ExecutionCapability, ExecutionReadiness, ExecutionTargetAdvertisement, FactoryTask, Goal, RuntimeKind } from "@enoughfactory/contracts";
 import type { TaskDetail } from "./types.js";
 
 const lexical = (left: string, right: string): number => left < right ? -1 : left > right ? 1 : 0;
+
+/** Goal defaults never replace an explicit task contract or an allocated attempt's frozen requirements. */
+export function effectiveTaskExecution(task: FactoryTask, goal: Pick<Goal, "execution">): FactoryTask {
+  return task.execution === undefined && goal.execution !== undefined ? { ...task, execution: goal.execution } : task;
+}
 
 /** Longest remaining dependency chain, including the task itself. Estimates guide order, not deadlines. */
 export function criticalPathMinutes(tasks: FactoryTask[]): Map<string, number> {
@@ -74,25 +79,109 @@ export function tasksConflict(left: FactoryTask, right: FactoryTask): boolean {
   });
 }
 
+/** Older services advertise only their existing container, never inferred Mac or visual tools. */
+export function deviceExecutionTargets(device: Device): ExecutionTargetAdvertisement[] {
+  if (device.executionTargets !== undefined) return device.executionTargets.filter(target => target.protocolVersion === 1);
+  return [{ id: `${device.id}:container`, kind: "container", protocolVersion: 1,
+    readiness: device.online ? "ready" : "offline", capabilities: [{ kind: "linux-shell", readiness: device.online ? "ready" : "offline" }],
+    capacity: device.capacity ?? 2, resources: device.workerResources, workspaceProviders: device.workspaceProviders ?? ["git"] }];
+}
+
+function supportsWorkspace(target: ExecutionTargetAdvertisement, device: Device, provider: "git" | "artifactfs"): boolean {
+  return (target.workspaceProviders ?? (target.kind === "container" ? device.workspaceProviders ?? ["git"] : ["git"])).includes(provider);
+}
+
+function authorTargets(task: Pick<FactoryTask, "execution">, device: Device, provider: "git" | "artifactfs" = "git", runtime?: RuntimeKind): ExecutionTargetAdvertisement[] {
+  const preference = task.execution?.target ?? "container";
+  return deviceExecutionTargets(device).filter(target => (preference === "auto" || target.kind === preference) && supportsWorkspace(target, device, provider) &&
+    (runtime === undefined || (target.runtimes ?? (target.kind === "host-macos" ? ["codex"] : ["codex", "antigravity", "claude"])).includes(runtime)))
+    .sort((left, right) => Number(left.kind !== "container") - Number(right.kind !== "container") || lexical(left.id, right.id));
+}
+
+function localCapabilities(task: Pick<FactoryTask, "execution">, target: ExecutionTargetAdvertisement): ExecutionCapability[] {
+  return [...new Set<ExecutionCapability>([target.kind === "container" ? "linux-shell" : "mac-shell", ...task.execution?.requiredCapabilities ?? []])];
+}
+
+function readyAuthorTarget(task: Pick<FactoryTask, "execution">, target: ExecutionTargetAdvertisement): boolean {
+  return target.readiness === "ready" && localCapabilities(task, target).every(kind => target.capabilities.some(capability => capability.kind === kind && capability.readiness === "ready"));
+}
+
+/** Resolve author location only. Delegated tools can be supplied by a different device. */
+export function selectExecutionTarget(task: Pick<FactoryTask, "execution">, device: Device, provider: "git" | "artifactfs" = "git", runtime: RuntimeKind = "codex"): ExecutionTargetAdvertisement | undefined {
+  return device.online ? authorTargets(task, device, provider, runtime).find(target => readyAuthorTarget(task, target)) : undefined;
+}
+
+export interface ExecutionCapabilityBlocker {
+  kind: "execution-capability"; readiness: Exclude<ExecutionReadiness, "ready">; reason: string;
+  capabilities?: ExecutionCapability[]; deviceIds?: string[]; targetIds?: string[];
+}
+
+const readinessRank: Record<Exclude<ExecutionReadiness, "ready">, number> = { busy: 0, preparing: 1, offline: 2, "setup-required": 3, unsupported: 4 };
+
+/** Unsupported requirements wait before an attempt exists; transient delegated tools queue their jobs. */
+export function taskCapabilityBlocker(task: FactoryTask, devices: Device[], authorDevices = devices, provider: "git" | "artifactfs" = "git", runtime: RuntimeKind = "codex"): ExecutionCapabilityBlocker | undefined {
+  const authors = authorDevices.filter(device => !task.deviceId || task.deviceId === device.id);
+  if (!authors.some(device => selectExecutionTarget(task, device, provider, runtime))) {
+    const failures: ExecutionCapabilityBlocker[] = [];
+    for (const device of authors) for (const target of authorTargets(task, device, provider, runtime)) {
+      const requirements = localCapabilities(task, target);
+      const unavailable = requirements.filter(kind => !target.capabilities.some(capability => capability.kind === kind && capability.readiness === "ready"));
+      const advertised = unavailable.map(kind => target.capabilities.find(capability => capability.kind === kind));
+      const readiness: ExecutionCapabilityBlocker["readiness"] = !device.online ? "offline" : target.readiness !== "ready" ? target.readiness
+        : advertised.some(capability => !capability) ? "unsupported" : advertised.map(capability => capability!.readiness).filter((state): state is ExecutionCapabilityBlocker["readiness"] => state !== "ready").sort((left, right) => readinessRank[left] - readinessRank[right])[0] ?? "unsupported";
+      failures.push({ kind: "execution-capability", readiness, capabilities: unavailable, deviceIds: [device.id], targetIds: [target.id],
+        reason: target.reason ?? advertised.find(capability => capability?.reason)?.reason ?? `Waiting for ${unavailable.join(", ") || `${target.kind} execution`} on ${device.name} (${readiness}).` });
+    }
+    return failures.sort((left, right) => readinessRank[left.readiness] - readinessRank[right.readiness])[0] ?? {
+      kind: "execution-capability", readiness: "unsupported", deviceIds: authors.map(device => device.id),
+      capabilities: task.execution?.requiredCapabilities, reason: `No configured ${task.execution?.target === "host-macos" ? "Mac host" : "compatible author"} execution target supports this task with ${runtime} and ${provider}.`,
+    };
+  }
+  const qualityCapabilities: ExecutionCapability[] = (task.quality?.platforms ?? []).map(platform => platform === "web" ? "chromium-inspection" : platform === "macos" ? "macos-app-inspection" : "ios-simulator-inspection");
+  for (const kind of new Set([...task.execution?.delegatedCapabilities ?? [], ...qualityCapabilities])) {
+    const available = devices.flatMap(device => deviceExecutionTargets(device).map(target => ({ device, target, capability: target.capabilities.find(capability => capability.kind === kind) })));
+    if (available.some(({ device, target, capability }) => device.online && ["ready", "busy", "preparing"].includes(target.readiness) && capability && ["ready", "busy", "preparing"].includes(capability.readiness))) continue;
+    const failures = available.filter(item => item.capability).map(({ device, target, capability }): ExecutionCapabilityBlocker => {
+      const readiness = !device.online ? "offline" : target.readiness !== "ready" ? target.readiness : capability!.readiness;
+      return { kind: "execution-capability", readiness: readiness === "ready" ? "unsupported" : readiness, capabilities: [kind], deviceIds: [device.id], targetIds: [target.id],
+        reason: capability!.reason ?? target.reason ?? `Waiting for ${kind} on ${device.name} (${readiness}).` };
+    });
+    return failures.sort((left, right) => readinessRank[left.readiness] - readinessRank[right.readiness])[0] ?? {
+      kind: "execution-capability", readiness: "unsupported", capabilities: [kind], reason: `No configured device supports the required ${kind} tool.`,
+    };
+  }
+  return undefined;
+}
+
 /** The caller supplies live/reserved attempts as tasks, including unresolved remote cancellation. */
-export function placementConstraint(task: FactoryTask, device: Device, activeTasks: FactoryTask[]): string | undefined {
-  const active = activeTasks.filter(item => !item.deviceId || item.deviceId === device.id);
-  const capacity = device.capacity ?? 2;
+export function placementConstraint(task: FactoryTask, device: Device, activeTasks: FactoryTask[], provider: "git" | "artifactfs" = "git", runtime: RuntimeKind = "codex"): string | undefined {
+  const target = selectExecutionTarget(task, device, provider, runtime);
+  if (!target) return "No ready execution target supports this task.";
+  const active = activeTasks.filter(item => !verificationOnlyReservation(item) && (!item.deviceId || item.deviceId === device.id) &&
+    ((item as FactoryTask & Pick<Attempt, "executionTargetKind">).executionTargetKind ?? "container") === target.kind);
+  const capacity = target.capacity ?? (target.kind === "container" ? device.capacity ?? 2 : 1);
   if (active.length >= capacity) return `Worker capacity reached (${active.length} / ${capacity} active tasks).`;
-  if (!device.workerResources) return undefined;
+  const resources = target.resources ?? (target.kind === "container" ? device.workerResources : undefined);
+  if (!resources) return undefined;
   const cpus = task.resources?.cpus ?? 1, memoryGiB = task.resources?.memoryGiB ?? 1;
-  const availableCpus = device.workerResources.cpus - active.reduce((sum, item) => sum + (item.resources?.cpus ?? 1), 0);
-  const availableMemory = device.workerResources.memoryGiB - active.reduce((sum, item) => sum + (item.resources?.memoryGiB ?? 1), 0);
+  const availableCpus = resources.cpus - active.reduce((sum, item) => sum + (item.resources?.cpus ?? 1), 0);
+  const availableMemory = resources.memoryGiB - active.reduce((sum, item) => sum + (item.resources?.memoryGiB ?? 1), 0);
   if (cpus > availableCpus) return `Needs ${cpus} CPU; ${Math.max(0, availableCpus)} CPU available on ${device.name}.`;
   if (memoryGiB > availableMemory) return `Needs ${memoryGiB} GiB memory; ${Math.max(0, availableMemory)} GiB available on ${device.name}.`;
   return undefined;
 }
 
 export interface SchedulingBlocker {
-  kind: "dependency" | "write-conflict" | "goal-capacity" | "device-capacity" | "resource" | "device-unavailable";
+  kind: "dependency" | "write-conflict" | "goal-capacity" | "device-capacity" | "resource" | "device-unavailable" | "execution-capability";
   reason: string;
   taskIds?: string[];
   deviceIds?: string[];
+  readiness?: ExecutionCapabilityBlocker["readiness"]; capabilities?: ExecutionCapability[]; targetIds?: string[];
+}
+
+/** Source ownership remains reserved while a finished author waits for its separate verifier. */
+export function verificationOnlyReservation(task: FactoryTask): boolean {
+  return (task as FactoryTask & { verificationOnly?: boolean }).verificationOnly === true;
 }
 
 export interface CheckInputBlocker {
@@ -114,6 +203,7 @@ export function taskCheckInputBlocker(detail: Pick<TaskDetail, "requiredCheckEnv
 /** Shared dispatch/inspection explanation. Repository ownership and unresolved attempts are supplied by the caller. */
 export function taskSchedulingBlocker(task: FactoryTask, goal: Goal, tasks: FactoryTask[], activeTasks: FactoryTask[],
   conflictingTasks: FactoryTask[], devices: Device[]): SchedulingBlocker | undefined {
+  task = effectiveTaskExecution(task, goal);
   const byId = new Map(tasks.map(item => [item.id, item]));
   const dependencies = task.dependsOn.filter(id => byId.get(id)?.status !== "completed");
   if (dependencies.length) return { kind: "dependency", taskIds: dependencies,
@@ -123,16 +213,25 @@ export function taskSchedulingBlocker(task: FactoryTask, goal: Goal, tasks: Fact
   const conflicts = [...new Map(conflictingTasks.filter(item => tasksConflict(task, item)).map(item => [item.id, item])).values()];
   if (conflicts.length) return { kind: "write-conflict", taskIds: conflicts.map(item => item.id),
     reason: `Waiting for overlapping write paths: ${conflicts.map(item => item.title).join(", ")}.` };
-  const activeForGoal = activeTasks.filter(item => item.goalId === goal.id).length;
+  const activeForGoal = activeTasks.filter(item => item.goalId === goal.id && !verificationOnlyReservation(item)).length;
   if (activeForGoal >= goal.concurrency) return { kind: "goal-capacity",
     reason: `Goal concurrency reached (${activeForGoal} / ${goal.concurrency} active tasks).` };
   const provider = goal.workspaceProvider ?? "git";
   const allowed = devices.filter(device => (!task.deviceId || task.deviceId === device.id) &&
-    (provider === "git" || device.workspaceProviders?.includes(provider)));
+    authorTargets(task, device, provider).length > 0);
   const eligible = allowed.filter(device => device.online);
-  if (!eligible.length) return { kind: "device-unavailable", deviceIds: allowed.map(device => device.id),
-    reason: provider === "artifactfs" ? "Waiting for an online worker with ArtifactFS support." : "Waiting for an online worker." };
-  const constraints = eligible.map(device => ({ device, reason: placementConstraint(task, device, activeTasks) }));
+  if (!eligible.length) {
+    const candidates = devices.filter(device => !task.deviceId || task.deviceId === device.id);
+    if ((task.execution !== undefined || task.quality !== undefined) && candidates.some(device => device.online)) {
+      const blocker = taskCapabilityBlocker(task, devices, candidates, provider, goal.runtime);
+      if (blocker) return blocker;
+    }
+    return { kind: "device-unavailable", deviceIds: allowed.map(device => device.id),
+      reason: provider === "artifactfs" ? "Waiting for an online worker with ArtifactFS support." : "Waiting for an online worker." };
+  }
+  const capabilityBlocker = taskCapabilityBlocker(task, devices, allowed, provider, goal.runtime);
+  if (capabilityBlocker) return capabilityBlocker;
+  const constraints = eligible.map(device => ({ device, reason: placementConstraint(task, device, activeTasks, provider, goal.runtime) }));
   if (constraints.some(item => item.reason === undefined)) return undefined;
   const resource = constraints.find(item => !item.reason!.startsWith("Worker capacity reached"));
   return { kind: resource ? "resource" : "device-capacity", deviceIds: eligible.map(device => device.id),
@@ -141,16 +240,19 @@ export function taskSchedulingBlocker(task: FactoryTask, goal: Goal, tasks: Fact
 
 /** One reservation per attempt. Retired-but-unconfirmed effects keep their original owner and write footprint. */
 export function activeExecutionTasks(tasks: FactoryTask[], attempts: Attempt[], unconfirmedAttemptIds = new Set<string>(),
-  contractsByAttempt?: Map<string, AttemptInspection["contract"]>): FactoryTask[] {
+  contractsByAttempt?: Map<string, AttemptInspection["contract"]>, verificationWaitAttemptIds = new Set<string>()): FactoryTask[] {
   const byId = new Map(tasks.map(task => [task.id, task]));
   const active: FactoryTask[] = [], included = new Set<string>();
   const reserve = (task: FactoryTask, attempt: Attempt, uncertain: boolean): void => {
     const contract = contractsByAttempt?.get(attempt.id);
-    const reservation = { ...task, deviceId: attempt.deviceId, currentAttemptId: attempt.id };
+    const reservation = { ...task, deviceId: attempt.deviceId, currentAttemptId: attempt.id,
+      executionTargetId: attempt.executionTargetId, executionTargetKind: attempt.executionTargetKind ?? "container",
+      verificationOnly: !uncertain && attempt.status === "succeeded" && verificationWaitAttemptIds.has(attempt.id) };
     if (contract) {
       reservation.estimatedMinutes = contract.estimatedMinutes;
       reservation.writePaths = contract.writePaths;
       reservation.resources = contract.resources;
+      reservation.execution = contract.execution;
     }
     if (uncertain && (!reservation.writePaths?.length || (attempt.status === "retired" && !contract))) reservation.writePaths = ["**"];
     active.push(reservation);

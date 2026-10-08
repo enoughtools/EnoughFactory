@@ -1,6 +1,13 @@
 import type { RuntimeCapability, RuntimeKind } from "@enoughfactory/contracts";
-import { CodexTurn } from "./codex.ts";
-import { ContainerProcess, containerCommand, checkContainerId, type SpawnProcess } from "./process.ts";
+import { CodexTurn, codexAppServerArguments, codexManagedFeatureArguments } from "./codex.ts";
+import { ContainerProcess, containerCommand, checkContainerId, type AgentProcess, type SpawnProcess } from "./process.ts";
+import { HostProcess, cancelHostProcess, reconcileHostProcesses, type HostProcessState } from "./host-process.ts";
+import { hostCodexAvailability, provisionHostCodex, type HostCodexRuntime } from "./host-provision.ts";
+import { prepareHostSession, retireHostSessionState } from "./host-state.ts";
+import { codexToolConfiguration, validateToolEnvironment } from "./tool-config.ts";
+import { createHash } from "node:crypto";
+import { readdir } from "node:fs/promises";
+import path from "node:path";
 import { ApprovalRouter } from "./policy.ts";
 import { availability, copyMinimalAuth, provisionRuntime, releaseCodexPayload, writePrivateFile, type CodexPayloadRelease, type RuntimeOptions } from "./provision.ts";
 import { AgentError, type ProvisionOptions, type TurnCallbacks, type TurnInput, type TurnResult } from "./types.ts";
@@ -10,19 +17,65 @@ export { ApprovalRouter, matchPolicyRule } from "./policy.ts";
 export { CODEX_PROTOCOL_VERSION, codexApprovalResponse } from "./codex.ts";
 export type { CodexPayloadRelease } from "./provision.ts";
 export { prepareAgentToolchain, verifyPreparedAgentToolchain, type PreparedAgentToolchain, type AgentToolchainOptions } from "./toolchain-image.ts";
+export { HostProcess, cancelHostProcess, reconcileHostProcesses, type HostProcessState } from "./host-process.ts";
+export { provisionHostCodex, hostCodexAvailability, type HostCodexRuntime, type HostProvisionOptions } from "./host-provision.ts";
+export { codexToolConfiguration } from "./tool-config.ts";
 
-interface LiveTurn { containerId: string; controller: AbortController; process?: ContainerProcess; router: ApprovalRouter; codex?: CodexTurn; }
+type ContainerTurnInput = TurnInput & { containerId: string };
+interface LiveTurn { containerId?: string; sessionId: string; controller: AbortController; process?: AgentProcess; router: ApprovalRouter; codex?: CodexTurn; }
 export interface AgentManagerOptions extends RuntimeOptions {
   autoProvision?: boolean;
   copyHostAuth?: boolean;
   hostAuthDir?: string;
+  /** Explicit Factory-owned payload/state directory; never a global provider install. */
+  hostRuntimeDir?: string;
+  /** Private worker workspace parents. The service also verifies exact session ownership. */
+  hostWorkspaceRoots?: string[];
 }
 export class AgentManager {
   private live = new Map<string, LiveTurn>();
   private provisioning = new Map<string, Promise<RuntimeCapability>>();
   private containerUses = new Map<string, number>();
   private releasing = new Set<string>();
+  private hostRetiring = new Set<string>();
   constructor(private options: AgentManagerOptions = {}) {}
+  async hostAvailability(signal?: AbortSignal): Promise<RuntimeCapability[]> {
+    let runtime: HostCodexRuntime | undefined, details: string | undefined;
+    try {
+      if (!this.options.hostRuntimeDir || !this.options.hostWorkspaceRoots?.length) details = "Native authoring is not configured for this device.";
+      else runtime = await hostCodexAvailability({ runtimeDirectory: this.options.hostRuntimeDir, spawnProcess: this.options.spawnProcess, signal });
+    } catch (error) { details = error instanceof Error ? error.message : String(error); }
+    return [{ kind: "codex", available: !!runtime, version: runtime?.version, fullAccess: true, interactiveApprovals: !!runtime, resume: !!runtime, details: runtime ? "Pinned Codex in an owned Mac workspace. Same-user full host access; this is not container isolation." : details ?? "Prepare the pinned native Codex runtime." }];
+  }
+  async provisionHostRuntime(signal?: AbortSignal): Promise<HostCodexRuntime> {
+    if (!this.options.hostRuntimeDir || !this.options.hostWorkspaceRoots?.length) throw new AgentError("Native authoring is not configured for this device.", "HOST_EXECUTION_UNCONFIGURED");
+    return provisionHostCodex({ runtimeDirectory: this.options.hostRuntimeDir, spawnProcess: this.options.spawnProcess, signal });
+  }
+  async provisionHost(signal?: AbortSignal): Promise<RuntimeCapability> {
+    const runtime = await this.provisionHostRuntime(signal);
+    return { kind: "codex", available: true, version: runtime.version, fullAccess: true, interactiveApprovals: true, resume: true, details: "Pinned Codex in an owned Mac workspace. Same-user full host access; this is not container isolation." };
+  }
+  async hostProcesses(): Promise<HostProcessState[]> {
+    if (!this.options.hostRuntimeDir) return [];
+    const directory = path.join(this.options.hostRuntimeDir, "sessions");
+    try {
+      const entries = await readdir(directory, { withFileTypes: true });
+      return entries.filter(entry => entry.isDirectory() && /^[a-f0-9]{64}$/.test(entry.name)).flatMap(entry => reconcileHostProcesses(path.join(directory, entry.name, "processes")));
+    } catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return []; throw error; }
+  }
+  async cancelHostSession(sessionId: string): Promise<void> {
+    if (!this.options.hostRuntimeDir) throw new AgentError("Native authoring is not configured for this device.", "HOST_EXECUTION_UNCONFIGURED");
+    const directory = path.join(this.options.hostRuntimeDir, "sessions", createHash("sha256").update(sessionId).digest("hex"), "processes");
+    for (const record of reconcileHostProcesses(directory)) if (record.state !== "exited") await cancelHostProcess(directory, record.processKey);
+  }
+  /** Terminal independent verifiers only: the service preserves SQLite chat/CAS first. */
+  async retireHostSession(sessionId: string, expectedCwd: string): Promise<boolean> {
+    if (!this.options.hostRuntimeDir) return false;
+    if (this.hostRetiring.has(sessionId) || [...this.live.values()].some(live => !live.containerId && live.sessionId === sessionId)) throw new AgentError("The host verifier provider still has a live owner.", "HOST_PROCESS_ACTIVE");
+    this.hostRetiring.add(sessionId);
+    try { return await retireHostSessionState(sessionId, expectedCwd, this.options.hostRuntimeDir); }
+    finally { this.hostRetiring.delete(sessionId); }
+  }
   private assertNotReleasing(containerId: string): void {
     if (this.releasing.has(containerId)) throw Object.assign(new AgentError("This container is releasing its idle Codex payload. Retry after cleanup completes.", "RUNTIME_CLEANUP_ACTIVE", true), { agentStarted: false });
   }
@@ -80,13 +133,15 @@ export class AgentManager {
   }
   async runTurn(input: TurnInput, callbacks: TurnCallbacks): Promise<TurnResult> {
     if (this.live.has(input.chatId)) throw new AgentError("This conversation already has a live agent turn.", "TURN_ALREADY_RUNNING");
+    if (input.executionTarget && !["container", "host-macos"].includes(input.executionTarget)) throw new AgentError("The requested agent execution target is unsupported.", "INVALID_EXECUTION_TARGET");
+    if (input.executionTarget === "host-macos") return this.runHostTurn(input, callbacks);
     if (!input.containerId) throw new AgentError("Agent work requires an isolated container session.", "CONTAINER_REQUIRED");
     if (!input.prompt.trim()) throw new AgentError("A message is required.", "EMPTY_PROMPT");
     if (input.runtime === "claude" && input.approvalMode !== "approve-all") throw new AgentError("Claude's current headless adapter supports Approve all. Choose Codex or Antigravity for typed approvals.", "UNSUPPORTED_APPROVAL_MODE");
     this.assertNotReleasing(input.containerId);
     const controller = new AbortController();
     const router = new ApprovalRouter(input, callbacks, controller.signal);
-    const live: LiveTurn = { containerId: input.containerId, controller, router };
+    const live: LiveTurn = { containerId: input.containerId, sessionId: input.sessionId, controller, router };
     this.live.set(input.chatId, live);
     try {
       if (this.options.autoProvision !== false && input.antigravityTransport !== "cli") {
@@ -95,10 +150,13 @@ export class AgentManager {
       }
       if (controller.signal.aborted) throw new AgentError("Agent turn interrupted.", "INTERRUPTED");
       const cwd = input.cwd ?? await containerCommand(input.containerId, ["sh", "-c", 'printf "%s" "${ENVMUX_WORKDIR:-/work}"'], { ...this.options, signal: controller.signal });
-      const selected = { ...input, cwd };
+      const selected: ContainerTurnInput = { ...input, containerId: input.containerId, cwd };
+      validateToolEnvironment(input.toolEnvironment);
+      if (input.mcpServers && (input.runtime !== "codex" || input.codexTransport === "exec")) throw new AgentError("Inspection tools are currently verified for the Codex app-server adapter.", "UNSUPPORTED_TOOL_RUNTIME");
+      if (input.mcpServers) codexToolConfiguration(input.mcpServers); // Validate before dispatch. Private per-thread RPC config avoids shared-container config races.
       let result: TurnResult;
       if (input.runtime === "codex" && input.codexTransport !== "exec") {
-        const process = new ContainerProcess(input.containerId, ["codex", "app-server", "--listen", "stdio://"], this.options.dockerEndpoint, this.options.spawnProcess, cwd, input.runtime);
+        const process = new ContainerProcess(input.containerId, ["codex", ...codexAppServerArguments()], this.options.dockerEndpoint, this.options.spawnProcess, cwd, input.runtime, { environment: input.toolEnvironment });
         live.process = process;
         const turn = new CodexTurn(selected, callbacks, process, router, controller.signal); live.codex = turn;
         result = await turn.run();
@@ -133,7 +191,48 @@ export class AgentManager {
   }
   async shutdown(): Promise<void> { await Promise.allSettled([...this.live.keys()].map((id) => this.interrupt(id))); }
 
-  private async runAntigravitySdk(input: TurnInput, callbacks: TurnCallbacks, live: LiveTurn): Promise<TurnResult> {
+  private async runHostTurn(input: TurnInput, callbacks: TurnCallbacks): Promise<TurnResult> {
+    if (!input.prompt.trim()) throw new AgentError("A message is required.", "EMPTY_PROMPT");
+    if (input.runtime !== "codex" || input.codexTransport === "exec") throw new AgentError("Native authoring currently supports the pinned Codex app-server adapter.", "UNSUPPORTED_HOST_RUNTIME");
+    if (input.containerId) throw new AgentError("A native authoring turn cannot also select a container.", "INVALID_EXECUTION_TARGET");
+    if (this.hostRetiring.has(input.sessionId)) throw new AgentError("This terminal verifier provider home is being retired.", "HOST_SESSION_RETIRED");
+    if ([...this.live.values()].some(live => !live.containerId && live.sessionId === input.sessionId)) throw new AgentError("This native authoring session already has a live turn.", "TURN_ALREADY_RUNNING");
+    if (!this.options.hostRuntimeDir || !this.options.hostWorkspaceRoots?.length) throw new AgentError("Native authoring is not configured for this device.", "HOST_EXECUTION_UNCONFIGURED");
+    const controller = new AbortController(), router = new ApprovalRouter(input, callbacks, controller.signal);
+    const live: LiveTurn = { sessionId: input.sessionId, controller, router }; this.live.set(input.chatId, live);
+    try {
+      await callbacks.onEvent({ kind: "status", text: "Preparing native agent runtime", data: { status: "starting", runtime: "codex", executionTarget: "host-macos" } });
+      const runtime = this.options.autoProvision === false
+        ? await hostCodexAvailability({ runtimeDirectory: this.options.hostRuntimeDir, spawnProcess: this.options.spawnProcess, signal: controller.signal })
+        : await this.provisionHostRuntime(controller.signal);
+      if (!runtime) throw new AgentError("Prepare the pinned native Codex runtime before authoring.", "RUNTIME_MISSING");
+      if (controller.signal.aborted) throw new AgentError("Agent turn interrupted.", "INTERRUPTED");
+      const state = await prepareHostSession(input, runtime, { runtimeDirectory: this.options.hostRuntimeDir, workspaceRoots: this.options.hostWorkspaceRoots, copyHostAuth: this.options.copyHostAuth, hostAuthDir: this.options.hostAuthDir });
+      if (controller.signal.aborted) throw new AgentError("Agent turn interrupted.", "INTERRUPTED");
+      const process = new HostProcess(runtime.nodePath, [runtime.codexPath, ...codexAppServerArguments()], { cwd: state.cwd, environment: state.environment, processDirectory: state.processDirectory, sessionId: input.sessionId, spawnProcess: this.options.spawnProcess });
+      live.process = process;
+      await process.ready;
+      const turn = new CodexTurn({ ...input, cwd: state.cwd }, callbacks, process, router, controller.signal); live.codex = turn;
+      const result = await turn.run();
+      await callbacks.onEvent({ kind: "status", text: "Agent turn completed", data: { status: "idle", threadId: result.threadId, stopReason: result.stopReason, executionTarget: "host-macos" } });
+      return result;
+    } catch (error) {
+      const failure = error instanceof Error ? error : new Error(String(error)), agentStarted = live.codex?.executionMayHaveStarted === true;
+      Object.assign(failure, { agentStarted, executionEnded: !agentStarted || failure instanceof AgentError && failure.executionEnded });
+      await callbacks.onEvent({ kind: "error", text: failure.message, data: { code: failure instanceof AgentError ? failure.code : "AGENT_RUNTIME_ERROR", interrupted: controller.signal.aborted, agentStarted, executionEnded: (failure as AgentError).executionEnded, phase: agentStarted ? "execution" : "preparation", executionTarget: "host-macos" } });
+      throw failure;
+    } finally {
+      controller.abort(); await router.cancel();
+      try { await live.process?.stop(); }
+      catch (error) {
+        const failure = error instanceof Error ? error : new Error(String(error));
+        Object.assign(failure, { agentStarted: live.codex?.executionMayHaveStarted === true, executionEnded: false });
+        throw failure;
+      } finally { if (this.live.get(input.chatId) === live) this.live.delete(input.chatId); }
+    }
+  }
+
+  private async runAntigravitySdk(input: ContainerTurnInput, callbacks: TurnCallbacks, live: LiveTurn): Promise<TurnResult> {
     const process = new ContainerProcess(input.containerId, ["/opt/enoughfactory/antigravity/bin/python", "-u", "/opt/enoughfactory/agents/antigravity_bridge.py"], this.options.dockerEndpoint, this.options.spawnProcess, input.cwd, input.runtime);
     live.process = process;
     return new Promise<TurnResult>((resolve, reject) => {
@@ -178,11 +277,11 @@ export class AgentManager {
       process.write({ type: "start", prompt: input.prompt, threadId: input.threadId, approvalMode: input.approvalMode, model: input.model, systemInstructions: input.systemInstructions, saveDir: "/root/.enoughfactory/antigravity/sessions" });
     });
   }
-  private async runCli(input: TurnInput, callbacks: TurnCallbacks, live: LiveTurn): Promise<TurnResult> {
+  private async runCli(input: ContainerTurnInput, callbacks: TurnCallbacks, live: LiveTurn): Promise<TurnResult> {
     if (input.approvalMode !== "approve-all") throw new AgentError("This CLI route has no bidirectional approval channel.", "UNSUPPORTED_APPROVAL_MODE");
     const prompt = input.systemInstructions ? `${input.systemInstructions}\n\n${input.prompt}` : input.prompt;
     const args = input.runtime === "codex"
-      ? ["codex", "exec", ...(input.threadId ? ["resume", input.threadId] : []), "--json", "--dangerously-bypass-approvals-and-sandbox", ...(input.model ? ["--model", input.model] : []), "-"]
+      ? ["codex", ...codexManagedFeatureArguments(), "exec", ...(input.threadId ? ["resume", input.threadId] : []), "--json", "--dangerously-bypass-approvals-and-sandbox", ...(input.model ? ["--model", input.model] : []), "-"]
       : input.runtime === "claude" ? ["claude", "-p", "--output-format", "stream-json", "--verbose", "--dangerously-skip-permissions", ...(input.threadId ? ["--resume", input.threadId] : []), ...(input.model ? ["--model", input.model] : []), prompt]
       : ["agy", "-p", prompt, "--output-format", "stream-json", "--dangerously-skip-permissions", ...(input.threadId ? ["--conversation", input.threadId] : []), ...(input.model ? ["--model", input.model] : [])];
     const process = new ContainerProcess(input.containerId, args, this.options.dockerEndpoint, this.options.spawnProcess, input.cwd, input.runtime); live.process = process;

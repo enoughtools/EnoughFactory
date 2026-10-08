@@ -1,0 +1,21 @@
+import { execFileSync } from 'node:child_process';
+import { mkdirSync, copyFileSync, rmSync } from 'node:fs';
+import { dirname, resolve, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { beginNativeBuild, finishNativeBuild } from '../build-receipt.mjs';
+const here = dirname(fileURLToPath(import.meta.url));
+const out = resolve(process.env.ENOUGH_NATIVE_BUILD_DIRECTORY ?? join(here, '../../.build'));
+await beginNativeBuild('macos', out);
+const app = join(out, 'EnoughFactory Native Inspection.app');
+mkdirSync(join(app, 'Contents/MacOS'), { recursive: true });
+copyFileSync(join(here, 'Info.plist'), join(app, 'Contents/Info.plist'));
+const executable = join(app, 'Contents/MacOS/EnoughNativeInspection');
+const slices = ['arm64', 'x86_64'].map(arch => ({ arch, path: join(out, `EnoughNativeInspection-${arch}`) }));
+for (const slice of slices) execFileSync('/usr/bin/xcrun', ['swiftc', '-swift-version', '5', '-O', '-parse-as-library', '-target', `${slice.arch}-apple-macos14.0`, '-framework', 'AppKit', '-framework', 'ApplicationServices', '-framework', 'ScreenCaptureKit', join(here, 'InspectionHelper.swift'), '-o', slice.path], { stdio: 'inherit' });
+execFileSync('/usr/bin/lipo', ['-create', ...slices.map(x => x.path), '-output', executable], { stdio: 'inherit' });
+for (const slice of slices) rmSync(slice.path);
+// Release packaging supplies the same stable signing identity used across updates.
+const identity = process.env.ENOUGH_NATIVE_SIGNING_IDENTITY ?? '-';
+execFileSync('/usr/bin/codesign', ['--force', '--sign', identity, '--identifier', 'tools.enough.factory.native-inspection', ...(identity === '-' ? [] : ['--options', 'runtime', '--timestamp']), app], { stdio: 'inherit' });
+await finishNativeBuild('macos', out);
+console.log(app);

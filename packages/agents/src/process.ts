@@ -6,6 +6,15 @@ import { dockerInvocation, type DockerRuntimeEndpoint } from "@enoughfactory/run
 import { AgentError } from "./types.ts";
 
 export type SpawnProcess = typeof spawn;
+export interface AgentProcess {
+  readonly exit: Promise<{ code: number | null; signal: NodeJS.Signals | null }>;
+  lines(callback: (line: string) => void): void;
+  write(value: unknown): void;
+  end(): void;
+  errorText(): string;
+  stop(): Promise<void>;
+}
+export interface ContainerProcessOptions { environment?: Record<string, string>; codexHome?: string; }
 function requireEndpoint(endpoint?: DockerRuntimeEndpoint): DockerRuntimeEndpoint {
   if (!endpoint) throw new AgentError("EnoughFactory's managed container runtime is not configured.", "MANAGED_RUNTIME_UNCONFIGURED");
   return endpoint;
@@ -58,14 +67,18 @@ export class ContainerProcess {
   private stderr = "";
   private stopped = false;
   private inputEnded = false;
-  constructor(readonly containerId: string, args: string[], private endpoint?: DockerRuntimeEndpoint, private spawnProcess: SpawnProcess = spawn, cwd?: string, runtime?: "codex" | "claude" | "antigravity") {
+  constructor(readonly containerId: string, args: string[], private endpoint?: DockerRuntimeEndpoint, private spawnProcess: SpawnProcess = spawn, cwd?: string, runtime?: "codex" | "claude" | "antigravity", options: ContainerProcessOptions = {}) {
     checkContainerId(containerId);
     this.endpoint = Object.freeze({ ...requireEndpoint(endpoint) });
     // A new process group lets interruption terminate the container process and its tools,
     // rather than merely disconnect the Docker client while commands continue invisibly.
     const providerFile = runtime ? `/root/.enoughfactory/providers/${runtime}.env` : undefined;
-    const wrapper = `umask 077; export HOME=/root; export CODEX_HOME=/root/.codex; export CLAUDE_CONFIG_DIR=/root/.claude; export PATH=/opt/enoughfactory/node/bin:/root/.local/bin:$PATH; export IS_SANDBOX=1; ${providerFile ? `if [ -f ${quote(providerFile)} ]; then . ${quote(providerFile)}; fi;` : ""} exec setsid --wait sh -c 'echo $$ > "$1"; shift; exec "$@"' enough-agent /tmp/enoughfactory-${this.processKey}.pid "$@"`;
-    const invocation = dockerInvocation(this.endpoint, ["exec", "-i", "--user", "0", ...(cwd ? ["--workdir", cwd] : []), containerId, "sh", "-c", wrapper, "enough-agent", ...args]);
+    const environment = options.environment ?? {};
+    for (const [key, value] of Object.entries(environment)) if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key) || value.includes("\0")) throw new AgentError("A tool environment entry is invalid.", "INVALID_TOOL_CONFIG");
+    // Values use Docker's stdin-side environment, rather than shell text or public argv.
+    const wrapper = `umask 077; export HOME=/root; export CODEX_HOME=${quote(options.codexHome ?? "/root/.codex")}; export CLAUDE_CONFIG_DIR=/root/.claude; export PATH=/opt/enoughfactory/node/bin:/root/.local/bin:$PATH; export IS_SANDBOX=1; ${providerFile ? `if [ -f ${quote(providerFile)} ]; then . ${quote(providerFile)}; fi;` : ""} exec setsid --wait sh -c 'echo $$ > "$1"; shift; exec "$@"' enough-agent /tmp/enoughfactory-${this.processKey}.pid "$@"`;
+    const invocation = dockerInvocation(this.endpoint, ["exec", "-i", "--user", "0", ...Object.keys(environment).flatMap(key => ["--env", key]), ...(cwd ? ["--workdir", cwd] : []), containerId, "sh", "-c", wrapper, "enough-agent", ...args]);
+    Object.assign(invocation.env, environment);
     this.process = spawnProcess(invocation.command, invocation.args, { stdio: "pipe", env: invocation.env }) as ChildProcessWithoutNullStreams;
     this.process.stderr.on("data", (chunk: Buffer) => { this.stderr = (this.stderr + chunk.toString()).slice(-16_384); });
     this.process.stdin.on("error", () => {});

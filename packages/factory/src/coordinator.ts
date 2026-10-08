@@ -4,15 +4,17 @@ import type {
   AttemptDetail, CandidateRef, ConfigureGoalInput, ControlRecord, ControllerRecordRequirement, CoordinatorOptions, CreateGoalInput,
   EvaluationRecord, ExecutionResult, GoalCheckRecord, PlanRecord, PlannedTask, RepositoryEvidence, TaskDetail,
 } from "./types.js";
-import { readCheckCommands, readEvaluation, readJsonObject, readPlan, readTasks, validateDependencies } from "./protocol.js";
-import { FactoryOperationError, FactoryDecisionError, FactoryControllerError, FactoryCapacityError } from "./errors.js";
-import { activeExecutionTasks, descendants, placementConstraint, sortReadyTasks, taskSchedulingBlocker, taskCheckInputBlocker } from "./scheduler.js";
+import { UI_QUALITY_CHECK_COMMAND } from "./types.js";
+import { readCheckCommands, readEvaluation, readJsonObject, readPlan, readTasks, validateDependencies, validateTaskExecution } from "./protocol.js";
+import { FactoryOperationError, FactoryDecisionError, FactoryControllerError, FactoryCapacityError, FactoryVerificationWaitError } from "./errors.js";
+import { activeExecutionTasks, descendants, deviceExecutionTargets, placementConstraint, selectExecutionTarget, sortReadyTasks, taskSchedulingBlocker, taskCheckInputBlocker, taskCapabilityBlocker, verificationOnlyReservation, effectiveTaskExecution } from "./scheduler.js";
 import { ControllerEvidence, controllerPrompt } from "./controller-evidence.js";
 
 const TABLE = {
   goals: "goals", tasks: "tasks", attempts: "attempts", decisions: "decisions",
   plans: "factory-plans", control: "factory-control", taskDetails: "factory-task-details",
   attemptDetails: "factory-attempt-details", evaluations: "factory-evaluations", goalChecks: "factory-goal-checks",
+  inspectionEvents: "factory-inspection-events",
 } as const;
 const terminalGoals = new Set<Goal["status"]>(["completed", "canceled", "failed"]);
 const activeAttempts = new Set<Attempt["status"]>(["created", "running", "unknown"]);
@@ -44,6 +46,7 @@ export class FactoryCoordinator {
     if (input.maxAttempts !== undefined && (!Number.isInteger(input.maxAttempts) || input.maxAttempts < 1)) throw new Error("Attempt budget must be a positive integer.");
     if (input.maxDurationMs !== undefined && (!Number.isFinite(input.maxDurationMs) || input.maxDurationMs <= 0)) throw new Error("Time budget must be positive.");
     const at = this.now(), autonomy = input.autonomy ?? "autonomous";
+    const execution = validateTaskExecution(input.execution);
     const goal: Goal = {
       id: randomUUID(), projectId: input.projectId, coordinatorId: this.options.deviceId,
       title: input.title?.trim() || input.objective.trim().split("\n")[0]!.slice(0, 96),
@@ -54,6 +57,7 @@ export class FactoryCoordinator {
       nextAction: autonomy === "manual" ? "Plan when requested" : "Plan the goal and its completion criteria",
       concurrency: Math.max(1, Math.min(32, Math.floor(input.concurrency ?? 8))),
       ...(input.maxAttempts === undefined ? {} : { maxAttempts: input.maxAttempts }),
+      ...(execution === undefined ? {} : { execution }),
     };
     this.options.store.transaction(() => {
       this.options.store.set(TABLE.goals, goal);
@@ -80,7 +84,8 @@ export class FactoryCoordinator {
           this.decision(goal.id, "controller-recovered", "An interrupted controller decision will be recomputed from current records.");
         }
         for (const attempt of this.attempts(goal.id).filter(item => this.isCurrent(item) && (activeAttempts.has(item.status) || (item.status === "succeeded" && this.task(item.taskId).status === "review")))) {
-          if (this.attemptDetail(attempt.id).capacityWait) continue;
+          const detail = this.attemptDetail(attempt.id);
+          if (detail.capacityWait || (attempt.status === "succeeded" && detail.verificationWait && detail.candidate && detail.phase === "checking")) continue;
           this.options.store.set(TABLE.attempts, { ...attempt, status: "unknown" as const });
           this.decision(goal.id, "attempt-recovered", "Execution status is unknown after service recovery; reconcile with its owner before continuing.", { attemptId: attempt.id });
         }
@@ -108,25 +113,26 @@ export class FactoryCoordinator {
     if (this.ticking) return;
     this.ticking = true;
     try {
+      const observedAt = Date.parse(this.now());
       for (const attempt of this.options.store.list<Attempt>(TABLE.attempts)) {
         if (attempt.status !== "retired" || this.options.store.get<AttemptDetail>(TABLE.attemptDetails, attempt.id)?.cancellation !== "requested" || this.cancellations.has(attempt.id)) continue;
         if (!this.options.devices().some(device => device.id === attempt.deviceId && device.online) || this.reconciling.has(attempt.id)) continue;
-        if (this.enabled && Date.now() - (this.lastObservation.get(attempt.id) ?? 0) < 10_000) continue;
-        this.lastObservation.set(attempt.id, Date.now());
+        if (this.enabled && observedAt - (this.lastObservation.get(attempt.id) ?? 0) < 10_000) continue;
+        this.lastObservation.set(attempt.id, observedAt);
         this.reconciling.add(attempt.id);
         this.track(this.acknowledgeCancel(attempt).finally(() => this.reconciling.delete(attempt.id)));
       }
       for (const goal of this.goals()) {
         if (goal.coordinatorId !== this.options.deviceId || terminalGoals.has(goal.status)) continue;
         for (const attempt of this.attempts(goal.id)) {
-          if (activeAttempts.has(attempt.status) && !this.busyAttempts.has(attempt.id) && !this.reconciling.has(attempt.id) && (!this.enabled || Date.now() - (this.lastObservation.get(attempt.id) ?? 0) >= 10_000)) {
+          if (activeAttempts.has(attempt.status) && !this.busyAttempts.has(attempt.id) && !this.reconciling.has(attempt.id) && (!this.enabled || observedAt - (this.lastObservation.get(attempt.id) ?? 0) >= 10_000)) {
             if (this.attemptDetail(attempt.id).capacityWait) {
               if (["paused", "waiting", "draft"].includes(this.goal(goal.id).status) || this.checkBudget(this.goal(goal.id)) || !this.admit(goal.id)) continue;
               this.busyAttempts.add(attempt.id);
               this.track(this.execute(attempt).finally(() => this.busyAttempts.delete(attempt.id)));
               continue;
             }
-            this.lastObservation.set(attempt.id, Date.now());
+            this.lastObservation.set(attempt.id, observedAt);
             this.reconciling.add(attempt.id);
             this.track(this.reconcileAttempt(attempt).finally(() => this.reconciling.delete(attempt.id)));
           }
@@ -200,7 +206,11 @@ export class FactoryCoordinator {
       this.writeGoal(goalId, { status: control.stage === "plan" ? "planning" : "running", error: undefined, nextAction: "Resume from current durable state" });
       this.decision(goalId, "resumed", "Coordination resumed from its retained plan and attempts.");
     });
-    for (const attempt of this.attempts(goalId)) this.lastObservation.delete(attempt.id);
+    for (const attempt of this.attempts(goalId)) {
+      this.lastObservation.delete(attempt.id);
+      const detail = this.attemptDetail(attempt.id);
+      if (detail.recoveryObservation) this.options.store.set(TABLE.attemptDetails, { ...detail, recoveryObservation: undefined });
+    }
     this.changed();
   }
 
@@ -223,6 +233,7 @@ export class FactoryCoordinator {
     if (input.maxDurationMs !== undefined && input.maxDurationMs !== null && (!Number.isFinite(input.maxDurationMs) || input.maxDurationMs <= 0)) throw new Error("maxDurationMs must be positive or null.");
     if (input.maxAttempts !== undefined && input.maxAttempts !== null && (!Number.isInteger(input.maxAttempts) || input.maxAttempts < 1)) throw new Error("Attempt budget must be a positive integer or null.");
     if (input.concurrency !== undefined && (!Number.isInteger(input.concurrency) || input.concurrency < 1 || input.concurrency > 32)) throw new Error("Concurrency must be between 1 and 32.");
+    const execution = validateTaskExecution(input.execution);
     this.options.store.transaction(() => {
       this.writeGoal(goalId, {
         ...(input.autonomy === undefined ? {} : { autonomy: input.autonomy }),
@@ -230,15 +241,17 @@ export class FactoryCoordinator {
         ...(input.runtime === undefined ? {} : { runtime: input.runtime }),
         ...(input.concurrency === undefined ? {} : { concurrency: input.concurrency }),
         ...(input.maxAttempts === undefined ? {} : { maxAttempts: input.maxAttempts ?? undefined }),
+        ...(execution === undefined ? {} : { execution }),
       });
       if (input.maxDurationMs !== undefined) this.options.store.set(TABLE.control, { ...this.control(goalId), maxDurationMs: input.maxDurationMs ?? undefined });
       if (input.autonomy && input.autonomy !== "manual" && goal.status === "draft") this.writeGoal(goalId, { status: this.control(goalId).stage === "plan" ? "planning" : "running" });
       this.decision(goalId, "configuration", "Goal execution settings updated. Approval changes apply to subsequently started turns.", {
         autonomy: input.autonomy, approvalMode: input.approvalMode, runtime: input.runtime, concurrency: input.concurrency,
-        maxAttempts: input.maxAttempts, maxDurationMs: input.maxDurationMs,
+        maxAttempts: input.maxAttempts, maxDurationMs: input.maxDurationMs, execution,
       });
       if (this.control(goalId).waitingFor === "budget-changed") this.wake(goalId, "Execution budget was updated.");
       else if (input.runtime && this.control(goalId).waitingFor === "runtime-available") this.wake(goalId, "The goal runtime was updated.");
+      else if (execution && this.control(goalId).waitingFor === "execution-capability") this.wake(goalId, "Execution requirements were updated.");
     });
     this.changed();
   }
@@ -268,10 +281,11 @@ export class FactoryCoordinator {
     this.changed();
   }
 
-  async steer(goalId: string, input: { objective?: string; context?: string; criteria?: string[]; autonomy?: Goal["autonomy"]; approvalMode?: Goal["approvalMode"] }): Promise<void> {
+  async steer(goalId: string, input: { objective?: string; context?: string; criteria?: string[]; autonomy?: Goal["autonomy"]; approvalMode?: Goal["approvalMode"]; execution?: Goal["execution"] }): Promise<void> {
     const goal = this.goal(goalId);
     if (terminalGoals.has(goal.status)) throw new Error("The goal is terminal.");
     if (input.objective !== undefined && !input.objective.trim()) throw new Error("The objective cannot be empty.");
+    const execution = validateTaskExecution(input.execution);
     const attempts = this.attempts(goalId).filter(attempt => activeAttempts.has(attempt.status));
     this.options.store.transaction(() => {
       const control = this.control(goalId);
@@ -282,6 +296,7 @@ export class FactoryCoordinator {
         ...(input.criteria === undefined ? {} : { criteria: [...new Set(input.criteria.map(value => value.trim()).filter(Boolean))] }),
         ...(input.autonomy === undefined ? {} : { autonomy: input.autonomy }),
         ...(input.approvalMode === undefined ? {} : { approvalMode: input.approvalMode }),
+        ...(execution === undefined ? {} : { execution }),
       });
       for (const task of this.tasks(goalId).filter(task => task.status !== "completed" && task.status !== "canceled")) this.writeTask(task.id, { status: "canceled" });
       for (const attempt of attempts) this.revoke(attempt);
@@ -329,11 +344,23 @@ export class FactoryCoordinator {
   }
 
   notifyCondition(condition: string, goalId?: string): void {
+    // A receipt can arrive while its pending check is returning. Retain the event
+    // before walking waits so that the result handler cannot park behind it.
+    if (condition === "inspection-evidence") for (const goal of this.goals()) {
+      if ((goalId && goal.id !== goalId) || terminalGoals.has(goal.status)) continue;
+      this.options.store.set(TABLE.inspectionEvents, { id: goal.id, revision: this.inspectionEventRevision(goal.id) + 1 });
+    }
     for (const task of this.options.store.list<FactoryTask>(TABLE.tasks)) {
       if (goalId && task.goalId !== goalId) continue;
       const goal = this.goal(task.goalId), detail = this.taskDetail(task.id);
+      const attempt = task.currentAttemptId ? this.options.store.get<Attempt>(TABLE.attempts, task.currentAttemptId) : undefined;
+      const attemptDetail = attempt && this.options.store.get<AttemptDetail>(TABLE.attemptDetails, attempt.id);
+      if (!terminalGoals.has(goal.status) && task.status === "review" && attempt && this.isCurrent(attempt) && attemptDetail?.verificationWait?.condition === condition) {
+        this.options.store.set(TABLE.attemptDetails, { ...attemptDetail, verificationWait: undefined });
+        this.decision(goal.id, "verification-woken", `Inspection evidence changed for ${task.title}; continue the same retained author attempt.`, { taskId: task.id, attemptId: attempt.id, condition });
+      }
       if (terminalGoals.has(goal.status) || detail.waitingFor !== condition || task.status !== "failed") continue;
-      if (taskCheckInputBlocker(detail)) continue;
+      if (taskCheckInputBlocker(detail) || taskCapabilityBlocker(effectiveTaskExecution(task, goal), this.options.devices(), undefined, goal.workspaceProvider ?? "git", goal.runtime)) continue;
       this.options.store.transaction(() => {
         this.writeTask(task.id, { status: "queued", currentAttemptId: undefined });
         this.options.store.set(TABLE.taskDetails, { ...detail, waitingFor: undefined, waitReason: undefined, waitSince: undefined });
@@ -402,14 +429,14 @@ export class FactoryCoordinator {
             this.options.store.get<AttemptDetail>(TABLE.attemptDetails, task.currentAttemptId ?? "")) }));
         return [
           "You are the EnoughFactory planner. Build the entire objective, preserving all explicit requirements. Make routine implementation decisions yourself.",
-          "Return one JSON object: {summary,criteria:string[],checks:string[],tasks:[{key,title,description,kind:'feature'|'unit'|'architecture'|'test',acceptanceCriteria:string[],expectedOutputs:string[],dependsOn:string[],checks:string[],requiredCheckEnvironment?:string[],estimatedMinutes?:number,writePaths?:string[],resources?:{cpus?:number,memoryGiB?:number},deviceId?:string}]}. Stable task keys must be unique, dependencies acyclic, checks focused and executable inside the isolated runtime.",
+          "Return one JSON object: {summary,criteria:string[],checks:string[],tasks:[{key,title,description,kind:'feature'|'unit'|'architecture'|'test',acceptanceCriteria:string[],expectedOutputs:string[],dependsOn:string[],checks:string[],requiredCheckEnvironment?:string[],execution?:{target?:'auto'|'container'|'host-macos',requiredCapabilities?:string[],delegatedCapabilities?:string[]},quality?:{platforms:('web'|'macos'|'ios-simulator')[],workflows:[{id,platform}],referenceIds:string[]},estimatedMinutes?:number,writePaths?:string[],resources?:{cpus?:number,memoryGiB?:number},deviceId?:string}]}. Stable task keys must be unique, dependencies acyclic, checks focused and executable on the configured target.",
+          "For material UI implementation or final UI delivery, declare explicit quality platforms, representative workflow identities and supplied referenceIds. Keep unrelated architecture/backend-only work independent; legacy absence does not acquire a global UI gate. Use execution.requiredCapabilities for requirements local to the author, and execution.delegatedCapabilities for browser or native tools another device can supply. Supported capabilities are linux-shell, mac-shell, chromium-inspection, apple-compilation, macos-app-inspection and ios-simulator-inspection. A Mac device running Linux containers is not a Mac-shell executor. Omitted task execution inherits the goal's explicit execution default; otherwise it preserves container execution. An explicit task execution replaces that default. Auto may select a configured Mac host for local Mac requirements. Plan only against the advertised inventory, and keep missing genuine capabilities explicit rather than substitute passing portable tests for native/visual verification.",
           "If a task requires independently supplied verification inputs, declare their names in requiredCheckEnvironment. Supported names are ENOUGH_EVIDENCE_ROOT, ENOUGH_NATIVE_UI_RECEIPT_DESCRIPTOR, ENOUGH_NATIVE_INDEX_SHA256 and ENOUGH_ACCEPTANCE_INDEX_SHA256. The coordinator will wait before dispatch until its authenticated check-input configuration contains every named value. Plan descriptions and checks cannot provision these values. Existing task-local external waits survive a stable-key replan; changing a plan is not evidence that their prerequisites arrived.",
           "Choose task kinds by outcome: feature delivers observable product behavior; unit implements a bounded component or change; architecture resolves a structural decision and preserves its rationale and handoff; test supplies focused verification for an identified uncertainty. Give each task concrete acceptance criteria and expected deliverables. Do not invent extra architecture/test tasks or mandatory reviews when the work does not need them.",
           "Every ordinary checks entry is a shell command, never an instruction or explanation. A structured validation profile explicitly advertised by the runtime is also a valid check; preserve its exact prefix and JSON rather than wrapping it in a shell command. For example use 'sh scripts/check-foundation.sh', not 'Run scripts/check-foundation.sh to validate the foundation'. Task checks verify only outputs available when that task and its actual prerequisites finish. An architecture or interface task should verify its deliverables without requiring the future application, packages or tests to exist. Plan-level checks are final whole-goal checks, run once on the integrated result after all tasks finish; do not copy them into every task or require expensive full-product verification at every layer. Empty task checks are acceptable when concrete deliverable evidence is the appropriate verification.",
           "Maximize useful parallel work: establish shared interfaces/contracts in small prerequisite tasks, then give independent implementations disjoint ownership. DependsOn is for actual required outputs, not preferred chronology or artificial phases. Avoid making every task depend on a broad setup task. Declare repository-relative writePaths (files, directories or globs) for likely writes, estimatedMinutes for effort and resources for meaningful CPU/memory needs. Estimates guide scheduling; do not invent precision. Keep verification proportionate; do not require human approval or ceremonies unless the goal's actual policy requires them.",
           "Do not claim implementation or completion. A task may include configured release/deployment actions. Recorded goal completion criteria are authoritative: return their exact text unchanged, including criteria added through user steering. Derive explicit observable goal criteria only when none are recorded. Put implementation-specific requirements in task acceptanceCriteria; routine replanning must not add paraphrased or duplicate goal criteria.",
           context,
-          `Devices: ${JSON.stringify(this.options.devices())}`,
           `Current whole-goal check contract: ${JSON.stringify({ revision: this.planRecord(goal.id)?.revision, checks: this.planRecord(goal.id)?.checks ?? [] })}`,
           `Already integrated work: ${JSON.stringify(integrated)}`,
           `Retained unfinished work: ${JSON.stringify(retained)}`,
@@ -440,6 +467,10 @@ export class FactoryCoordinator {
     for (const task of this.tasks(goal.id).filter(task => task.status === "review")) {
       if (!task.currentAttemptId || this.busyAttempts.has(task.currentAttemptId) || this.reconciling.has(task.currentAttemptId)) continue;
       const attempt = this.attempt(task.currentAttemptId);
+      // Unknown capture/integration effects use the bounded reconciliation lane.
+      // Scheduling them here bypasses that lane and creates a microtask retry loop.
+      if (attempt.status !== "succeeded") continue;
+      if (this.attemptDetail(attempt.id).verificationWait) continue;
       if (goal.status === "paused" && this.attemptDetail(attempt.id).candidate) continue;
       this.busyAttempts.add(attempt.id);
       this.track(this.processResult(attempt, this.attemptDetail(attempt.id).result ?? { status: "succeeded", text: "Recovered retained candidate." }).finally(() => this.busyAttempts.delete(attempt.id)));
@@ -448,7 +479,7 @@ export class FactoryCoordinator {
 
   private dispatch(goal: Goal, manageController = true): void {
     if (!this.admit(goal.id)) return;
-    const tasks = this.tasks(goal.id).filter(task => task.status !== "canceled");
+    const tasks = this.tasks(goal.id).filter(task => task.status !== "canceled").map(task => effectiveTaskExecution(task, goal));
     const failed = tasks.find(task => task.status === "failed" && !this.taskDetail(task.id).waitingFor);
     if (failed && manageController) {
       if (goal.autonomy === "autonomous" || this.taskDetail(failed.id).selected) {
@@ -462,10 +493,10 @@ export class FactoryCoordinator {
       if (goal.autonomy !== "manual") this.scheduleGoal(goal.id, () => this.evaluate(this.goal(goal.id)));
       this.changed(); return;
     }
-    const running = this.activeWork().filter(task => task.goalId === goal.id).length;
+    const running = this.activeWork().filter(task => task.goalId === goal.id && !verificationOnlyReservation(task)).length;
     let capacity = Math.max(0, goal.concurrency - running);
     let eligible = 0, placed = 0;
-    const verificationWaits: string[] = [];
+    const verificationWaits: string[] = [], capabilityWaits: string[] = [];
     const stableKeys = new Map(tasks.map(task => [task.id, this.taskDetail(task.id).key]));
     for (const task of sortReadyTasks(tasks, stableKeys)) {
       if (capacity === 0) break;
@@ -486,28 +517,36 @@ export class FactoryCoordinator {
       });
       const blocker = taskSchedulingBlocker(task, goal, tasks, active, conflicts, this.options.devices());
       if (blocker) {
+        if (blocker.kind === "execution-capability") capabilityWaits.push(blocker.reason);
         if (["device-unavailable", "device-capacity", "resource"].includes(blocker.kind)) eligible++;
         continue;
       }
       eligible++;
       const device = this.place(task);
       if (!device) continue;
+      const target = selectExecutionTarget(task, device, goal.workspaceProvider ?? "git", goal.runtime);
+      if (!target) continue;
       if (this.checkBudget(this.goal(goal.id))) return;
       const attempts = this.options.store.list<Attempt>(TABLE.attempts).filter(item => item.taskId === task.id);
-      const attempt: Attempt = { id: randomUUID(), taskId: task.id, generation: Math.max(0, ...attempts.map(item => item.generation)) + 1, deviceId: device.id, status: "created", startedAt: this.now() };
+      const attempt: Attempt = { id: randomUUID(), taskId: task.id, generation: Math.max(0, ...attempts.map(item => item.generation)) + 1, deviceId: device.id, executionTargetId: target.id, executionTargetKind: target.kind, status: "created", startedAt: this.now() };
       this.options.store.transaction(() => {
         this.options.store.set(TABLE.attempts, attempt);
         this.options.store.set<AttemptDetail>(TABLE.attemptDetails, { id: attempt.id, goalId: goal.id, goalRevision: goal.revision, assignmentGoalRevision: goal.revision, cancellation: "none", phase: "preparing",
-          contract: { title: task.title, description: task.description, kind: task.kind, acceptanceCriteria: task.acceptanceCriteria, expectedOutputs: task.expectedOutputs, estimatedMinutes: task.estimatedMinutes, writePaths: task.writePaths, resources: task.resources, dependsOn: [...task.dependsOn], checks: this.taskChecks(task.id), planRevision: detail.planRevision } });
+          contract: { title: task.title, description: task.description, kind: task.kind, acceptanceCriteria: task.acceptanceCriteria, expectedOutputs: task.expectedOutputs, estimatedMinutes: task.estimatedMinutes, writePaths: task.writePaths, resources: task.resources, execution: task.execution, quality: task.quality, dependsOn: [...task.dependsOn], checks: this.taskChecks(task.id), planRevision: detail.planRevision } });
         this.writeTask(task.id, { status: "running", currentAttemptId: attempt.id, deviceId: device.id });
-        this.decision(goal.id, "dispatch", `Dispatched ${task.title} to ${device.name}.`, { taskId: task.id, attemptId: attempt.id, generation: attempt.generation, deviceId: device.id });
+        this.decision(goal.id, "dispatch", `Dispatched ${task.title} to ${device.name}.`, { taskId: task.id, attemptId: attempt.id, generation: attempt.generation, deviceId: device.id, executionTargetId: target.id, executionTargetKind: target.kind });
       });
       capacity--; placed++; this.busyAttempts.add(attempt.id);
       this.track(this.execute(attempt).finally(() => this.busyAttempts.delete(attempt.id)));
     }
     if (placed) this.changed();
+    else if (capabilityWaits.length && !running && !failed && manageController && !tasks.some(task => task.currentAttemptId && this.attemptDetail(task.currentAttemptId).verificationWait)) this.wait(goal.id, [...new Set(capabilityWaits)].join(" "), "execution-capability");
     else if (verificationWaits.length && !running && !failed) {
       const reason = `Waiting for verification evidence from the coordinator for ${verificationWaits.join("; ")}.`;
+      if (this.goal(goal.id).nextAction !== reason) { this.writeGoal(goal.id, { nextAction: reason }); this.changed(); }
+    }
+    else if (!running && !failed && tasks.some(task => task.currentAttemptId && this.attemptDetail(task.currentAttemptId).verificationWait)) {
+      const reason = "Waiting for inspection evidence; successful source authoring remains retained.";
       if (this.goal(goal.id).nextAction !== reason) { this.writeGoal(goal.id, { nextAction: reason }); this.changed(); }
     }
     else if (manageController && !failed && eligible && !running) this.wait(goal.id, goal.workspaceProvider === "artifactfs" ? "Waiting for an online worker with ArtifactFS support and capacity." : "Waiting for an online worker with capacity.", "device-online");
@@ -516,7 +555,9 @@ export class FactoryCoordinator {
 
   private async execute(attempt: Attempt): Promise<void> {
     let executing = false;
-    const task = this.task(attempt.taskId), goal = this.goal(task.goalId), project = this.project(goal);
+    const currentTask = this.task(attempt.taskId), goal = this.goal(currentTask.goalId), project = this.project(goal);
+    const frozenContract = this.attemptDetail(attempt.id).contract;
+    const task = frozenContract ? { ...currentTask, execution: frozenContract.execution } : currentTask;
     try {
       const retained = this.attemptDetail(attempt.id);
       const workspace = retained.capacityWait === "executing" && retained.workspace ? retained.workspace
@@ -527,7 +568,7 @@ export class FactoryCoordinator {
         this.writeAttempt(attempt.id, { status: "running", baseCommit: workspace.baseCommit, ...(workspace.sessionId ? { sessionId: workspace.sessionId } : {}) });
       });
       executing = true;
-      const result = await this.options.runtime.execute({ goal: this.goal(goal.id), task: this.task(task.id), attempt: this.attempt(attempt.id), workspace, project, prompt: this.executionPrompt(goal, task), assignmentGoalRevision: this.attemptDetail(attempt.id).assignmentGoalRevision ?? this.attemptDetail(attempt.id).goalRevision });
+      const result = await this.options.runtime.execute({ goal: this.goal(goal.id), task, attempt: this.attempt(attempt.id), workspace, project, prompt: this.executionPrompt(goal, task), assignmentGoalRevision: this.attemptDetail(attempt.id).assignmentGoalRevision ?? this.attemptDetail(attempt.id).goalRevision });
       if (!this.isCurrent(attempt)) return;
       await this.processResult(attempt, result);
     } catch (error) {
@@ -545,6 +586,7 @@ export class FactoryCoordinator {
     const { spend: _legacySpend, ...currentResult } = result as ExecutionResult & { spend?: unknown };
     result = currentResult;
     const attempt = this.attempt(attemptInput.id), task = this.task(attempt.taskId), goal = this.goal(task.goalId), project = this.project(goal);
+    const inspectionEventRevision = this.inspectionEventRevision(goal.id);
     if (result.status === "waiting" && result.agentStarted === false && result.wakeCondition === "host-disk-space") {
       this.deferExecution(attempt, result.waitReason || "Waiting for host disk space before provider setup.", "executing"); return;
     }
@@ -589,25 +631,36 @@ export class FactoryCoordinator {
         });
       }
       if (this.goal(goal.id).status === "paused") { this.writeGoal(goal.id, { nextAction: "Candidate retained; integration waits for resume" }); this.changed(); return; }
-      const checks = this.attemptDetail(attempt.id).contract?.checks ?? this.taskChecks(task.id);
+      const frozenContract = this.attemptDetail(attempt.id).contract;
+      const quality = frozenContract ? frozenContract.quality : task.quality;
+      if (quality && !this.options.workspaces.qualityChecks) throw new Error("Configured UI acceptance requires the factory's verified inspection adapter. Source is retained; UI acceptance cannot be replaced by shell check success.");
+      const checks = [...new Set([...(frozenContract?.checks ?? this.taskChecks(task.id)), ...(quality ? [UI_QUALITY_CHECK_COMMAND] : [])])];
+      const verification = { goal: this.goal(goal.id), task: this.task(task.id), attempt: this.attempt(attempt.id), quality };
       let checkResults = this.attemptDetail(attempt.id).checks;
       if (!checkResults) {
-        checkResults = await this.options.workspaces.check(project, candidate, checks);
+        checkResults = await this.options.workspaces.check(project, candidate, checks, verification);
         if (!this.isCurrent(attempt)) return;
         if (checkResults.some(check => check.candidateCommit !== candidate!.commit)) throw new Error("Verification returned evidence for a different candidate.");
+        // A real failed check needs repair even when a separate visual receipt is
+        // still pending; missing evidence cannot conceal an observed defect.
+        const pending = checkResults.every(check => check.passed || check.recovery?.condition === "inspection-evidence")
+          ? checkResults.find(check => !check.passed && check.recovery?.condition === "inspection-evidence") : undefined;
+        if (pending?.recovery) throw new FactoryVerificationWaitError(pending.recovery.reason);
         this.options.store.set(TABLE.attemptDetails, { ...this.attemptDetail(attempt.id), checks: checkResults });
       }
       if (checkResults.some(check => !check.passed)) throw new Error(`Candidate checks failed:\n${checkResults.filter(check => !check.passed).map(check => `${check.command}\n${check.output}`).join("\n")}`);
       if (checks.some(command => !checkResults!.some(check => check.command === command))) throw new Error("Verification omitted a configured check.");
+      if (quality && !checkResults.some(check => check.command === UI_QUALITY_CHECK_COMMAND && check.passed && check.checkedCommit === candidate.commit)) throw new Error("UI acceptance did not verify the exact saved candidate.");
       if (!this.integrationAllowed(attempt)) { this.changed(); return; }
       this.options.store.set(TABLE.attemptDetails, { ...this.attemptDetail(attempt.id), phase: "integrating" as const });
-      const integration = await this.options.workspaces.integrate(project, candidate, { checks, isCurrent: () => this.integrationAllowed(attempt) });
+      const integration = await this.options.workspaces.integrate(project, candidate, { checks, isCurrent: () => this.integrationAllowed(attempt), verification });
       if (!this.isCurrent(attempt)) return;
       if (integration.candidateCommit !== candidate.commit) throw new Error("Integration reported a different candidate.");
       if (integration.checks.some(check => !check.passed)) throw new Error("The combined repository did not pass its integration checks.");
       if (checks.some(command => !integration.checks.some(check => check.command === command && check.passed))) throw new Error("Integration omitted a required combined-result check.");
+      if (quality && !integration.checks.some(check => check.command === UI_QUALITY_CHECK_COMMAND && check.passed && check.candidateCommit === candidate.commit && check.checkedCommit === integration.commit)) throw new Error("UI acceptance did not verify the actual combined integration source.");
       this.options.store.transaction(() => {
-        this.options.store.set(TABLE.attemptDetails, { ...this.attemptDetail(attempt.id), integration, phase: "done" as const });
+        this.options.store.set(TABLE.attemptDetails, { ...this.attemptDetail(attempt.id), integration, phase: "done" as const, recoveryObservation: undefined });
         this.writeTask(task.id, { status: "completed" });
         this.writeAttempt(attempt.id, { status: "succeeded", endedAt: this.now(), error: undefined });
         this.decision(goal.id, "integrated", `${task.title} integrated at ${integration.commit.slice(0, 12)}.`, { taskId: task.id, attemptId: attempt.id, candidate: candidate.commit, commit: integration.commit, checks: integration.checks });
@@ -615,7 +668,15 @@ export class FactoryCoordinator {
       if (this.options.workspaces.release) await this.options.workspaces.release(detail.workspace).catch(() => undefined);
     } catch (error) {
       if (this.isCurrent(attempt)) {
-        if (error instanceof FactoryCapacityError) {
+        if (error instanceof FactoryVerificationWaitError) {
+          const retained = this.attemptDetail(attempt.id);
+          const receiptArrived = this.inspectionEventRevision(goal.id) !== inspectionEventRevision;
+          this.options.store.set(TABLE.attemptDetails, { ...retained, phase: "checking" as const,
+            verificationWait: receiptArrived ? undefined : { condition: "inspection-evidence" as const, reason: error.message, since: retained.verificationWait?.since ?? this.now() } });
+          this.writeAttempt(attempt.id, { status: "succeeded", error: undefined });
+          this.writeTask(task.id, { status: "review" });
+          this.decision(goal.id, receiptArrived ? "verification-recheck" : "verification-waiting", receiptArrived ? "Inspection evidence changed while the check returned; recheck this retained source once." : error.message, { taskId: task.id, attemptId: attempt.id, candidateId: retained.candidate?.id });
+        } else if (error instanceof FactoryCapacityError) {
           this.writeTask(task.id, { status: "review" });
           this.capacityWait(goal.id, error.message);
         } else if (this.goal(goal.id).status === "paused") {
@@ -630,7 +691,8 @@ export class FactoryCoordinator {
 
   private async reconcileAttempt(attempt: Attempt): Promise<void> {
     if (!this.isCurrent(attempt)) return;
-    const task = this.task(attempt.taskId), goal = this.goal(task.goalId), detail = this.attemptDetail(attempt.id);
+    const storedTask = this.task(attempt.taskId), goal = this.goal(storedTask.goalId), detail = this.attemptDetail(attempt.id);
+    const task = detail.contract ? { ...storedTask, execution: detail.contract.execution } : storedTask;
     if (!this.options.devices().some(device => device.id === attempt.deviceId && device.online)) {
       if (attempt.status !== "unknown") this.markUnknown(attempt, "The owning device is offline; termination is not known.");
       return;
@@ -640,8 +702,10 @@ export class FactoryCoordinator {
         const integrated = await this.options.workspaces.reconcileIntegration(this.project(goal), detail.candidate);
         if (!this.isCurrent(attempt)) return;
         if (integrated) {
+          const quality = detail.contract ? detail.contract.quality : task.quality;
+          if (quality && (!this.options.workspaces.qualityChecks || !integrated.checks.some(check => check.command === UI_QUALITY_CHECK_COMMAND && check.passed && check.candidateCommit === detail.candidate!.commit && check.checkedCommit === integrated.commit))) throw new Error("Recovered integration has no verified UI acceptance for its actual source. Preserve the outcome and reconcile its evidence before accepting the task.");
           this.options.store.transaction(() => {
-            this.options.store.set(TABLE.attemptDetails, { ...detail, integration: integrated, phase: "done" as const });
+            this.options.store.set(TABLE.attemptDetails, { ...detail, integration: integrated, phase: "done" as const, recoveryObservation: undefined });
             this.writeAttempt(attempt.id, { status: "succeeded", endedAt: this.now() });
             this.writeTask(task.id, { status: "completed" });
             this.decision(goal.id, "integration-recovered", "The exact candidate was already integrated before the coordinator restarted.", { attemptId: attempt.id, commit: integrated.commit });
@@ -650,6 +714,7 @@ export class FactoryCoordinator {
         }
       }
       if (["capturing", "checking", "integrating"].includes(detail.phase) && detail.result?.status === "succeeded") {
+        if (detail.recoveryObservation?.phase === detail.phase && Date.parse(detail.recoveryObservation.retryAt) > Date.parse(this.now())) return;
         await this.processResult(attempt, detail.result); return;
       }
       const report = await this.options.runtime.reconcile(attempt);
@@ -658,6 +723,7 @@ export class FactoryCoordinator {
         if (attempt.status !== "unknown") this.markUnknown(attempt, "The owner has not confirmed the execution outcome."); return;
       }
       if (report.status === "running") {
+        if (detail.recoveryObservation) this.options.store.set(TABLE.attemptDetails, { ...detail, recoveryObservation: undefined });
         this.writeAttempt(attempt.id, { status: "running", error: undefined });
         this.recoveredExecutionProgress(attempt, task);
         if (attempt.status !== "running") this.changed();
@@ -676,7 +742,7 @@ export class FactoryCoordinator {
         if (suspended) { this.changed(); return; }
         this.recoveredExecutionProgress(attempt, task);
         this.changed();
-        const result = await this.options.runtime.execute({ goal: this.goal(goal.id), task: this.task(task.id), attempt: this.attempt(attempt.id), workspace, project: this.project(goal), prompt: this.executionPrompt(goal, task), assignmentGoalRevision: this.attemptDetail(attempt.id).assignmentGoalRevision ?? this.attemptDetail(attempt.id).goalRevision });
+        const result = await this.options.runtime.execute({ goal: this.goal(goal.id), task, attempt: this.attempt(attempt.id), workspace, project: this.project(goal), prompt: this.executionPrompt(goal, task), assignmentGoalRevision: this.attemptDetail(attempt.id).assignmentGoalRevision ?? this.attemptDetail(attempt.id).goalRevision });
         if (this.isCurrent(attempt)) await this.processResult(attempt, result);
         return;
       }
@@ -806,7 +872,7 @@ export class FactoryCoordinator {
       const recordRequirements: ControllerRecordRequirement[] = [];
       const prompt = controllerPrompt(evidence => [
         "You are the EnoughFactory completion evaluator. Audit the entire original objective against the actual repository and retained execution evidence. A worker's final response, green unrelated tests or partial implementation do not prove completion.",
-        "Inspect/run only meaningful checks needed for uncertain criteria. Return JSON {complete:boolean,summary:string,criteria:[{criterion:string,satisfied:boolean,evidence:string[]}],additionalTasks?:[{key,title,description,kind:'feature'|'unit'|'architecture'|'test',acceptanceCriteria:string[],expectedOutputs:string[],dependsOn:string[],checks:string[],requiredCheckEnvironment?:string[]}],waitReason?:string,wakeCondition?:string}. Use task kinds for concrete delivery outcomes, not mandatory role ceremonies. Tasks needing independently supplied verification inputs must declare the supported requiredCheckEnvironment names; a prose prerequisite does not gate dispatch.",
+        "Inspect/run only meaningful checks needed for uncertain criteria. Return JSON {complete:boolean,summary:string,criteria:[{criterion:string,satisfied:boolean,evidence:string[]}],additionalTasks?:[{key,title,description,kind:'feature'|'unit'|'architecture'|'test',acceptanceCriteria:string[],expectedOutputs:string[],dependsOn:string[],checks:string[],requiredCheckEnvironment?:string[],execution?:{target?:'auto'|'container'|'host-macos',requiredCapabilities?:string[],delegatedCapabilities?:string[]},quality?:{platforms:('web'|'macos'|'ios-simulator')[],workflows:[{id,platform}],referenceIds:string[]}}],waitReason?:string,wakeCondition?:string}. Use task kinds for concrete delivery outcomes, not mandatory role ceremonies. Tasks needing independently supplied verification inputs must declare the supported requiredCheckEnvironment names; a prose prerequisite does not gate dispatch. Select author requirements and delegated tools from the execution inventory; absence of native or visual support cannot be replaced by portable test success.",
         "Use each criterion's exact original text. Every satisfied criterion requires concrete current-state evidence such as files, runtime outcomes, exact commit check records or published URLs. If something remains, add actionable tasks. Never weaken the objective to declare completion. No mandatory human gate applies to autonomous plus approve-all.",
         "Also inspect the accepted tasks' acceptance criteria and expected deliverables. Integration records prove accepted source, not that every requested behavior or deliverable exists. Add concrete follow-up work for any unmet contract that matters to the original objective.",
         "The current integrated primary repository and attached current project folders are the sources for the final product audit. Historical candidate IDs and CAS references identify retained source; their bodies are optional evidence and are not automatically transferred for evaluation. Use the mounted manifest to determine actual available files. Never claim to have inspected a historical candidate body merely from its identity or integration record.",
@@ -892,7 +958,9 @@ export class FactoryCoordinator {
         ...(task.expectedOutputs ?? previous?.expectedOutputs ? { expectedOutputs: task.expectedOutputs ?? previous?.expectedOutputs } : {}),
         ...(task.estimatedMinutes ?? previous?.estimatedMinutes ? { estimatedMinutes: task.estimatedMinutes ?? previous?.estimatedMinutes } : {}),
         ...(task.writePaths ?? previous?.writePaths ? { writePaths: task.writePaths ?? previous?.writePaths } : {}),
-        ...(task.resources ?? previous?.resources ? { resources: task.resources ?? previous?.resources } : {}) });
+        ...(task.resources ?? previous?.resources ? { resources: task.resources ?? previous?.resources } : {}),
+        ...(task.execution ?? previous?.execution ? { execution: task.execution ?? previous?.execution } : {}),
+        ...(task.quality ?? previous?.quality ? { quality: task.quality ?? previous?.quality } : {}) });
       this.options.store.set<TaskDetail>(TABLE.taskDetails, { ...previousDetail, id, key: task.key, checks: task.checks, planChecks: [], planRevision: goal.revision, waitingFor: waiting ? previousDetail.waitingFor : undefined, waitReason: waiting ? previousDetail.waitReason : undefined, waitSince: waiting ? previousDetail.waitSince : undefined,
         requiredCheckEnvironment: task.requiredCheckEnvironment ?? previousDetail?.requiredCheckEnvironment,
         repairInstructions: supersededRepair ? undefined : previousDetail?.repairInstructions, priorRepairInstructions, replanInstructions, selected: goal.autonomy === "autonomous", failureSignatures: previousDetail?.failureSignatures ?? [] });
@@ -926,7 +994,7 @@ export class FactoryCoordinator {
     const id = randomUUID();
     this.operationControllers.get(goal.id)?.abort();
     this.operationControllers.set(goal.id, new AbortController());
-    this.options.store.set(TABLE.control, { ...this.control(goal.id), operation: { id, revision: goal.revision, kind } });
+    this.options.store.set(TABLE.control, { ...this.control(goal.id), operation: { id, revision: goal.revision, kind, inspectionEventRevision: this.inspectionEventRevision(goal.id) } });
     return id;
   }
   private operationCurrent(goalId: string, id: string): boolean {
@@ -937,6 +1005,23 @@ export class FactoryCoordinator {
     if (!this.operationCurrent(goalId, id)) return;
     this.options.store.transaction(() => {
       const control = this.control(goalId);
+      if (error instanceof FactoryControllerError && error.recovery === "inspection-evidence") {
+        const receiptArrived = control.operation?.inspectionEventRevision !== undefined && control.operation.inspectionEventRevision !== this.inspectionEventRevision(goalId);
+        this.options.store.set(TABLE.control, { ...control, operation: undefined, wakeAt: undefined,
+          waitingFor: receiptArrived ? undefined : "inspection-evidence", waitReason: receiptArrived ? undefined : this.error(error) });
+        if (receiptArrived) {
+          this.writeGoal(goalId, { status: control.stage === "plan" ? "planning" : "running", error: undefined, nextAction: "Inspection evidence changed; continue the retained controller review" });
+          this.decision(goalId, "controller-inspection-recheck", "Inspection evidence changed while its controller wait was returning; continue the same review.");
+        } else if (control.stage === "diagnose" || (control.stage === "plan" && control.replanTaskIds?.length)) {
+          this.writeGoal(goalId, { status: "running", nextAction: "Controller review waits for inspection evidence; independent work can continue" });
+          this.decision(goalId, "controller-inspection-waiting", this.error(error));
+        } else {
+          // Let wait() persist the visible state while preserving stage/manualAction
+          // and the unchanged preparation-failure budget.
+          this.wait(goalId, this.error(error), "inspection-evidence");
+        }
+        this.changed(); return;
+      }
       if (error instanceof FactoryDecisionError) {
         const signature = createHash("sha256").update(this.error(error)).digest("hex");
         const count = (control.decisionFailures?.count ?? 0) + 1;
@@ -994,10 +1079,17 @@ export class FactoryCoordinator {
     this.changed();
   }
   private markUnknown(attempt: Attempt, error: unknown): void {
-    this.writeAttempt(attempt.id, { status: "unknown", error: this.error(error) });
+    const reason = this.error(error), detail = this.attemptDetail(attempt.id), prior = detail.recoveryObservation;
+    const repeated = prior?.phase === detail.phase && prior.reason === reason;
+    const failures = repeated ? prior.failures + 1 : 1;
+    this.options.store.set(TABLE.attemptDetails, { ...detail, recoveryObservation: { phase: detail.phase, reason, failures,
+      retryAt: new Date(Date.parse(this.now()) + controllerRetryDelays[Math.min(failures - 1, controllerRetryDelays.length - 1)]!).toISOString() } });
+    this.lastObservation.set(attempt.id, Date.parse(this.now()));
+    this.writeAttempt(attempt.id, { status: "unknown", error: reason });
     const goalId = this.task(attempt.taskId).goalId;
     this.writeGoal(goalId, { nextAction: "Reconcile the owner and its effect journal before retrying" });
-    this.decision(goalId, "execution-unknown", this.error(error), { attemptId: attempt.id }); this.changed();
+    if (!repeated) this.decision(goalId, "execution-unknown", reason, { attemptId: attempt.id });
+    this.changed();
   }
   private failAttempt(attempt: Attempt, error: unknown): void {
     const task = this.task(attempt.taskId), detail = this.taskDetail(task.id), text = this.error(error);
@@ -1011,16 +1103,26 @@ export class FactoryCoordinator {
     }); this.changed();
   }
   private place(task: FactoryTask) {
+    task = effectiveTaskExecution(task, this.goal(task.goalId));
     const load = this.activeWork();
     const provider = this.goal(task.goalId).workspaceProvider ?? 'git';
-    return this.options.devices().filter(device => device.online && (provider === 'git' || device.workspaceProviders?.includes(provider)) && (!task.deviceId || task.deviceId === device.id) && !placementConstraint(task, device, load))
-      .sort((a, b) => load.filter(item => item.deviceId === a.id).length / (a.capacity ?? 2) - load.filter(item => item.deviceId === b.id).length / (b.capacity ?? 2) || Number(b.local) - Number(a.local) || a.id.localeCompare(b.id))[0];
+    const runtime = this.goal(task.goalId).runtime;
+    const devices = this.options.devices();
+    if (taskCapabilityBlocker(task, devices, undefined, provider, runtime)) return undefined;
+    const utilization = (device: typeof devices[number]) => {
+      const target = selectExecutionTarget(task, device, provider, runtime)!;
+      const active = load.filter(item => !verificationOnlyReservation(item) && item.deviceId === device.id && ((item as FactoryTask & Pick<Attempt, "executionTargetKind">).executionTargetKind ?? "container") === target.kind).length;
+      return active / Math.max(1, target.capacity ?? (target.kind === "container" ? device.capacity ?? 2 : 1));
+    };
+    return devices.filter(device => device.online && (!task.deviceId || task.deviceId === device.id) && !placementConstraint(task, device, load, provider, runtime))
+      .sort((a, b) => utilization(a) - utilization(b) || Number(b.local) - Number(a.local) || a.id.localeCompare(b.id))[0];
   }
   private activeWork(): FactoryTask[] {
     const attempts = this.options.store.list<Attempt>(TABLE.attempts);
     const details = new Map(attempts.map(attempt => [attempt.id, this.options.store.get<AttemptDetail>(TABLE.attemptDetails, attempt.id)]));
     const unconfirmed = new Set(attempts.filter(attempt => attempt.status === "retired" && details.get(attempt.id)?.cancellation === "requested").map(attempt => attempt.id));
-    return activeExecutionTasks(this.options.store.list<FactoryTask>(TABLE.tasks), attempts, unconfirmed, new Map(attempts.map(attempt => [attempt.id, details.get(attempt.id)?.contract])));
+    const verificationWaits = new Set(attempts.filter(attempt => details.get(attempt.id)?.verificationWait).map(attempt => attempt.id));
+    return activeExecutionTasks(this.options.store.list<FactoryTask>(TABLE.tasks), attempts, unconfirmed, new Map(attempts.map(attempt => [attempt.id, details.get(attempt.id)?.contract])), verificationWaits);
   }
   private hasAvailableDevice(goal: Goal): boolean {
     return this.tasks(goal.id).filter(task => ["queued", "ready"].includes(task.status)).some(task => !!this.place(task));
@@ -1054,7 +1156,7 @@ export class FactoryCoordinator {
   }
   private wake(goalId: string, reason: string): void {
     const goal = this.goal(goalId), control = this.control(goalId);
-    const stage = control.waitingFor === "host-disk-space" || control.controllerFailures && ["plan", "diagnose", "evaluate"].includes(control.stage) ? control.stage : this.nextStage(goalId);
+    const stage = ["host-disk-space", "inspection-evidence"].includes(control.waitingFor ?? "") || control.controllerFailures && ["plan", "diagnose", "evaluate"].includes(control.stage) ? control.stage : this.nextStage(goalId);
     this.options.store.transaction(() => {
       this.options.store.set(TABLE.control, { ...this.control(goalId), stage, waitingFor: undefined, waitReason: undefined, wakeAt: undefined });
       this.writeGoal(goalId, { status: stage === "plan" ? "planning" : "running", error: undefined, nextAction: reason });
@@ -1092,21 +1194,32 @@ export class FactoryCoordinator {
     // Older services embedded complete failed check logs here. Keep requirements/steering/handoff exact,
     // while treating the diagnostic reason like the other retained failure text.
     const reason = control.replanReason && evidence ? evidence.text(control.replanReason, `${TABLE.control}/${goal.id}.replanReason`, 8192) : undefined;
-    return `Original objective:\n${goal.objective}\n\nRequired completion criteria:\n${goal.criteria.map(value => `- ${value}`).join("\n")}\n\nAutonomy: ${goal.autonomy}; approvals: ${goal.approvalMode}.\n\nSteering context:\n${control.steering.join("\n")}\n\nReplanning reason:\n${reason?.omittedCharacters ? JSON.stringify(reason) : control.replanReason ?? "Initial plan"}${control.replanInstructions ? `\n\nCurrent diagnosis handoff:\n${control.replanInstructions}` : ""}`;
+    const devices = this.options.devices();
+    const executionInventory = { devices: [...devices].sort((left, right) => Number(right.online) - Number(left.online) || Number(right.local) - Number(left.local) || left.id.localeCompare(right.id)).slice(0, 32).map(device => ({
+      id: device.id, name: device.name.slice(0, 128), online: device.online, targets: deviceExecutionTargets(device).slice(0, 4).map(target => ({
+        id: target.id, kind: target.kind, protocolVersion: target.protocolVersion, readiness: target.readiness, capacity: target.capacity, resources: target.resources, workspaceProviders: target.workspaceProviders, runtimes: target.runtimes,
+        reason: target.reason?.slice(0, 256), capabilities: target.capabilities.slice(0, 6).map(capability => ({ kind: capability.kind, readiness: capability.readiness, version: capability.version?.slice(0, 128), reason: capability.reason?.slice(0, 256) })),
+      })),
+    })), omittedDevices: Math.max(0, devices.length - 32) };
+    return `Original objective:\n${goal.objective}\n\nRequired completion criteria:\n${goal.criteria.map(value => `- ${value}`).join("\n")}\n\nAutonomy: ${goal.autonomy}; approvals: ${goal.approvalMode}.\n\nGoal execution default:\n${JSON.stringify(goal.execution ?? { target: "container" })}\n\nExecution inventory:\n${JSON.stringify(executionInventory)}\n\nSteering context:\n${control.steering.join("\n")}\n\nReplanning reason:\n${reason?.omittedCharacters ? JSON.stringify(reason) : control.replanReason ?? "Initial plan"}${control.replanInstructions ? `\n\nCurrent diagnosis handoff:\n${control.replanInstructions}` : ""}`;
   }
   private executionPrompt(goal: Goal, task: FactoryTask): string {
     const detail = this.executionTaskDetail(task);
+    const attempt = task.currentAttemptId ? this.options.store.get<Attempt>(TABLE.attempts, task.currentAttemptId) : undefined;
+    const target = attempt?.executionTargetKind ?? "container";
     const guidance = {
       feature: "Feature contract: deliver the observable product behavior across the necessary layers. Account for the acceptance scenarios, including relevant failure or loading behavior. Report concrete behavior and evidence rather than only implementation details.",
       unit: "Unit contract: complete the bounded component or change described by this task. Preserve surrounding interfaces and integrate with its callers. Verify the relevant behavior without expanding into unrelated work.",
       architecture: "Architecture contract: resolve the structural decision against the actual source and requirements. Preserve the chosen design, rationale, tradeoffs and actionable handoff in repository deliverables. Implement a technical foundation only when the task asks for it; a conversational proposal alone is not a deliverable.",
       test: "Test contract: address the identified verification uncertainty with meaningful checks or product scenarios. Record actual results and limitations, and preserve reusable verification where requested. Do not add tests that merely mirror implementation or claim evidence from checks you did not run.",
     };
-    return ["You are executing an EnoughFactory task inside its isolated full-permission container. Make routine decisions and deliver the requested outcome. Run focused relevant checks, preserve useful work, and finish with evidence of what actually changed. Do not stop at a proposal.", this.context(goal), `Task: ${task.title}\n${task.description}`, task.kind ? guidance[task.kind] : "Generic task contract: complete the described work and provide concrete evidence of its outcome.",
+    return [`You are executing an EnoughFactory task ${target === "host-macos" ? "on the configured Mac host in its private project workspace" : "inside its isolated full-permission container"}. Make routine decisions and deliver the requested outcome. Run focused relevant checks, preserve useful work, and finish with evidence of what actually changed. Do not stop at a proposal.`, this.context(goal), `Task: ${task.title}\n${task.description}`, task.kind ? guidance[task.kind] : "Generic task contract: complete the described work and provide concrete evidence of its outcome.",
+      `Execution requirements: ${JSON.stringify(task.execution ?? { target: "container" })}. Delegated tools are separate from the author runtime; use only configured capabilities and retain their actual observations and results.`,
+      ...(task.quality ? [`Required UI acceptance: ${JSON.stringify(task.quality)}. Use real inspection tools, view the actual screenshot images, exercise the named workflows and compare the configured references. Submit the authenticated current-source quality report through the factory's quality tool; passing a build or writing a report alone does not satisfy this acceptance contract.`] : []),
       `Task acceptance criteria:\n${task.acceptanceCriteria?.map(value => `- ${value}`).join("\n") || "Use the task description and goal criteria."}`,
       `Expected deliverables:\n${task.expectedOutputs?.map(value => `- ${value}`).join("\n") || "Preserved changes and a factual outcome summary."}`,
       "A few passing scenarios do not complete this task. Continue in-scope work until its acceptance criteria and expected deliverables are satisfied and relevant checks pass. Investigate and repair your own check failures before ending. If a genuine dependency outside this task's scope prevents progress, preserve useful work and identify the exact missing API or behavior and its owner; do not leave unrelated in-scope work unfinished.",
-      `Planned write paths: ${JSON.stringify(task.writePaths ?? "Not declared on this legacy task")}. Other independent work may run in parallel. Preserve shared interfaces, keep changes focused on this task and report any necessary changes outside its declared scope. These paths coordinate ownership; your container retains full permissions.`,
+      `Planned write paths: ${JSON.stringify(task.writePaths ?? "Not declared on this legacy task")}. Other independent work may run in parallel. Preserve shared interfaces, keep changes focused on this task and report any necessary changes outside its declared scope. These paths coordinate ownership; ${target === "host-macos" ? "host execution follows the configured project/device access scope" : "your container retains full permissions"}.`,
       ...(detail.lastCandidate ? [`Latest retained source input: ${JSON.stringify({ id: detail.lastCandidate.id, commit: detail.lastCandidate.commit })}. This candidate seeds the prepared workspace. Preserve its useful work and accepted changes; older restoration references do not supersede this source input.`] : []),
       ...(detail.replanInstructions ? [`Current diagnosis handoff for this replacement plan:\n${detail.replanInstructions}\nApply it within this task's current contract and dependencies.`] : []),
       `Repair instructions: ${detail.repairInstructions ?? "None"}`, `Configured checks: ${JSON.stringify(detail.checks)}`, "The factory will capture and integrate the exact candidate. Do not merge into another attempt's workspace. Project-configured deployment capabilities are authorized according to the goal policy; report any uncertain external effects explicitly."].join("\n\n");
@@ -1139,8 +1252,22 @@ export class FactoryCoordinator {
   private attempts(goalId: string): Attempt[] { const ids = new Set(this.tasks(goalId).map(task => task.id)); return this.options.store.list<Attempt>(TABLE.attempts).filter(attempt => ids.has(attempt.taskId)); }
   private attempt(id: string): Attempt { const value = this.options.store.get<Attempt>(TABLE.attempts, id); if (!value) throw new Error("Attempt not found."); return value; }
   private control(id: string): ControlRecord { const value = this.options.store.get<ControlRecord>(TABLE.control, id); if (!value) throw new Error("Factory control record missing."); return value; }
-  private taskDetail(id: string): TaskDetail { const value = this.options.store.get<TaskDetail>(TABLE.taskDetails, id); if (!value) throw new Error("Task details missing."); return value; }
+  private taskDetail(id: string): TaskDetail {
+    const value = this.options.store.get<TaskDetail>(TABLE.taskDetails, id);
+    if (value) return value;
+    // Legacy accepted work may predate task-detail records. Project its retained
+    // contract for audits without inventing a new execution/check history.
+    const task = this.options.store.get<FactoryTask>(TABLE.tasks, id);
+    if (task?.status === "completed") {
+      const contract = task.currentAttemptId ? this.options.store.get<AttemptDetail>(TABLE.attemptDetails, task.currentAttemptId)?.contract : undefined;
+      const plan = this.planRecord(task.goalId);
+      return { id, key: Object.entries(plan?.taskKeys ?? {}).find(([, taskId]) => taskId === id)?.[0] ?? id,
+        checks: contract?.checks ?? [], planChecks: [], planRevision: contract?.planRevision ?? plan?.revision ?? 0, selected: false, failureSignatures: [] };
+    }
+    throw new Error("Task details missing.");
+  }
   private attemptDetail(id: string): AttemptDetail { const value = this.options.store.get<AttemptDetail>(TABLE.attemptDetails, id); if (!value) throw new Error("Attempt details missing."); return value; }
+  private inspectionEventRevision(goalId: string): number { return this.options.store.get<{ id: string; revision: number }>(TABLE.inspectionEvents, goalId)?.revision ?? 0; }
   private planRecord(id: string): PlanRecord | undefined { return this.options.store.get<PlanRecord>(TABLE.plans, id); }
   private taskChecks(taskId: string): string[] {
     const task = this.task(taskId), detail = this.taskDetail(taskId), plan = this.planRecord(task.goalId);

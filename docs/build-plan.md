@@ -18,6 +18,8 @@ The first deliverable is the envmux workbench. A future instruction to build the
 - ArtifactFS becomes a repository workspace provider alongside ordinary Git. Scheduling, goal state and evidence manifests have separate storage.
 - Core product functionality, protocol definitions, adapters and setup are OSS and self-hostable. Users choose and authorize their agent/model dependencies.
 
+The proposed extension for capability-aware execution, browser/native inspection and Mac host workers is scoped in [Execution and inspection](execution-and-inspection-scope.md). It preserves the existing container mode and adds explicit host/tool capabilities; the scope document distinguishes planned support from current behavior.
+
 ## Delivery layers
 
 | Layer | Product delivered | Main interface | Focused verification |

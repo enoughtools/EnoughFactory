@@ -4,6 +4,8 @@ import { criticalPathMinutes } from '@enoughfactory/factory/scheduler';
 import { ArrowRight, ArrowUpRight, Clock3, Download, FileText, History, ListChecks, MessageSquare, Play, RotateCcw, ShieldOff } from 'lucide-react';
 import type { DeviceClient } from './api';
 import { downloadArtifact } from './artifacts';
+import { DeviceExecutionReadiness, capabilityLabels, ReadinessStatus } from './ExecutionReadiness';
+import { InspectionResults } from './InspectionResults';
 import { relativeTime } from './hooks';
 import { Button, Field, Modal, Status } from './ui';
 import { taskGraphLayout } from './task-graph-layout';
@@ -59,7 +61,8 @@ function executionSummary(item: AttemptInspection | undefined) {
   if (status === 'retired') return 'This attempt was retired. Its saved work and verification results are still available.';
   if (status === 'unknown') return 'The owning device has not confirmed whether this attempt finished.';
   if (item.integration) return 'This attempt’s saved changes were merged into the project.';
-  if (item.checks?.some(check => !check.passed)) return 'The saved candidate did not pass verification.';
+  if (status === 'succeeded' && item.verificationWait && item.cancellation !== 'requested') return 'The agent’s work is saved. The factory is waiting for verification evidence on this candidate.';
+  if (item.checks?.some(check => !check.passed && !check.recovery)) return 'The saved candidate did not pass verification.';
   if (status === 'failed') return 'This attempt stopped before its work could be accepted.';
   if (item.result?.status === 'waiting') return item.result.waitReason || 'The agent is waiting for an external condition.';
   if (status === 'succeeded') return 'The agent finished its turn. Acceptance depends on the recorded checks and integration.';
@@ -75,7 +78,8 @@ function ExecutionOverview({ inspection, item, cancellationReason, historical, s
   const configured = item?.contract?.checks ?? (historical ? [] : inspection.checks);
   const missing = configured.filter(command => !checks.some(check => check.command === command && (!candidate || check.candidateCommit === candidate))).length;
   const passed = checks.filter(check => check.passed).length;
-  const failed = checks.length - passed;
+  const pending = checks.filter(check => !check.passed && check.recovery).length;
+  const failed = checks.length - passed - pending;
   const technicalError = item?.attempt.error ?? item?.result?.error ?? (historical ? undefined : inspection.lastError);
   const reason = !canceled && !historical && inspection.reason !== technicalError ? inspection.reason : undefined;
   const technicalReason = reason && /\n|curl:|openssl|candidate checks failed|enoent|traceback|error:\s/i.test(reason);
@@ -86,7 +90,7 @@ function ExecutionOverview({ inspection, item, cancellationReason, historical, s
       <dl className="ti-execution-record">
         <div><dt>Agent</dt><dd>{item?.result ? `Turn ${item.result.status}` : item ? item.attempt.status === 'running' ? 'Running' : item.attempt.status === 'created' ? 'Waiting to start' : 'No turn result recorded' : 'Not started'}</dd></div>
         <div><dt>Saved work</dt><dd>{candidate ? <><code>{candidate.slice(0, 12)}</code> · exact source retained</> : 'No candidate saved'}</dd></div>
-        <div><dt>Verification</dt><dd>{inspection.detailsAvailable === false ? 'Details unavailable from this device service' : checks.length ? <>{passed} passed{failed > 0 && ` · ${failed} failed`}{missing > 0 && ` · ${missing} without a result`}</> : configured.length ? `${configured.length} checks without a result` : 'No command checks configured'}</dd></div>
+        <div><dt>Verification</dt><dd>{inspection.detailsAvailable === false ? 'Details unavailable from this device service' : checks.length ? <>{passed} passed{failed > 0 && ` · ${failed} failed`}{pending > 0 && ` · ${pending} waiting for evidence`}{missing > 0 && ` · ${missing} without a result`}</> : configured.length ? `${configured.length} checks without a result` : 'No command checks configured'}</dd></div>
         <div><dt>Integration</dt><dd>{item?.integration ? <>Merged as <code>{item.integration.commit.slice(0, 12)}</code></> : 'No merge recorded'}</dd></div>
       </dl>
       {failed > 0 && checks.some(check => !check.passed && /no such file or directory/i.test(check.output)) && <p>A verification command could not find a required file in this saved candidate.</p>}
@@ -119,9 +123,10 @@ function CheckResults({ checks, title }: { checks: TaskCheck[]; title: string })
   return <section className="ti-section"><h3>{title} <span>{checks.length}</span></h3>
     <p className="ti-muted">Recorded command results on the saved source. Open a result to inspect its output.</p>
     {checks.length ? <div className="ti-check-list">{checks.map((check, index) => <details className="ti-check" key={`${check.command}-${index}`}>
-      <summary><Status state={check.passed ? 'completed' : 'failed'} label={check.passed ? 'Passed' : 'Failed'} /><code>{check.command}</code><span>{check.exitCode === undefined ? 'Exit not recorded' : `Exit ${check.exitCode}`}{check.outputTruncated && ' · output truncated'}</span></summary>
+      <summary><Status state={check.passed ? 'completed' : check.recovery ? 'waiting' : 'failed'} label={check.passed ? 'Passed' : check.recovery ? 'Waiting for evidence' : 'Failed'} /><code>{check.command}</code><span>{check.recovery ? 'Candidate preserved' : check.exitCode === undefined ? 'Exit not recorded' : `Exit ${check.exitCode}`}{check.outputTruncated && ' · output truncated'}</span></summary>
+      {check.recovery && <p className="ti-muted">{check.recovery.reason}</p>}
       <pre className="ti-output">{check.output || 'No command output recorded.'}</pre>
-      <details className="ti-check-source"><summary>Verified source</summary><dl className="ti-references"><Commit label="Candidate" value={check.candidateCommit} /><Commit label="Checked source" value={check.checkedCommit} /></dl></details>
+      <details className="ti-check-source"><summary>Source identity</summary><dl className="ti-references"><Commit label="Candidate" value={check.candidateCommit} /><Commit label="Checked source" value={check.checkedCommit} /></dl></details>
     </details>)}</div> : <p className="ti-muted">No check results recorded.</p>}
   </section>;
 }
@@ -168,6 +173,7 @@ export function TaskInspector({ inspection, state, goal, selectedAttemptId, disp
   const [retryOpen, setRetryOpen] = useState(false);
   const [retryDraft, setRetryDraft] = useState<RetryDraft | null>(null);
   const [retryError, setRetryError] = useState<string | null>(null);
+  const [readinessOpen, setReadinessOpen] = useState(false);
   const inspectorElement = useRef<HTMLElement>(null);
   useEffect(() => {
     const inspector = inspectorElement.current;
@@ -190,7 +196,7 @@ export function TaskInspector({ inspection, state, goal, selectedAttemptId, disp
       delete inspector.dataset.stickyHeader;
     };
   }, [inspection.task.id]);
-  useEffect(() => { setTab('overview'); setRetryOpen(false); setRetryDraft(null); setRetryError(null); }, [inspection.task.id]);
+  useEffect(() => { setTab('overview'); setRetryOpen(false); setRetryDraft(null); setRetryError(null); setReadinessOpen(false); }, [inspection.task.id]);
   const { task } = inspection;
   const criticalMinutes = useMemo(() => {
     const tasks = state.tasks.filter(item => item.goalId === goal.id).map(item => item.id === task.id ? task : item);
@@ -212,7 +218,10 @@ export function TaskInspector({ inspection, state, goal, selectedAttemptId, disp
   const retryChanged = !canRetry || !retryDraft || retryDraft.taskId !== task.id || retryDraft.goalRevision !== goal.revision || retryDraft.attemptId !== (task.currentAttemptId ?? null);
   const taskWait = inspection.wait;
   const verificationInputs = inspection.verificationInputs?.missingEnvironment.length ? inspection.verificationInputs : undefined;
-  const canResumeWait = !verificationInputs && !!taskWait?.condition.trim() && task.status === 'failed' && !terminal && goal.status !== 'paused' && dispatchAllowed;
+  const verificationWait = !historical && !terminal && attempt?.status === 'succeeded' && item?.cancellation !== 'requested' && ['running', 'review'].includes(task.status) ? item?.verificationWait : undefined;
+  const executionBlocker = inspection.executionBlocker;
+  const readinessDevices = state.devices.filter(device => device.platform !== 'browser' && (!executionBlocker?.deviceIds?.length || executionBlocker.deviceIds.includes(device.id)));
+  const canResumeWait = !verificationInputs && !verificationWait && !executionBlocker && !!taskWait?.condition.trim() && task.status === 'failed' && !terminal && goal.status !== 'paused' && dispatchAllowed;
   const canRetire = !terminal && task.status !== 'completed' && attempt && attempt.id === task.currentAttemptId && (['created', 'running', 'unknown', 'failed'].includes(attempt.status) || (task.status === 'review' && attempt.status === 'succeeded'));
   async function act(name: string, action: () => Promise<unknown>) { if (busy) return; setBusy(name); try { await run(action); } finally { setBusy(null); } }
   function openRetry() {
@@ -241,14 +250,16 @@ export function TaskInspector({ inspection, state, goal, selectedAttemptId, disp
   }
   const selectAttempt = (id: string) => onSelectAttempt(id);
   return <section className="task-inspector" ref={inspectorElement} aria-label={`Inspect ${task.title}`} aria-busy={busy !== null}>
-    <header className="ti-header"><div><p className="ti-eyebrow">{task.kind ?? 'Task'}{inspection.planRevision !== undefined ? ` · Plan ${inspection.planRevision}` : ''}</p><h2>{task.title}</h2><div className="ti-header-meta"><Status state={inspection.state} label={task.status === 'canceled' ? 'Canceled task' : undefined} /><span>{device?.name ?? 'Unassigned'}{device?.online === false ? ' · offline' : ''}</span>{attempt && <span>Attempt {attempt.generation}{historical ? ' · previous' : ''}</span>}</div></div>
+    <header className="ti-header"><div><p className="ti-eyebrow">{task.kind ?? 'Task'}{inspection.planRevision !== undefined ? ` · Plan ${inspection.planRevision}` : ''}</p><h2>{task.title}</h2><div className="ti-header-meta"><Status state={inspection.state} label={task.status === 'canceled' ? 'Canceled task' : undefined} /><span>{device?.name ?? 'Unassigned'}{device?.online === false ? ' · offline' : ''}</span>{attempt?.executionTargetKind && <span>{attempt.executionTargetKind === 'host-macos' ? 'Mac agent' : 'Container agent'}</span>}{attempt && <span>Attempt {attempt.generation}{historical ? ' · previous' : ''}</span>}</div></div>
       <div className="ti-actions">{canRun && <Button size="sm" disabled={busy !== null} onClick={() => void act('run', () => client.post(`/api/tasks/${encodeURIComponent(task.id)}/run`, { expectedGoalRevision: goal.revision }))}><Play size={13} />{busy === 'run' ? 'Starting…' : 'Run task'}</Button>}{canRetry && <Button size="sm" variant="outline" disabled={busy !== null} onClick={openRetry}><RotateCcw size={13} />Retry task with instructions</Button>}{sessionId && <Button size="sm" variant="ghost" onClick={() => openSession(sessionId)}><ArrowUpRight size={13} />Workspace</Button>}{chatId && chatSessionId && onOpenChat && <Button size="sm" variant="ghost" onClick={() => onOpenChat(chatSessionId, chatId)}><MessageSquare size={13} />Agent chat</Button>}</div>
     </header>
-    {(verificationInputs || taskWait || (inspection.state === 'waiting' && task.status === 'failed')) && <section className="ti-task-wait" aria-label="Current task prerequisite">
+    {verificationWait && <section className="ti-task-wait" aria-label="Pending verification evidence"><div className="ti-task-wait-heading"><Clock3 size={16} /><strong>Waiting for verification evidence</strong><time dateTime={verificationWait.since} title={time(verificationWait.since)}>Waiting since {relativeTime(verificationWait.since)}</time></div><p className="ti-preserve">{verificationWait.reason}</p><p className="ti-muted">The saved candidate stays in review while the testing device produces its results. The factory will continue with this candidate when the evidence arrives.</p><div className="ti-summary-actions"><Button size="sm" variant="outline" onClick={() => setTab('evidence')}><ListChecks size={13} />Inspect testing progress</Button><Button size="sm" variant="ghost" onClick={() => setReadinessOpen(true)}>View device testing setup</Button></div></section>}
+    {!verificationWait && executionBlocker && <section className="ti-task-wait" aria-label="Required execution capability"><div className="ti-task-wait-heading"><Clock3 size={16} /><strong>{executionBlocker.readiness === 'setup-required' ? 'Testing setup needed' : 'Waiting for a compatible device'}</strong><ReadinessStatus readiness={executionBlocker.readiness} /></div><p className="ti-preserve">{executionBlocker.reason}</p>{executionBlocker.capabilities?.length ? <p className="ti-muted">Required: {executionBlocker.capabilities.map(capability => capabilityLabels[capability]).join(', ')}.</p> : null}<p className="ti-muted">The factory will continue when the required tools are ready. This wait does not start another authoring attempt.</p><Button size="sm" variant="outline" onClick={() => setReadinessOpen(true)}>{executionBlocker.readiness === 'setup-required' ? 'Set up testing' : 'View device readiness'}</Button></section>}
+    {!verificationWait && !executionBlocker && (verificationInputs || taskWait || (inspection.state === 'waiting' && task.status === 'failed')) && <section className="ti-task-wait" aria-label="Current task prerequisite">
       <div className="ti-task-wait-heading"><Clock3 size={16} /><strong>{verificationInputs ? 'Waiting for verification evidence' : 'Waiting for a prerequisite'}</strong>{taskWait?.since ? <time dateTime={taskWait.since} title={time(taskWait.since)}>Waiting since {relativeTime(taskWait.since)}</time> : !verificationInputs && <span>Wait start was not recorded</span>}</div>
-      <p className="ti-preserve">{taskWait?.reason || inspection.reason || 'The coordinator has not recorded what this task needs before it can continue.'}</p>
-      {taskWait && taskWait.condition !== taskWait.reason && <details><summary>Required prerequisite</summary><p className="ti-preserve">{taskWait.condition}</p></details>}
-      {verificationInputs && <><p className="ti-muted">The coordinator must supply the required verification evidence before another attempt can start. Resuming alone cannot provide it.</p><details><summary>Required verification inputs</summary><ul>{verificationInputs.missingEnvironment.map(name => <li key={name}><code>{name}</code></li>)}</ul></details></>}
+      <p className="ti-preserve">{verificationInputs ? 'The factory is waiting for verification results from the device running these checks.' : taskWait?.reason || inspection.reason || 'The coordinator has not recorded what this task needs before it can continue.'}</p>
+      {!verificationInputs && taskWait && taskWait.condition !== taskWait.reason && <details><summary>Required prerequisite</summary><p className="ti-preserve">{taskWait.condition}</p></details>}
+      {verificationInputs && <p className="ti-muted">The required evidence must be available before another attempt can start. Retrying alone cannot provide it.</p>}
       {taskWait?.condition.trim() ? <>{!verificationInputs && <p className="ti-muted">Supply the prerequisite before resuming. Resuming starts another attempt; the failed attempt and its evidence remain saved.</p>}<div className="ti-summary-actions"><Button variant="outline" size="sm" disabled={busy !== null || !canResumeWait} onClick={() => void act('wake', () => client.post(`/api/goals/${encodeURIComponent(goal.id)}/wake`, { condition: taskWait.condition }))}><Play size={13} />{busy === 'wake' ? 'Resuming…' : 'Resume task'}</Button>{goal.status === 'paused' && <span className="ti-muted">Resume the goal first.</span>}</div></> : !verificationInputs && <p className="ti-muted">No recovery condition is available. Inspect goal recovery before retrying.</p>}
       {(!taskWait?.condition.trim() || verificationInputs) && onOpenGoalActivity && <Button size="sm" variant="ghost" onClick={onOpenGoalActivity}><History size={13} />View goal recovery</Button>}
     </section>}
@@ -265,9 +276,10 @@ export function TaskInspector({ inspection, state, goal, selectedAttemptId, disp
     <div role="tabpanel" id={`ti-panel-${task.id}-${tab}`} aria-labelledby={`ti-tab-${task.id}-${tab}`} tabIndex={0}>
       {tab === 'overview' && <ExecutionOverview inspection={inspection} item={item} historical={historical} cancellationReason={cancellationReason} showEvidence={() => setTab('evidence')} showRequirements={() => setTab('contract')} showRecovery={onOpenGoalActivity} />}
       {tab === 'contract' && <>{item?.contract && <p className="ti-contract-revision">Requirements used by attempt {attempt?.generation} · plan {item.contract.planRevision}</p>}<Contract inspection={item?.contract ? { ...inspection, task: { ...task, ...item.contract }, dependencies: state.tasks.filter(dependency => item.contract!.dependsOn.includes(dependency.id)), checks: item.contract.checks } : inspection} criticalMinutes={!attempt || attempt.id === task.currentAttemptId ? criticalMinutes : undefined} onSelectTask={onSelectTask} /></>}
-      {tab === 'evidence' && <div className="ti-content">{attempts.length > 1 && <label className="ti-attempt-picker">Evidence for<select value={attempt?.id ?? ''} onChange={event => selectAttempt(event.target.value)}>{attempts.map(value => <option key={value.attempt.id} value={value.attempt.id}>Attempt {value.attempt.generation} · {value.attempt.status}</option>)}</select></label>}<AttemptEvidence item={item} configuredChecks={item?.contract?.checks ?? (attempt?.id === task.currentAttemptId ? inspection.checks : [])} detailsAvailable={inspection.detailsAvailable !== false} client={client} run={run} offline={device?.online === false} />{inspection.detailsAvailable !== false && <ArtifactList artifacts={inspection.artifacts} goal={goal} client={client} run={run} />}</div>}
-      {tab === 'activity' && <div className="ti-content"><AttemptHistory attempts={attempts} selectedId={attempt?.id} state={state} onSelect={selectAttempt} />{item?.result?.status === 'waiting' && item.result.wakeCondition && attempt?.id === task.currentAttemptId && attempt?.status !== 'retired' && goal.status === 'waiting' && <div className="ti-wake"><p>Waiting for <strong>{item.result.wakeCondition}</strong>{item.result.waitReason ? `: ${item.result.waitReason}` : ''}</p><Button variant="outline" size="sm" disabled={busy !== null || !!verificationInputs} onClick={() => void act('wake', () => client.post(`/api/goals/${encodeURIComponent(goal.id)}/wake`, { condition: item?.result?.wakeCondition }))}><Play size={13} />Condition satisfied · Resume</Button></div>}{device?.online === false && <p className="ti-muted">Live tools and device-local chats are unavailable while {device.name} is offline. Recorded task evidence remains here.</p>}</div>}
+      {tab === 'evidence' && <div className="ti-content">{attempts.length > 1 && <label className="ti-attempt-picker">Evidence for<select value={attempt?.id ?? ''} onChange={event => selectAttempt(event.target.value)}>{attempts.map(value => <option key={value.attempt.id} value={value.attempt.id}>Attempt {value.attempt.generation} · {value.attempt.status}</option>)}</select></label>}<InspectionResults taskId={task.id} attemptId={attempt?.id} devices={state.devices} client={client} run={run} onOpenChat={onOpenChat} openSession={openSession} /><AttemptEvidence item={item} configuredChecks={item?.contract?.checks ?? (attempt?.id === task.currentAttemptId ? inspection.checks : [])} detailsAvailable={inspection.detailsAvailable !== false} client={client} run={run} offline={device?.online === false} />{inspection.detailsAvailable !== false && <ArtifactList artifacts={inspection.artifacts} goal={goal} client={client} run={run} />}</div>}
+      {tab === 'activity' && <div className="ti-content"><AttemptHistory attempts={attempts} selectedId={attempt?.id} state={state} onSelect={selectAttempt} />{item?.result?.status === 'waiting' && item.result.wakeCondition && attempt?.id === task.currentAttemptId && attempt?.status !== 'retired' && goal.status === 'waiting' && <div className="ti-wake"><p>Waiting for <strong>{item.result.wakeCondition}</strong>{item.result.waitReason ? `: ${item.result.waitReason}` : ''}</p><Button variant="outline" size="sm" disabled={busy !== null || !!verificationInputs || !!executionBlocker} onClick={() => void act('wake', () => client.post(`/api/goals/${encodeURIComponent(goal.id)}/wake`, { condition: item?.result?.wakeCondition }))}><Play size={13} />Condition satisfied · Resume</Button></div>}{device?.online === false && <p className="ti-muted">Live tools and device-local chats are unavailable while {device.name} is offline. Recorded task evidence remains here.</p>}</div>}
     </div>
+    <Modal open={readinessOpen} onClose={() => setReadinessOpen(false)} title="Device readiness" description="The factory uses the agents and testing tools reported by your connected computers."><div className="modal-form">{readinessDevices.length ? readinessDevices.map(device => <section key={device.id}><h3>{device.name}</h3><DeviceExecutionReadiness device={device} client={client} run={run} /></section>) : <p>No compatible device is connected. Pair a computer with the required tools from Devices.</p>}</div></Modal>
     <Modal open={retryOpen} onClose={() => { if (busy !== 'retry') setRetryOpen(false); }} title="Retry task with instructions" description="Start a fresh attempt using the current goal policy. The previous attempt, its chat and saved evidence remain available.">
       <form className="modal-form" onSubmit={event => { event.preventDefault(); void retry(); }}>
         <p><strong>{task.title}</strong></p>

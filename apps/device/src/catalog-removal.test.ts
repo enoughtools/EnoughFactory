@@ -63,7 +63,8 @@ test('environment removal rejects uncertain execution and preserves history thro
   assert.deepEqual((await request<Session[]>('GET','/api/sessions')).body,[]);assert.equal((await request<Session[]>('GET','/api/sessions?archived=1')).body[0]!.id,'environment');
   assert.deepEqual((await request<FactoryState>('GET','/api/state')).body.chats,[]);assert.equal((await request<Session>('GET','/api/sessions/environment')).body.branch,'envmux/environment');
   assert.equal((await request<string>('GET','/api/sessions/environment/output')).body,'Retained output');
-  assert.equal((await request('POST','/api/sessions/environment/restart')).status,409);assert.equal((await request('POST','/api/chats',{sessionId:'environment'})).status,409);
+  const restart=await request('POST','/api/sessions/environment/restart');
+  assert.equal(restart.status,409,JSON.stringify(restart.body));assert.equal((await request('POST','/api/chats',{sessionId:'environment'})).status,409);
   const restored=await request<Session>('POST','/api/sessions/environment/restore');assert.equal(restored.status,200);assert.equal(restored.body.archivedAt,undefined);assert.equal((await request('POST','/api/sessions/environment/restore')).status,200);
   assert.equal((await request<FactoryState>('GET','/api/state')).body.chats[0]!.id,chat.id);assert.deepEqual(['attempts','factory-attempt-details','factory-workers','chats','artifacts'].map(bucket=>app.store.list(bucket)),receipts);
   assert.equal(app.store.events<{text:string}>('chat',chat.id)[0]!.value.text,'Original conversation');assert.equal(await readFile(evidence,'utf8'),'immutable proof');

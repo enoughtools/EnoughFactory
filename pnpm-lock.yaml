@@ -50,6 +50,9 @@ importers:
       '@enoughfactory/agents':
         specifier: workspace:*
         version: link:../../packages/agents
+      '@enoughfactory/browser-inspection':
+        specifier: workspace:*
+        version: link:../../packages/browser-inspection
       '@enoughfactory/contracts':
         specifier: workspace:*
         version: link:../../packages/contracts
@@ -59,6 +62,9 @@ importers:
       '@enoughfactory/factory':
         specifier: workspace:*
         version: link:../../packages/factory
+      '@enoughfactory/native-inspection':
+        specifier: workspace:*
+        version: link:../../packages/native-inspection
       '@enoughfactory/peers':
         specifier: workspace:*
         version: link:../../packages/peers
@@ -168,6 +174,15 @@ importers:
         specifier: workspace:*
         version: link:../runtime
 
+  packages/browser-inspection:
+    dependencies:
+      '@enoughfactory/runtime':
+        specifier: workspace:*
+        version: link:../runtime
+      '@enoughfactory/workspaces':
+        specifier: workspace:*
+        version: link:../workspaces
+
   packages/contracts: {}
 
   packages/envmux:
@@ -181,6 +196,8 @@ importers:
       '@enoughfactory/contracts':
         specifier: workspace:*
         version: link:../contracts
+
+  packages/native-inspection: {}
 
   packages/peers:
     dependencies:

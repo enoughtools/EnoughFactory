@@ -10,6 +10,7 @@ import { createRequire } from 'node:module';
 import { ensureElectron } from '../apps/desktop/ensure-electron.mjs';
 import { prepareContainerRuntime } from './prepare-container-runtime.mjs';
 import { componentQualificationRequirements } from '../release/marketing/verify-component-qualification.mjs';
+import { packageNativeInspectionAssets } from '../packages/native-inspection/native/package-assets.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const nodeVersion = '22.22.0';
@@ -172,6 +173,10 @@ const envmux = join(root, 'artifacts', 'envmux', target, 'envmux');
 await required(envmux, 'Published native envmux engine');
 if (opt.build) {
   execFileSync('pnpm', ['--filter', '@enoughfactory/web', '--filter', '@enoughfactory/device', '--filter', '@enoughfactory/desktop', 'run', 'build'], { cwd: root, stdio: 'inherit' });
+  if (opt.platform === 'darwin' && !process.env.ENOUGHFACTORY_PREBUILT_NATIVE_ASSETS) {
+    execFileSync(process.execPath, [join(root, 'packages/native-inspection/native/macos/build.mjs')], { cwd: root, stdio: 'inherit' });
+    execFileSync('/bin/bash', [join(root, 'packages/native-inspection/native/ios/build-runner.sh')], { cwd: root, stdio: 'inherit' });
+  }
 }
 const deviceDist = join(root, 'apps', 'device', 'dist');
 await required(join(deviceDist, 'service.cjs'), 'Bundled device service');
@@ -204,6 +209,11 @@ for (const notice of ['LICENSE', 'THIRD_PARTY_NOTICES.md']) {
 }
 await prepareRuntime(opt.platform, opt.arch, resources);
 await prepareNative(opt.platform, opt.arch, resources);
+if (opt.platform === 'darwin') {
+  const nativeAssets = join(resources, 'runtime/native-inspection');
+  if (process.env.ENOUGHFACTORY_PREBUILT_NATIVE_ASSETS) await cp(resolve(process.env.ENOUGHFACTORY_PREBUILT_NATIVE_ASSETS), nativeAssets, { recursive: true });
+  else await packageNativeInspectionAssets(nativeAssets);
+}
 await prepareContainerRuntime(opt.platform, opt.arch, join(resources, 'runtime', 'container'));
 // Preserve the previously exercised guest payload byte for byte. Product source
 // companion filenames change separately; this does not claim a new engine run.

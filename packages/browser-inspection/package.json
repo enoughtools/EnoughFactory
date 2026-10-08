@@ -1,0 +1,9 @@
+{
+  "name": "@enoughfactory/browser-inspection",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": "./src/index.ts",
+  "scripts": { "typecheck": "tsc -p tsconfig.json", "verify": "tsx --test tests/*.test.ts", "verify:container": "tsx tests/container-pilot.ts" },
+  "dependencies": { "@enoughfactory/runtime": "workspace:*", "@enoughfactory/workspaces": "workspace:*" }
+}

@@ -1,10 +1,11 @@
 import { useEffect, useState } from 'react';
-import type { ApprovalMode, AutonomyMode, FactoryState, RuntimeKind, Session } from '@enoughfactory/contracts';
+import type { ApprovalMode, AutonomyMode, FactoryState, RuntimeKind, Session, TaskExecutionRequirements } from '@enoughfactory/contracts';
 import { FileText, MessageSquare, Plus, Send, Target, Upload } from 'lucide-react';
 import type { DeviceClient } from './api';
 import { ChatPane } from './ChatPane';
 import { clearGoalDraft, goalObjective, parseGoalProposal, readGoalDraft, saveGoalDraft, type GoalDraft } from './goal-draft';
 import { policies } from './SettingsPage';
+import { GoalExecutionPreference } from './GoalExecutionPreference';
 import { Button, Field, Input, Status, Spinner } from './ui';
 import './goal-composer.css';
 
@@ -38,6 +39,7 @@ function ProjectDraft({ state, client, run, projectId, busy, onSubmit, creationE
   const [runtime, setRuntime] = useState<RuntimeKind>(state.settings.defaultRuntime);
   const [concurrency, setConcurrency] = useState(8);
   const [workspaceProvider, setWorkspaceProvider] = useState<'git' | 'artifactfs'>('git');
+  const [execution, setExecution] = useState<TaskExecutionRequirements>({ target: 'auto' });
   const [starting, setStarting] = useState(false);
   const [assistantError, setAssistantError] = useState<string | null>(null);
   const [draftNotice, setDraftNotice] = useState<string | null>(null);
@@ -77,7 +79,7 @@ function ProjectDraft({ state, client, run, projectId, busy, onSubmit, creationE
     catch { setAssistantError('The specification file could not be read.'); }
   }
   return <div className="goal-draft-layout">
-    <form className="goal-draft-editor modal-form" onSubmit={event => { event.preventDefault(); if (!readyToCreate) return; void onSubmit({ projectId, title: draft.title.trim(), objective: goalObjective(draft), criteria: draft.criteria.split('\n').map(value => value.trim()).filter(Boolean), autonomy, approvalMode, runtime, concurrency, workspaceProvider }).then(created => { if (created) clearGoalDraft(draftKey, draft); }); }}>
+    <form className="goal-draft-editor modal-form" onSubmit={event => { event.preventDefault(); if (!readyToCreate) return; void onSubmit({ projectId, title: draft.title.trim(), objective: goalObjective(draft), criteria: draft.criteria.split('\n').map(value => value.trim()).filter(Boolean), autonomy, approvalMode, runtime, concurrency, workspaceProvider, execution }).then(created => { if (created) clearGoalDraft(draftKey, draft); }); }}>
       <div className="goal-draft-fields">
         <Field label="Goal name" hint="Optional. Defaults to the first line of your outcome."><Input value={draft.title} onChange={event => update({ title: event.target.value })} placeholder="Goal name" /></Field>
         <Field label="Outcome"><textarea autoFocus rows={2} value={draft.objective} onChange={event => update({ objective: event.target.value })} placeholder="What should exist when this goal is complete?" /></Field>
@@ -90,7 +92,7 @@ function ProjectDraft({ state, client, run, projectId, busy, onSubmit, creationE
           <Field label="Approval policy"><select value={approvalMode} onChange={event => setApprovalMode(event.target.value as ApprovalMode)}>{policies.map(policy => <option key={policy.mode} value={policy.mode}>{policy.label}</option>)}</select></Field>
           <Field label="Execution agent"><select value={runtime} onChange={event => setRuntime(event.target.value as RuntimeKind)}><option value="codex">Codex</option><option value="antigravity">Antigravity</option><option value="claude">Claude</option></select></Field>
           <Field label="Repository workspace"><select value={workspaceProvider} onChange={event => setWorkspaceProvider(event.target.value as 'git' | 'artifactfs')}><option value="git">Git — isolated worktree</option><option value="artifactfs" disabled={!artifactFsAvailable}>ArtifactFS — lazy Git mount</option></select></Field>
-        </div></details>
+        </div><GoalExecutionPreference execution={execution} onChange={setExecution} coordinator={state.devices.find(device => device.id === project.deviceId)} runtime={runtime} provider={workspaceProvider} client={client} run={run} /></details>
       </div>
       {creationError && <div className="error-banner" role="alert">{creationError}</div>}
       <footer className="goal-draft-footer"><span role="status">{!saved ? 'Draft storage unavailable; keep this window open' : draftNotice ?? 'Draft saved on this device'}</span><Button type="submit" disabled={busy || !readyToCreate}><Target size={15} />{busy ? 'Starting…' : autonomy === 'manual' ? 'Create goal' : 'Start goal'}</Button></footer>

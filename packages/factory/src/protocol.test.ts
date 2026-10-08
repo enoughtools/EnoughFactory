@@ -1,9 +1,32 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { FactoryDecisionError } from "./errors.js";
-import { readCheckCommands, readEvaluation, readPlan, readTasks, validateDependencies, validateRequiredCheckEnvironment } from "./protocol.js";
+import { readCheckCommands, readEvaluation, readPlan, readTasks, validateDependencies, validateRequiredCheckEnvironment, validateTaskExecution, validateTaskQuality } from "./protocol.js";
 
 const task = { key: "implementation", title: "Implement feature", description: "Deliver the requested behavior", dependsOn: [], checks: [] };
+
+test("execution contracts preserve omission and distinguish author requirements from delegated tools", () => {
+  assert.equal(validateTaskExecution(undefined), undefined);
+  assert.deepEqual(validateTaskExecution({}), {});
+  const execution = { target: "auto", requiredCapabilities: ["mac-shell"], delegatedCapabilities: ["ios-simulator-inspection", "chromium-inspection"] };
+  assert.deepEqual(validateTaskExecution(execution), execution);
+  assert.deepEqual(readTasks([{ ...task, execution }])[0]!.execution, execution);
+  assert.equal(Object.hasOwn(readTasks([task])[0]!, "execution"), false);
+  for (const value of [null, [], "host-macos", { target: "darwin" }, { target: null }, { host: true }, { requiredCapabilities: "mac-shell" }, { requiredCapabilities: ["mac-shell", "mac-shell"] }, { delegatedCapabilities: ["fake-ui"] }]) {
+    assert.throws(() => validateTaskExecution(value), FactoryDecisionError);
+  }
+});
+
+test("quality acceptance is explicit, bounded and bound to declared platforms and workflow identities", () => {
+  const quality = { platforms: ["web", "macos"], workflows: [{ id: "compose-close", platform: "macos" }], referenceIds: ["mail-web"] };
+  assert.deepEqual(validateTaskQuality(quality), quality);
+  assert.deepEqual(readTasks([{ ...task, quality }])[0]!.quality, quality);
+  assert.equal(validateTaskQuality(undefined), undefined);
+  assert.equal(Object.hasOwn(readTasks([task])[0]!, "quality"), false);
+  for (const invalid of [null, {}, { ...quality, arbitrary: true }, { ...quality, platforms: [] }, { ...quality, platforms: ["macos", "macos"] }, { ...quality, platforms: ["linux"] }, { ...quality, workflows: [{ id: "compose", platform: "ios-simulator" }] }, { ...quality, workflows: [{ id: "compose", platform: "macos" }, { id: "compose", platform: "macos" }] }, { ...quality, referenceIds: ["mail-web", " mail-web "] }, { ...quality, referenceIds: ["bad\nreference"] }]) {
+    assert.throws(() => validateTaskQuality(invalid), FactoryDecisionError);
+  }
+});
 
 test("verification prerequisites accept only supported unique input names and preserve explicit clearing", () => {
   const keys = ["ENOUGH_EVIDENCE_ROOT", "ENOUGH_NATIVE_INDEX_SHA256", "ENOUGH_NATIVE_UI_RECEIPT_DESCRIPTOR", "ENOUGH_ACCEPTANCE_INDEX_SHA256"];

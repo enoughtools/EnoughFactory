@@ -9,6 +9,39 @@ import { stageCapturedSource } from "../src/capture-staging.ts";
 
 const exec = promisify(execFile);
 
+test("capture skips ignored cache directories without losing tracked build inputs or authored source", async () => {
+  const root = await mkdtemp(join(tmpdir(), "enough-capture-ignored-"));
+  try {
+    const git = async (...args: string[]) => (await exec("git", ["-C", root, "-c", "core.hooksPath=/dev/null", ...args])).stdout;
+    const file = async (path: string, value = "source\n") => { await mkdir(join(root, path, ".."), { recursive: true }); await writeFile(join(root, path), value); };
+    await git("init", "--quiet");
+    await git("config", "user.name", "Fixture"); await git("config", "user.email", "fixture@example.test");
+    await file("Package.swift", "// swift-tools-version: 6.0\n");
+    await file("Packages/Nested/Package.swift", "// swift-tools-version: 6.0\n");
+    await file(".build/build-source.sh"); await file(".build/deleted-source.sh");
+    await file("Packages/Nested/.build/build-source.sh");
+    await git("add", "--all"); await git("commit", "--quiet", "-m", "tracked build inputs");
+    const ignore = ".build/\nnode_modules/\ndist/\n";
+    await file(".gitignore", ignore);
+    for (const path of [".build/build.db", ".build/arm64-apple-macosx/debug/description.json", "Packages/Nested/.build/build.db", "Packages/Nested/.build/arm64-apple-macosx/debug/description.json", "node_modules/cache/output.js", "Packages/Nested/node_modules/cache/output.js", "dist/output.js", "Packages/Nested/dist/output.js"]) await file(path, "ignored generated output\n");
+    await file(".build/build-source.sh", "authored build input edit\n");
+    await rm(join(root, ".build/deleted-source.sh"));
+    await file("Packages/Nested/.build/build-source.sh", "nested build input edit\n");
+    await file("Sources/main.swift", "authored source\n");
+    await file("scripts/build.sh", "authored build script\n");
+    await file("staged-source.swift", "explicit staged source\n"); await git("add", "--", "staged-source.swift");
+    const result = await stageCapturedSource(git, { isRegularFile: async path => { const entry = await lstat(join(root, path)); return entry.isFile() && !entry.isSymbolicLink(); } });
+    assert.deepEqual(result.omittedSwiftBuildCaches, []);
+    const indexed = (await git("ls-files", "-z")).split("\0").filter(Boolean);
+    assert.deepEqual(indexed, [".build/build-source.sh", ".gitignore", "Package.swift", "Packages/Nested/.build/build-source.sh", "Packages/Nested/Package.swift", "Sources/main.swift", "scripts/build.sh", "staged-source.swift"]);
+    assert.equal(await git("show", ":.build/build-source.sh"), "authored build input edit\n");
+    assert.equal(await git("show", ":Packages/Nested/.build/build-source.sh"), "nested build input edit\n");
+    assert.equal(await git("show", ":scripts/build.sh"), "authored build script\n");
+    assert.equal(await readFile(join(root, ".gitignore"), "utf8"), ignore);
+    assert.equal(await readFile(join(root, ".build/build.db"), "utf8"), "ignored generated output\n");
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
 test("capture omits only new SwiftPM caches and preserves staged source, deletions and build inputs", async () => {
   const root = await mkdtemp(join(tmpdir(), "enough-capture-source-"));
   try {

@@ -1,0 +1,79 @@
+# App quality and inspection acceptance
+
+EnoughFactory must inspect and improve the product users will actually run. Compilation, accepted task counts and a feature inventory cannot establish that its interface works or looks good. The quality loop is: inspect the real reference, run the current product, observe, act, verify, critique, repair and repeat.
+
+## Product integration
+
+`apps/device/src/factory-quality.ts` supplies compact worker, planner, evaluator and diagnosis instructions. Append the corresponding `factoryQualityInstructions(role)` to worker and controller system instructions in `apps/device/src/factory.ts`. Keep capability availability in the separately supplied inventory; these instructions do not claim a browser, native runner or reference exists.
+
+For a task with material user-facing behavior, the coordinator supplies an explicit `QualityExpectation`: current inspection authority, the immutable source identity (including additional roots), required platforms, representative workflow IDs and inspected reference IDs. Do not guess this contract from task titles or impose a whole-product screenshot suite on architecture/backend work. Final delivery reviews the integrated source; candidate and integration identities remain distinct.
+
+The author retains a bounded `QualityEvidenceReport` as an artifact. Its workflow entries identify a screenshot before an action, the action and a screenshot after it, with a concrete observed assertion. Each passed workflow also supplies the original `assertionEvidenceId` returned by the broker's assertion tool on that resulting observation. The service verifies the original passed assertion and its bytes; authored prose alone cannot satisfy it. Its visual reviews compare the supplied reference and cover hierarchy, spacing, clipping, typography, controls and states. Serious unresolved defects require focused repairs. A small issue can be recorded without becoming a new approval ceremony.
+
+`validateQualityEvidence()` resolves report references through the service's trusted journals. The resolver must verify retained screenshot bytes against ArtifactStore manifests, read original broker action/observation records, confirm the source and authority, and read a provider image-delivery record. An authored report cannot create those receipts. An image-delivery record is written only when actual screenshot content reaches the provider through its tested tool/image route, or a verified image-view completion; merely staging a file or including image-shaped tool arguments is insufficient. Broker observations/actions require monotonic session sequence numbers and a successful original observing action; a stale observation, failed snapshot, unknown action outcome or different session cannot establish a workflow result.
+
+An inspected reference receipt pins the original artifact manifests and verified bytes, rather than looking up whatever content currently has an artifact ID. Reference images also require real provider image delivery. A newer valid reference inspection can recover from an older unavailable view. The service fences trusted journal changes across asynchronous artifact verification so that a new failed report or unknown backend outcome cannot race an acceptance result.
+
+The result distinguishes missing evidence, observed repair work and evidence ready for review. This is a provenance/coverage gate, not an automatic beauty score. The evaluator must still see the images and judge whether the comparisons and assertions are true. Retain the report and original evidence with the accepted result. A resolver error or corrupted artifact must remain missing/invalid evidence rather than success.
+
+`factoryQualityEvidenceContext()` formats a bounded selection of current-source screenshot references and optional UI excerpts for a controller or continuation. It preserves separate observation, evidence and artifact IDs and explicitly states that metadata contains no image bytes. The provider's image route supplies the actual images separately. Action `observationId` is compared with the original UI observation identity, not its screenshot artifact ID.
+
+`InspectionQualityService` in `apps/device/src/inspection-quality.ts` resolves the original SQLite inspection/provider journals, verifies the image and report bytes through ArtifactStore, saves submitted reports, and supplies the enforced `enoughfactory:ui-quality` check. The frozen task `quality` policy selects the required platforms, workflows and reference IDs. Both the saved candidate and the actual combined integration source must pass this check. A preview's synthetic Git commit is never relabeled as a candidate or integration commit: exact aggregate and per-root content digest equivalence gets its own retained receipt containing both identities. Changed source or secondary roots require fresh matching inspection evidence.
+
+Missing inspection evidence produces a persisted verifier wait that preserves the existing author attempt and candidate. A genuine failed broker assertion, reported workflow failure or open serious visual defect requests repair. Resuming evidence collection must not create a fresh author attempt or repeatedly retry an unavailable native capability.
+
+Before completion of a goal with explicit UI acceptance, `InspectionQualityService.reviewCheck()` requires a separate evaluator's own real image deliveries and original reference reads. The evaluator returns `visualReview: {source,reviews}` using the report's visual review shape. The factory supplies the trusted current integrated source; authored identity alone cannot select it. Every reviewed screenshot must retain its original successful observation and match all current source/root digests. Old controllers, author image deliveries, changed reference manifests, unknown outcomes and an empty or incomplete critique cannot substitute for this review. Open serious defects refuse completion and remain actionable repair work.
+
+The final evaluator also reads each required workflow's original resulting assertion through `factory_review_evidence`. Its read receipt pins the exact artifact and integrated source. The service revalidates the latest current-authority report for every relevant workflow policy; an older passing report cannot mask a newer failure. Superseded author attempts do not permanently poison a later repaired result. Reports and evaluator reads participate in the acceptance fence, so a failure arriving during verification cannot race completion.
+
+`factory_review_screens` supplies bounded, original-verified quality report summaries with workflow and assertion IDs, current-source and current-authority markers, and explicit omitted counts. `factory_review_evidence` also accepts a quality report ID to return its original JSON. A retained recorded gate status is historical context; final verification checks the evidence again. The final source comes from the owning canonical project and all declared roots. A changed or reverted private evaluator checkout cannot substitute for that source, and a canonical change during review invalidates acceptance. Platform-only policies still validate their latest reports and cannot hide an open serious visual defect behind an empty workflow list.
+
+Browser assertions parse the pinned Playwright MCP `Snapshot` section, with the older `Page Snapshot` spelling also supported. Console logs and generated code are excluded. Actual input values remain separate from reference and ARIA metadata. Unsupported or incomplete snapshot syntax, failed refreshes and silently omitted control names cannot establish absence; positive observations remain available. Native restart is a journaled, acknowledged workflow action and can establish draft persistence through its resulting observation.
+
+## EnoughMail pilot
+
+The current web reference is the EnoughMail UI in the supplied `mail-web` working folder. In this development checkout its source is `forms/open-cloud/apps/mail/src/ui`: `MailApp.tsx`, `MailFrame.tsx`, `mailbox.css`, `Compose.tsx` and `Settings.tsx`. The actual library is the pinned EnoughUI source, with the native package vendored under `Vendor/EnoughUI` in the mail repository. Record the exact mounted reference identity used by the run; these local paths do not promise that future workers have them. Source inspection identifies intended flows; browser screenshots and exercised behavior establish the current web UX.
+
+Source-backed design cues to verify against actual screens:
+
+- A persistent navigation rail and an inbox/list/reader hierarchy leave most of the window for mail. Search, filtering and bulk actions stay compact. Subject, sender, preview and date use deliberate hierarchy rather than equally large controls.
+- EnoughUI supplies real buttons, inputs, menus, tooltips, spinners and empty states. Reuse its tokens and component behavior; an imported library that is bypassed by hand-built controls is not design-system adherence.
+- The web reader has focused reply/reply-all/forward actions and secondary conversation actions in a menu. Composition preserves the reading context and provides a clear way back to mail. Draft recovery, interrupted sends and offline recovery expose understandable state and actions.
+- Comfortable padding and usable scrolling are intentional. Check sidebar labels, reader content, composer fields and bottom actions at narrow and normal widths. Fix clipped or inaccessible content without shrinking every control or removing all insets.
+- Settings and infrequent administrative features live away from the primary mail reading/writing flow. Keyboard shortcuts pause while typing; visible focus belongs to the actual interactive control.
+
+Start with the observed draft-close defect on both macOS and the owned iPhone Simulator:
+
+1. Open a fixture message, choose Reply, edit the body and observe its saved state.
+2. Choose Close and keep draft. Observe that composition actually disappears and the inbox/reader returns.
+3. Reopen the retained draft and assert its sender, recipients, subject and edited body.
+4. Restart the isolated app session and reopen that draft again; assert persistence from the app UI.
+5. Capture inbox/reader/composer screens at representative sizes, compare them to the actual EnoughMail web reference and EnoughUI, repair visible defects and inspect the rebuilt source again.
+
+These journeys prove the new development loop and fix concrete problems. They do not replace the user's original feature, offline, live-service, native-build or distribution criteria. Keep fixture success separate from authenticated service and signing results; a missing credential is a concrete prerequisite, not a reason to claim the whole application complete.
+
+## Compact report shape
+
+```json
+{
+  "version": 1,
+  "source": { "snapshotId": "from-broker", "sha256": "original-snapshot-sha256" },
+  "workflows": [{
+    "id": "close-and-keep-draft", "platform": "macos",
+    "before": "screenshot-evidence-id", "action": "action-id", "after": "screenshot-evidence-id",
+    "outcome": "passed", "assertion": "Composer is absent; the inbox is visible.",
+    "assertionEvidenceId": "original-broker-assertion-evidence-id"
+  }],
+  "reviews": [{
+    "platform": "macos", "observations": ["screenshot-evidence-id"],
+    "references": [{ "id": "mail-web", "comparison": "Concrete observed comparison" }],
+    "dimensions": {
+      "hierarchy": "Observed finding", "spacing": "Observed finding", "clipping": "Observed finding",
+      "typography": "Observed finding", "controls": "Observed finding", "states": "Observed finding"
+    },
+    "defects": []
+  }]
+}
+```
+
+Use the complete broker source identity, not the abbreviated example. Keep only selected useful checkpoints and failure images. Do not duplicate base64 images into reports or chat history, generate hundreds of nominal scenarios for a small repair, or make the user interpret internal planning JSON as the product's result.

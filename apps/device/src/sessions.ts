@@ -1,7 +1,7 @@
 import { EnvmuxEngine, type EnvmuxSession, type EnvmuxReady, type EnvmuxState } from '@enoughfactory/envmux';
 import type { Project, Session, RepositoryChanges, ContainerRuntimeStatus, WorkingDirectoryMount, Chat, RuntimeKind } from '@enoughfactory/contracts';
 import { dockerInvocation, type DockerRuntimeEndpoint } from '@enoughfactory/runtime';
-import { ArtifactStore, WorkingDirectoryManager, type WorkingDirectorySource, type WorkingDirectorySnapshot, type WorkingDirectoryCapture } from '@enoughfactory/workspaces';
+import { ArtifactStore, WorkingDirectoryManager, type WorkingDirectorySource, type WorkingDirectorySnapshot, type WorkingDirectoryCapture, type WorkspaceRecord } from '@enoughfactory/workspaces';
 import { Store } from './store.ts';
 import { exec, HttpError, id, now } from './util.ts';
 import path from 'node:path';
@@ -11,14 +11,18 @@ import { managedRepositoryReader, readRepositoryChanges } from './repository-cha
 import { prepareDevelopmentToolchain, validateFrozenDevelopmentToolchain, type FrozenDevelopmentToolchain } from './development-toolchain.ts';
 import { retireStoppedFactoryContainer } from './factory-container-retirement.ts';
 import { restoreFactoryContainerArchives } from './factory-container-restore.ts';
+import { HostWorkspaceManager, type HostWorkspacePrepared } from './host-workspaces.ts';
 import { prepareAgentToolchain, verifyPreparedAgentToolchain, type PreparedAgentToolchain } from '@enoughfactory/agents';
 
 interface WorkspaceBinding { bindSource:string; stateVolume:string; }
 interface PrivateSession { id: string; ready: EnvmuxReady; projectPath: string; pid?: number; workspace?:WorkspaceBinding; }
-interface LaunchRecord { id:string;projectPath:string;generation:number;dockerHost:string;workspace?:WorkspaceBinding; workingDirectorySources?:WorkingDirectorySource[]; referenceContext?:WorkingDirectorySource; developmentToolchain?:FrozenDevelopmentToolchain; agentToolchain?:PreparedAgentToolchain; }
+interface LaunchRecord { id:string;projectPath:string;generation:number;dockerHost?:string;executionTargetKind?:'container'|'host-macos';executionTargetId?:string;workspace?:WorkspaceBinding; workingDirectorySources?:WorkingDirectorySource[]; referenceContext?:WorkingDirectorySource; developmentToolchain?:FrozenDevelopmentToolchain; agentToolchain?:PreparedAgentToolchain; }
 type RetirementReceipt = Awaited<ReturnType<typeof retireStoppedFactoryContainer>>;
 interface ContainerRetirement { id:string;containerId:string;name:string;status:'archiving'|'removed'|'restored';receipt?:RetirementReceipt;archive?:string;updatedAt:string; }
 interface LaunchOptions { workspace?:WorkspaceBinding; workingDirectorySources?:WorkingDirectorySource[]; referenceContext?:WorkingDirectorySource; developmentToolchain?:FrozenDevelopmentToolchain; assertCurrent?:()=>void; retainedEnvironment?:RetirementReceipt; agentToolchain?:PreparedAgentToolchain; }
+export interface SessionExecutionContext {kind:'container'|'host-macos';targetId?:string;workdir:string;containerId?:string;referencePath?:string;referenceContainerPath?:string;}
+interface HostSessionRecord {id:string;deviceId:string;generation:number;prepared:HostWorkspacePrepared;releasedAt?:string;}
+export interface HostLaunchOptions {workspace:WorkspaceRecord;workingDirectorySources?:WorkingDirectorySource[];referenceContext?:WorkingDirectorySource;executionTargetId?:string;assertCurrent?:()=>void;onCreated?:(session:Session)=>void;}
 interface RuntimeAccess { endpoint:DockerRuntimeEndpoint; ensureReady():Promise<DockerRuntimeEndpoint>; bridgeHostAddress():string|undefined; }
 class SessionGenerationChangedError extends HttpError {constructor(){super(409,'A newer environment connection replaced this request.');}}
 export class SessionController {
@@ -37,17 +41,19 @@ export class SessionController {
   readonly beforeStop: Array<(sessionId:string)=>Promise<void>> = [];
   readonly afterCaptureBeforeStop: Array<(sessionId:string)=>Promise<void>> = [];
   directoryManager: WorkingDirectoryManager;
+  hostWorkspaces:HostWorkspaceManager;
   private directoryCaptures = new Map<string,Promise<WorkingDirectoryCapture[]>>();
   constructor(private store: Store, private deviceId: string, private changed: () => void, private event: (topic: string, data: unknown) => void, private runtime:RuntimeAccess, private workspaceDataDir=path.join(path.dirname(path.dirname(runtime.endpoint.configDirectory)),'workspace-data')) {
     this.engine = new EnvmuxEngine({binary: process.env.ENOUGHFACTORY_ENVMUX_PATH,dockerRuntime:runtime.endpoint,containerHostAddress:runtime.bridgeHostAddress(),workspaceRoot: process.env.ENOUGHFACTORY_REPO||process.env.ENOUGHFACTORY_RESOURCES||path.resolve(process.cwd(),process.cwd().endsWith('/apps/device')?'../..':'.')});
     this.directoryManager=new WorkingDirectoryManager({dataDir:workspaceDataDir,artifacts:new ArtifactStore(path.join(workspaceDataDir,'artifacts'),deviceId)});
+    this.hostWorkspaces=new HostWorkspaceManager({workspaceDataDir,artifacts:new ArtifactStore(path.join(workspaceDataDir,'artifacts'),deviceId),directoryManager:this.directoryManager});
   }
-  setDeviceId(deviceId: string): void {this.deviceId=deviceId;this.directoryManager=new WorkingDirectoryManager({dataDir:this.workspaceDataDir,artifacts:new ArtifactStore(path.join(this.workspaceDataDir,'artifacts'),deviceId)});}
-  owns(sessionId:string):boolean {return (this.store.get<LaunchRecord>('session-launch',sessionId)?.dockerHost||this.store.get<PrivateSession>('session-private',sessionId)?.ready.dockerHost)===this.runtime.endpoint.host;}
-  needsTermination(sessionId:string):boolean {return this.owns(sessionId)&&this.store.get<ContainerRetirement>('session-container-retirement',sessionId)?.status!=='removed'&&this.record(sessionId).status!=='stopped'&&(this.live.has(sessionId)||this.starts.has(sessionId)||Boolean(this.store.get<PrivateSession>('session-private',sessionId)));}
+  setDeviceId(deviceId: string): void {this.deviceId=deviceId;this.directoryManager=new WorkingDirectoryManager({dataDir:this.workspaceDataDir,artifacts:new ArtifactStore(path.join(this.workspaceDataDir,'artifacts'),deviceId)});this.hostWorkspaces=new HostWorkspaceManager({workspaceDataDir:this.workspaceDataDir,artifacts:new ArtifactStore(path.join(this.workspaceDataDir,'artifacts'),deviceId),directoryManager:this.directoryManager});}
+  owns(sessionId:string):boolean {const host=this.store.get<HostSessionRecord>('session-host',sessionId);if(this.record(sessionId).executionTargetKind==='host-macos')return !!host&&host.deviceId===this.deviceId&&this.record(sessionId).deviceId===this.deviceId;return (this.store.get<LaunchRecord>('session-launch',sessionId)?.dockerHost||this.store.get<PrivateSession>('session-private',sessionId)?.ready.dockerHost)===this.runtime.endpoint.host;}
+  needsTermination(sessionId:string):boolean {if(this.record(sessionId).executionTargetKind==='host-macos')return this.owns(sessionId)&&this.record(sessionId).status!=='stopped'&&!!this.store.get<HostSessionRecord>('session-host',sessionId);return this.owns(sessionId)&&this.store.get<ContainerRetirement>('session-container-retirement',sessionId)?.status!=='removed'&&this.record(sessionId).status!=='stopped'&&(this.live.has(sessionId)||this.starts.has(sessionId)||Boolean(this.store.get<PrivateSession>('session-private',sessionId)));}
   serviceActivity():{starting:number;stopping:number} {return {starting:new Set([...this.starts.keys(),...this.launchJobs.keys(),...this.restoring]).size,stopping:new Set([...this.stopping,...this.stopJobs.keys(),...this.stoppedInputReleases]).size};}
-  retirementIdentityKey(sessionId:string):string {const launch=this.store.get<LaunchRecord>('session-launch',sessionId),saved=this.store.get<PrivateSession>('session-private',sessionId);return `${launch?.generation??0}:${saved?.ready.instance??this.record(sessionId).containerId??''}`;}
-  retirementContainerName(sessionId:string):string {const name=this.store.get<PrivateSession>('session-private',sessionId)?.ready.instance??this.record(sessionId).containerId;if(!name)throw new HttpError(409,'No owned container identity was confirmed for this environment.','ENVIRONMENT_IDENTITY_UNKNOWN');return name;}
+  retirementIdentityKey(sessionId:string):string {if(this.record(sessionId).executionTargetKind==='host-macos'){const host=this.store.get<HostSessionRecord>('session-host',sessionId);return `host:${host?.generation??0}:${host?.prepared.cwd??''}`;}const launch=this.store.get<LaunchRecord>('session-launch',sessionId),saved=this.store.get<PrivateSession>('session-private',sessionId);return `${launch?.generation??0}:${saved?.ready.instance??this.record(sessionId).containerId??''}`;}
+  retirementContainerName(sessionId:string):string {if(this.record(sessionId).executionTargetKind==='host-macos')throw new HttpError(409,'This native host workspace has no container.','HOST_SESSION');const name=this.store.get<PrivateSession>('session-private',sessionId)?.ready.instance??this.record(sessionId).containerId;if(!name)throw new HttpError(409,'No owned container identity was confirmed for this environment.','ENVIRONMENT_IDENTITY_UNKNOWN');return name;}
   private namespaceId(projectPath:string,name:string):string {return createHash('sha256').update(JSON.stringify([this.runtime.endpoint.host,projectPath,name])).digest('hex');}
   private ownsNamespace(sessionId:string):boolean {
     const launch=this.store.get<LaunchRecord>('session-launch',sessionId),record=this.record(sessionId);if(!launch)return false;
@@ -64,7 +70,7 @@ export class SessionController {
     try{process.kill(pid,0);return true;}catch(error){if((error as NodeJS.ErrnoException).code==='ESRCH')return false;return true;}
   }
   canRetireEnvironment(sessionId:string):boolean {
-    const record=this.record(sessionId);
+    const record=this.record(sessionId);if(record.executionTargetKind==='host-macos')return false;
     return this.owns(sessionId)&&this.ownsNamespace(sessionId)&&['stopped','failed','unknown'].includes(record.status)&&!this.starts.has(sessionId)&&!this.launchJobs.has(sessionId)&&!this.stopJobs.has(sessionId)&&!this.stopping.has(sessionId)&&!this.directoryCaptures.has(sessionId)&&!this.restoring.has(sessionId)&&!this.nativeOwnerAlive(sessionId);
   }
   /** A terminal provider outcome and a stopped container are independent facts. */
@@ -123,6 +129,13 @@ export class SessionController {
   }
   runtimeProgress(status:ContainerRuntimeStatus):void {for(const sessionId of this.runtimeWaits)this.patch(sessionId,{phase:status.phase||'Preparing EnoughFactory runtime'});}
   async recover(): Promise<void> {
+    for(const saved of this.store.list<HostSessionRecord>('session-host')){
+      const record=this.store.get<Session>('sessions',saved.id);if(!record||record.archivedAt||record.status==='stopped'||saved.releasedAt)continue;
+      if(saved.deviceId!==this.deviceId||record.deviceId!==this.deviceId||record.executionTargetKind!=='host-macos'){this.patch(saved.id,{status:'unknown',phase:'Native workspace ownership changed.'});continue;}
+      try{const prepared=await this.hostWorkspaces.load(saved.id);if(JSON.stringify(prepared)!==JSON.stringify(saved.prepared))throw new Error('Native workspace binding changed after its retained owner record.');this.store.set('session-host',{...saved,prepared});if(record.status==='starting')this.patch(saved.id,{status:'unknown',phase:'The device service restarted during native workspace preparation.'});}
+      catch(error){this.patch(saved.id,{status:'unknown',phase:'Native workspace requires recovery.',error:(error as Error).message});}
+    }
+    for(const record of this.store.list<Session>('sessions'))if(record.executionTargetKind==='host-macos'&&!record.archivedAt&&record.status!=='stopped'&&!this.store.get<HostSessionRecord>('session-host',record.id))this.patch(record.id,{status:'unknown',phase:'The native workspace owner was not recorded; preserved files require recovery.'});
     for (const saved of this.store.list<PrivateSession>('session-private')) {
       const record = this.store.get<Session>('sessions', saved.id);
       if (!record || record.archivedAt || record.status === 'stopped'||this.archivedEnvironment(saved.id)||this.stoppedInputReleases.has(saved.id)||this.restoring.has(saved.id)) continue;
@@ -234,8 +247,86 @@ export class SessionController {
     }).catch(error=>{if(!current())return;if(abort.signal.aborted&&this.stopping.has(record.id)&&!this.live.has(record.id)){this.stopping.delete(record.id);this.patch(record.id,{status:'stopped',error:undefined,phase:'Startup canceled; retained work is preserved'});}else this.patch(record.id,{status:this.live.has(record.id)?'unknown':'failed',error:error.message,phase:this.live.has(record.id)?'Environment retained; additional setup was not confirmed':'Could not prepare the environment'});}).finally(()=>{this.restoring.delete(record.id);this.runtimeWaits.delete(record.id);if(this.starts.get(record.id)===abort)this.starts.delete(record.id);if(this.launchJobs.get(record.id)===job)this.launchJobs.delete(record.id);this.notifyTerminal(record.id);});
     this.launchJobs.set(record.id,job);
   }
+  async createHost(project:Project,name:string,options:HostLaunchOptions):Promise<Session> {
+    this.assertActiveProject(project);
+    if(process.platform!=='darwin')throw new HttpError(409,'Native Mac authoring requires a configured Mac device.','HOST_UNSUPPORTED');
+    if(!/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$/.test(name))throw new HttpError(400,'Invalid native workspace name.');
+    if(this.store.list<Session>('sessions').some(session=>session.projectId===project.id&&session.name===name&&!['stopped','failed'].includes(session.status)))throw new HttpError(409,'This native workspace already exists.');
+    const record:Session={id:id('session'),projectId:project.id,deviceId:this.deviceId,name,status:'starting',phase:'Preparing private native workspace',executionTargetKind:'host-macos',executionTargetId:options.executionTargetId,createdAt:now(),updatedAt:now(),services:[]};
+    const generation=1,abort=new AbortController();
+    this.generations.set(record.id,generation);this.starts.set(record.id,abort);this.store.set('sessions',record);
+    this.store.set<LaunchRecord>('session-launch',{id:record.id,projectPath:project.path,generation,executionTargetKind:'host-macos',executionTargetId:options.executionTargetId,workingDirectorySources:options.workingDirectorySources,referenceContext:options.referenceContext});
+    this.changed();
+    options.onCreated?.(record);
+    const assertCurrent=()=>{
+      options.assertCurrent?.();
+      if(abort.signal.aborted||this.generations.get(record.id)!==generation||this.stopping.has(record.id))throw new SessionGenerationChangedError();
+    };
+    const job=(async()=>{
+      try {
+        assertCurrent();
+        const prepared=await this.hostWorkspaces.prepare({sessionId:record.id,workspace:options.workspace,workingDirectorySources:options.workingDirectorySources,referenceContext:options.referenceContext,assertCurrent});
+        // Publish the retained binding before checking cancellation, so stop can
+        // capture every prepared root even if readiness is never announced.
+        this.store.set<HostSessionRecord>('session-host',{id:record.id,deviceId:this.deviceId,generation,prepared});
+        const workingDirectories=prepared.roots.map(root=>({...this.publicRoot(root,'ready'),path:root.path}));
+        this.patch(record.id,{workingDirectories});
+        assertCurrent();
+        this.patch(record.id,{status:'ready',phase:'Private native workspace ready',branch:options.workspace.branch,workingDirectories});
+      } catch(error) {
+        this.patch(record.id,{
+          status:abort.signal.aborted?(this.stopping.has(record.id)?'stopping':'stopped'):'failed',
+          phase:abort.signal.aborted?'Native preparation canceled; files retained':'Native workspace preparation failed',
+          error:(error as Error).message,
+        });
+        throw error;
+      } finally {
+        if(this.starts.get(record.id)===abort)this.starts.delete(record.id);
+        this.launchJobs.delete(record.id);
+      }
+    })();
+    this.launchJobs.set(record.id,job);
+    await job;
+    return this.record(record.id);
+  }
+  execution(sessionId:string):SessionExecutionContext {
+    const record=this.assertWorkAvailable(sessionId);
+    if(record.executionTargetKind==='host-macos'){
+      const host=this.store.get<HostSessionRecord>('session-host',sessionId);
+      if(!host||host.deviceId!==this.deviceId||record.deviceId!==this.deviceId||host.releasedAt)throw new HttpError(409,'This native workspace is unavailable; its captured source and conversation remain retained.','HOST_WORKSPACE_UNAVAILABLE');
+      return {kind:'host-macos',targetId:record.executionTargetId,workdir:host.prepared.cwd,referencePath:host.prepared.referenceContext?.path,referenceContainerPath:host.prepared.referenceContext?.containerPath};
+    }
+    const engine=this.get(sessionId);
+    return {kind:'container',targetId:record.executionTargetId,containerId:engine.ready.instance,workdir:engine.ready.workdir};
+  }
+  async assertHostExecutionCurrent(sessionId:string):Promise<void> {
+    if(this.record(sessionId).executionTargetKind!=='host-macos')return;
+    const host=this.store.get<HostSessionRecord>('session-host',sessionId);
+    if(!host||host.deviceId!==this.deviceId||this.record(sessionId).deviceId!==this.deviceId||host.releasedAt)throw new HttpError(409,'The native workspace owner is unavailable.');
+    const current=await this.hostWorkspaces.load(sessionId);
+    if(current.sessionId!==sessionId||JSON.stringify(current)!==JSON.stringify(host.prepared))throw new HttpError(409,'The native workspace identity changed.');
+  }
+  async waitExecutionReady(sessionId:string,timeoutMs=30*60_000):Promise<SessionExecutionContext> {
+    const started=Date.now();
+    while(Date.now()-started<timeoutMs){
+      const record=this.record(sessionId);
+      if(record.status==='ready'){await this.assertHostExecutionCurrent(sessionId);return this.execution(sessionId);}
+      if(['failed','stopped','unknown'].includes(record.status))throw new Error(record.error||record.phase||'Execution workspace unavailable');
+      await new Promise(resolve=>setTimeout(resolve,200));
+    }
+    throw new Error('Execution workspace preparation timed out.');
+  }
+  async disposeHostWorkspace(sessionId:string):Promise<void> {
+    if(this.record(sessionId).executionTargetKind!=='host-macos')return;
+    this.assertCanArchive(sessionId);
+    const host=this.store.get<HostSessionRecord>('session-host',sessionId);
+    if(!host||host.releasedAt)return;
+    await this.hostWorkspaces.dispose(host.prepared);
+    this.store.set('session-host',{...host,releasedAt:now()});this.changed();
+  }
   get(sessionId: string): EnvmuxSession {
     this.assertWorkAvailable(sessionId);
+    if(this.record(sessionId).executionTargetKind==='host-macos')throw new HttpError(409,'This native host workspace has no container connection.','HOST_SESSION');
     const session=this.live.get(sessionId); if(!session) throw new HttpError(409,'This environment is not connected.','SESSION_UNAVAILABLE'); return session;
   }
   assertCanStartWork(sessionId:string):void{this.assertWorkAvailable(sessionId);if(this.record(sessionId).status!=='ready'||this.stopping.has(sessionId)||this.stopJobs.has(sessionId)||this.directoryCaptures.has(sessionId))throw new HttpError(409,'Wait until the environment is ready and its working folders have finished being preserved.','ENVIRONMENT_BUSY');}
@@ -266,6 +357,12 @@ export class SessionController {
     const operation=this.stopSession(sessionId).finally(()=>{this.stopJobs.delete(sessionId);this.notifyTerminal(sessionId);});this.stopJobs.set(sessionId,operation);return operation;
   }
   private async stopSession(sessionId:string):Promise<void>{
+    if(this.record(sessionId).executionTargetKind==='host-macos'){
+      this.stopping.add(sessionId);this.patch(sessionId,{status:'stopping',phase:'Preserving native workspace'});
+      try{this.starts.get(sessionId)?.abort();await this.launchJobs.get(sessionId)?.catch(()=>{});for(const hook of this.beforeStop)await hook(sessionId);await this.captureWorkingDirectories(sessionId);this.stopping.delete(sessionId);this.patch(sessionId,{status:'stopped',phase:'Native workspace and conversation retained',error:undefined});}
+      catch(error){this.stopping.delete(sessionId);this.patch(sessionId,{status:'unknown',phase:'Native execution termination is unconfirmed; workspace retained',error:(error as Error).message});throw error;}
+      return;
+    }
     this.stopping.add(sessionId);
     this.patch(sessionId,{status:'stopping',phase:'Returning work to Git'});
     if(this.starts.has(sessionId)&&!this.live.has(sessionId)){this.starts.get(sessionId)!.abort();await this.launchJobs.get(sessionId);if(this.record(sessionId).status==='failed')throw new Error(this.record(sessionId).error||'Startup has not confirmed termination.');return;}
@@ -276,6 +373,12 @@ export class SessionController {
     await this.disposeReferenceContext(sessionId);
   }
   async restart(sessionId: string): Promise<void> {
+    if(this.record(sessionId).executionTargetKind==='host-macos'){
+      this.assertWorkAvailable(sessionId);if(this.stopJobs.has(sessionId)||this.stopping.has(sessionId)||this.starts.has(sessionId)||this.store.list<Chat>('chats').some(c=>c.sessionId===sessionId&&['running','waiting'].includes(c.status)))throw new HttpError(409,'Confirm the native agent has stopped before resuming this workspace.','HOST_WORKSPACE_BUSY');
+      await this.assertHostExecutionCurrent(sessionId);
+      if(this.record(sessionId).status==='stopped'){const host=this.store.get<HostSessionRecord>('session-host',sessionId)!;await this.hostWorkspaces.beginContinuation(host.prepared);this.store.delete('session-working-directory-captures',sessionId);}
+      this.patch(sessionId,{status:'ready',phase:'Retained native workspace ready',error:undefined});return;
+    }
     const launchNamespace=this.store.get<LaunchRecord>('session-launch',sessionId),restartRecord=this.record(sessionId);
     if(launchNamespace){
       if(this.store.list<Session>('sessions').some(other=>other.id!==sessionId&&other.name===restartRecord.name&&this.store.get<LaunchRecord>('session-launch',other.id)?.projectPath===launchNamespace.projectPath&&(this.stoppedInputReleases.has(other.id)||this.restoring.has(other.id))))throw new HttpError(409,'This environment name is preserving or restoring its previous contents.','ENVIRONMENT_BUSY');
@@ -307,6 +410,10 @@ export class SessionController {
     this.patch(sessionId,{status:'starting',phase:'Preparing EnoughFactory runtime',error:undefined,services:[]});this.launch(record,project,{workspace:launch?.workspace||saved?.workspace,workingDirectorySources:launch?.workingDirectorySources,referenceContext:launch?.referenceContext,developmentToolchain:launch?.developmentToolchain||record.developmentToolchain,agentToolchain:launch?.agentToolchain});
   }
   async changes(sessionId: string, selectedPath?: string, rootId?:string): Promise<RepositoryChanges> {
+    if(this.record(sessionId).executionTargetKind==='host-macos'){
+      await this.assertHostExecutionCurrent(sessionId);const root=rootId?this.record(sessionId).workingDirectories?.find(item=>item.id===rootId):undefined;if(rootId&&!root)throw new HttpError(404,'Working folder not found.');const cwd=root?.path??this.execution(sessionId).workdir;
+      return readRepositoryChanges(async args=>{try{const r=await exec('git',['--no-optional-locks','--no-pager','--literal-pathspecs','-c','core.hooksPath=/dev/null','-C',cwd,...args]);return {code:0,stdout:r.stdout,stderr:r.stderr};}catch(error){return error as {code:number;stdout:string;stderr:string};}},selectedPath,root?.baseCommit);
+    }
     if(!rootId){const engine=this.get(sessionId);return readRepositoryChanges(managedRepositoryReader(this.runtime.endpoint,engine.ready),selectedPath);}
     const root=(this.record(sessionId).workingDirectories||[]).find(item=>item.id===rootId);if(!root)throw new HttpError(404,'Working folder not found.');
     if(this.record(sessionId).status!=='stopped'){const engine=this.get(sessionId);return readRepositoryChanges(managedRepositoryReader(this.runtime.endpoint,{...engine.ready,workdir:root.path}),selectedPath,root.baseCommit);}
@@ -349,6 +456,7 @@ export class SessionController {
     this.store.set('session-reference-context-provision',{id:sessionId,complete:true,sha256:source.sourceArtifact.sha256});
   }
   async disposeReferenceContext(sessionId:string):Promise<void>{
+    if(this.record(sessionId).executionTargetKind==='host-macos')return;
     if(!/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,79}$/.test(sessionId))throw new Error('Invalid reference context session identity.');
     if(this.needsTermination(sessionId))throw new Error('Confirm environment termination before disposing its reference inputs.');
     await rm(path.join(this.workspaceDataDir,'working-directories',`${sessionId}-reference-context`),{recursive:true,force:true});
@@ -358,11 +466,22 @@ export class SessionController {
     if(this.store.list<Chat>('chats').some(chat=>chat.sessionId===sessionId&&['running','waiting'].includes(chat.status)))throw new HttpError(409,'Wait for or interrupt the active agent before capturing working folders.');
     const existing=this.directoryCaptures.get(sessionId);if(existing)return existing;
     if(this.record(sessionId).status==='stopped'){
-      const roots=this.store.get<{id:string;roots:WorkingDirectoryCapture[]}>('session-working-directory-captures',sessionId)?.roots||[],expected=this.record(sessionId).workingDirectories!;
+      let roots=this.store.get<{id:string;roots:WorkingDirectoryCapture[]}>('session-working-directory-captures',sessionId)?.roots||[];const expected=this.record(sessionId).workingDirectories!;
+      if(this.record(sessionId).executionTargetKind==='host-macos'){
+        await this.assertHostExecutionCurrent(sessionId);const host=this.store.get<HostSessionRecord>('session-host',sessionId)!;const verified=await this.hostWorkspaces.capture(host.prepared);
+        if(JSON.stringify(verified)!==JSON.stringify(roots))throw new HttpError(409,'The stopped native folders differ from their retained capture. Preserve a deliberate continuation before accepting changed files.');
+        roots=verified;
+      }
       if(roots.length!==expected.length||expected.some(root=>!roots.some(capture=>capture.id===root.id&&capture.name===root.name&&capture.baseCommit===root.baseCommit)))throw new HttpError(409,'Not every additional working folder has a confirmed retained snapshot. Inspect the retained environment before accepting this attempt.');
       return roots;
     }
     const operation=(async()=>{
+      if(this.record(sessionId).executionTargetKind==='host-macos'){
+        await this.assertHostExecutionCurrent(sessionId);const host=this.store.get<HostSessionRecord>('session-host',sessionId)!;
+        const worker=this.store.list<{id:string;sessionId?:string;goal?:{id:string};task?:{id:string}}>('factory-workers').find(record=>record.sessionId===sessionId);
+        const roots=await this.hostWorkspaces.capture(host.prepared,worker?{goalId:worker.goal?.id,taskId:worker.task?.id,attemptId:worker.id}:{});for(const capture of roots)for(const manifest of [capture.bundleArtifact,capture.diffArtifact])this.store.set('artifacts',manifest);
+        this.store.set('session-working-directory-captures',{id:sessionId,roots});this.patch(sessionId,{workingDirectories:host.prepared.roots.map(root=>({...this.publicRoot(root,'captured',roots.find(item=>item.id===root.id)),path:root.path}))});return roots;
+      }
       const engine=this.live.get(sessionId);if(!engine)throw new HttpError(409,'Reconnect the environment before capturing its folders.');
       const snapshots=await this.directoryManager.sourceSnapshots(sessionId),exports:string[]=[];
       await this.docker(['pause',engine.ready.instance]);

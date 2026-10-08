@@ -4,11 +4,12 @@ import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import type { Artifact, Attempt, AttemptInspection, ControllerRun, FactoryTask, Goal, GoalInspection, Project, TaskInspection } from '@enoughfactory/contracts';
+import type { Artifact, Attempt, AttemptInspection, ControllerRun, Device, FactoryTask, Goal, GoalInspection, Project, TaskInspection } from '@enoughfactory/contracts';
 import type { AttemptDetail, ControlRecord, FactoryRuntimePort, FactoryWorkspacePort, PlanRecord, TaskDetail } from '@enoughfactory/factory';
 import { DeviceApp } from './app.ts';
 import type { ChatController } from './chats.ts';
 import { initializeFactory } from './factory.ts';
+import { HostDiskAdmission } from './host-disk-admission.ts';
 
 test('authenticated inspection projects exact receipts without writes and isolates unknown work to its dependency and write branches', async t => {
   const directory = mkdtempSync(path.join(tmpdir(), 'enoughfactory-inspection-'));
@@ -74,8 +75,12 @@ test('authenticated inspection projects exact receipts without writes and isolat
     const check = {
       command: 'verify/feature', passed: true, output: 'Scenario returned the expected response\n',
       exitCode: 0, candidateCommit: 'candidate-sha', checkedCommit: 'candidate-sha',
+      appleValidation: { version: 1 as const, candidateId: 'candidate', candidateCommit: 'candidate-sha', checkedCommit: 'candidate-sha',
+        profile: { tool: 'xcodebuild' as const, project: 'App.xcodeproj', scheme: 'App', platform: 'macos' as const, configuration: 'Debug' as const },
+        sandbox: 'macos-seatbelt-deny-default' as const, developerDirectory: '/Applications/Xcode.app/Contents/Developer', workingDirectories: [],
+        products: [{ id: 'native-product', name: 'Native app', mime: 'application/zip', sha256: 'product-hash', size: 72, deviceId: app.device.id, createdAt: at }] },
     };
-    const combinedCheck = { ...check, output: 'Combined repository scenario passed\n', checkedCommit: 'integrated-sha' };
+    const combinedCheck = { ...check, output: 'Combined repository scenario passed\n', checkedCommit: 'integrated-sha', appleValidation: { ...check.appleValidation, checkedCommit: 'integrated-sha' } };
     const failedCheck = {
       command: 'verify/feature', passed: false, output: 'Health scenario returned 503\n', exitCode: 17,
       candidateCommit: 'failed-candidate-sha', checkedCommit: 'failed-candidate-sha',
@@ -170,6 +175,7 @@ test('authenticated inspection projects exact receipts without writes and isolat
     assert.deepEqual(taskView.checks, ['verify/feature']);
     assert.deepEqual(taskView.attempts.map(item => item.attempt.id), [acceptedAttempt.id, failedAttempt.id]);
     assert.deepEqual(taskView.attempts[0]!.checks, [check]);
+    assert.equal(taskView.attempts[0]!.checks![0]!.appleValidation!.products[0]!.id, 'native-product', 'Native product references survive public check projection');
     assert.deepEqual(taskView.attempts[0]!.integration!.checks, [combinedCheck]);
     assert.deepEqual(taskView.attempts[1]!.checks, [failedCheck]);
     assert.equal(taskView.artifacts[0]!.sha256, artifact.sha256);
@@ -203,6 +209,7 @@ test('authenticated inspection projects exact receipts without writes and isolat
 });
 
 test('stale inspector commands preserve newer attempts, pause and replanning controls', async t => {
+  t.mock.method(HostDiskAdmission.prototype, 'blocker', () => undefined);
   const directory = mkdtempSync(path.join(tmpdir(), 'enoughfactory-task-actions-'));
   t.after(() => rmSync(directory, { recursive: true, force: true }));
   const previousDirectory = process.env.ENOUGHFACTORY_HOME;
@@ -292,7 +299,7 @@ test('stale inspector commands preserve newer attempts, pause and replanning con
       const before = snapshot(), view = await viewTask();
       assert.equal(view.state, 'waiting');
       assert.deepEqual(view.verificationInputs, { missingEnvironment: ['EVIDENCE_DESCRIPTOR'] });
-      assert.match(view.reason!, /EVIDENCE_DESCRIPTOR/);
+      assert.match(view.reason!, /verification evidence/i);
       assert.equal(JSON.stringify(view).includes('/private/coordinator-evidence'), false);
       assert.deepEqual(snapshot(), before, 'Reading prerequisite metadata cannot change task or attempt state');
       if (status === 'failed') {
@@ -439,6 +446,7 @@ test('stale inspector commands preserve newer attempts, pause and replanning con
 });
 
 test('retry acknowledges its authorized successor dispatched before cancellation returns', async t => {
+  t.mock.method(HostDiskAdmission.prototype, 'blocker', () => undefined);
   const directory = mkdtempSync(path.join(tmpdir(), 'enoughfactory-retry-dispatch-race-'));
   t.after(() => rmSync(directory, { recursive: true, force: true }));
   const previousDirectory = process.env.ENOUGHFACTORY_HOME;
@@ -541,4 +549,125 @@ test('task-local prerequisite waits expose their actual age without changing fai
   assert.deepEqual(buckets.map(bucket => store.list(bucket)), before, 'Legacy fallback is a read-only projection');
   store.set('factory-task-details', { ...current, waitSince: undefined, waitingFor: undefined });
   assert.equal(inspectTask(store, [], task).wait, undefined, 'A cleared condition cannot expose a stale wake action');
+});
+
+test('native capability readiness projects a durable prerequisite without rewriting attempt outcomes', async t => {
+  const { Store } = await import('./store.ts');
+  const { inspectTask } = await import('./task-inspection.ts');
+  const directory = mkdtempSync(path.join(tmpdir(), 'enoughfactory-capability-inspection-'));
+  const store = new Store(directory);
+  t.after(() => { store.close(); rmSync(directory, { recursive: true, force: true }); });
+  const at = '2026-10-08T00:00:00.000Z';
+  const goal: Goal = { id: 'goal', projectId: 'project', coordinatorId: 'owner', title: 'Deliver', objective: 'Deliver the native app', criteria: ['The app works'],
+    status: 'running', autonomy: 'autonomous', approvalMode: 'approve-all', runtime: 'codex', concurrency: 2, revision: 1, createdAt: at, updatedAt: at };
+  const task: FactoryTask = { id: 'task', goalId: goal.id, title: 'Verify the native workflow', description: 'Use actual native tools', dependsOn: [],
+    execution: { target: 'container', delegatedCapabilities: ['macos-app-inspection'] }, status: 'queued', createdAt: at, updatedAt: at };
+  const device: Device = { id: 'owner', name: 'Test Mac', platform: 'darwin', arch: 'arm64', online: true, lastSeen: at, local: true, executionTargets: [
+    { id: 'container', kind: 'container', protocolVersion: 1, readiness: 'ready', capabilities: [{ kind: 'linux-shell', readiness: 'ready' }] },
+    { id: 'host-macos', kind: 'host-macos', protocolVersion: 1, readiness: 'ready', capabilities: [{ kind: 'macos-app-inspection', readiness: 'setup-required', reason: 'The Mac testing helper must be connected.' }] },
+  ] };
+  store.set('goals', goal); store.set('tasks', task);
+  store.set<ControlRecord>('factory-control', { id: goal.id, stage: 'plan', startedAt: at, steering: [] });
+  const buckets = ['goals', 'tasks', 'attempts', 'factory-task-details', 'factory-attempt-details', 'factory-control', 'decisions'];
+  const before = buckets.map(bucket => store.list(bucket));
+  const queued = inspectTask(store, [device], task);
+  assert.equal(queued.state, 'waiting', 'Planning cannot conceal an unsupported native prerequisite');
+  assert.equal(queued.reason, 'The Mac testing helper must be connected.');
+  assert.deepEqual(queued.executionBlocker, { kind: 'execution-capability', readiness: 'setup-required', capabilities: ['macos-app-inspection'],
+    deviceIds: [device.id], targetIds: ['host-macos'], reason: queued.reason });
+  assert.deepEqual(buckets.map(bucket => store.list(bucket)), before, 'Readiness is a read-only projection and cannot allocate an attempt');
+  assert.equal(inspectTask(store, [{ ...device, executionTargets: undefined }], task).executionBlocker!.readiness, 'unsupported', 'The Mac platform does not imply native UI support');
+
+  const attempt: Attempt = { id: 'fifth', taskId: task.id, generation: 5, deviceId: device.id, status: 'failed', startedAt: at, endedAt: at, error: 'Native evidence was unavailable' };
+  const failed = { ...task, status: 'failed' as const, currentAttemptId: attempt.id };
+  store.set('tasks', failed); store.set('attempts', attempt);
+  store.set<AttemptDetail>('factory-attempt-details', { id: attempt.id, goalId: goal.id, goalRevision: 1, phase: 'checking', cancellation: 'none', result: { status: 'succeeded', text: 'Author turn completed' } });
+  const failedView = inspectTask(store, [device], failed);
+  assert.equal(failedView.state, 'waiting');
+  assert.equal(failedView.executionBlocker!.readiness, 'setup-required');
+  assert.deepEqual(store.get<Attempt>('attempts', attempt.id), attempt, 'Missing tools cannot retire or rewrite a failed author attempt');
+  assert.equal(failedView.attempts[0]!.result!.status, 'succeeded', 'Provider completion remains distinct from failed acceptance');
+
+  const readyDevice: Device = { ...device, executionTargets: device.executionTargets!.map(target => ({ ...target, capabilities: target.capabilities.map(capability => ({ ...capability, readiness: 'ready', reason: undefined })) })) };
+  store.set('tasks', task); store.set<ControlRecord>('factory-control', { id: goal.id, stage: 'dispatch', startedAt: at, steering: [] });
+  const ready = inspectTask(store, [readyDevice], task);
+  assert.equal(ready.executionBlocker, undefined); assert.equal(ready.state, 'ready');
+  const unknown = { ...attempt, status: 'unknown' as const, endedAt: undefined };
+  const running = { ...failed, status: 'running' as const };
+  store.set('tasks', running); store.set('attempts', unknown);
+  const unknownView = inspectTask(store, [device], running);
+  assert.equal(unknownView.state, 'unknown'); assert.equal(unknownView.executionBlocker, undefined, 'Capability waits cannot replace unresolved execution authority');
+});
+
+test('goal execution defaults gate queued inspection and manual dispatch without replacing explicit task requirements', async t => {
+  const { Store } = await import('./store.ts');
+  const { inspectTask, taskDispatchBlocker } = await import('./task-inspection.ts');
+  const directory = mkdtempSync(path.join(tmpdir(), 'enoughfactory-goal-capability-inspection-'));
+  const store = new Store(directory);
+  t.after(() => { store.close(); rmSync(directory, { recursive: true, force: true }); });
+  const at = '2026-10-08T00:00:00.000Z';
+  const goal: Goal = { id: 'goal', projectId: 'project', coordinatorId: 'owner', title: 'Native app', objective: 'Deliver', criteria: ['Works'],
+    status: 'running', autonomy: 'autonomous', approvalMode: 'approve-all', runtime: 'codex', concurrency: 2, revision: 1, createdAt: at, updatedAt: at, execution: { target: 'host-macos' } };
+  const task: FactoryTask = { id: 'task', goalId: goal.id, title: 'Implement', description: 'Use the goal target', dependsOn: [], status: 'queued', createdAt: at, updatedAt: at };
+  const device: Device = { id: 'owner', name: 'Mac', platform: 'darwin', arch: 'arm64', local: true, online: true, lastSeen: at, capacity: 2 };
+  store.set('goals', goal); store.set('tasks', task);
+  store.set<ControlRecord>('factory-control', { id: goal.id, stage: 'plan', startedAt: at, steering: [] });
+  assert.equal(inspectTask(store, [device], task).executionBlocker?.readiness, 'unsupported', 'A goal host default must not inherit legacy container readiness');
+  assert.equal(inspectTask(store, [device], task).state, 'waiting', 'Controller planning does not hide missing goal capabilities');
+  assert.equal(taskDispatchBlocker(store, [device], task, goal)?.kind, 'execution-capability');
+  const explicit = { ...task, execution: { target: 'container' as const } };
+  assert.equal(inspectTask(store, [device], explicit).executionBlocker, undefined, 'Explicit per-task placement owns its contract');
+  assert.equal(taskDispatchBlocker(store, [device], explicit, goal), undefined);
+  const ready: Device = { ...device, executionTargets: [{ id: 'mac-host', kind: 'host-macos', protocolVersion: 1, readiness: 'ready', capabilities: [{ kind: 'mac-shell', readiness: 'ready' }] }] };
+  store.set<ControlRecord>('factory-control', { id: goal.id, stage: 'dispatch', startedAt: at, steering: [] });
+  assert.equal(inspectTask(store, [ready], task).state, 'ready');
+  assert.equal(inspectTask(store, [ready], task).executionBlocker, undefined);
+  assert.equal(taskDispatchBlocker(store, [ready], task, goal), undefined);
+  assert.equal(store.get<FactoryTask>('tasks', task.id)!.execution, undefined, 'Projection cannot rewrite recorded task contracts');
+});
+
+test('verification evidence wait preserves candidate and check provenance while releasing author capacity but retaining frozen write ownership', async t => {
+  const { Store } = await import('./store.ts');
+  const { inspectTask, taskDispatchBlocker } = await import('./task-inspection.ts');
+  const directory = mkdtempSync(path.join(tmpdir(), 'enoughfactory-verification-wait-inspection-'));
+  const store = new Store(directory);
+  t.after(() => { store.close(); rmSync(directory, { recursive: true, force: true }); });
+  const at = '2026-10-08T00:00:00.000Z', waitingAt = '2026-10-08T00:15:00.000Z';
+  const goal: Goal = { id: 'goal', projectId: 'project', coordinatorId: 'owner', title: 'Deliver', objective: 'Deliver', criteria: ['Works'],
+    status: 'running', autonomy: 'autonomous', approvalMode: 'approve-all', runtime: 'codex', concurrency: 1, revision: 1, createdAt: at, updatedAt: at, execution: { target: 'host-macos' } };
+  const task: FactoryTask = { id: 'review', goalId: goal.id, title: 'Verify app', description: 'Use retained source', dependsOn: [], writePaths: ['new-scope/'], status: 'review', currentAttemptId: 'fifth', createdAt: at, updatedAt: at };
+  const attempt: Attempt = { id: 'fifth', taskId: task.id, generation: 5, deviceId: 'owner', executionTargetId: 'mac-host', executionTargetKind: 'host-macos', status: 'succeeded', startedAt: at, endedAt: waitingAt, candidate: 'candidate-C' };
+  const previous: Attempt = { ...attempt, id: 'fourth', generation: 4, status: 'failed', error: 'Previous candidate failed' };
+  const wait: NonNullable<AttemptDetail['verificationWait']> = { condition: 'inspection-evidence', reason: 'The testing device is producing workflow results.', since: waitingAt };
+  const detail: AttemptDetail = { id: attempt.id, goalId: goal.id, goalRevision: 1, phase: 'checking', cancellation: 'none', verificationWait: wait,
+    contract: { title: task.title, description: task.description, dependsOn: [], checks: ['enoughfactory:ui-quality'], planRevision: 1, writePaths: ['protected/'], execution: { target: 'host-macos' } },
+    candidate: { id: 'candidate', commit: 'candidate-C', baseCommit: 'base' }, result: { status: 'succeeded', text: 'Author work saved' },
+    checks: [{ command: 'enoughfactory:ui-quality', passed: false, output: 'Awaiting exact source evidence', candidateCommit: 'candidate-C', checkedCommit: 'checked-M', executionTargetKind: 'host-macos', hostPermissions: 'full-host', recovery: { condition: 'inspection-evidence', reason: wait.reason } }],
+    checkInputs: { configurationRevision: 1, workingDirectoryIds: [], environment: { PRIVATE_INPUT: 'must-stay-private' } } };
+  const independent: FactoryTask = { id: 'independent', goalId: goal.id, title: 'Independent work', description: '', dependsOn: [], writePaths: ['other/'], status: 'queued', createdAt: at, updatedAt: at };
+  const conflicting = { ...independent, id: 'conflicting', title: 'Conflicting work', writePaths: ['protected/file.ts'] };
+  const device: Device = { id: 'owner', name: 'Mac', platform: 'darwin', arch: 'arm64', online: true, local: true, lastSeen: at, executionTargets: [{ id: 'mac-host', kind: 'host-macos', protocolVersion: 1, readiness: 'ready', capacity: 1, capabilities: [{ kind: 'mac-shell', readiness: 'ready' }] }] };
+  store.set('goals', goal); for (const item of [task, independent, conflicting]) store.set('tasks', item);
+  for (const item of [attempt, previous]) store.set('attempts', item);
+  store.set('factory-attempt-details', detail);
+  store.set<ControlRecord>('factory-control', { id: goal.id, stage: 'dispatch', startedAt: at, steering: [] });
+  const buckets = ['goals', 'tasks', 'attempts', 'factory-attempt-details', 'factory-control'];
+  const before = buckets.map(bucket => store.list(bucket));
+  const view = inspectTask(store, [device], task);
+  assert.equal(view.state, 'waiting'); assert.equal(view.reason, wait.reason);
+  assert.deepEqual(view.attempts[0]!.verificationWait, wait);
+  assert.equal(view.attempts[0]!.attempt.status, 'succeeded');
+  assert.equal(view.attempts[0]!.candidate?.commit, 'candidate-C');
+  assert.equal(view.attempts[0]!.checks?.[0]?.candidateCommit, 'candidate-C');
+  assert.equal(view.attempts[0]!.checks?.[0]?.checkedCommit, 'checked-M');
+  assert.equal(view.attempts[0]!.checks?.[0]?.executionTargetKind, 'host-macos');
+  assert.equal(view.attempts[0]!.checks?.[0]?.hostPermissions, 'full-host');
+  assert.deepEqual(view.attempts[0]!.checks?.[0]?.recovery, { condition: 'inspection-evidence', reason: wait.reason });
+  assert.equal(view.attempts[1]!.attempt.status, 'failed', 'The earlier failed attempt remains truthful');
+  assert.equal(JSON.stringify(view).includes('must-stay-private'), false);
+  assert.equal(taskDispatchBlocker(store, [device], independent, goal), undefined, 'A waiting verifier does not consume the one author slot');
+  assert.equal(taskDispatchBlocker(store, [device], conflicting, goal)?.kind, 'write-conflict', 'Frozen candidate ownership remains reserved');
+  assert.deepEqual(buckets.map(bucket => store.list(bucket)), before, 'Inspection never resumes or rewrites saved work');
+  store.set('attempts', { ...attempt, status: 'unknown' });
+  assert.equal(inspectTask(store, [device], task).state, 'unknown', 'Unknown execution authority has precedence over a retained evidence wait');
 });

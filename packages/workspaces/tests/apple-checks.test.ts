@@ -6,7 +6,7 @@ import { dirname, join } from "node:path";
 import { ArtifactStore } from "../src/artifacts.ts";
 import {
   APPLE_PRODUCT_INVENTORY_SOURCE, appleCheckArtifacts, appleCheckExecutor, appleEnvironment, appleManifestCompilerSource,
-  appleSandboxProfile, appleToolArguments, isAppleCheckCommand, parseAppleCheckCommand, runNativeGroup,
+  appleSandboxProfile, appleToolArguments, isAppleCheckCommand, NativeTeardownError, parseAppleCheckCommand, runNativeGroup,
 } from "../src/apple-checks.ts";
 import type { Candidate } from "../src/types.ts";
 
@@ -134,6 +134,35 @@ test("native cancellation kills ordinary build descendants and remains bounded",
       assert.match(handled.stderr, /canceled/);
     } finally { clearTimeout(timer); }
   } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("native teardown confirms a vanished group when Darwin returns EPERM after leader exit", async t => {
+  const originalKill = process.kill.bind(process);
+  let checks = 0;
+  t.mock.method(process, "kill", ((pid: number, signal?: NodeJS.Signals | number) => {
+    if (pid < 0 && signal === "SIGKILL") { checks++; throw Object.assign(new Error("kill EPERM"), { code: "EPERM" }); }
+    return originalKill(pid, signal);
+  }) as typeof process.kill);
+  const result = await runNativeGroup("/bin/sh", ["-c", "printf completed"], { cwd: tmpdir(), env: { PATH: "/usr/bin:/bin" }, timeoutMs: 5_000 });
+  assert.equal(checks, 1);
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.stdout, "completed");
+});
+
+test("native teardown retains uncertainty when EPERM leaves a live build descendant", async t => {
+  const originalKill = process.kill.bind(process);
+  let group: number | undefined;
+  t.mock.method(process, "kill", ((pid: number, signal?: NodeJS.Signals | number) => {
+    if (pid < 0 && signal === "SIGKILL") { group = pid; throw Object.assign(new Error("kill EPERM"), { code: "EPERM" }); }
+    return originalKill(pid, signal);
+  }) as typeof process.kill);
+  try {
+    await assert.rejects(runNativeGroup("/bin/sh", ["-c", "sleep 30 & printf parent-completed"], { cwd: tmpdir(), env: { PATH: "/usr/bin:/bin" }, timeoutMs: 5_000 }), NativeTeardownError);
+    assert.ok(group && group < 0);
+  } finally {
+    // This test owns the group that its injected permission failure retained.
+    if (group) try { originalKill(group, "SIGKILL"); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error; }
+  }
 });
 
 test("fake Apple executor binds products/evidence to exact check and combined commits", { skip: process.platform !== "darwin" }, async () => {

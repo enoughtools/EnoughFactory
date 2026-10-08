@@ -1,6 +1,6 @@
 import type { EvaluationResponse, PlanResponse, PlannedTask } from "./types.js";
 import { FactoryDecisionError } from "./errors.js";
-import type { TaskKind } from "@enoughfactory/contracts";
+import { EXECUTION_CAPABILITIES, type TaskKind, type TaskExecutionRequirements, type TaskQualityRequirements, type QualityPlatform, type ExecutionCapability } from "@enoughfactory/contracts";
 
 /** Parse the last JSON object even when a provider wraps it in explanatory prose. */
 export function readJsonObject(text: string): Record<string, unknown> {
@@ -93,6 +93,46 @@ export function validateRequiredCheckEnvironment(value: unknown): string[] | und
   return [...value] as string[];
 }
 
+/** Keep local execution requirements distinct from tools a capable peer may supply. */
+export function validateTaskExecution(value: unknown): TaskExecutionRequirements | undefined {
+  if (value === undefined) return undefined;
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new FactoryDecisionError("execution must be an object containing target, requiredCapabilities or delegatedCapabilities.");
+  const item = value as Record<string, unknown>;
+  if (Object.keys(item).some(key => !["target", "requiredCapabilities", "delegatedCapabilities"].includes(key))) throw new FactoryDecisionError("execution supports only target, requiredCapabilities and delegatedCapabilities.");
+  if (item.target !== undefined && !["auto", "container", "host-macos"].includes(item.target as string)) throw new FactoryDecisionError("execution.target must be auto, container or host-macos.");
+  const capabilities = (entry: unknown, name: string): ExecutionCapability[] => {
+    if (!Array.isArray(entry) || entry.length > EXECUTION_CAPABILITIES.length || entry.some(capability => !EXECUTION_CAPABILITIES.includes(capability as ExecutionCapability)) || new Set(entry).size !== entry.length) throw new FactoryDecisionError(`${name} must contain unique supported capabilities: ${EXECUTION_CAPABILITIES.join(", ")}.`);
+    return [...entry] as ExecutionCapability[];
+  };
+  return {
+    ...(item.target === undefined ? {} : { target: item.target as TaskExecutionRequirements["target"] }),
+    ...(item.requiredCapabilities === undefined ? {} : { requiredCapabilities: capabilities(item.requiredCapabilities, "execution.requiredCapabilities") }),
+    ...(item.delegatedCapabilities === undefined ? {} : { delegatedCapabilities: capabilities(item.delegatedCapabilities, "execution.delegatedCapabilities") }),
+  };
+}
+
+/** Visual acceptance is an explicit bounded task contract, never inferred for legacy work. */
+export function validateTaskQuality(value: unknown): TaskQualityRequirements | undefined {
+  if (value === undefined) return undefined;
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new FactoryDecisionError("quality must contain platforms, workflows and referenceIds.");
+  const item = value as Record<string, unknown>;
+  if (Object.keys(item).some(key => !["platforms", "workflows", "referenceIds"].includes(key))) throw new FactoryDecisionError("quality supports only platforms, workflows and referenceIds.");
+  if (!Array.isArray(item.platforms) || !item.platforms.length || item.platforms.length > 3 || item.platforms.some(platform => !["web", "macos", "ios-simulator"].includes(platform as string)) || new Set(item.platforms).size !== item.platforms.length) throw new FactoryDecisionError("quality.platforms must contain unique web, macos or ios-simulator platforms.");
+  const platforms = [...item.platforms] as QualityPlatform[];
+  if (!Array.isArray(item.workflows) || item.workflows.length > 32) throw new FactoryDecisionError("quality.workflows must contain at most 32 workflow identities.");
+  const workflows = item.workflows.map(entry => {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) throw new FactoryDecisionError("A quality workflow needs an id and platform.");
+    const workflow = entry as Record<string, unknown>;
+    if (Object.keys(workflow).some(key => !["id", "platform"].includes(key)) || typeof workflow.id !== "string" || !workflow.id.trim() || workflow.id.length > 160 || /[\u0000-\u001f\u007f]/.test(workflow.id) || !platforms.includes(workflow.platform as QualityPlatform)) throw new FactoryDecisionError("A quality workflow needs a nonempty bounded id and one of the configured platforms.");
+    return { id: workflow.id.trim(), platform: workflow.platform as QualityPlatform };
+  });
+  if (new Set(workflows.map(workflow => `${workflow.platform}:${workflow.id}`)).size !== workflows.length) throw new FactoryDecisionError("quality.workflows repeats a platform/workflow identity.");
+  if (!Array.isArray(item.referenceIds) || item.referenceIds.length > 16 || item.referenceIds.some(id => typeof id !== "string" || !id.trim() || id.length > 256 || /[\u0000-\u001f\u007f]/.test(id))) throw new FactoryDecisionError("quality.referenceIds must contain at most 16 bounded reference identities.");
+  const referenceIds = (item.referenceIds as string[]).map(id => id.trim());
+  if (new Set(referenceIds).size !== referenceIds.length) throw new FactoryDecisionError("quality.referenceIds repeats a reference identity.");
+  return { platforms, workflows, referenceIds };
+}
+
 export function readTasks(value: unknown): PlannedTask[] {
   if (!Array.isArray(value)) throw new FactoryDecisionError("The plan must contain a tasks array.");
   const seen = new Set<string>();
@@ -110,6 +150,8 @@ export function readTasks(value: unknown): PlannedTask[] {
       ...(item.expectedOutputs === undefined ? {} : { expectedOutputs: strings(item.expectedOutputs, `${item.key}.expectedOutputs`) }),
       ...(item.estimatedMinutes === undefined ? {} : { estimatedMinutes: positiveNumber(item.estimatedMinutes, `${item.key}.estimatedMinutes`, 10080) }),
       ...(item.resources === undefined ? {} : { resources: resources(item.resources, `${item.key}.resources`) }),
+      ...(item.execution === undefined ? {} : { execution: validateTaskExecution(item.execution) }),
+      ...(item.quality === undefined ? {} : { quality: validateTaskQuality(item.quality) }),
       ...(item.requiredCheckEnvironment === undefined ? {} : { requiredCheckEnvironment: validateRequiredCheckEnvironment(item.requiredCheckEnvironment) }),
       ...(item.writePaths === undefined ? {} : { writePaths: writePaths(item.writePaths, `${item.key}.writePaths`) }) };
   });

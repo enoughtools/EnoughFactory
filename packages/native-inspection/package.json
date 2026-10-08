@@ -1,0 +1,17 @@
+{
+  "name": "@enoughfactory/native-inspection",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "tsx --test src/*.test.ts native/*.test.mjs native/ios/*.test.mjs",
+    "build:mac": "node native/macos/build.mjs",
+    "build:ios": "bash native/ios/build-runner.sh",
+    "package:assets": "node native/package-assets.mjs",
+    "verify": "tsx --test src/*.test.ts"
+  }
+}

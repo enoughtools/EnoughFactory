@@ -8,7 +8,7 @@
     "start": "tsx src/index.ts",
     "build": "node build.mjs",
     "typecheck": "tsc -p tsconfig.json",
-    "verify": "tsx --test src/lifecycle.test.ts src/sessions-retirement.test.ts src/terminal-session-cleanup.test.ts src/factory-container-restore.test.ts src/factory-archive-imports.test.ts src/factory-archive-cas.test.ts src/store.test.ts src/worker-capacity.test.ts src/host-disk-admission.test.ts src/catalog-removal.test.ts src/factory-recovery.test.ts src/factory-controller-error.test.ts src/factory-worker-inputs.test.ts src/factory-container-retirement.test.ts src/manual-continuation-retention.test.ts src/task-inspection.test.ts src/controller-context.test.ts src/worker-context.test.ts src/repository-changes.test.ts src/working-directories.test.ts src/development-toolchain.test.ts"
+    "verify": "tsx --test src/*.test.ts"
   },
   "dependencies": {
     "@enoughfactory/contracts": "workspace:*",
@@ -19,7 +19,9 @@
     "@enoughfactory/peers": "workspace:*",
     "@enoughfactory/factory": "workspace:*",
     "@enoughfactory/workspaces": "workspace:*",
-    "@enoughfactory/previews": "workspace:*"
+    "@enoughfactory/previews": "workspace:*",
+    "@enoughfactory/native-inspection": "workspace:*",
+    "@enoughfactory/browser-inspection": "workspace:*"
   },
   "devDependencies": {
     "@types/ws": "^8.18.1"

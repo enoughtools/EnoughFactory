@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { Attempt, AttemptInspection, Device, FactoryTask, Goal } from "@enoughfactory/contracts";
-import { activeExecutionTasks, criticalPathMinutes, descendants, placementConstraint, sortReadyTasks, taskSchedulingBlocker, taskCheckInputBlocker, tasksConflict } from "./scheduler.js";
+import { activeExecutionTasks, criticalPathMinutes, descendants, deviceExecutionTargets, placementConstraint, selectExecutionTarget, sortReadyTasks, taskCapabilityBlocker, taskSchedulingBlocker, taskCheckInputBlocker, tasksConflict, verificationOnlyReservation, effectiveTaskExecution } from "./scheduler.js";
 import type { TaskCheckInputsConfiguration } from "./types.js";
 
 function task(id: string, patch: Partial<FactoryTask> = {}): FactoryTask {
@@ -12,6 +12,74 @@ function device(patch: Partial<Device> = {}): Device {
   return { id: "worker", name: "Worker", platform: "linux", arch: "x64", online: true, local: true,
     lastSeen: "2026-10-05T00:00:00.000Z", ...patch };
 }
+
+function macDevice(patch: Partial<Device> = {}): Device {
+  return device({ id: "mac", name: "Mac", platform: "darwin", executionTargets: [
+    { id: "mac:container", kind: "container", protocolVersion: 1, readiness: "ready", capacity: 1, capabilities: [{ kind: "linux-shell", readiness: "ready" }] },
+    { id: "mac:host", kind: "host-macos", protocolVersion: 1, readiness: "ready", capacity: 1, resources: { cpus: 2, memoryGiB: 4 }, capabilities: [{ kind: "mac-shell", readiness: "ready" }, { kind: "macos-app-inspection", readiness: "ready" }] },
+  ], ...patch });
+}
+
+test("host OS does not imply native execution and legacy placement stays inside its container", () => {
+  const legacyMac = device({ platform: "darwin" });
+  assert.deepEqual(deviceExecutionTargets(legacyMac).map(target => target.kind), ["container"]);
+  assert.equal(selectExecutionTarget(task("legacy"), macDevice())?.kind, "container");
+  assert.equal(selectExecutionTarget(task("native", { execution: { target: "host-macos" } }), legacyMac), undefined);
+  assert.equal(taskCapabilityBlocker(task("native", { execution: { target: "auto", requiredCapabilities: ["mac-shell"] } }), [legacyMac])?.readiness, "unsupported");
+  assert.equal(selectExecutionTarget(task("native", { execution: { target: "auto", requiredCapabilities: ["mac-shell"] } }), macDevice())?.id, "mac:host");
+  assert.equal(selectExecutionTarget(task("blocked"), device({ executionTargets: [] })), undefined, "An explicit unsupported registry cannot fall back to a legacy container");
+});
+
+test("delegated inspection may run elsewhere, while unavailable support blocks before placement", () => {
+  const author = device(), native = macDevice();
+  const work = task("inspect", { deviceId: author.id, execution: { delegatedCapabilities: ["macos-app-inspection"] } });
+  assert.equal(taskCapabilityBlocker(work, [author, native]), undefined);
+  assert.equal(taskSchedulingBlocker(work, goal(), [work], [], [], [author, native]), undefined);
+  const busy = structuredClone(native);
+  busy.executionTargets![1]!.capabilities[1]!.readiness = "busy";
+  assert.equal(taskCapabilityBlocker(work, [author, busy]), undefined, "Busy delegated tools queue jobs without forcing another author attempt");
+  busy.executionTargets![1]!.capabilities[1]!.readiness = "preparing";
+  assert.equal(taskCapabilityBlocker(work, [author, busy]), undefined);
+  busy.executionTargets![1]!.capabilities[1]!.readiness = "setup-required";
+  busy.executionTargets![1]!.capabilities[1]!.reason = "Enable accessibility for Mac testing.";
+  assert.equal(taskCapabilityBlocker(work, [author, busy])?.reason, "Enable accessibility for Mac testing.");
+  assert.equal(taskSchedulingBlocker(work, goal(), [work], [], [], [author, busy])?.readiness, "setup-required");
+  assert.equal(taskCapabilityBlocker(work, [author, { ...native, online: false }])?.readiness, "offline");
+  assert.deepEqual(taskCapabilityBlocker(work, [author])?.capabilities, ["macos-app-inspection"]);
+});
+
+test("local target readiness and budgets stay independent of container capacity", () => {
+  const native = macDevice({ capacity: 0, workerResources: { cpus: 1, memoryGiB: 1 } });
+  const work = task("native", { execution: { target: "host-macos" }, resources: { cpus: 2, memoryGiB: 4 } });
+  const containerWork = task("container-work", { deviceId: native.id });
+  assert.equal(placementConstraint(work, native, [containerWork]), undefined);
+  const hostReservation = activeExecutionTasks([task("host-work", { deviceId: native.id, currentAttemptId: "running" })], [attempt("running", "host-work", { deviceId: native.id, executionTargetId: "mac:host", executionTargetKind: "host-macos" })]);
+  assert.match(placementConstraint(work, native, hostReservation)!, /capacity reached/);
+  assert.equal(placementConstraint(task("container-next"), native, hostReservation), undefined);
+  native.executionTargets![1]!.readiness = "preparing";
+  assert.equal(taskCapabilityBlocker(work, [native])?.readiness, "preparing");
+  native.executionTargets![1]!.readiness = "busy";
+  assert.equal(taskCapabilityBlocker(work, [native])?.readiness, "busy");
+});
+
+test("container workspace support cannot silently grant ArtifactFS to a host worker", () => {
+  const native = macDevice({ workspaceProviders: ["git", "artifactfs"] });
+  const work = task("native", { execution: { target: "host-macos" } });
+  assert.equal(selectExecutionTarget(work, native, "artifactfs"), undefined);
+  assert.equal(taskSchedulingBlocker(work, goal({ workspaceProvider: "artifactfs" }), [work], [], [], [native])?.kind, "execution-capability");
+  native.executionTargets![1]!.workspaceProviders = ["git", "artifactfs"];
+  assert.equal(selectExecutionTarget(work, native, "artifactfs")?.id, "mac:host");
+  assert.equal(taskSchedulingBlocker(work, goal({ workspaceProvider: "artifactfs" }), [work], [], [], [native]), undefined);
+});
+
+test("host dispatch refuses an unadvertised provider without restricting legacy container providers", () => {
+  const native = macDevice(), work = task("native", { execution: { target: "host-macos" } });
+  assert.equal(selectExecutionTarget(work, native, "git", "claude"), undefined);
+  assert.match(taskSchedulingBlocker(work, goal({ runtime: "claude" }), [work], [], [], [native])!.reason, /supports this task with claude/);
+  assert.equal(selectExecutionTarget(task("legacy"), device(), "git", "antigravity")?.kind, "container");
+  native.executionTargets![1]!.runtimes = ["codex", "claude"];
+  assert.equal(selectExecutionTarget(work, native, "git", "claude")?.kind, "host-macos");
+});
 
 test("verification gating uses configured nonempty values and never infers requirements from source or checks", () => {
   const requiredCheckEnvironment = ["ENOUGH_EVIDENCE_ROOT", "ENOUGH_NATIVE_INDEX_SHA256"];
@@ -150,4 +218,34 @@ test("unknown and retired unconfirmed executions retain distinct original reserv
   assert.equal(reservations.find(item => item.id === "review")!.deviceId, "worker");
   assert.deepEqual(activeExecutionTasks([current], [attempt("retired", "same", { status: "retired" })], new Set(["retired"]))[0]!.writePaths, ["**"]);
   assert.equal(activeExecutionTasks([task("legacy", { currentAttemptId: "known" })], [attempt("known", "legacy")])[0]!.writePaths, undefined);
+});
+
+test("settled inspection waits release author capacity but retain source ownership and uncertain executions", () => {
+  const reviewing = task("review", { status: "review", currentAttemptId: "review-attempt", writePaths: ["apps/mail"], resources: { cpus: 4 } });
+  const waiting = new Set(["review-attempt"]), author = attempt("review-attempt", reviewing.id, { status: "succeeded" });
+  const active = activeExecutionTasks([reviewing], [author], undefined, undefined, waiting);
+  assert.equal(verificationOnlyReservation(active[0]!), true);
+  const independent = task("independent", { writePaths: ["docs"] });
+  const worker = device({ capacity: 1, workerResources: { cpus: 1, memoryGiB: 1 } });
+  assert.equal(taskSchedulingBlocker(independent, goal({ concurrency: 1 }), [reviewing, independent], active, active, [worker]), undefined);
+  const overlapping = task("overlap", { writePaths: ["apps/mail/src"] });
+  assert.equal(taskSchedulingBlocker(overlapping, goal({ concurrency: 1 }), [reviewing, overlapping], active, active, [worker])!.kind, "write-conflict");
+  for (const status of ["unknown", "retired"] as const) {
+    const uncertain = activeExecutionTasks([reviewing], [{ ...author, status }], new Set([author.id]), undefined, waiting);
+    assert.equal(verificationOnlyReservation(uncertain[0]!), false, `A ${status} execution still owns runtime resources`);
+    assert.match(placementConstraint(independent, worker, uncertain)!, /capacity reached/);
+  }
+});
+
+test("goal execution defaults apply before allocation while explicit task requirements replace them", () => {
+  const execution = { target: "host-macos" as const, requiredCapabilities: ["mac-shell" as const] };
+  const nativeGoal = goal({ execution }), legacy = task("legacy"), portable = task("portable", { execution: { target: "container" } });
+  assert.equal(effectiveTaskExecution(legacy, goal()), legacy, "Legacy omission keeps ordinary container execution");
+  assert.deepEqual(effectiveTaskExecution(legacy, nativeGoal).execution, execution);
+  assert.equal(effectiveTaskExecution(portable, nativeGoal), portable);
+  assert.equal(taskSchedulingBlocker(legacy, nativeGoal, [legacy], [], [], [device()])!.kind, "execution-capability");
+  assert.equal(taskSchedulingBlocker(portable, nativeGoal, [portable], [], [], [device()]), undefined);
+  const mac = macDevice();
+  assert.equal(taskSchedulingBlocker(legacy, nativeGoal, [legacy], [], [], [mac]), undefined);
+  assert.equal(selectExecutionTarget(effectiveTaskExecution(legacy, nativeGoal), mac)!.kind, "host-macos");
 });

@@ -1,0 +1,9 @@
+.device-readiness { border-top: 1px solid var(--factory-line-soft); padding: 14px 0; }
+.device-readiness-heading, .device-readiness-row { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px 12px; }
+.device-readiness-heading { margin-bottom: 12px; }
+.device-readiness-heading h3, .device-readiness-target > .device-readiness-row strong { font-size: 11px; font-weight: 600; }
+.device-readiness-target + .device-readiness-target { margin-top: 16px; }
+.device-readiness-target ul { list-style: none; margin: 8px 0 0; padding: 0; }
+.device-readiness-target li { padding: 8px 0; font-size: 11px; }
+.device-readiness-note { color: var(--factory-muted); font-size: 10px; line-height: 1.65; margin: 6px 0; overflow-wrap: anywhere; }
+.device-readiness-guidance { white-space: pre-wrap; overflow-wrap: anywhere; }

@@ -3,6 +3,34 @@ export const PROTOCOL_VERSION = 1;
 export type RuntimeKind = "codex" | "antigravity" | "claude";
 export type ApprovalMode = "approve-all" | "rules" | "manual";
 export type AutonomyMode = "manual" | "assisted" | "autonomous";
+export const EXECUTION_CAPABILITIES = ["linux-shell", "mac-shell", "chromium-inspection", "apple-compilation", "macos-app-inspection", "ios-simulator-inspection"] as const;
+export type ExecutionCapability = typeof EXECUTION_CAPABILITIES[number];
+export type ExecutionTargetKind = "container" | "host-macos";
+export type ExecutionTargetPreference = ExecutionTargetKind | "auto";
+export type ExecutionReadiness = "ready" | "preparing" | "busy" | "offline" | "setup-required" | "unsupported";
+export interface ExecutionCapabilityAdvertisement {
+  kind: ExecutionCapability; readiness: ExecutionReadiness; version?: string; reason?: string; setupAction?: string;
+}
+export interface ExecutionTargetAdvertisement {
+  id: string; kind: ExecutionTargetKind; protocolVersion: 1; readiness: ExecutionReadiness;
+  capabilities: ExecutionCapabilityAdvertisement[]; reason?: string; setupAction?: string;
+  workspaceProviders?: ("git" | "artifactfs")[];
+  runtimes?: RuntimeKind[];
+  /** Capacity belongs to this target, independently of the device's container pool. */
+  capacity?: number; resources?: { cpus: number; memoryGiB: number };
+}
+export interface TaskExecutionRequirements {
+  /** Omission preserves legacy container execution; auto is an explicit placement choice. */
+  target?: ExecutionTargetPreference;
+  /** Capabilities that must be available where the author process executes. */
+  requiredCapabilities?: ExecutionCapability[];
+  /** Tools may be delegated to another configured execution target/device. */
+  delegatedCapabilities?: ExecutionCapability[];
+}
+export type QualityPlatform = "web" | "macos" | "ios-simulator";
+export interface TaskQualityRequirements {
+  platforms: QualityPlatform[]; workflows: Array<{ id: string; platform: QualityPlatform }>; referenceIds: string[];
+}
 export interface PolicyRule { id: string; tool?: string; commandPattern?: string; decision: "allow" | "deny" | "ask"; }
 export interface WorkingDirectory { id: string; name: string; path: string; }
 export type DevelopmentToolchainId = "default" | "swift-6.0.3";
@@ -37,6 +65,8 @@ export interface Session {
   services: Service[]; containerId?: string; enginePid?: number;
   workingDirectories?: WorkingDirectoryMount[];
   developmentToolchain?: DevelopmentToolchain;
+  executionTargetId?: string; executionTargetKind?: ExecutionTargetKind;
+  verificationRunId?: string;
   /** Reversible catalog removal; execution and evidence records remain available by identity. */
   archivedAt?: string;
 }
@@ -46,6 +76,8 @@ export interface Device {
   /** CPU and memory available to this device's owned container runtime. */
   workerResources?: { cpus: number; memoryGiB: number };
   workspaceProviders?: ("git" | "artifactfs")[];
+  /** Explicitly probed execution support; the host platform is not a capability advertisement. */
+  executionTargets?: ExecutionTargetAdvertisement[];
 }
 export interface RuntimeCapability {
   kind: RuntimeKind; available: boolean; version?: string; fullAccess: boolean;
@@ -54,6 +86,8 @@ export interface RuntimeCapability {
 export interface Chat {
   id: string; sessionId: string; deviceId: string; title: string; runtime: RuntimeKind;
   attemptId?: string;
+  /** Separate immutable-source verifier authority, never permission to reopen the author. */
+  verificationRunId?: string;
   approvalMode: ApprovalMode; status: "idle" | "running" | "waiting" | "failed" | "interrupted";
   createdAt: string; updatedAt: string; threadId?: string; error?: string;
 }
@@ -75,6 +109,8 @@ export interface Goal {
   runtime: RuntimeKind; createdAt: string; updatedAt: string; revision: number;
   nextAction?: string; error?: string; concurrency: number; maxAttempts?: number;
   workspaceProvider?: "git" | "artifactfs";
+  /** Explicit controller placement and default for tasks without their own execution requirements. */
+  execution?: TaskExecutionRequirements;
 }
 export type TaskKind = "feature" | "unit" | "architecture" | "test";
 export interface TaskResources { cpus?: number; memoryGiB?: number; }
@@ -83,6 +119,8 @@ export interface FactoryTask {
   /** Absent on legacy generic tasks. Kind changes the worker's delivery contract. */
   kind?: TaskKind; acceptanceCriteria?: string[]; expectedOutputs?: string[];
   estimatedMinutes?: number; writePaths?: string[]; resources?: TaskResources;
+  execution?: TaskExecutionRequirements;
+  quality?: TaskQualityRequirements;
   status: "queued" | "ready" | "running" | "review" | "completed" | "failed" | "canceled";
   deviceId?: string; sessionId?: string; currentAttemptId?: string; createdAt: string; updatedAt: string;
 }
@@ -90,17 +128,31 @@ export interface Attempt {
   id: string; taskId: string; generation: number; deviceId: string; sessionId?: string; chatId?: string;
   status: "created" | "running" | "succeeded" | "failed" | "retired" | "unknown";
   startedAt: string; endedAt?: string; candidate?: string; baseCommit?: string; error?: string;
+  /** Frozen execution placement; absent on legacy container attempts. */
+  executionTargetId?: string; executionTargetKind?: ExecutionTargetKind;
 }
 export type AttemptPhase = "preparing" | "executing" | "capturing" | "checking" | "integrating" | "done";
 export type TaskWorkState = "blocked" | "ready" | "queued" | "running" | "review" | "preparing" | "executing" | "capturing" | "checking" | "integrating" | "accepted" | "failed" | "canceled" | "unknown" | "waiting";
+export type AppleValidationProfile =
+  | { tool: "swift"; package: string; action: "build" | "test" }
+  | { tool: "xcodebuild"; project: string; scheme: string; platform: "macos" | "ios-simulator"; configuration: "Debug" | "Release" };
+export interface AppleValidationMetadata {
+  version: 1; candidateId: string; candidateCommit: string; checkedCommit: string; profile: AppleValidationProfile;
+  sandbox: "macos-seatbelt-deny-default"; developerDirectory: string;
+  workingDirectories: Array<{ containerPath: string; commit: string }>; products: Artifact[]; artifact?: Artifact;
+}
 export interface TaskCheck {
   command: string; passed: boolean; output: string; exitCode?: number;
   candidateCommit: string; checkedCommit?: string; outputTruncated?: boolean;
   developmentToolchain?: DevelopmentToolchain;
+  appleValidation?: AppleValidationMetadata;
+  executionTargetKind?: ExecutionTargetKind; hostPermissions?: "full-host";
+  recovery?: { condition: "inspection-evidence"; reason: string };
 }
 export interface AttemptInspection {
   attempt: Attempt; phase?: AttemptPhase; cancellation?: "none" | "requested" | "acknowledged";
-  contract?: { title: string; description: string; kind?: TaskKind; acceptanceCriteria?: string[]; expectedOutputs?: string[]; estimatedMinutes?: number; writePaths?: string[]; resources?: TaskResources; dependsOn: string[]; checks: string[]; planRevision: number };
+  verificationWait?: { condition: "inspection-evidence"; reason: string; since: string };
+  contract?: { title: string; description: string; kind?: TaskKind; acceptanceCriteria?: string[]; expectedOutputs?: string[]; estimatedMinutes?: number; writePaths?: string[]; resources?: TaskResources; execution?: TaskExecutionRequirements; quality?: TaskQualityRequirements; dependsOn: string[]; checks: string[]; planRevision: number };
   workspace?: { id: string; provider: "git" | "artifactfs"; baseCommit: string; sessionId?: string; deviceId?: string; workingDirectories?: WorkingDirectoryMount[]; developmentToolchain?: DevelopmentToolchain };
   candidate?: { id: string; commit: string; baseCommit: string; branch?: string; tree?: string; deviceId?: string; developmentToolchain?: DevelopmentToolchain };
   result?: { status: string; text: string; error?: string; waitReason?: string; wakeCondition?: string };
@@ -113,12 +165,13 @@ export interface TaskInspection extends TaskOverview {
   wait?: { condition: string; reason: string; since?: string };
   /** Required verifier input names only; coordinator configuration values remain private. */
   verificationInputs?: { missingEnvironment: string[] };
+  executionBlocker?: { kind: "execution-capability"; readiness: Exclude<ExecutionReadiness, "ready">; reason: string; capabilities?: ExecutionCapability[]; deviceIds?: string[]; targetIds?: string[] };
   checks: string[]; planRevision?: number; repairInstructions?: string; lastError?: string;
   dependencies: FactoryTask[]; dependents: FactoryTask[]; attempts: AttemptInspection[]; artifacts: Artifact[];
 }
 export interface ControllerRun {
   id: string; goalId: string; role: "planner" | "evaluator" | "diagnosis";
-  sessionId: string; chatId?: string; status: "starting" | "running" | "completed" | "interrupted" | "failed";
+  sessionId: string; chatId?: string; status: "starting" | "running" | "waiting" | "completed" | "interrupted" | "failed";
   updatedAt: string; error?: string;
 }
 export interface GoalInspection {
@@ -128,6 +181,48 @@ export interface GoalInspection {
 }
 export interface Decision { id: string; goalId: string; at: string; kind: string; text: string; data?: unknown; }
 export interface Artifact { id: string; goalId?: string; taskId?: string; attemptId?: string; name: string; mime: string; sha256: string; size: number; deviceId: string; createdAt: string; }
+export interface InspectionAuthority {
+  goalId: string; goalRevision: number; taskId: string; attemptId: string; authorityGeneration: number; policyRevision: number;
+}
+export interface InspectionSourceIdentity {
+  snapshotId: string; sha256: string; candidateId?: string; candidateCommit?: string; checkedCommit?: string;
+  roots?: Array<{ id: string; sha256: string; commit?: string }>;
+}
+export interface InspectionVerificationRun {
+  id: string; authority: InspectionAuthority; source: InspectionSourceIdentity; quality: TaskQualityRequirements;
+  /** Final product inspection retains an accepted author identity and fences the current goal revision separately. */
+  purpose?: "task" | "goal-final"; goalRevision?: number;
+  policySha256: string; ownerDeviceId: string; executionTargetKind: ExecutionTargetKind; executionTargetId: string;
+  sessionId?: string; chatId?: string;
+  status: "queued" | "preparing" | "running" | "waiting" | "unknown" | "succeeded" | "failed" | "canceled";
+  createdAt: string; updatedAt: string; reason?: string; deadlineAt: string; startedAt?: string; completedAt?: string;
+}
+export type InspectionJobStatus = "queued" | "preparing" | "running" | "waiting" | "cancellation-requested" | "unknown" | "succeeded" | "failed" | "canceled";
+export interface InspectionJob {
+  id: string; authority: InspectionAuthority; ownerDeviceId: string; executionTargetId: string;
+  capability: ExecutionCapability; source: InspectionSourceIdentity; profile: Record<string, unknown>;
+  status: InspectionJobStatus; createdAt: string; updatedAt: string; sessionId?: string; reason?: string; leaseIds?: string[];
+}
+export type InspectionSessionStatus = "starting" | "ready" | "waiting" | "stopping" | "stopped" | "unknown" | "failed";
+export interface InspectionSession {
+  id: string; jobId: string; authority: InspectionAuthority; ownerDeviceId: string; executionTargetId: string;
+  capability: ExecutionCapability; source: InspectionSourceIdentity; status: InspectionSessionStatus;
+  createdAt: string; updatedAt: string; reason?: string; simulatorId?: string; latestObservationId?: string;
+  processIdentity?: { pid: number; startedAt: string; executableSha256?: string };
+}
+export type InspectionActionKind = "build" | "start" | "restart" | "navigate" | "observe" | "screenshot" | "click" | "type" | "key" | "scroll" | "run-tests" | "stop";
+export type InspectionActionStatus = "requested" | "running" | "cancellation-requested" | "succeeded" | "failed" | "unknown" | "canceled";
+export interface InspectionAction {
+  id: string; jobId: string; sessionId: string; authority: InspectionAuthority; kind: InspectionActionKind;
+  /** Each broker validates the capability-specific argument schema before execution. */
+  arguments: Record<string, unknown>; observationId?: string; status: InspectionActionStatus;
+  createdAt: string; updatedAt: string; evidenceIds?: string[]; reason?: string;
+}
+export interface InspectionEvidence {
+  id: string; jobId: string; sessionId?: string; actionId?: string; authority: InspectionAuthority; source: InspectionSourceIdentity;
+  kind: "screenshot" | "observation" | "log" | "trace" | "assertion" | "build-product";
+  artifact: Artifact; createdAt: string; metadata?: Record<string, unknown>;
+}
 export interface ContainerRuntimeStatus {
   kind: "lima" | "rootless";
   state: "unavailable" | "stopped" | "starting" | "ready" | "stopping" | "failed";

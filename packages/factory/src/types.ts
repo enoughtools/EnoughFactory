@@ -1,4 +1,4 @@
-import type { ApprovalMode, Attempt, AttemptInspection, AutonomyMode, Device, FactoryTask, Goal, Project, RuntimeKind, TaskKind, DevelopmentToolchain } from "@enoughfactory/contracts";
+import type { ApprovalMode, AppleValidationMetadata, Attempt, AttemptInspection, AutonomyMode, Device, ExecutionTargetKind, FactoryTask, Goal, Project, RuntimeKind, TaskKind, TaskExecutionRequirements, TaskQualityRequirements, DevelopmentToolchain } from "@enoughfactory/contracts";
 
 /** All writes inside a transaction must commit together, including decisions. */
 export interface FactoryStore {
@@ -23,6 +23,9 @@ export interface CheckResult {
   command: string; passed: boolean; output: string; exitCode?: number;
   candidateCommit: string; checkedCommit?: string;
   developmentToolchain?: DevelopmentToolchain;
+  appleValidation?: AppleValidationMetadata;
+  executionTargetKind?: ExecutionTargetKind; hostPermissions?: "full-host";
+  recovery?: { condition: "inspection-evidence"; reason: string };
 }
 export interface RepositoryEvidence {
   head: string; branch: string; status: string; summary?: string; diff?: string;
@@ -33,14 +36,20 @@ export interface RepositoryEvidence {
 export interface IntegrationResult {
   commit: string; previousHead: string; candidateCommit: string; checks: CheckResult[];
 }
+export const UI_QUALITY_CHECK_COMMAND = "enoughfactory:ui-quality";
+export interface FactoryVerificationContext {
+  goal: Goal; task: FactoryTask; attempt: Attempt; quality?: TaskQualityRequirements;
+}
 export interface FactoryWorkspacePort {
+  /** The adapter checks configured UI evidence against both candidate and combined source. */
+  qualityChecks?: true;
   prepare(input: { goal: Goal; task: FactoryTask; attempt: Attempt; project: Project; previousCandidate?: CandidateRef }): Promise<WorkspaceRef>;
   capture(workspace: WorkspaceRef, input: { goal: Goal; task: FactoryTask; attempt: Attempt }): Promise<CandidateRef>;
-  check(project: Project, candidate: CandidateRef, commands: string[]): Promise<CheckResult[]>;
+  check(project: Project, candidate: CandidateRef, commands: string[], verification?: FactoryVerificationContext): Promise<CheckResult[]>;
   /** Check an isolated exact final repository snapshot after task dependencies integrate. */
   checkGoal?(project: Project, commands: string[], goal: Goal): Promise<{ repository: RepositoryEvidence; checks: CheckResult[] }>;
   /** Recheck the combined result when HEAD changed. Fence immediately before writing. */
-  integrate(project: Project, candidate: CandidateRef, input: { checks: string[]; isCurrent: () => boolean }): Promise<IntegrationResult>;
+  integrate(project: Project, candidate: CandidateRef, input: { checks: string[]; isCurrent: () => boolean; verification?: FactoryVerificationContext }): Promise<IntegrationResult>;
   inspect(project: Project): Promise<RepositoryEvidence>;
   reconcileIntegration?(project: Project, candidate: CandidateRef): Promise<IntegrationResult | undefined>;
   release?(workspace: WorkspaceRef): Promise<void>;
@@ -71,6 +80,8 @@ export interface ControllerRecordRequirement {
 export interface PlannedTask {
   key: string; title: string; description: string; dependsOn: string[];
   checks: string[]; deviceId?: string;
+  execution?: TaskExecutionRequirements;
+  quality?: TaskQualityRequirements;
   /** Names of coordinator-configured verification inputs required before dispatch. */
   requiredCheckEnvironment?: string[];
   kind?: TaskKind; acceptanceCriteria?: string[]; expectedOutputs?: string[];
@@ -114,6 +125,8 @@ export interface AttemptDetail {
   integration?: IntegrationResult; cancellation: "none" | "requested" | "acknowledged";
   phase: "preparing" | "executing" | "capturing" | "checking" | "integrating" | "done";
   capacityWait?: "preparing" | "executing";
+  verificationWait?: { condition: "inspection-evidence"; reason: string; since: string };
+  recoveryObservation?: { phase: AttemptDetail["phase"]; reason: string; retryAt: string; failures: number };
 }
 export interface CriterionEvidence { criterion: string; satisfied: boolean; evidence: string[]; }
 export interface EvaluationResponse {
@@ -138,7 +151,7 @@ export interface ControlRecord {
   replanInstructions?: string;
   /** Only these unfinished tasks are replaced by a localized repair plan. */
   replanTaskIds?: string[];
-  operation?: { id: string; revision: number; kind: "planner" | "evaluator" | "diagnosis" };
+  operation?: { id: string; revision: number; kind: "planner" | "evaluator" | "diagnosis"; inspectionEventRevision?: number };
   manualAction?: "plan" | "evaluate";
   decisionFailures?: { signature: string; count: number };
   /** Persisted consecutive failures; service restarts cannot reset the retry budget. */
@@ -148,10 +161,12 @@ export interface CreateGoalInput {
   projectId: string; title?: string; objective: string; criteria?: string[];
   runtime?: RuntimeKind; approvalMode?: ApprovalMode; autonomy?: AutonomyMode;
   concurrency?: number; maxAttempts?: number; maxDurationMs?: number;
+  execution?: TaskExecutionRequirements;
 }
 export interface ConfigureGoalInput {
   autonomy?: AutonomyMode; approvalMode?: ApprovalMode; runtime?: RuntimeKind; concurrency?: number;
   maxAttempts?: number | null; maxDurationMs?: number | null;
+  execution?: TaskExecutionRequirements;
 }
 export interface CoordinatorOptions {
   store: FactoryStore; runtime: FactoryRuntimePort; workspaces: FactoryWorkspacePort;

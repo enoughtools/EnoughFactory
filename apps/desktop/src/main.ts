@@ -111,6 +111,7 @@ async function startOrConnectService(preparedResources?: string): Promise<Connec
         ENOUGHFACTORY_HOME: dataDirectory,
         ENOUGHFACTORY_PORT: process.env.ENOUGHFACTORY_PORT ?? '4317',
         ENOUGHFACTORY_RESOURCES: app.isPackaged ? durable : undefined,
+        ENOUGHFACTORY_NATIVE_ASSETS: app.isPackaged ? join(durable, 'runtime/native-inspection') : process.env.ENOUGHFACTORY_NATIVE_ASSETS,
         ENOUGHFACTORY_REPO: app.isPackaged ? undefined : repository,
         ENOUGHFACTORY_CONTAINER_ASSETS: app.isPackaged ? join(durable, 'runtime/container')
           : (process.env.ENOUGHFACTORY_CONTAINER_ASSETS ?? join(repository, '.cache/container-runtime', `${process.platform}-${process.arch}`)),

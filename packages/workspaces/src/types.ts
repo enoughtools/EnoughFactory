@@ -74,6 +74,8 @@ export interface WorkspaceRecord {
   repairConflicts?: string[];
   developmentToolchain?: DevelopmentToolchain;
   checkInputs?: FrozenCheckInputs;
+  /** Frozen placement; omitted legacy records retain container semantics. */
+  executionTargetKind?: "container" | "host-macos";
 }
 
 export interface Candidate {
@@ -93,6 +95,8 @@ export interface Candidate {
   workingDirectories?: WorkingDirectoryCapture[];
   developmentToolchain?: DevelopmentToolchain;
   checkInputs?: FrozenCheckInputs;
+  /** Captured with the immutable source evidence, never inferred from command text. */
+  executionTargetKind?: "container" | "host-macos";
 }
 
 export interface CommandResult {
@@ -103,6 +107,11 @@ export interface CommandResult {
   startedAt: string;
   endedAt: string;
   timedOut?: boolean;
+  executionTargetKind?: "container" | "host-macos";
+  /** Native host execution is explicit full access, not container confinement. */
+  hostPermissions?: "full-host";
+  /** Structured application checker result; never parsed from command output. */
+  factoryQuality?: unknown;
   /** Actual checker image, which can differ from the author device's architecture. */
   developmentToolchain?: DevelopmentToolchain;
   /** An explicit check-container compatibility layer; separate from the frozen compiler image. */
@@ -127,6 +136,9 @@ export interface CheckContext {
   timeoutMs: number;
   signal?: AbortSignal;
   workingDirectories?: Array<{ path: string; containerPath: string; commit: string }>;
+  executionTargetKind?: "container" | "host-macos";
+  /** Application-owned verification authority bound to this exact checked tree. */
+  verification?: unknown;
 }
 
 export interface CheckExecutor {
