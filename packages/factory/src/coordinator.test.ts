@@ -751,6 +751,47 @@ test("completion records evidence for every explicit criterion after all work is
   assert.equal(evidence[0]!.head, "integrated-head");
 });
 
+test("evaluation dispatches independent follow-up work before waiting for external evidence", async () => {
+  const factory = harness();
+  const goal = await finishTask(factory);
+  const accepted = factory.store.list<FactoryTask>("tasks")[0]!;
+  const acceptedDetail = factory.store.get<TaskDetail>("factory-task-details", accepted.id)!;
+  const attemptsBefore = factory.store.list<AttemptDetail>("factory-attempt-details");
+  const waitReason = "Native UI, live services and signing evidence need external access; this does not block the independent implementation repair.";
+  const wakeCondition = "native-live-signing-evidence";
+  const evaluation: EvaluationResponse = { complete: false, summary: "Repair the missing account provisioning workflow",
+    criteria: completeEvaluation.criteria.map((criterion, index) => index ? { ...criterion, satisfied: false, evidence: [] } : criterion),
+    additionalTasks: [{ key: "account-provisioning-native-workflow", title: "Wire native account provisioning",
+      description: "Implement the missing account provisioning mapping without requiring signing or live credentials",
+      dependsOn: ["implement"], checks: ["check-account-provisioning"] }], waitReason, wakeCondition };
+  factory.evaluating(async () => evaluation);
+  await factory.coordinator.tick(); await factory.coordinator.waitForIdle();
+  const continuing = factory.store.get<Goal>("goals", goal.id)!;
+  assert.equal(continuing.status, "running");
+  assert.equal(continuing.revision, goal.revision + 1);
+  assert.deepEqual(continuing.criteria, goal.criteria);
+  assert.equal(factory.store.get<ControlRecord>("factory-control", goal.id)!.stage, "dispatch");
+  const repair = factory.store.list<FactoryTask>("tasks").find(task => task.id !== accepted.id)!;
+  assert.equal(repair.status, "queued");
+  assert.deepEqual(repair.dependsOn, [accepted.id]);
+  assert.deepEqual(factory.store.get<FactoryTask>("tasks", accepted.id), accepted);
+  assert.deepEqual(factory.store.get<TaskDetail>("factory-task-details", accepted.id), acceptedDetail);
+  assert.deepEqual(factory.store.list<AttemptDetail>("factory-attempt-details"), attemptsBefore);
+  const retainedEvaluation = factory.store.list<EvaluationRecord>("factory-evaluations")[0]!;
+  assert.deepEqual(retainedEvaluation.evaluation, evaluation, "external wait requirements remain immutable evidence while independent work runs");
+  await factory.coordinator.tick(); await factory.coordinator.waitForIdle();
+  assert.equal(factory.calls.execute, 2, "the independent repair is actually dispatched");
+  assert.equal(factory.store.get<FactoryTask>("tasks", repair.id)!.status, "completed");
+  factory.evaluating(async () => ({ ...evaluation, additionalTasks: undefined }));
+  await factory.coordinator.tick(); await factory.coordinator.waitForIdle();
+  assert.equal(factory.store.get<Goal>("goals", goal.id)!.status, "waiting", "external evidence remains required after implementation finishes");
+  assert.deepEqual(factory.store.get<Goal>("goals", goal.id)!.criteria, goal.criteria);
+  assert.equal(factory.store.get<ControlRecord>("factory-control", goal.id)!.waitingFor, wakeCondition);
+  assert.equal(factory.store.get<ControlRecord>("factory-control", goal.id)!.waitReason, waitReason);
+  assert.deepEqual(factory.store.get<EvaluationRecord>("factory-evaluations", retainedEvaluation.id), retainedEvaluation);
+  assert.equal(factory.store.list<EvaluationRecord>("factory-evaluations")[1]!.evaluation.criteria[1]!.satisfied, false);
+});
+
 test("bounded tasks integrate with their own checks before whole-goal checks run on the complete repository", async () => {
   const factory = harness();
   factory.planning(async () => ({ ...plan, checks: ["npm run check-product"], tasks: [

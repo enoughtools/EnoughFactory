@@ -835,9 +835,6 @@ export class FactoryCoordinator {
           this.writeGoal(goal.id, { status: "completed", nextAction: "Completion criteria satisfied", error: undefined });
           this.decision(goal.id, "completed", evaluation.summary, { evaluationId: record.id, head: after.head, criteria: evaluation.criteria });
         });
-      } else if (evaluation.waitReason) {
-        this.options.store.set(TABLE.control, { ...this.control(goal.id), operation: undefined });
-        this.wait(goal.id, evaluation.waitReason, evaluation.wakeCondition ?? "external-condition");
       } else if (extra.length) {
         this.options.store.transaction(() => {
           this.writeGoal(goal.id, { revision: this.goal(goal.id).revision + 1, status: "running", nextAction: "Address the remaining acceptance work" });
@@ -845,6 +842,9 @@ export class FactoryCoordinator {
           this.options.store.set(TABLE.control, { ...this.control(goal.id), stage: "dispatch", operation: undefined, manualAction: undefined });
           this.decision(goal.id, "evaluation-follow-up", evaluation.summary, { evaluationId: record.id, tasks: extra.map(task => task.key) });
         });
+      } else if (evaluation.waitReason) {
+        this.options.store.set(TABLE.control, { ...this.control(goal.id), operation: undefined });
+        this.wait(goal.id, evaluation.waitReason, evaluation.wakeCondition ?? "external-condition");
       } else {
         this.decision(goal.id, "evaluation-incomplete", evaluation.summary || "Completion lacked evidence for all criteria.", { evaluationId: record.id, required });
         const failedChecks = goalChecksPassed ? "" : `Failed goal checks (all receipt outcomes retained for exact record indexes):\n${JSON.stringify(new ControllerEvidence().goalChecks(goalChecks))}`;
