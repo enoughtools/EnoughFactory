@@ -249,7 +249,11 @@ export class InspectionVerifier {
       const assertCurrent = () => this.assertCurrent(this.get(id), abort.signal);
       const onSession = (session: Session) => {
         assertCurrent();
-        this.options.app.store.set('sessions', { ...session, verificationRunId: id });
+        // Preparation/restart may advance runtime state while callers still hold
+        // their initial starting/stopped object. Attach ownership to the live
+        // record rather than rewinding readiness, roots or the runtime phase.
+        const current = this.options.app.sessions.record(session.id);
+        this.options.app.store.set('sessions', { ...current, verificationRunId: id });
         this.patch(id, { sessionId: session.id });
       };
       const preparation = { run, snapshot, project: input.project, signal: abort.signal, assertCurrent, onSession };

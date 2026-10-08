@@ -80,6 +80,7 @@ async function fixture(t: TestContext, extraFileMode = 0o644) {
       owns: (id: string) => sessions.has(id) && store.get<Session>('sessions', id)?.deviceId === 'mac',
       waitExecutionReady: async (id: string) => {
         assert.ok(sessions.has(id));
+        assert.equal(store.get<Session>('sessions', id)?.status, 'ready', 'The runtime only dispatches from the current ready session record');
         return { kind: 'host-macos', targetId: 'mac-host', workdir: preparedSources.get(id)!.roots[0]!.path };
       },
       execution: (id: string) => {
@@ -192,7 +193,10 @@ async function legacyContainerFixture(t: TestContext, seed: 'waiting' | 'unknown
   const fakeSessions = {
     ...f.options.app.sessions,
     execution: (_id: string) => ({ kind: 'container' as const, targetId: target.id, containerId: 'legacy-container', workdir: '/workspaces/primary' }),
-    waitExecutionReady: async (_id: string) => ({ kind: 'container' as const, targetId: target.id, containerId: 'legacy-container', workdir: '/workspaces/primary' }),
+    waitExecutionReady: async (id: string) => {
+      assert.equal(f.store.get<Session>('sessions', id)?.status, 'ready', 'A stopped container record cannot execute work');
+      return { kind: 'container' as const, targetId: target.id, containerId: 'legacy-container', workdir: '/workspaces/primary' };
+    },
     archivedEnvironment: (id: string) => f.store.get('session-container-retirement', id),
     canRetireEnvironment: (id: string) => f.options.app.sessions.owns(id) && f.store.get<Session>('sessions', id)?.status === 'stopped',
     withStoppedInputs: async <T>(id: string, operation: () => Promise<T>): Promise<T> => {
@@ -210,6 +214,7 @@ async function legacyContainerFixture(t: TestContext, seed: 'waiting' | 'unknown
     prepareExecution: async preparation => {
       const prepared = await f.options.prepareExecution!(preparation);
       const session = { ...prepared, status: state, executionTargetKind: undefined, containerId: 'legacy-container' } as Session;
+      f.store.set('sessions', session);
       preparation.onSession(session);
       if (state === 'stopped') f.store.set('session-container-retirement', { id: session.id, containerId: 'e'.repeat(64), name: 'legacy-container', status: 'removed', receipt: { version: 2, status: 'removed', containerId: 'e'.repeat(64), identity: { sessionId: session.id, name: 'legacy-container', sessionName: session.name } }, archive: path.join(f.directory, 'retained-container.tar'), updatedAt: new Date().toISOString() });
       throw seed === 'waiting'
@@ -295,6 +300,54 @@ test('a known setup failure waits and retries the same independent owner without
   assert.deepEqual(retried.source, originalSource); assert.deepEqual(f.source, originalSource);
   assert.equal(f.store.get<Chat>('chats', retried.chatId!)!.attemptId, undefined);
   assert.equal(f.stopped.length, 1);
+});
+
+test('publishing a stale starting session after preparation cannot overwrite the current ready runtime state', async t => {
+  const f = await fixture(t); f.setProvider('hold');
+  const advancedAt = '2099-01-01T00:00:00.000Z';
+  let stale!: Session;
+  const verifier = f.anotherVerifier({ prepareExecution: async preparation => {
+    await f.options.prepareExecution!({ ...preparation, onSession: session => {
+      stale = { ...session, status: 'starting', services: [], updatedAt: '2000-01-01T00:00:00.000Z' };
+      f.store.set('sessions', stale); preparation.onSession(stale);
+      f.store.set('sessions', { ...f.store.get<Session>('sessions', session.id)!, status: 'ready', phase: 'Runtime ready', enginePid: 421,
+        services: [{ name: 'native-inspection', status: 'ready' }], updatedAt: advancedAt });
+    } });
+    return stale;
+  } });
+  const result = verifier.ensure(f.input);
+  await eventually(() => f.calls.length === 1);
+  const run = f.store.get<InspectionVerificationRun>(INSPECTION_VERIFIER_RUNS, inspectionVerificationKey(f.input))!;
+  const current = f.store.get<Session>('sessions', run.sessionId!)!;
+  assert.equal(stale.status, 'starting'); assert.equal(current.status, 'ready');
+  assert.equal(current.phase, 'Runtime ready'); assert.equal(current.enginePid, 421); assert.equal(current.updatedAt, advancedAt);
+  assert.deepEqual(current.services, [{ name: 'native-inspection', status: 'ready' }]); assert.equal(current.verificationRunId, run.id);
+  assert.equal(f.preparations.length, 1); assert.equal(f.sessions.size, 1); assert.equal(f.store.list('chats').length, 1);
+  assert.deepEqual(run.source, f.source);
+  f.finishProvider(); assert.equal((await result).status, 'failed', 'A real quality receipt is still required after dispatch');
+  assert.equal(f.calls.length, 1);
+});
+
+test('restarting a stopped verifier keeps the current ready runtime record when its captured session is republished', async t => {
+  const f = await legacyContainerFixture(t, 'waiting', 'stopped'); f.setProvider('hold');
+  const stopped = f.store.get<Session>('sessions', f.run.sessionId!)!;
+  assert.equal(stopped.status, 'stopped');
+  const advancedAt = '2099-02-01T00:00:00.000Z', originalRestart = f.containerSessions.restart;
+  f.containerSessions.restart = async id => {
+    await originalRestart(id);
+    f.store.set('sessions', { ...f.store.get<Session>('sessions', id)!, phase: 'Restored and ready', enginePid: 842,
+      services: [{ name: 'browser-inspection', status: 'ready', port: 9222 }], updatedAt: advancedAt });
+  };
+  const result = f.verifier.ensure(f.input);
+  await eventually(() => f.calls.length === 1);
+  const current = f.store.get<Session>('sessions', stopped.id)!;
+  assert.equal(stopped.status, 'stopped'); assert.equal(current.status, 'ready');
+  assert.equal(current.phase, 'Restored and ready'); assert.equal(current.enginePid, 842); assert.equal(current.updatedAt, advancedAt);
+  assert.deepEqual(current.services, [{ name: 'browser-inspection', status: 'ready', port: 9222 }]);
+  assert.equal(current.verificationRunId, f.run.id); assert.deepEqual(f.restarted, [stopped.id]);
+  assert.equal(f.preparations.length, 1); assert.equal(f.sessions.size, 1); assert.equal(f.sourceChecks(), 1);
+  assert.equal(f.store.list('chats').length, 1); assert.deepEqual(f.store.get<InspectionVerificationRun>(INSPECTION_VERIFIER_RUNS, f.run.id)!.source, f.source);
+  f.finishProvider(); assert.equal((await result).status, 'failed'); assert.equal(f.calls.length, 1);
 });
 
 test('legacy container metadata reuses ready and stopped independent owners while explicit native mismatches stay unknown', async t => {
