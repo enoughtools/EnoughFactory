@@ -1,12 +1,12 @@
 .workspace-content.has-goal { display: flex; flex-direction: column; overflow: hidden; }
 .goal-workspace { display: flex; flex-direction: column; flex: 1; width: 100%; min-width: 0; min-height: 0; overflow: hidden; }
 .goal-workspace:not(.work-view):not(.activity-view):not(.decisions-view):not(.artifacts-view) { overflow: auto; }
-.goal-workspace .page-header { gap: 12px; margin-bottom: 0; padding: 8px 12px; }
+.goal-workspace .page-header { gap: 12px; margin-bottom: 0; padding: 0 0 8px; }
 .goal-workspace .page-header .eyebrow { font-size: 10px; line-height: 1.3; margin-bottom: 2px; }
 .goal-workspace .page-header .page-title { font-size: 18px; line-height: 1.35; }
 .goal-workspace > :not(.task-work-layout):not(.task-detail-layout):not(.factory-activity):not(.history-panel) { flex-shrink: 0; }
 .goal-workspace .page-header [data-slot="button"], .task-work-toolbar [data-slot="button"], .task-detail-toolbar [data-slot="button"], .goal-action-notice [data-slot="button"], .task-cancellation-summary [data-slot="button"] { min-height: 28px; height: 28px; padding: 4px 8px; font-size: 11px; }
-.goal-view-tabs { margin-bottom: 0; padding: 0 4px; overflow-y: hidden; }
+.goal-view-tabs { margin-bottom: 8px; padding: 0; overflow-y: hidden; }
 .goal-workspace .goal-view-tabs .session-tab { min-height: 32px; padding: 6px 10px; font-size: 11px; }
 .goal-action-notice { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 12px; padding: 7px 10px; margin-bottom: 8px; border: 1px solid var(--factory-line); background: var(--factory-paper); font-size: 11px; }
 .goal-action-notice.needs-attention { border-left: 3px solid var(--factory-warn, #b27a18); }
@@ -18,7 +18,7 @@
 .goal-error-details summary { cursor: pointer; width: fit-content; }
 .goal-error-details pre, .task-service-notice pre { max-height: 140px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font-family: var(--font-mono, monospace); font-size: 10px; line-height: 1.5; background: var(--factory-surface); padding: 8px; margin: 5px 0; }
 .goal-error-details p { margin: 4px 0; overflow-wrap: anywhere; }
-.task-work-toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; padding: 6px 12px; }
+.task-work-toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; padding: 0 0 12px; }
 .task-search { display: flex; align-items: center; gap: 5px; max-width: 260px; flex: 1; min-width: 120px; margin-left: 8px; }
 .task-search input { height: 28px; min-height: 28px; min-width: 0; padding: 4px 7px; font-size: 11px; }
 .task-work-toolbar select { height: 28px; border: 1px solid var(--factory-line); color: var(--factory-ink); background: var(--factory-surface); font-size: 11px; padding: 0 6px; }
@@ -55,7 +55,7 @@
 .task-table-title > svg { flex-shrink: 0; margin-left: auto; margin-top: 2px; opacity: 0; }
 .task-table-title:hover > svg, .task-table-title:focus-visible > svg { opacity: 1; }
 .task-table-reason { display: -webkit-box; -webkit-line-clamp: 1; -webkit-box-orient: vertical; overflow: hidden; color: var(--factory-secondary); font-size: 10px; margin-top: 4px; line-height: 1.4; }
-.task-detail-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 6px 12px; }
+.task-detail-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 0 0 12px; }
 .task-detail-layout { display: grid; grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0, 1fr); flex: 1; min-width: 0; min-height: 0; overflow: hidden; gap: 12px; }
 .task-detail-layout.with-tools { grid-template-columns: minmax(340px, 45%) minmax(0, 1fr); }
 .task-inspection-pane { min-width: 0; min-height: 0; overflow: auto; }

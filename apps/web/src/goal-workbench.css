@@ -1,6 +1,6 @@
-.goal-workbench { width: 100%; min-width: 0; }
-.goal-workbench .page-header { margin-bottom: 12px; }
-.workbench-facts { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 18px; margin-bottom: 16px; color: var(--factory-secondary); font-size: 11px; }
+.goal-workbench { display: flex; flex-direction: column; gap: 16px; width: 100%; min-width: 0; }
+.goal-workbench > .page-header, .goal-workbench > .panel, .goal-workbench > .runtime-compact, .goal-workbench > details { margin: 0; }
+.workbench-facts { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 18px; color: var(--factory-secondary); font-size: 11px; }
 .workbench-facts code { margin-left: auto; max-width: 45%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 10px; }
 .workbench-goals-panel .panel-body, .workbench-projects-panel .panel-body { padding: 0; }
 .workbench-goals { display: flex; flex-direction: column; min-width: 0; }
@@ -15,7 +15,7 @@
 .workbench-goal-progress > .workbench-goal-attention { color: var(--factory-warn); }
 .workbench-goal-agents > strong { color: var(--factory-ink); font-size: 16px; font-weight: 500; }
 .workbench-goal-agents > span { overflow-wrap: anywhere; }
-.workbench-goal-history, .workbench-diagnostics { border: 1px solid var(--factory-line); margin: 0 0 16px; background: var(--factory-surface); }
+.workbench-goal-history, .workbench-diagnostics { border: 1px solid var(--factory-line); background: var(--factory-surface); }
 .workbench-goal-history > summary, .workbench-diagnostics > summary { cursor: pointer; padding: 9px 12px; font-size: 11px; color: var(--factory-secondary); }
 .workbench-goal-history > summary > span, .workbench-diagnostics > summary > span { margin-left: 12px; font-size: 10px; color: var(--factory-muted); }
 .workbench-goal-history[open] > summary, .workbench-diagnostics[open] > summary { border-bottom: 1px solid var(--factory-line); }
@@ -27,7 +27,6 @@
 .workbench-project-row strong { display: block; font-size: 12px; font-weight: 500; }
 .workbench-project-row span { display: block; color: var(--factory-secondary); font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .workbench-project-row [data-slot="button"] { font-size: 10px; padding: 5px 7px; }
-.workbench-diagnostics { margin-top: 20px; }
 .workbench-diagnostics-body { padding: 12px; }
 .workbench-diagnostics-empty { margin: 0; color: var(--factory-secondary); font-size: 11px; }
 .workbench-diagnostics .session-row-main { min-width: 0; }
