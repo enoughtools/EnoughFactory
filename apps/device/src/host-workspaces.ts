@@ -344,7 +344,9 @@ async function copyTree(source: string, destination: string, readOnly: boolean):
   const copy = async (from: string, to: string): Promise<void> => {
     const entry = await lstat(from);
     if (entry.isSymbolicLink()) { await symlink(await readlink(from), to); return; }
-    if (entry.isFile()) { await copyFile(from, to, constants.COPYFILE_EXCL); await chmod(to, (entry.mode & 0o777) & (readOnly ? ~0o222 : 0o777)); return; }
+    // Copy-on-write shares storage until either private copy is edited, with a
+    // normal independent file copy on filesystems that cannot clone blocks.
+    if (entry.isFile()) { await copyFile(from, to, constants.COPYFILE_EXCL | constants.COPYFILE_FICLONE); await chmod(to, (entry.mode & 0o777) & (readOnly ? ~0o222 : 0o777)); return; }
     if (!entry.isDirectory()) throw new Error('Host workspace input contains an unsupported special file.');
     await mkdir(to, { mode: 0o700 });
     const names = await readdir(from);

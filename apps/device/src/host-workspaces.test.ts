@@ -68,6 +68,9 @@ test('host workspaces recover isolated roots, retain independent output and inte
   assert.deepEqual(await recovered.prepare(f.input), prepared, 'Prepare after reconnect never reseeds authored files');
   assert.equal(await readFile(path.join(prepared.roots[0]!.path, 'ignored.txt'), 'utf8'), 'host authored ignored output\n');
   assert.equal(await readFile(path.join(f.snapshots[0]!.path, 'ignored.txt'), 'utf8'), 'ignored baseline\n');
+  const retainedBaseline = (await f.directoryManager.sourceSnapshots('session-host-roots'))[0]!;
+  assert.equal(await readFile(path.join(retainedBaseline.path, 'ignored.txt'), 'utf8'), 'ignored baseline\n', 'Author writes must leave the imported host baseline intact');
+  await f.artifacts.path(retainedBaseline.sourceArtifact);
   assert.equal(await readFile(path.join(f.project, 'tracked.txt'), 'utf8'), 'original\n');
 
   // Capture rebuilds Git from the verified bundle, never trusting the author's config/hooks.

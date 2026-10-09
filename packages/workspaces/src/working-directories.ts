@@ -396,7 +396,7 @@ async function copyTree(source: string, target: string): Promise<void> {
     const entry = await lstat(from);
     if (entry.isSymbolicLink()) await symlink(await readlink(from), to);
     else if (entry.isDirectory()) { await mkdir(to, { mode: (entry.mode & 0o777) | 0o700 }); await copyTree(from, to); await chmod(to, entry.mode & 0o777); }
-    else if (entry.isFile()) await copyFile(from, to);
+    else if (entry.isFile()) await copyFile(from, to, constants.COPYFILE_FICLONE);
     else throw new Error(`Working directory contains an unsupported special file: ${name}`);
   }
 }

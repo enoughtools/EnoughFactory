@@ -1,4 +1,5 @@
 import { copyFile, cp, mkdir, rm, writeFile } from 'node:fs/promises';
+import { constants } from 'node:fs';
 import { createHash } from 'node:crypto';
 import path from 'node:path';
 import type { Attempt, DevelopmentToolchain, FactoryTask, Goal, Project } from '@enoughfactory/contracts';
@@ -141,7 +142,7 @@ export async function prepareControllerContext(input: {
         const bundleRef = String(candidate.bundleArtifact.metadata?.ref ?? '');
         const collisions = await bundleCaseCollisions(bundle, bundleRef, candidate.commit, candidate.baseCommit, path.join(staging, 'objects', candidate.id, 'primary.git'));
         await mkdir(path.join(contents, relative), { recursive: true, mode: 0o700 });
-        await copyFile(bundle, path.join(contents, relative, 'source.bundle'));
+        await copyFile(bundle, path.join(contents, relative, 'source.bundle'), constants.COPYFILE_FICLONE);
         entry.sourceBundle = `${candidateRoot}/source.bundle`;
         entry.bundleRef = bundleRef;
         entry.bundleSha256 = candidate.bundleArtifact.sha256;
@@ -160,7 +161,7 @@ export async function prepareControllerContext(input: {
           const extraBundle = await input.workspaces.artifacts.path(capture.bundleArtifact), extraRef = String(capture.bundleArtifact.metadata?.ref ?? '');
           const extraCollisions = await bundleCaseCollisions(extraBundle, extraRef, capture.commit, capture.baseCommit, path.join(staging, 'objects', candidate.id, 'working-directories', `${capture.id}.git`));
           await mkdir(path.join(contents, relative, 'bundles'), { recursive: true, mode: 0o700 });
-          await copyFile(extraBundle, path.join(contents, relative, 'bundles', `${capture.id}.bundle`));
+          await copyFile(extraBundle, path.join(contents, relative, 'bundles', `${capture.id}.bundle`), constants.COPYFILE_FICLONE);
           const extra: NonNullable<typeof entry.workingDirectories>[number] = { id: capture.id, name: capture.name,
             sourceBundle: `${candidateRoot}/bundles/${capture.id}.bundle`, bundleRef: extraRef,
             commit: capture.commit, baseCommit: capture.baseCommit, bundleSha256: capture.bundleArtifact.sha256, ...inventory };
@@ -310,6 +311,7 @@ function uniqueName(base: string, used: string[]): string {
 }
 async function copyTree(source: string, destination: string): Promise<void> {
   await cp(source, destination, { recursive: true, dereference: false, verbatimSymlinks: true,
+    mode: constants.COPYFILE_FICLONE,
     filter: filename => path.basename(filename).toLowerCase() !== '.git' });
 }
 
