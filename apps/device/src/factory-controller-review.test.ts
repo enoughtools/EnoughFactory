@@ -5,6 +5,7 @@ import path from 'node:path';
 import test, { type TestContext } from 'node:test';
 import type { ControllerRun, Device, FactoryTask, Goal, Project, Session } from '@enoughfactory/contracts';
 import type { TurnInput } from '@enoughfactory/agents';
+import { FactoryControllerError } from '@enoughfactory/factory';
 import { git } from '../../../packages/workspaces/src/process.ts';
 import { DeviceApp } from './app.ts';
 import { ChatController } from './chats.ts';
@@ -265,3 +266,38 @@ async function waitUntil(predicate: () => boolean, timeoutMs = 10_000): Promise<
     await new Promise(resolve => setTimeout(resolve, 25));
   }
 }
+
+
+test('container evaluator provisions its frozen runtime before canonical source export and provider dispatch', async t => {
+  const f=await fixture(t), {app,chats}=f.state();
+  app.allowRuntimeStart();
+  app.diagnostics.containerRuntime={kind:'lima',state:'ready',socketPath:'/fixture-owned.sock',dataDirectory:path.join(f.directory,'runtime-data'),stateDirectory:path.join(f.directory,'runtime-state'),artifactFsSupported:false,cpus:4,memoryGiB:8};
+  app.setDevice({...app.device,executionTargets:[{id:'owned-container-target',kind:'container',protocolVersion:1,readiness:'ready',capacity:2,workspaceProviders:['git'],runtimes:['codex'],capabilities:[{kind:'linux-shell',readiness:'ready'}]}]});
+  const goal={...app.store.get<Goal>('goals',f.goal.id)!,execution:{target:'container' as const}};app.store.set('goals',goal);
+  t.mock.method(app,'ensureRuntimeReady',async()=>{});
+  let execution!:ReturnType<typeof app.sessions.execution>, sessionId='', provisioned=false, exports=0;
+  t.mock.method(app.sessions,'create',async(project:Project,name:string)=>{
+    sessionId='owned-controller-container-session';
+    execution={kind:'container',targetId:'owned-container-target',containerId:'owned-controller-container',workdir:project.path};
+    const session:Session={id:sessionId,projectId:project.id,deviceId:app.device.id,name,status:'ready',createdAt:goal.createdAt,updatedAt:goal.updatedAt,services:[]};
+    app.store.set('sessions',session);return session;
+  });
+  t.mock.method(app.sessions,'waitExecutionReady',async(id:string,_timeout?:number,signal?:AbortSignal)=>{assert.equal(id,sessionId);assert(signal,'Preparation uses the original service cancellation signal');signal.throwIfAborted();return execution;});
+  t.mock.method(app.sessions,'execution',(id:string)=>{assert.equal(id,sessionId);return execution;});
+  t.mock.method(chats.manager,'provision',async(containerId:string,runtime:string,options:{copyHostAuth?:boolean},signal?:AbortSignal)=>{
+    assert.equal(containerId,'owned-controller-container');assert.equal(runtime,goal.runtime);assert.deepEqual(options,{copyHostAuth:true});assert(signal);signal.throwIfAborted();
+    assert.equal(exports,0);assert.equal(f.turns.length,0);provisioned=true;
+    return {kind:'codex',available:true,fullAccess:true,interactiveApprovals:true,resume:true};
+  });
+  f.prepareReview(async input=>{
+    exports++;assert.equal(provisioned,true,'Pinned Node must exist before the canonical exporter runs');
+    assert.equal(input.run.sessionId,sessionId);assert.equal(app.sessions.execution(sessionId).containerId,'owned-controller-container');
+    assert.equal(f.turns.length,0,'Source capture is required before the first provider turn');
+    assert.equal(await readFile(path.join(execution.workdir,'source.txt'),'utf8'),'current native source\n');
+    throw new FactoryControllerError('Fixture source export was reached after runtime preparation.','inspection-evidence');
+  });
+  await assert.rejects(f.complete(),error=>(error as FactoryControllerError).recovery==='inspection-evidence');
+  assert.equal(exports,1);assert.equal(f.turns.length,0);assert.equal(provisioned,true);
+  assert.equal(await readFile(path.join(f.primary,'source.txt'),'utf8'),'current native source\n');
+  app.store.set('sessions',{...app.sessions.record(sessionId),status:'stopped'});
+});

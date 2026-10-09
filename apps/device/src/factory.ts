@@ -838,13 +838,24 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
         record = { id: operation, goalId: goal.id, role, sessionId, status: 'starting', updatedAt: now() };
         app.store.set('factory-controller-runs', record);
         app.store.set('factory-controller-inputs', { id: operation, goalId: goal.id, role, sessionId, status: 'prepared', updatedAt: now() });
-        await app.sessions.waitExecutionReady(session.id);
+        const execution=await app.sessions.waitExecutionReady(session.id,undefined,signal);
         hostDisk.assert();
         if (signal?.aborted) throw new Error('The controller decision was revoked.');
         const chat = chats.create({ sessionId: session.id, runtime: goal.runtime, approvalMode: goal.approvalMode, title: `${goal.title} · ${role}` });
         chatId = chat.id;
         app.store.set('factory-controller-runs', { ...record, chatId: chat.id, status: 'starting', updatedAt: now() });
-        if(role==='evaluator'&&needsControllerReview(goal))await inspection.prepareControllerReview?.({goal,run:{...record,chatId:chat.id,status:'running'},signal});
+        if(role==='evaluator'&&needsControllerReview(goal)){
+          if(!host){
+            if(execution.kind!=='container'||!execution.containerId)throw new Error('The controller did not receive its configured container execution target.');
+            // Source export needs the pinned helper before the first provider turn.
+            await chats.manager.provision(execution.containerId,goal.runtime,{copyHostAuth:true},signal);
+            if(signal?.aborted)throw new Error('The controller decision was revoked.');
+            app.sessions.assertCanStartWork(session.id);
+            const current=app.sessions.execution(session.id);
+            if(current.kind!=='container'||current.containerId!==execution.containerId)throw new Error('The controller container changed before source preparation.');
+          }
+          await inspection.prepareControllerReview?.({goal,run:{...record,chatId:chat.id,status:'running'},signal});
+        }
         providerInvoked = true;
         const systemInstructions = [`You are the EnoughFactory ${role}. ${host?'You run on the configured Mac with full same-user host access in a private Git snapshot; this is not a container sandbox.':'This container contains an isolated snapshot of the current project repository with full container permissions.'} Inspect the actual source and relevant runtime evidence to make your decision under ${goal.approvalMode} policy. Your role is to decide the next factory action; implementation belongs to assigned worker tasks. Do not modify product source as part of this decision. Return the structured JSON requested in the prompt. Goal: ${goal.objective}`, role === 'evaluator' ? 'Audit current behavior in the integrated primary repository. Historical candidate source bundles are not duplicated into this audit; full stored task/attempt contracts, checks and integration records remain available through the evidence manifest. Historical artifact references do not promise their bodies are present and cannot be claimed inspected.' : '', validationInstructions(host?'host-macos':'container'),factoryQualityInstructions(role),toolchainInstructions(app.sessions.record(session.id).developmentToolchain),executionInstructions(context.instructions,session.id)].filter(Boolean).join('\n\n');
         const dispatchCapacity=controllerSlotReason(goal,operation);if(dispatchCapacity)throw new FactoryControllerError(dispatchCapacity,'inspection-evidence');
