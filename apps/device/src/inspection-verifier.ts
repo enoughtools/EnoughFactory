@@ -105,6 +105,7 @@ export class InspectionVerifier {
   private readonly timeoutMs: number;
   private closing = false;
   private sweeping?: Promise<{ retiredRunIds: string[]; errors: Array<{ runId: string; reason: string }> }>;
+  private revokedReconciliation?: Promise<{ canceledRunIds: string[]; errors: Array<{ runId: string; reason: string }> }>;
 
   constructor(private readonly options: InspectionVerifierOptions) {
     this.timeoutMs = options.timeoutMs ?? 20 * 60_000;
@@ -164,6 +165,62 @@ export class InspectionVerifier {
       if (!original.length || processes.some(process => process.state !== 'exited' || !!process.pid && !process.termination) || !original.every(process => hostProofMatchesVerifier(process, run, execution.workdir))) return unavailable('The original verifier provider or one of its owned tools has unconfirmed termination.');
       return { ready: true };
     } catch { return unavailable('The original verifier execution evidence is unavailable.'); }
+  }
+  /** An ended setup wait must not reserve service ownership after its author is revoked. */
+  reconcileRevokedWaiting(canRetireInspection: (run: InspectionVerificationRun) => boolean, signal?: AbortSignal): Promise<{ canceledRunIds: string[]; errors: Array<{ runId: string; reason: string }> }> {
+    if (this.closing) return Promise.resolve({ canceledRunIds: [], errors: [] });
+    if (this.revokedReconciliation) return this.revokedReconciliation;
+    const operation = this.reconcileRevokedWaitingOwned(canRetireInspection, signal).finally(() => { this.revokedReconciliation = undefined; });
+    this.revokedReconciliation = operation;
+    return operation;
+  }
+  private async reconcileRevokedWaitingOwned(canRetireInspection: (run: InspectionVerificationRun) => boolean, signal?: AbortSignal): Promise<{ canceledRunIds: string[]; errors: Array<{ runId: string; reason: string }> }> {
+    const result: { canceledRunIds: string[]; errors: Array<{ runId: string; reason: string }> } = { canceledRunIds: [], errors: [] };
+    for (const original of this.options.app.store.list<InspectionVerificationRun>(INSPECTION_VERIFIER_RUNS)) {
+      if (original.status !== 'waiting' || !original.sessionId || !original.chatId || !original.startedAt) continue;
+      const originalChat = this.options.app.store.get<Chat>('chats', original.chatId);
+      const saved = this.options.app.store.get<VerificationInputs>(INPUTS, original.id);
+      const eligible = () => {
+        signal?.throwIfAborted();
+        const current = this.get(original.id), goal = this.options.app.store.get<Goal>('goals', original.authority.goalId);
+        // Paused updates preserve their recorded boundary. Normal continuation
+        // can reconcile the revoked gate after the operator resumes the goal.
+        if (this.closing || !goal || goal.status === 'paused' || canonical(current) !== canonical(original) || !this.providerOwnerCurrent(current)
+          || this.options.authorityCurrent(current.authority) && !(current.purpose === 'goal-final' && goal.revision !== current.goalRevision)
+          || !canRetireInspection(current) || !saved || saved.retiredAt || saved.retirement
+          || canonical(this.options.app.store.get(INPUTS, current.id)) !== canonical(saved)
+          || !originalChat || canonical(this.options.app.store.get('chats', original.chatId!)) !== canonical(originalChat)) return false;
+        const session = this.options.app.sessions.record(original.sessionId!);
+        return session.verificationRunId === original.id && session.deviceId === original.ownerDeviceId && this.options.app.sessions.owns(session.id)
+          && (session.executionTargetKind ?? 'container') === original.executionTargetKind
+          && !this.options.app.store.list<Chat>('chats').some(chat => chat.sessionId === session.id && ['running', 'waiting'].includes(chat.status));
+      };
+      try {
+        if (!eligible() || !(await this.providerSettled(original)).ready || !eligible()) continue;
+        if (saved!.transfer.snapshotId !== original.source.snapshotId || saved!.transfer.sourceDigest !== original.source.sha256) throw new Error('The revoked verifier source transfer changed its checked identity.');
+        for (const artifact of [saved!.transfer.sourceManifest, ...saved!.transfer.sourceArtifacts.map(root => root.manifest)]) {
+          if (canonical(await this.artifacts.get(artifact.id)) !== canonical(artifact)) throw new Error('The revoked verifier durable source manifest changed.');
+          await this.artifacts.path(artifact);
+        }
+        if (!eligible()) continue;
+        // Ordinary stop captures additional roots and confirms owned provider
+        // termination. It never reopens the author or declares UI acceptance.
+        const previousSession = this.options.app.sessions.record(original.sessionId!);
+        await this.options.app.sessions.stop(original.sessionId!);
+        if (!eligible() || this.options.app.sessions.record(original.sessionId!).status !== 'stopped'
+          || !(await this.providerSettled(original)).ready || !eligible()) continue;
+        this.options.app.store.transaction(() => {
+          if (!eligible() || this.options.app.sessions.record(original.sessionId!).status !== 'stopped') throw new Error('Revoked verifier ownership changed before reconciliation.');
+          this.options.app.store.append('inspection-verifier-reconciliation', original.id, { action: 'revoked-waiting-owner', previous: original, chat: originalChat,
+            previousSession, source: original.source, sourceManifest: saved!.transfer.sourceManifest, at: this.now() });
+          this.patch(original.id, { status: 'canceled', reason: 'The original author authority was revoked after the waiting verifier and its inspection effects were positively confirmed stopped. Its source, conversation and earlier evidence remain retained.', completedAt: this.now() });
+        });
+        result.canceledRunIds.push(original.id);
+      } catch (error) {
+        result.errors.push({ runId: original.id, reason: (error as Error).message });
+      }
+    }
+    return result;
   }
   private assertCurrent(run: InspectionVerificationRun, signal?: AbortSignal): void {
     signal?.throwIfAborted();
@@ -797,6 +854,7 @@ export class InspectionVerifier {
     this.closing = true;
     for (const live of this.active.values()) live.abort.abort(new Error('Device service is stopping independent verification.'));
     await Promise.allSettled([...this.active.values()].map(live => live.promise));
+    await this.revokedReconciliation;
     await this.sweeping;
   }
 }

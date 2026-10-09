@@ -78,6 +78,35 @@ test('retained all-root source survives cold cleanup and service restart with ex
   assert.equal(await readFile(join(f.primary, 'app.ts'), 'utf8'), 'export const layout = "repaired";\r\n');
 });
 
+test('temporary release removes unretained copies and hands retained copies to ordinary owner-aware cleanup', async t => {
+  const f = await fixture(t), unretained = await f.capture();
+  await f.retention.releaseTemporary(unretained);
+  await assert.rejects(lstat(unretained.path), { code: 'ENOENT' });
+  const retained = await f.capture(), receipt = await f.retention.retain(retained, authority);
+  const { job } = f.job(retained);
+  await f.retention.releaseTemporary(retained);
+  assert.deepEqual(f.receipt(retained.id), receipt, 'Releasing a temporary owner does not invent or alter durable ownership');
+  await f.snapshots.verify(retained);
+  f.advance();
+  assert.ok((await f.retention.sweep({ maxSnapshotBytes: 1 })).keptSnapshotIds.includes(retained.id));
+  f.jobs.reconcileJob(job.id, { status: 'failed', releaseConfirmed: true, reason: 'The injected queued inspection ended without native effects.' });
+  assert.ok((await f.retention.sweep()).retiredSnapshotIds.includes(retained.id));
+  await assert.rejects(lstat(retained.path), { code: 'ENOENT' });
+});
+
+test('temporary release fails closed for a foreign path, mismatched identity or missing durable bytes', async t => {
+  const f = await fixture(t), snapshot = await f.capture();
+  const receipt = await f.retention.retain(snapshot, authority);
+  await assert.rejects(f.retention.releaseTemporary({ ...snapshot, path: f.primary }), /not owned/);
+  await assert.rejects(f.retention.releaseTemporary({ ...snapshot, sourceDigest: '0'.repeat(64) }), /differs from its retained identity/);
+  await f.snapshots.verify(snapshot);
+  const artifactPath = await f.artifacts.path(receipt.transfer.sourceManifest);
+  await rm(artifactPath);
+  await assert.rejects(f.retention.releaseTemporary(snapshot));
+  await f.snapshots.verify(snapshot);
+  assert.equal(await readFile(join(f.primary, 'app.ts'), 'utf8'), 'export const layout = "repaired";\r\n');
+});
+
 test('byte pressure retires eligible old copies but keeps newly captured source even for a continuing author', async t => {
   const f = await fixture(t), old = await f.capture(); await f.retention.retain(old, authority);
   f.advance(20_000);

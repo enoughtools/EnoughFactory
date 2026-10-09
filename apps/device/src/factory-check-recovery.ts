@@ -4,7 +4,7 @@ import path from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import type { CandidateRef, CheckResult, ConfirmCheckRecoveryResult, FactoryVerificationContext } from '@enoughfactory/factory';
 import { UI_QUALITY_CHECK_COMMAND } from '@enoughfactory/factory';
-import { parseAppleCheckCommand, type AppleCheckEvidence, type AppleCheckResult, type ArtifactManifest, type Candidate, type CheckReport, type WorkspaceManager } from '@enoughfactory/workspaces';
+import { isAppleCheckCommand, parseAppleCheckCommand, type AppleCheckEvidence, type AppleCheckResult, type ArtifactManifest, type Candidate, type CheckReport, type CommandResult, type WorkspaceManager } from '@enoughfactory/workspaces';
 
 export interface RetainedCheckRecoveryInput {
   workspaces: Pick<WorkspaceManager, 'candidate' | 'artifacts' | 'hasUnsettledChecks'>;
@@ -63,9 +63,29 @@ export async function confirmRetainedCheckRecovery(input: RetainedCheckRecoveryI
     evidenceIds.push(report.logArtifact.id);
 
     for (const command of report.commands) {
+      assertSettledCommand(command);
       const apple = (command as AppleCheckResult).appleValidation;
+      if (command.command === UI_QUALITY_CHECK_COMMAND) {
+        requireProof(!apple && input.verification.quality, 'The original UI check has no frozen application quality context.');
+        const quality = command.factoryQuality as CheckResult | undefined;
+        requireProof(quality && typeof quality === 'object' && !Array.isArray(quality) && quality.command === UI_QUALITY_CHECK_COMMAND &&
+          quality.candidateCommit === candidate.commit && quality.checkedCommit === report.commit && typeof quality.passed === 'boolean' &&
+          (quality.output === undefined || typeof quality.output === 'string') && (quality.exitCode === undefined || quality.exitCode === command.exitCode) &&
+          command.exitCode === (quality.passed ? 0 : 1) && !command.timedOut && command.stdout === (quality.output || '') && command.stderr === '',
+        'The original UI result is missing, contradictory or bound to different checked source.');
+        // Provider/backend termination is checked by retainedVerificationSettled before
+        // and after this proof. This immutable failed result is not a passing UI review.
+        continue;
+      }
+      requireProof(command.factoryQuality === undefined, 'A non-UI command contains an application verification receipt.');
+      if (!isAppleCheckCommand(command.command)) {
+        requireProof(!apple && candidate.executionTargetKind === 'host-macos' && command.executionTargetKind === 'host-macos' && command.hostPermissions === 'full-host',
+          'The original ordinary check has no positively completed owned host execution result.');
+        // Ordinary checks use the original host result and the report's clean
+        // post-release audit, rather than an Apple build receipt.
+        continue;
+      }
       requireProof(apple?.artifact, 'This original checker has no retained positive Apple execution receipt.');
-      requireProof(!command.cleanupErrors?.length, 'The original check could not confirm resource termination.');
       requireProof(apple.version === 1 && apple.sandbox === 'macos-seatbelt-deny-default' && apple.developerDirectory === '/Applications/Xcode.app/Contents/Developer' &&
         apple.candidateId === candidate.id && apple.candidateCommit === candidate.commit && apple.checkedCommit === candidate.commit &&
         same(apple.profile, parseAppleCheckCommand(command.command)) && same(apple.workingDirectories, (candidate.workingDirectories ?? []).map(({ containerPath, commit }) => ({ containerPath, commit }))),
@@ -80,8 +100,8 @@ export async function confirmRetainedCheckRecovery(input: RetainedCheckRecoveryI
       for (const product of apple.products) await authenticateArtifact(input, product, input.deviceId, candidate, true);
       evidenceIds.push(apple.artifact.id);
     }
-    // NativeTeardownError never produces an Apple receipt. A normal retained receipt,
-    // followed by WorkspaceManager's clean post-release audit, proves settled execution.
+    // Each executor's original completed result and the clean post-release audit
+    // prove settled checks; UI provider/backend settlement is additionally fenced by the caller.
     // The older runner recorded timeout as a boolean; exit 130 and prose alone are not transient proof.
     const automatic = report.status === 'canceled' || report.commands.some(command => command.timedOut === true);
     requireProof(!input.workspaces.hasUnsettledChecks(candidate.id), 'Check execution or integration changed while recovery evidence was inspected.');
@@ -91,6 +111,14 @@ export async function confirmRetainedCheckRecovery(input: RetainedCheckRecoveryI
   } catch (error) {
     return { status: 'unknown', reason: error instanceof Error ? error.message : String(error) };
   }
+}
+
+function assertSettledCommand(command: CommandResult): void {
+  requireProof(typeof command.command === 'string' && Number.isInteger(command.exitCode) && typeof command.stdout === 'string' && typeof command.stderr === 'string' &&
+    (command.timedOut === undefined || typeof command.timedOut === 'boolean') && !command.cleanupErrors?.length &&
+    typeof command.startedAt === 'string' && typeof command.endedAt === 'string' && Number.isFinite(Date.parse(command.startedAt)) &&
+    Number.isFinite(Date.parse(command.endedAt)) && Date.parse(command.endedAt) >= Date.parse(command.startedAt),
+  'The original command has no completed outcome or could not confirm resource termination.');
 }
 
 async function authenticateSource(input: RetainedCheckRecoveryInput, candidate: Candidate): Promise<string[]> {
@@ -136,7 +164,8 @@ function projectChecks(report: CheckReport, candidateCommit: string): CheckResul
   return report.commands.map(command => {
     if (command.command === UI_QUALITY_CHECK_COMMAND) {
       const quality = command.factoryQuality as CheckResult | undefined;
-      if (quality?.command === UI_QUALITY_CHECK_COMMAND && quality.candidateCommit === candidateCommit && quality.checkedCommit === report.commit) return { ...quality, passed: quality.passed === true && command.exitCode === 0 && !command.timedOut };
+      if (quality && typeof quality === 'object' && !Array.isArray(quality) && quality.command === UI_QUALITY_CHECK_COMMAND && quality.candidateCommit === candidateCommit && quality.checkedCommit === report.commit) return { ...quality, passed: quality.passed === true && command.exitCode === 0 && !command.timedOut };
+      return { command: command.command, passed: false, output: 'Recorded UI quality evidence does not identify the exact checked source.', exitCode: 1, candidateCommit, checkedCommit: report.commit };
     }
     return { command: command.command, passed: command.exitCode === 0 && !command.timedOut, output: `${command.stdout}${command.stderr}`, exitCode: command.exitCode, candidateCommit, checkedCommit: report.commit,
       developmentToolchain: command.developmentToolchain, executionTargetKind: command.executionTargetKind, hostPermissions: command.hostPermissions,

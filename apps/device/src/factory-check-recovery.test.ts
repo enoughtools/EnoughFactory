@@ -54,7 +54,7 @@ async function fixture(t: TestContext, owner = 'coordinator') {
     const report: CheckReport = { ...reportBase, logArtifact };
     await mkdir(path.join(root, 'reports'), { recursive: true });
     await writeFile(path.join(root, 'reports', `${report.id}.json`), JSON.stringify(report));
-    input.previousChecks = [{ command: selected.command, passed: selected.exitCode === 0 && !selected.timedOut, output: `${selected.stdout}${selected.stderr}`, exitCode: selected.exitCode, candidateCommit: primary, checkedCommit: primary, ...(selected.appleValidation ? { appleValidation: selected.appleValidation } : {}) }];
+    input.previousChecks = [{ command: selected.command, passed: selected.exitCode === 0 && !selected.timedOut, output: `${selected.stdout}${selected.stderr}`, exitCode: selected.exitCode, candidateCommit: primary, checkedCommit: primary, executionTargetKind: selected.executionTargetKind, hostPermissions: selected.hostPermissions, developmentToolchain: selected.developmentToolchain, ...(selected.appleValidation ? { appleValidation: selected.appleValidation } : {}) }];
     return report;
   };
   const report = await persist();
@@ -183,13 +183,76 @@ test('nested Apple receipt must be the original exact source, result, profile an
   });
 });
 
-test('ordinary host errors have no positive Apple receipt and remain unknown', async t => {
+test('a completed ordinary host failure reopens checks without inventing an Apple receipt or passing the failure', async t => {
   const f = await fixture(t); await rm(path.join(f.root, 'reports'), { recursive: true });
-  const ordinary = { ...f.receipt.result, command: 'xcodebuild build', executionTargetKind: 'host-macos' as const, hostPermissions: 'full-host' as const };
+  const ordinary = { ...f.receipt.result, command: 'sh scripts/checks/final-internal-acceptance.sh', timedOut: false, exitCode: 1, stderr: 'Internal acceptance failed.', executionTargetKind: 'host-macos' as const, hostPermissions: 'full-host' as const };
   await f.persist({ result: ordinary as AppleCheckResult });
   f.input.commands[0] = ordinary.command;
-  f.input.previousChecks[0] = { ...f.input.previousChecks[0]!, executionTargetKind: 'host-macos', hostPermissions: 'full-host' };
-  assert.equal((await confirmRetainedCheckRecovery(f.input)).status, 'unknown');
+  const before = structuredClone(f.input.previousChecks);
+  const proof = await confirmRetainedCheckRecovery(f.input);
+  assert.ok(proof.status === 'settled' && proof.automatic === false);
+  assert.deepEqual(f.input.previousChecks, before);
+  assert.equal(f.input.previousChecks[0]!.passed, false);
+});
+
+test('ordinary host admission requires its actual completed executor result, not a catch-only or uncertain result', async t => {
+  const cases: Array<[string, (result: AppleCheckResult) => void]> = [
+    ['unconfirmed cleanup', result => { result.cleanupErrors = ['Owned descendant termination is unknown']; }],
+    ['missing executor kind', result => { delete result.executionTargetKind; }],
+    ['foreign execution kind', result => { result.executionTargetKind = 'container'; }],
+    ['missing full host permission receipt', result => { delete result.hostPermissions; }],
+    ['missing command end', result => { result.endedAt = ''; }],
+    ['reversed lifetime', result => { result.endedAt = '2026-10-08T21:59:00.000Z'; }],
+  ];
+  for (const [name, change] of cases) await t.test(name, async t => {
+    const f = await fixture(t); await rm(path.join(f.root, 'reports'), { recursive: true });
+    const result = { ...f.receipt.result, command: 'git diff --check', executionTargetKind: 'host-macos', hostPermissions: 'full-host' } as AppleCheckResult;
+    change(result); await f.persist({ result }); f.input.commands[0] = result.command;
+    const proof = await confirmRetainedCheckRecovery(f.input);
+    assert.equal(proof.status, 'unknown');
+  });
+});
+
+test('reserved Apple checks cannot fall through ordinary host recovery when their own receipt is absent', async t => {
+  const f = await fixture(t); await rm(path.join(f.root, 'reports'), { recursive: true });
+  await f.persist({ result: { ...f.receipt.result, executionTargetKind: 'host-macos', hostPermissions: 'full-host' } as AppleCheckResult });
+  const proof = await confirmRetainedCheckRecovery(f.input);
+  assert.ok(proof.status === 'unknown' && /Apple execution receipt/.test(proof.reason));
+});
+
+test('ordinary command identity cannot disguise an Apple execution receipt', async t => {
+  const f = await fixture(t); await rm(path.join(f.root, 'reports'), { recursive: true });
+  const result = { ...(f.report.commands[0] as AppleCheckResult), command: 'git diff --check', executionTargetKind: 'host-macos' as const, hostPermissions: 'full-host' as const };
+  await f.persist({ result }); f.input.commands[0] = result.command;
+  const proof = await confirmRetainedCheckRecovery(f.input);
+  assert.ok(proof.status === 'unknown' && /ordinary check/.test(proof.reason));
+});
+
+test('UI recovery keeps exact structured failures and refuses missing, contradictory or foreign quality receipts', async t => {
+  const cases: Array<[string, (quality: Record<string, unknown>, result: AppleCheckResult, f: Awaited<ReturnType<typeof fixture>>) => void]> = [
+    ['missing quality policy', (_quality, _result, f) => { delete f.verification.quality; }],
+    ['missing UI receipt', (_quality, result) => { delete result.factoryQuality; }],
+    ['array UI receipt', (_quality, result) => { result.factoryQuality = []; }],
+    ['wrong checked source', quality => { quality.checkedCommit = extra; }],
+    ['wrong candidate source', quality => { quality.candidateCommit = extra; }],
+    ['nonboolean outcome', quality => { quality.passed = 'false'; }],
+    ['contradictory passing outcome', quality => { quality.passed = true; }],
+    ['contradictory exit', quality => { quality.exitCode = 0; }],
+    ['replaced wrapper output', (_quality, result) => { result.stdout = 'Replacement UI summary'; }],
+    ['uncertain UI cleanup', (_quality, result) => { result.cleanupErrors = ['Inspection teardown remains unknown']; }],
+  ];
+  for (const [name, change] of cases) await t.test(name, async t => {
+    const f = await fixture(t); await rm(path.join(f.root, 'reports'), { recursive: true });
+    const quality = { command: UI_QUALITY_CHECK_COMMAND, passed: false, exitCode: 1, output: 'Missing owned source snapshot.', candidateCommit: primary, checkedCommit: primary };
+    const result = { ...f.receipt.result, command: UI_QUALITY_CHECK_COMMAND, timedOut: false, exitCode: 1, stdout: quality.output, stderr: '', factoryQuality: quality } as AppleCheckResult;
+    change(quality, result, f); await f.persist({ result }); f.input.commands = [UI_QUALITY_CHECK_COMMAND];
+    const retained = result.factoryQuality as CheckResult | undefined;
+    f.input.previousChecks = retained && typeof retained === 'object' && !Array.isArray(retained) && retained.command === UI_QUALITY_CHECK_COMMAND && retained.candidateCommit === primary && retained.checkedCommit === primary
+      ? [{ ...retained, passed: retained.passed === true && result.exitCode === 0 && !result.timedOut }]
+      : [{ command: UI_QUALITY_CHECK_COMMAND, passed: false, output: 'Recorded UI quality evidence does not identify the exact checked source.', exitCode: 1, candidateCommit: primary, checkedCommit: primary }];
+    const proof = await confirmRetainedCheckRecovery(f.input);
+    assert.ok(proof.status === 'unknown' && /original UI|original command/.test(proof.reason), JSON.stringify(proof));
+  });
 });
 
 test('ambiguous legacy reports and changed report pointers are never guessed', async t => {

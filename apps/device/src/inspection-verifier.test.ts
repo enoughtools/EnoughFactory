@@ -1597,6 +1597,82 @@ test('retained provider eligibility is read-only and requires positive terminati
   assert.equal((await f.recovered.providerSettled(f.run)).ready, false);
 });
 
+async function revokedWaitingFixture(t: TestContext) {
+  const f = await fixture(t);
+  f.options.pendingNativeSetup = () => ({ status: 'pending', reason: 'Independent native fixture source audit is queued.' });
+  const run = await f.verifier.ensure(f.input);
+  assert.equal(run.status, 'waiting');
+  const session = f.store.get<Session>('sessions', run.sessionId!)!;
+  f.store.set('sessions', { ...session, status: 'stopped' });
+  settledFixtureProvider(f, run);
+  f.store.set('sessions', session);
+  f.setCurrent(false);
+  return { ...f, run, session };
+}
+
+test('revoked waiting verifier reconciliation confirms the ended owner and preserves source, chat and failed evidence', async t => {
+  const f = await revokedWaitingFixture(t), originalInputs = f.store.get('inspection-verifier-inputs', f.run.id), originalChat = f.store.get('chats', f.run.chatId!)!;
+  const originalContract = f.store.get('factory-attempt-details', authority.attemptId), originalGoal = f.store.get('goals', authority.goalId);
+  const result = await f.verifier.reconcileRevokedWaiting(() => true);
+  assert.deepEqual(result, { canceledRunIds: [f.run.id], errors: [] });
+  const canceled = f.store.get<InspectionVerificationRun>(INSPECTION_VERIFIER_RUNS, f.run.id)!;
+  assert.equal(canceled.status, 'canceled'); assert.ok(canceled.completedAt); assert.match(canceled.reason!, /positively confirmed stopped/);
+  assert.deepEqual(canceled.source, f.run.source); assert.deepEqual(canceled.authority, f.run.authority);
+  assert.deepEqual(f.stopped, [f.session.id]); assert.equal(f.calls.length, 1, 'No author or replacement verifier is dispatched');
+  assert.deepEqual(f.store.get('inspection-verifier-inputs', f.run.id), originalInputs);
+  assert.deepEqual(f.store.get('chats', f.run.chatId!), originalChat);
+  assert.deepEqual(f.store.get('factory-attempt-details', authority.attemptId), originalContract);
+  assert.deepEqual(f.store.get('goals', authority.goalId), originalGoal);
+  const history = f.store.events<{ action: string; previous: InspectionVerificationRun }>('inspection-verifier-reconciliation', f.run.id);
+  assert.equal(history.length, 1); assert.equal(history[0]!.value.action, 'revoked-waiting-owner'); assert.deepEqual(history[0]!.value.previous, f.run);
+  await f.artifacts.path(retained(f, canceled).transfer.sourceManifest);
+  assert.deepEqual(await f.verifier.reconcileRevokedWaiting(() => true), { canceledRunIds: [], errors: [] });
+});
+
+test('revoked waiting verifier reconciliation holds paused goals, live owners and uncertain provider or inspection effects', async t => {
+  for (const condition of ['current-authority', 'paused-goal', 'running-chat', 'unknown-provider', 'missing-teardown', 'active-inspection', 'unknown-run'] as const) await t.test(condition, async inner => {
+    const f = await revokedWaitingFixture(inner);
+    if (condition === 'current-authority') f.setCurrent(true);
+    if (condition === 'paused-goal') f.store.set('goals', { ...f.goal, status: 'paused' });
+    if (condition === 'running-chat') f.store.set('chats', { ...f.store.get<Chat>('chats', f.run.chatId!)!, status: 'running' });
+    if (condition === 'unknown-provider') f.setHostProcesses([{ sessionId: f.session.id, state: 'unknown' }]);
+    if (condition === 'missing-teardown') f.setHostProcesses([]);
+    if (condition === 'unknown-run') f.store.set(INSPECTION_VERIFIER_RUNS, { ...f.run, status: 'unknown' });
+    const before = f.store.get(INSPECTION_VERIFIER_RUNS, f.run.id);
+    assert.deepEqual(await f.verifier.reconcileRevokedWaiting(() => condition !== 'active-inspection'), { canceledRunIds: [], errors: [] });
+    assert.deepEqual(f.store.get(INSPECTION_VERIFIER_RUNS, f.run.id), before);
+    assert.deepEqual(f.stopped, []); assert.equal(f.calls.length, 1);
+    assert.equal(f.store.events('inspection-verifier-reconciliation', f.run.id).length, 0);
+  });
+});
+
+test('revoked waiting verifier reconciliation revalidates asynchronous authority and shares concurrent maintenance', async t => {
+  const f = await revokedWaitingFixture(t), provider = f.options.chats.manager.hostProcesses.bind(f.options.chats.manager);
+  const started = deferred<void>(), release = deferred<void>();
+  f.options.chats.manager.hostProcesses = async () => { started.resolve(); await release.promise; return provider(); };
+  const first = f.verifier.reconcileRevokedWaiting(() => true), duplicate = f.verifier.reconcileRevokedWaiting(() => true);
+  assert.equal(first, duplicate);
+  await started.promise; f.setCurrent(true); release.resolve();
+  assert.deepEqual(await first, { canceledRunIds: [], errors: [] });
+  assert.deepEqual(f.store.get(INSPECTION_VERIFIER_RUNS, f.run.id), f.run); assert.deepEqual(f.stopped, []);
+});
+
+test('revoked waiting verifier reconciliation retains ownership when ordinary stop or durable source proof fails', async t => {
+  for (const condition of ['stop-unconfirmed', 'source-unavailable'] as const) await t.test(condition, async inner => {
+    const f = await revokedWaitingFixture(inner);
+    if (condition === 'stop-unconfirmed') f.setStopFails(true);
+    else {
+      const source = retained(f, f.run).transfer.sourceManifest;
+      await rm(await f.artifacts.path(source));
+    }
+    const result = await f.verifier.reconcileRevokedWaiting(() => true);
+    assert.deepEqual(result.canceledRunIds, []); assert.equal(result.errors.length, 1);
+    assert.deepEqual(f.store.get(INSPECTION_VERIFIER_RUNS, f.run.id), f.run);
+    assert.equal(f.calls.length, 1); assert.equal(f.store.events('inspection-verifier-reconciliation', f.run.id).length, 0);
+    if (condition === 'source-unavailable') assert.deepEqual(f.stopped, []);
+  });
+});
+
 test('retained provider eligibility rejects changed live ownership after awaiting host process receipts', async t => {
   const f = await rebootedVerifierFixture(t), proof = supervisedTerminationProof(f);
   const receipt = { ...f.process, pid: proof.supervisor.pid, termination: proof };

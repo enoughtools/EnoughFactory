@@ -33,7 +33,10 @@ export interface NativeProfileAudit {
   retirementStatus?:'configured'|'rejected'|'canceled';
   providerUnresolved?:boolean;
   sourceChanged?:boolean;
+  sourceCacheFailure?:NativeAuditSourceCacheFailure;
+  recoveryOf?:string;
 }
+export interface NativeAuditSourceCacheFailure {code:'ENOENT';snapshotId:string;sourceDigest:string;path:string;message:string;observedAt:string;}
 interface AuditRead { id: string; runId: string; chatId: string; rootId: string; path: string; fileSha256: string; offset: number; length: number; fileSize: number; artifact: ArtifactManifest; }
 interface AuditFinding { purpose: Purpose; reasoning: string; files: Array<{ rootId: string; path: string }>; }
 interface AuditVerdict { approved: boolean; findings: AuditFinding[]; blockedReasons?: string[]; }
@@ -46,6 +49,7 @@ interface SetupOptions {
   configure(projectId: string, profile: NativeFixtureProfile): void;
   retireReviewer?(run:NativeProfileAudit):Promise<void>;
   retainSnapshot?(snapshot:InspectionSnapshot,authority:InspectionAuthority):Promise<void>;
+  useSnapshot?<T>(snapshotId:string,work:(snapshot:InspectionSnapshot)=>Promise<T>,signal?:AbortSignal):Promise<T>;
 }
 const canonical = (value: unknown): string => Array.isArray(value) ? `[${value.map(canonical).join(',')}]` : value && typeof value === 'object' ? `{${Object.entries(value).filter(([, item]) => item !== undefined).sort(([a], [b]) => a.localeCompare(b)).map(([key, item]) => `${JSON.stringify(key)}:${canonical(item)}`).join(',')}}` : JSON.stringify(value) ?? 'null';
 const hash = (value: unknown) => createHash('sha256').update(canonical(value)).digest('hex');
@@ -101,6 +105,72 @@ export class NativeProfileSetup {
   get(id: string): NativeProfileAudit { const run = this.options.app.store.get<NativeProfileAudit>(PROFILE_AUDITS,id); if (!run) throw new Error('Native setup audit is unavailable.'); return run; }
   private patch(id: string, fields: Partial<NativeProfileAudit>) { const run={...this.get(id),...fields,updatedAt:new Date().toISOString()}; this.options.app.store.set(PROFILE_AUDITS,run); this.options.app.emit('inspection-profile-setup',this.publicView(run)); this.options.app.changed(); return run; }
   private assertCurrent(run: NativeProfileAudit, signal?: AbortSignal) { signal?.throwIfAborted(); const current=this.get(run.id),goal=this.options.app.store.get<Goal>('goals',run.authority.goalId); if(this.closing || !same(current.authority,run.authority) || current.proposalSha256!==hash(run.proposal) || !sourceMatches(current.source,run.source) || !this.options.authorityCurrent(run.authority) || run.ownerDeviceId!==this.options.app.device.id || !goal || ['paused','failed','canceled','completed'].includes(goal.status)) throw new Error('Native setup authority, goal state or source changed.'); }
+  private ownedSnapshot(run:NativeProfileAudit):boolean{return /^[A-Za-z0-9][A-Za-z0-9._-]{0,159}$/.test(run.snapshot.id)&&run.snapshot.path===path.join(this.options.app.dataDir,'inspection','inspection-snapshots',run.snapshot.id)&&run.source.snapshotId===run.snapshot.id&&run.source.sha256===run.snapshot.sourceDigest&&run.transfer.snapshotId===run.snapshot.id&&run.transfer.sourceDigest===run.snapshot.sourceDigest&&run.transfer.sourceArtifacts.length===run.snapshot.roots.length;}
+  private cacheFailure(run:NativeProfileAudit):NativeAuditSourceCacheFailure|undefined{
+    if(!this.ownedSnapshot(run)||run.verdict||run.receipt||run.sourceChanged||run.providerUnresolved)return;
+    const failure=run.sourceCacheFailure;
+    if(failure&&failure.code==='ENOENT'&&failure.path===run.snapshot.path&&failure.snapshotId===run.snapshot.id&&failure.sourceDigest===run.snapshot.sourceDigest)return failure;
+    // Older versions persisted only this exact filesystem exception. Arbitrary
+    // errors or missing individual source files are not infrastructure retries.
+    const message=`ENOENT: no such file or directory, realpath '${run.snapshot.path}'`;
+    return run.reason===message?{code:'ENOENT',snapshotId:run.snapshot.id,sourceDigest:run.snapshot.sourceDigest,path:run.snapshot.path,message,observedAt:run.updatedAt}:undefined;
+  }
+  private async restoreOwnedSnapshot(run:NativeProfileAudit,signal?:AbortSignal):Promise<InspectionSnapshot>{
+    if(!this.ownedSnapshot(run))throw new Error('The source audit no longer owns its exact retained all-root snapshot.');
+    for(const artifact of [run.transfer.sourceManifest,...run.transfer.sourceArtifacts.map(item=>item.manifest)]){
+      if(!same(await this.options.artifacts.get(artifact.id),artifact))throw new Error('The source audit retention manifest changed.');
+      await this.options.artifacts.path(artifact);
+    }
+    const snapshot=await importInspectionSnapshot({dataDir:path.join(this.options.app.dataDir,'inspection'),artifacts:this.options.artifacts,sourceArtifacts:run.transfer.sourceArtifacts,sourceManifest:run.transfer.sourceManifest,expectedSource:{snapshotId:run.snapshot.id,sourceDigest:run.snapshot.sourceDigest},context:run.authority,signal,limits:{maxBytes:INSPECTION_SOURCE_MAX_BYTES}});
+    if(!same(snapshot,run.snapshot))throw new Error('Restored audit source differs from its original frozen manifest.');
+    await this.options.snapshots.verify(snapshot,signal);return snapshot;
+  }
+  private async reviewerRetired(run:NativeProfileAudit):Promise<boolean>{
+    if(!run.chatId||!run.sessionId||run.retirementStatus||this.active.has(run.id)||this.options.chats.isRunning(run.chatId))return false;
+    const session=this.options.app.sessions.record(run.sessionId),chat=this.options.app.store.get<Chat>('chats',run.chatId);
+    const journal=this.options.app.store.get<{id:string;sessionId:string;chatId?:string;root:string;proposalSha256:string;source:InspectionSnapshotTransfer;retiredAt?:string}>('inspection-profile-audit-retirement',run.id);
+    if(!chat||['running','waiting'].includes(chat.status)||chat.sessionId!==session.id||chat.verificationRunId!==run.id||chat.deviceId!==run.ownerDeviceId||session.status!=='stopped'||session.verificationRunId!==run.id||session.deviceId!==run.ownerDeviceId||!journal?.retiredAt||!Number.isFinite(Date.parse(journal.retiredAt))||journal.id!==run.id||journal.sessionId!==session.id||journal.chatId!==chat.id||journal.root!==path.join(this.options.app.dataDir,'workspace-data','workspaces',run.id)||journal.proposalSha256!==run.proposalSha256)return false;
+    if(session.executionTargetKind==='host-macos'){const execution=this.options.app.sessions.retainedHostExecution(session.id);if(execution.kind!=='host-macos'||execution.workspaceId!==run.id||!execution.releasedAt||!Number.isFinite(Date.parse(execution.releasedAt)))return false;}
+    if(session.executionTargetKind!=='host-macos'&&!this.options.app.sessions.archivedEnvironment(session.id))return false;
+    for(const artifact of [journal.source.sourceManifest,...journal.source.sourceArtifacts.map(item=>item.manifest)]){if(!same(await this.options.artifacts.get(artifact.id),artifact))return false;await this.options.artifacts.path(artifact);}
+    return true;
+  }
+  private async cacheReviewerEnded(run:NativeProfileAudit):Promise<boolean>{
+    if(!run.chatId)return !run.sessionId&&!run.startedAt&&!run.providerUnresolved;
+    if(!run.sessionId||run.executionTargetKind!=='host-macos'||this.options.chats.isRunning(run.chatId))return false;
+    const session=this.options.app.sessions.record(run.sessionId),chat=this.options.app.store.get<Chat>('chats',run.chatId),execution=this.options.app.sessions.retainedHostExecution(run.sessionId);
+    if(!chat||['running','waiting'].includes(chat.status)||chat.sessionId!==session.id||chat.verificationRunId!==run.id||chat.deviceId!==run.ownerDeviceId||session.verificationRunId!==run.id||session.deviceId!==run.ownerDeviceId||!['ready','stopped'].includes(session.status)||execution.kind!=='host-macos'||execution.workspaceId!==run.id||execution.releasedAt)return false;
+    const processes=(await this.options.chats.manager.hostProcesses({readOnly:true})).filter(process=>process.sessionId===run.sessionId||process.sessionId.startsWith(`${run.sessionId}-decision-`));
+    if(!same(this.get(run.id),run)||!same(this.options.app.store.get('chats',chat.id),chat)||!same(this.options.app.sessions.record(session.id),session)||!same(this.options.app.sessions.retainedHostExecution(session.id),execution)||this.options.chats.isRunning(chat.id)||!this.options.authorityCurrent(run.authority)||!this.setupApproved(run))return false;
+    const original=processes.filter(process=>process.sessionId===run.sessionId&&process.cwd===execution.workdir&&Date.parse(process.createdAt??'')>=Date.parse(run.startedAt??run.createdAt));
+    return original.length>0&&processes.every(process=>{
+      const proof=process.termination;
+      return process.state==='exited'&&process.cwd===execution.workdir&&proof?.schemaVersion===2&&proof.kind==='supervised-termination'&&proof.evidence==='complete-owned-teardown'&&proof.previousStatus==='exited'&&proof.inventoryComplete===true&&proof.exitCode===null&&proof.exitSignal==='SIGKILL'&&proof.processKey===process.processKey&&proof.sessionId===process.sessionId&&proof.cwd===execution.workdir&&/^[a-f0-9]{64}$/.test(proof.priorRecordSha256)&&proof.supervisor?.pid===process.pid&&Number.isSafeInteger(proof.supervisor.pid)&&proof.supervisor.pid>=2&&proof.supervisor.path===process.recordPath.replace(/\.json$/,'.cjs')&&typeof proof.supervisor.identity==='string'&&proof.supervisor.identity.includes(proof.supervisor.path)&&proof.supervisor.identity.includes(process.processKey)&&Array.isArray(proof.children)&&proof.children.length<=2048&&proof.children.every(child=>Number.isSafeInteger(child.pid)&&child.pid>=2&&typeof child.identity==='string'&&!!child.identity)&&Number.isFinite(Date.parse(proof.observedAt))&&Date.parse(proof.observedAt)>=Date.parse(process.createdAt??'');
+    });
+  }
+  /** Retry only a lost audit cache after authenticated same-candidate check recovery. Earlier outcomes stay intact. */
+  async recoverSourceCaches(authority:InspectionAuthority,source:InspectionSourceIdentity,signal?:AbortSignal):Promise<void>{
+    for(const original of this.list().filter(run=>run.status==='rejected'&&same(run.authority,authority)&&sourceMatches(run.source,source)&&run.source.candidateId===source.candidateId&&run.source.candidateCommit===source.candidateCommit&&run.source.checkedCommit===source.checkedCommit)){
+      const failure=this.cacheFailure(original);if(!failure||this.list().some(run=>run.recoveryOf===original.id))continue;
+      if(this.list().some(run=>run.status==='rejected'&&run.verdict&&run.proposal.profile.id===original.proposal.profile.id&&same(run.authority,authority)&&sourceMatches(run.source,source)))continue;
+      this.assertCurrent(original,signal);
+      if(this.options.app.store.get<Goal>('goals',authority.goalId)?.approvalMode!=='approve-all'||!this.setupApproved(original)||!await this.reviewerRetired(original))continue;
+      const publish=async(snapshot:InspectionSnapshot)=>{
+        this.assertCurrent(original,signal);
+        if(!same(this.get(original.id),original)||!await this.reviewerRetired(original))throw new Error('The original source audit changed during cache recovery.');
+        await this.restoreOwnedSnapshot(original,signal);
+        if(!same(snapshot,original.snapshot))throw new Error('The retained audit cache changed its source identity.');
+        await this.options.retainSnapshot?.(snapshot,authority);this.assertCurrent(original,signal);
+        if(!same(this.get(original.id),original)||this.options.app.store.get<Goal>('goals',authority.goalId)?.approvalMode!=='approve-all')throw new Error('The original source audit or setup policy changed during cache recovery.');
+        if(this.list().some(run=>run.recoveryOf===original.id))return;
+        const at=new Date().toISOString(),id=`profile-audit-${randomUUID()}`;
+        const continuation:NativeProfileAudit={id,requestKey:hash([original.requestKey,'source-cache-recovery',id]),proposalSha256:original.proposalSha256,proposal:structuredClone(original.proposal),authority:structuredClone(original.authority),source:structuredClone(original.source),ownerDeviceId:original.ownerDeviceId,projectId:original.projectId,sourceSessionId:original.sourceSessionId,snapshot,transfer:structuredClone(original.transfer),status:'queued',createdAt:at,updatedAt:at,recoveryOf:original.id,candidate:source.candidateId&&source.candidateCommit?{id:source.candidateId,commit:source.candidateCommit,source:structuredClone(original.source)}:undefined};
+        this.options.app.store.transaction(()=>{this.options.app.store.append('inspection-profile-audit-recovery',original.id,{action:'source-cache-retry',previous:{id:original.id,status:original.status,reason:original.reason,updatedAt:original.updatedAt},failure,continuationId:id,source:original.source,sourceManifest:original.transfer.sourceManifest,at});this.options.app.store.set(PROFILE_AUDITS,continuation);});
+        this.pump(id);
+      };
+      if(this.options.useSnapshot)await this.options.useSnapshot(original.snapshot.id,publish,signal);else await publish(await this.restoreOwnedSnapshot(original,signal));
+    }
+  }
   async propose(input: { requestId: string; proposal: unknown; authority: InspectionAuthority; source: InspectionSourceIdentity; snapshot: InspectionSnapshot; projectId: string; sourceSessionId: string;sourceChatId?:string }): Promise<NativeProfileAudit> {
     if (!/^[A-Za-z0-9._-]{1,160}$/.test(input.requestId)) throw new Error('Native setup needs a bounded request identity.');
     const proposal=validateNativeProfileProposal(input.proposal,input.snapshot), proposalSha256=hash(proposal), requestKey=hash([input.authority,input.requestId]);
@@ -128,7 +198,15 @@ export class NativeProfileSetup {
   recover():void{for(const run of this.list())if(['preparing','running'].includes(run.status)||run.status==='unknown'&&!run.providerUnresolved&&(!run.chatId||!this.options.app.store.events('chat',run.chatId).length&&!this.options.app.store.get('chat-results',run.chatId)&&!this.options.app.store.get('chat-turn-failures',run.chatId))){const admitted=!!run.chatId&&(run.providerUnresolved===true||this.options.app.store.events<{kind:string;role?:string}>('chat',run.chatId).some(event=>event.value.kind==='message'&&event.value.role==='user'));this.patch(run.id,{status:admitted?'unknown':'waiting',providerUnresolved:admitted,reason:admitted?'The service restarted during the independent source audit. Its original conversation and source remain retained; provider termination must be confirmed before continuation.':'The service restarted before reviewer admission; continue its exact recorded scratch preparation.'});}}
   maintain():void{for(const run of this.list())if(run.retirementStatus||['queued','waiting','unknown'].includes(run.status))this.pump(run.id);}
   private pump(id:string):void{if(this.closing||this.active.has(id)||!this.get(id).retirementStatus&&!['queued','waiting','unknown'].includes(this.get(id).status))return; const operation=this.options.app.withServiceOperation(signal=>this.execute(id,signal)).finally(()=>this.active.delete(id));this.active.set(id,operation);void operation.catch(error=>this.options.app.emit('inspection-error',{auditId:id,error:(error as Error).message}));}
-  private async sourceCurrent(run:NativeProfileAudit,signal:AbortSignal){run={...run,candidate:this.get(run.id).candidate};this.assertCurrent(run,signal);await this.options.snapshots.verify(run.snapshot,signal);const session=this.options.app.sessions.record(run.sourceSessionId);
+  private async verifySourceCache(run:NativeProfileAudit,signal:AbortSignal):Promise<void>{
+    try{await this.options.snapshots.verify(run.snapshot,signal);}catch(error){
+      const failure=error as NodeJS.ErrnoException;
+      if(failure.code!=='ENOENT'||failure.path!==run.snapshot.path||!this.ownedSnapshot(run))throw error;
+      const sourceCacheFailure:NativeAuditSourceCacheFailure={code:'ENOENT',snapshotId:run.snapshot.id,sourceDigest:run.snapshot.sourceDigest,path:run.snapshot.path,message:failure.message,observedAt:new Date().toISOString()};
+      throw Object.assign(new Error('The retained source audit cache is unavailable. Restore this exact all-root source before continuing independent review.'),{code:'NATIVE_AUDIT_SOURCE_CACHE_UNAVAILABLE',sourceCacheFailure});
+    }
+  }
+  private async sourceCurrent(run:NativeProfileAudit,signal:AbortSignal){run={...run,candidate:this.get(run.id).candidate};this.assertCurrent(run,signal);await this.verifySourceCache(run,signal);const session=this.options.app.sessions.record(run.sourceSessionId);
     if(session.status==='stopped'&&run.candidate){const detail=this.options.app.store.get<{candidate?:{id:string;commit:string}}> ('factory-attempt-details',run.authority.attemptId);if(!detail?.candidate||detail.candidate.id!==run.candidate.id||detail.candidate.commit!==run.candidate.commit||!sourceMatches(run.candidate.source,run.source)||this.options.app.store.list<Chat>('chats').some(chat=>chat.sessionId===session.id&&(['running','waiting'].includes(chat.status)||this.options.chats.isRunning(chat.id))))throw new Error('The stopped author no longer owns the exact independently captured candidate.');this.assertCurrent(run,signal);return;}
     if(session.status==='stopped'&&session.executionTargetKind!=='host-macos')throw Object.assign(new Error('Waiting for the successful author’s exact captured candidate to bind this source audit.'),{code:'NATIVE_AUDIT_SOURCE_HANDOFF'});
     const source=await this.options.sourceCurrent(run.sourceSessionId,run.authority,signal);this.assertCurrent(run,signal);if(!sourceMatches(source,run.source))throw Object.assign(new Error('Application source changed during its independent fixture audit; propose the changed source again.'),{code:'NATIVE_AUDIT_SOURCE_CHANGED'});}
@@ -138,6 +216,14 @@ export class NativeProfileSetup {
     const abort=new AbortController();this.aborts.set(id,abort);const serviceAbort=()=>abort.abort(serviceSignal?.reason);serviceSignal?.addEventListener('abort',serviceAbort,{once:true});if(serviceSignal?.aborted)serviceAbort();let dispatched=false,ended=false,timer:ReturnType<typeof setTimeout>|undefined;const policyAtStart=this.options.app.store.get<Goal>('goals',this.get(id).authority.goalId);const monitor=setInterval(()=>{try{const current=this.get(id),goal=this.options.app.store.get<Goal>('goals',current.authority.goalId);this.assertCurrent(current);if(goal?.revision!==policyAtStart?.revision||goal?.approvalMode!==policyAtStart?.approvalMode||!this.setupApproved(current))throw new Error('Native setup policy changed during review.');}catch(error){abort.abort(error);const chatId=this.get(id).chatId;if(chatId)void this.options.chats.interrupt(chatId).catch(()=>{});}},1000);monitor.unref();
     try {
       let run=this.get(id);const retired=!this.options.authorityCurrent(run.authority)||['failed','completed','canceled'].includes(this.options.app.store.get<Goal>('goals',run.authority.goalId)?.status??'');if(retired&&run.status==='unknown'){if(run.chatId&&this.options.chats.isRunning(run.chatId)){await this.options.chats.interrupt(run.chatId).catch(()=>{});return run;}if(!await this.confirmedEnded(run))return run;return this.patch(id,{status:'canceled',providerUnresolved:false,reason:'The original author authority was retired after reviewer termination was confirmed.'});}this.assertCurrent(run,abort.signal);
+      if(run.sourceCacheFailure){
+        if(!await this.cacheReviewerEnded(run))return this.patch(id,{status:'unknown',providerUnresolved:true,reason:'Source cache recovery is waiting for complete owned original reviewer teardown.'});
+        this.assertCurrent(run,abort.signal);
+        const previous=run;await this.restoreOwnedSnapshot(run,abort.signal);this.assertCurrent(run,abort.signal);
+        if(!same(this.get(id),previous))throw new Error('Source audit ownership changed during cache restoration.');
+        this.options.app.store.append('inspection-profile-audit-recovery',id,{action:'source-cache-restored',previous:{status:previous.status,reason:previous.reason},failure:previous.sourceCacheFailure,source:previous.source,at:new Date().toISOString()});
+        run=this.patch(id,{sourceCacheFailure:undefined,providerUnresolved:false,reason:undefined});
+      }
       const goal=this.options.app.store.get<Goal>('goals',run.authority.goalId);
       const wait=(reason:string)=>this.patch(id,{status:run.status==='unknown'||run.providerUnresolved?'unknown':'waiting',reason});
       if(!this.setupApproved(run))return wait('Review the native fixture setup request in Approvals. Its original source and proposal stay saved.');
@@ -171,7 +257,7 @@ export class NativeProfileSetup {
       const stop=()=>{void this.options.chats.interrupt(chat.id).catch(()=>{});};abort.signal.addEventListener('abort',stop,{once:true});
       let response:{text:string};try{this.assertCurrent(run,abort.signal);const turn=this.options.chats.run(chat.id,this.prompt(run),{attemptId:run.authority.attemptId,verificationRunId:id,autonomous:true,systemInstructions:'You are the independent native fixture source auditor. You have full permissions in an owned execution workspace; this is not a host sandbox. The application source is supplied read-only by Factory tools. Do not execute its code, build it, edit it or launch any app. Inspect actual original source and report honestly.'});dispatched=true;this.patch(id,{providerUnresolved:true});response=await turn;ended=true;this.patch(id,{providerUnresolved:false});}finally{abort.signal.removeEventListener('abort',stop);}
       return await this.finish(this.get(id),response.text,abort.signal);
-    }catch(error){const run=this.get(id),goal=this.options.app.store.get<Goal>('goals',run.authority.goalId),failure=error as Error&{executionEnded?:boolean;agentStarted?:boolean;code?:string};const uncertain=(run.status==='unknown'||run.providerUnresolved||dispatched&&!ended)&&failure.agentStarted!==false&&failure.executionEnded!==true;return this.patch(id,{status:uncertain?'unknown':!this.options.authorityCurrent(run.authority)||['failed','completed','canceled'].includes(goal?.status??'')?'canceled':failure.code==='NATIVE_AUDIT_SOURCE_CHANGED'?'rejected':goal?.status==='paused'||abort.signal.aborted||failure.code==='NATIVE_AUDIT_SOURCE_HANDOFF'?'waiting':dispatched?'rejected':'waiting',providerUnresolved:uncertain,reason:failure.message});}
+    }catch(error){const run=this.get(id),goal=this.options.app.store.get<Goal>('goals',run.authority.goalId),failure=error as Error&{executionEnded?:boolean;agentStarted?:boolean;code?:string;sourceCacheFailure?:NativeAuditSourceCacheFailure};const uncertain=(run.status==='unknown'||run.providerUnresolved||dispatched&&!ended)&&failure.agentStarted!==false&&failure.executionEnded!==true;return this.patch(id,{status:uncertain?'unknown':!this.options.authorityCurrent(run.authority)||['failed','completed','canceled'].includes(goal?.status??'')?'canceled':failure.code==='NATIVE_AUDIT_SOURCE_CHANGED'?'rejected':goal?.status==='paused'||abort.signal.aborted||['NATIVE_AUDIT_SOURCE_HANDOFF','NATIVE_AUDIT_SOURCE_CACHE_UNAVAILABLE'].includes(failure.code??'')?'waiting':dispatched?'rejected':'waiting',providerUnresolved:uncertain,reason:failure.message,...(failure.sourceCacheFailure?{sourceCacheFailure:failure.sourceCacheFailure}:{})});}
     finally{serviceSignal?.removeEventListener('abort',serviceAbort);clearInterval(monitor);this.aborts.delete(id);if(timer)clearTimeout(timer);const run=this.get(id);if(run.sessionId&&!['running','unknown','waiting'].includes(run.status))try{if(this.options.retireReviewer)await this.options.retireReviewer(run);else await this.options.app.sessions.stop(run.sessionId);}catch(error){this.patch(id,{retirementStatus:run.status as 'configured'|'rejected'|'canceled',reason:`Audit reviewer cleanup remains unresolved: ${(error as Error).message}`});}}
   }
   private async confirmedEnded(run:NativeProfileAudit):Promise<boolean>{if(!run.chatId||!run.sessionId||this.options.chats.isRunning(run.chatId))return false;const session=this.options.app.sessions.record(run.sessionId);if(session.verificationRunId!==run.id||session.deviceId!==run.ownerDeviceId)return false;const result=this.options.app.store.get<{attemptId?:string;completedAt:string}>('chat-results',run.chatId),failure=this.options.app.store.get<{attemptId?:string;executionEnded?:boolean;completedAt:string}>('chat-turn-failures',run.chatId),start=Date.parse(run.startedAt??run.createdAt);if(result?.attemptId===run.authority.attemptId&&Date.parse(result.completedAt)>=start||failure?.attemptId===run.authority.attemptId&&failure.executionEnded===true&&Date.parse(failure.completedAt)>=start)return true;if(run.executionTargetKind!=='host-macos')return false;const processes=(await this.options.chats.manager.hostProcesses()).filter(process=>(process.sessionId===run.sessionId||process.sessionId.startsWith(`${run.sessionId}-decision-`))&&Date.parse(process.createdAt??'')>=start);return processes.length>0&&processes.every(process=>process.state==='exited');}

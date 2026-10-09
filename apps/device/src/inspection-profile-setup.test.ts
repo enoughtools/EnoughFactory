@@ -1,12 +1,13 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { createInterface } from 'node:readline';
 import test, { type TestContext } from 'node:test';
 import type { Approval, Attempt, Chat, ExecutionTargetAdvertisement, Goal, InspectionAuthority, InspectionSourceIdentity, Project, Session } from '@enoughfactory/contracts';
 import { ArtifactStore, InspectionSnapshotManager, type ArtifactManifest, type InspectionSnapshot } from '@enoughfactory/workspaces';
+import type { HostProcessState } from '@enoughfactory/agents';
 import type { DeviceApp } from './app.ts';
 import { ChatController, type AgentToolBridge, type AgentToolBridgeContext, type RunOptions } from './chats.ts';
 import type { NativeFixtureProfile } from './inspection-native.ts';
@@ -86,7 +87,7 @@ async function fixture(t: TestContext, effects: { retire?: boolean; target?: 'ho
   let providerGate: Promise<void> | undefined;
   let markAdmitted!: () => void;
   const admitted = new Promise<void>(resolve => { markAdmitted = resolve; });
-  let processes: Array<{ sessionId: string; state: string; createdAt: string }> = [];
+  let processes: Array<{ sessionId: string; state: string; createdAt: string } & Partial<Omit<HostProcessState, 'sessionId' | 'state' | 'createdAt'>>> = [];
   const configured: Array<{ projectId: string; profile: NativeFixtureProfile }> = [], calls: Array<{ chatId: string; options: RunOptions }> = [], stopped: string[] = [];
   const app = {
     dataDir, device: { id: 'mac' }, store, emit() {}, changed() {}, withServiceOperation: async <T>(operation: (signal: AbortSignal) => Promise<T>) => operation(new AbortController().signal),
@@ -179,6 +180,101 @@ async function fixture(t: TestContext, effects: { retire?: boolean; target?: 'ho
     restart: () => { serviceApprovals.clear(); setup = new NativeProfileSetup(options); setup.recover(); return setup; },
   };
 }
+
+/** Pre-fix persisted audit and its positive retirement receipt; no model verdict was committed. */
+async function legacyMissingCache(f: Awaited<ReturnType<typeof fixture>>) {
+  const source = { ...f.source, candidateId: 'saved-C', candidateCommit: 'c'.repeat(40), checkedCommit: 'c'.repeat(40) };
+  const queued = await f.propose({ source });
+  const sessionId = 'retired-reviewer', chatId = 'retired-reviewer-chat', at = new Date().toISOString();
+  const original: NativeProfileAudit = { ...queued, status: 'rejected', sessionId, chatId, executionTargetKind: 'host-macos', startedAt: at, updatedAt: at, providerUnresolved: false, reason: `ENOENT: no such file or directory, realpath '${queued.snapshot.path}'` };
+  f.store.set(PROFILE_AUDITS, original);
+  f.store.set('sessions', { id: sessionId, projectId: `workspace-${original.id}`, deviceId: 'mac', status: 'stopped', executionTargetKind: 'host-macos', verificationRunId: original.id });
+  f.store.set('chats', { id: chatId, sessionId, verificationRunId: original.id, deviceId: 'mac', runtime: 'codex', status: 'idle' });
+  f.store.set('inspection-profile-audit-retirement', { id: original.id, sessionId, chatId, root: path.join(f.app.dataDir, 'workspace-data', 'workspaces', original.id), proposalSha256: original.proposalSha256, source: original.transfer, createdAt: at, disposeStartedAt: at, retiredAt: at });
+  Object.assign(f.app.sessions, { retainedHostExecution: (id: string) => { assert.equal(id, sessionId); return { kind: 'host-macos', workspaceId: original.id, releasedAt: at }; } });
+  await f.snapshots.remove(original.snapshot);
+  return { original, source };
+}
+
+test('same-candidate recovery restores every retained root and links a fresh independent audit without rewriting the original rejection', { timeout: 30000 }, async t => {
+  const f = await fixture(t), { original, source } = await legacyMissingCache(f);
+  const before = structuredClone(f.setup.get(original.id));
+  await f.setup.recoverSourceCaches(authority, source);
+  const continuation = f.store.list<NativeProfileAudit>(PROFILE_AUDITS).find(run => run.recoveryOf === original.id)!;
+  assert(continuation); assert.notEqual(continuation.id, original.id);
+  assert.deepEqual(f.setup.get(original.id), before, 'The old failed outcome, reason and reviewer identities remain intact');
+  assert.deepEqual(continuation.source, original.source); assert.deepEqual(continuation.transfer, original.transfer);
+  assert.deepEqual(continuation.proposal, original.proposal); assert.equal(continuation.snapshot.path, original.snapshot.path);
+  await f.snapshots.verify(continuation.snapshot);
+  assert.equal(await readFile(path.join(continuation.snapshot.roots[1]!.path, 'Tokens.swift'), 'utf8'), '// Original pinned fixture preferences.\n');
+  const recovery = f.store.events<{ action: string; continuationId: string; previous: { reason: string } }>('inspection-profile-audit-recovery', original.id);
+  assert.equal(recovery.length, 1); assert.equal(recovery[0]!.value.action, 'source-cache-retry');
+  assert.equal(recovery[0]!.value.continuationId, continuation.id); assert.equal(recovery[0]!.value.previous.reason, original.reason);
+  await f.setup.recoverSourceCaches(authority, source);
+  assert.equal(f.store.list<NativeProfileAudit>(PROFILE_AUDITS).filter(run => run.recoveryOf === original.id).length, 1, 'Recovery is idempotent for this failed owner');
+  const completed = await f.execute(continuation);
+  assert.equal(completed.status, 'configured'); assert.equal(f.calls.length, 1, 'A new independent source-only reviewer supplies fresh judgment');
+  assert(completed.verdict); assert(completed.receipt); assert.equal(f.configured.length, 1);
+  assert.deepEqual(f.setup.get(original.id), before);
+});
+
+test('source-cache recovery refuses a verdict, changed candidate, uncertain reviewer, foreign path and incomplete CAS', { timeout: 60000 }, async t => {
+  for (const refusal of ['verdict', 'earlier-verdict', 'candidate', 'reviewer', 'path', 'CAS', 'authority'] as const) await t.test(refusal, async t => {
+    const f = await fixture(t), { original, source } = await legacyMissingCache(f);
+    let currentSource = source;
+    if (refusal === 'verdict' || refusal === 'earlier-verdict') {
+      const verdict = await f.artifacts.put('A real independent source rejection.', { ...authority, name: 'real-rejection.txt', mime: 'text/plain' });
+      f.store.set(PROFILE_AUDITS, { ...original, id: refusal === 'earlier-verdict' ? 'original-negative-source-review' : original.id, verdict });
+    } else if (refusal === 'candidate') currentSource = { ...source, candidateCommit: 'd'.repeat(40) };
+    else if (refusal === 'reviewer') f.store.set('sessions', { ...f.store.get<Session>('sessions', original.sessionId!)!, status: 'unknown' });
+    else if (refusal === 'path') f.store.set(PROFILE_AUDITS, { ...original, snapshot: { ...original.snapshot, path: f.primary } });
+    else if (refusal === 'CAS') await rm(await f.artifacts.path(original.transfer.sourceArtifacts[1]!.manifest));
+    else f.setCurrent(false);
+    const before = structuredClone(f.setup.get(original.id));
+    if (refusal === 'CAS' || refusal === 'authority') await assert.rejects(f.setup.recoverSourceCaches(authority, currentSource));
+    else await f.setup.recoverSourceCaches(authority, currentSource);
+    assert.deepEqual(f.setup.get(original.id), before);
+    assert.equal(f.store.list<NativeProfileAudit>(PROFILE_AUDITS).length, refusal === 'earlier-verdict' ? 2 : 1); assert.equal(f.store.events('inspection-profile-audit-recovery', original.id).length, 0);
+    assert.equal(f.calls.length, 0); assert.equal(f.configured.length, 0);
+  });
+});
+
+test('a missing owned cache after source review is a typed wait and preserves the original source judgment gap', { timeout: 30000 }, async t => {
+  const f = await fixture(t), queued = await f.propose();
+  f.setAfterReads(async () => { await f.snapshots.remove(f.setup.get(queued.id).snapshot); });
+  const waiting = await f.execute(queued);
+  assert.equal(waiting.status, 'waiting'); assert.equal(waiting.providerUnresolved, false);
+  assert.equal(waiting.sourceCacheFailure?.code, 'ENOENT'); assert.equal(waiting.sourceCacheFailure?.path, waiting.snapshot.path);
+  assert.equal(waiting.sourceCacheFailure?.snapshotId, waiting.source.snapshotId);
+  assert.equal(waiting.sourceCacheFailure?.sourceDigest, waiting.source.sha256);
+  assert.equal(waiting.verdict, undefined); assert.equal(waiting.receipt, undefined); assert.equal(f.configured.length, 0);
+  assert.match(waiting.reason!, /Restore this exact all-root source/);
+  f.setAfterReads(undefined);
+  const workdir=path.join(f.app.dataDir,'workspace-data','workspaces',waiting.id,'repository');
+  Object.assign(f.app.sessions,{retainedHostExecution:()=>({kind:'host-macos',workspaceId:waiting.id,workdir})});
+  f.setProcesses([{ sessionId: waiting.sessionId!, state: 'exited', createdAt: new Date().toISOString() }]);
+  const unknown=await f.execute(waiting);
+  assert.equal(unknown.status,'unknown');assert.match(unknown.reason!,/complete owned/);
+  await assert.rejects(lstat(waiting.snapshot.path),{code:'ENOENT'});
+  assert.equal(f.calls.length,1,'An exited label without positive complete teardown cannot resume a reviewer');
+  f.store.set('chat-turn-failures',{id:waiting.chatId!,attemptId:authority.attemptId,executionEnded:true,completedAt:new Date().toISOString()});
+  f.setProcesses([]);
+  assert.equal((await f.execute(unknown)).status,'unknown','A completed-turn shortcut and an empty process inventory cannot establish owned teardown');
+  await assert.rejects(lstat(waiting.snapshot.path),{code:'ENOENT'});assert.equal(f.calls.length,1);
+  const processKey='original-reviewer',recordPath=path.join(f.directory,'owned-process.json'),createdAt=waiting.startedAt!,at=new Date().toISOString(),supervisorPath=recordPath.replace(/\.json$/,'.cjs');
+  f.setProcesses([{sessionId:waiting.sessionId!,state:'exited',createdAt,processKey,recordPath,pid:1337,cwd:workdir,termination:{schemaVersion:2,kind:'supervised-termination',evidence:'complete-owned-teardown',observedAt:at,previousStatus:'exited',previousUpdatedAt:at,priorRecordSha256:'a'.repeat(64),currentBoot:{schemaVersion:1,platform:'darwin',machineId:'fixture-mac',bootId:'fixture-boot',startedAt:at,observedAt:at,uptimeMs:1000},processKey,sessionId:waiting.sessionId!,cwd:workdir,inventoryComplete:true,supervisor:{pid:1337,path:supervisorPath,identity:`node ${supervisorPath} ${processKey}`},children:[],exitCode:null,exitSignal:'SIGKILL'}}]);
+  const options=(f.setup as unknown as {options:{chats:ChatController}}).options,probe=options.chats.manager.hostProcesses.bind(options.chats.manager),priorChat=f.store.get<Chat>('chats',waiting.chatId!)!;
+  options.chats.manager.hostProcesses=async input=>{assert.equal(input?.readOnly,true);const observed=await probe(input);f.store.set('chats',{...priorChat,threadId:'changed-during-process-inspection'});return observed;};
+  assert.equal((await f.execute(unknown)).status,'unknown','Even a complete proof cannot cross a changed provider owner');
+  await assert.rejects(lstat(waiting.snapshot.path),{code:'ENOENT'});assert.equal(f.calls.length,1);
+  f.store.set('chats',priorChat);options.chats.manager.hostProcesses=probe;
+  const resumed = await f.execute(waiting);
+  assert.equal(resumed.status, 'configured'); assert.equal(resumed.sourceCacheFailure, undefined);
+  assert.equal(f.calls.length, 2, 'The confirmed-ended reviewer performs a fresh independent source review');
+  const restoration = f.store.events<{ action: string; failure: { code: string } }>('inspection-profile-audit-recovery', waiting.id);
+  assert.equal(restoration.length, 1); assert.equal(restoration[0]!.value.action, 'source-cache-restored'); assert.equal(restoration[0]!.value.failure.code, 'ENOENT');
+  await f.snapshots.verify(resumed.snapshot);
+});
 
 function realNativeSessions(t: TestContext, f: Awaited<ReturnType<typeof fixture>>, reproduceOverlap = false) {
   const workspaceDataDir = path.join(f.directory, 'service', 'workspace-data');

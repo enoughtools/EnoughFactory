@@ -74,6 +74,20 @@ export class InspectionRetention {
     });
   }
 
+  /** Relinquish a temporary checkout; a retained copy now belongs to its durable owners and cache sweep. */
+  async releaseTemporary(snapshot: InspectionSnapshot): Promise<void> {
+    if (snapshot.path !== this.snapshotPath(snapshot.id)) throw new Error('Temporary inspection source is not owned by this retention cache');
+    await this.exclusive(snapshot.id, async () => {
+      const saved = this.options.store.get<InspectionSourceRetention>(bucket, snapshot.id);
+      if (!saved) { await this.snapshots.remove(snapshot); return; }
+      if (saved.sourceDigest !== snapshot.sourceDigest) throw new Error('Temporary inspection source differs from its retained identity');
+      await this.verifyDurable(saved);
+      // Verifier imports preserve the snapshot ID, so a native audit may share
+      // this exact path with its original temporary check. Only sweep may retire
+      // a retained copy, after every reader, audit and job releases ownership.
+    });
+  }
+
   async restore(snapshotId: string, signal?: AbortSignal): Promise<InspectionSnapshot> {
     return this.exclusive(snapshotId, async () => {
       const saved = this.options.store.get<InspectionSourceRetention>(bucket, snapshotId);

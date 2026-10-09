@@ -6,7 +6,7 @@ import path from 'node:path';
 import test, { type TestContext } from 'node:test';
 import type { InspectionAuthority, InspectionEvidence, InspectionJob, InspectionSourceIdentity, InspectionVerificationRun, TaskQualityRequirements } from '@enoughfactory/contracts';
 import type { BrowserObservation } from '@enoughfactory/browser-inspection';
-import { InspectionSnapshotManager, type InspectionSnapshot } from '@enoughfactory/workspaces';
+import { InspectionSnapshotManager, exportInspectionSnapshot, importInspectionSnapshot, type InspectionSnapshot } from '@enoughfactory/workspaces';
 import type { DeviceApp } from './app.ts';
 import type { AgentToolBridgeContext, ChatController } from './chats.ts';
 import { InspectionService } from './inspection-service.ts';
@@ -169,6 +169,53 @@ test('native profile proposals preserve independently owned verifier snapshots w
   await external.verify(snapshot);
   const owned = f.service.profileSetup.get(audit.id);
   assert.notEqual(owned.snapshot.path, snapshot.path); await f.service.snapshots.verify(owned.snapshot);
+});
+
+test('a quality check releases its temporary owner without deleting source shared by two native audits', { timeout: 30000 }, async t => {
+  const f = await nativeProposalFixture(t);
+  for (const id of ['mail-web', 'verification-inputs', 'repair-source']) {
+    const directory = path.join(f.directory, id);
+    await mkdir(directory); await writeFile(path.join(directory, 'original.txt'), `Original ${id} bytes`);
+    f.context.session.workingDirectories!.push({ id, name: id, path: directory, kind: 'git', baseCommit: 'b'.repeat(40), status: 'ready' });
+  }
+  const externalDataDir = path.join(f.directory, 'verifier'), external = new InspectionSnapshotManager({ dataDir: externalDataDir, artifacts: f.service.artifacts });
+  let verifierSnapshot!: InspectionSnapshot, temporary!: InspectionSnapshot;
+  const audits: NativeProfileAudit[] = [];
+  Object.assign(f.service.quality, { check: async () => ({ command: 'ui-quality', passed: false, exitCode: 1, output: 'Independent inspection is required.', recovery: { condition: 'inspection-evidence', reason: 'Inspect this exact source.' } }) });
+  Object.assign(f.service.verifier, { ensure: async (input: Parameters<typeof f.service.verifier.ensure>[0]) => {
+    temporary = input.snapshot;
+    const transfer = await exportInspectionSnapshot({ snapshot: temporary, artifacts: f.service.artifacts, context: input.authority });
+    verifierSnapshot = await importInspectionSnapshot({ dataDir: externalDataDir, artifacts: f.service.artifacts, sourceArtifacts: transfer.sourceArtifacts, sourceManifest: transfer.sourceManifest, expectedSource: { snapshotId: temporary.id, sourceDigest: temporary.sourceDigest }, context: input.authority });
+    assert.notEqual(verifierSnapshot.path, temporary.path); assert.equal(verifierSnapshot.id, temporary.id);
+    f.context.chat.verificationRunId = 'original-verifier';
+    Object.assign(f.service.verifier, { verificationSource: async () => ({ id: verifierSnapshot.id, source: input.source, snapshot: verifierSnapshot, run: { id: 'original-verifier' } }), verifySnapshot: (snapshot: InspectionSnapshot, signal?: AbortSignal) => external.verify(snapshot, signal) });
+    const mac = value<{ audit: NativeProfileAudit }>(await f.call('factory_native_profile_propose', f.args)).audit;
+    audits.push(f.service.profileSetup.get(mac.id));
+    const { fixtureExpectedDataRoot: _macDataRoot, ...iosProfile } = f.args.profile;
+    const ios = value<{ audit: NativeProfileAudit }>(await f.call('factory_native_profile_propose', { ...f.args, requestId: 'ios-native-profile', profile: { ...iosProfile, id: 'ios-fixture', build: { ...iosProfile.build, platform: 'ios-simulator' } } })).audit;
+    audits.push(f.service.profileSetup.get(ios.id));
+    return { status: 'waiting', reason: 'Both native source audits are queued.' };
+  } });
+  const roots = f.context.session.workingDirectories!;
+  const input = { goal: f.store.get('goals', 'goal'), task: f.store.get('tasks', 'task'), attempt: f.store.get('attempts', 'attempt'), candidate: { id: 'C', commit: 'c'.repeat(40), workingDirectories: roots.map(root => ({ id: root.id, name: root.name, containerPath: root.id })) }, quality: f.quality, path: f.workdir, workingDirectories: roots.map(root => ({ path: root.path, containerPath: root.id })), checkedCommit: 'c'.repeat(40), signal: new AbortController().signal } as Parameters<typeof f.service.qualityCheck>[0];
+  const checked = await f.service.qualityCheck(input);
+  assert.equal(checked.recovery?.condition, 'inspection-evidence'); assert.equal(audits.length, 2);
+  assert.equal(temporary.roots.length, 5);
+  for (const audit of audits) {
+    assert.equal(audit.status, 'queued'); assert.equal(audit.snapshot.path, temporary.path, 'The audit shares the original temporary cache path');
+    assert.equal(audit.source.sha256, temporary.sourceDigest); await f.service.snapshots.verify(audit.snapshot);
+  }
+  const pressure = { maxSnapshotBytes: 1, minIdleMs: 0, pressureIdleMs: 0 };
+  assert.ok((await f.service.retention.sweep(pressure)).keptSnapshotIds.includes(temporary.id));
+  f.store.set('inspection-profile-audits', { ...audits[0]!, status: 'canceled' });
+  assert.ok((await f.service.retention.sweep(pressure)).keptSnapshotIds.includes(temporary.id), 'The second audit still owns all source roots');
+  await f.service.snapshots.verify(audits[1]!.snapshot);
+  f.store.set('inspection-profile-audits', { ...audits[1]!, status: 'canceled' });
+  assert.ok((await f.service.retention.sweep(pressure)).retiredSnapshotIds.includes(temporary.id), 'The last audit releases ordinary cache cleanup; there is no permanent pin');
+  await assert.rejects(lstat(temporary.path), { code: 'ENOENT' });
+  await external.verify(verifierSnapshot);
+  assert.equal(await readFile(path.join(f.workdir, 'App.swift'), 'utf8'), '// Original isolated fixture entry.');
+  assert.equal(await readFile(path.join(f.referencePath, 'Button.swift'), 'utf8'), 'Original EnoughUI button source');
 });
 
 function retainedCandidateInput(f: Awaited<ReturnType<typeof fixture>>) {

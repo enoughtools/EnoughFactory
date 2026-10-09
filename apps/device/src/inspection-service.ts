@@ -130,7 +130,7 @@ export class InspectionService {
     this.profileSetup=new NativeProfileSetup({app,chats,artifacts:this.artifacts,snapshots:this.snapshots,authorityCurrent:authority=>this.authorityCurrent(authority),verifySnapshot:async(snapshot,signal)=>{if(snapshot.path.startsWith(path.join(app.dataDir,'inspection','inspection-snapshots')+path.sep))await this.snapshots.verify(snapshot,signal);else await this.verifier.verifySnapshot(snapshot,signal);},readiness:()=>this.readiness(),sourceCurrent:async(sessionId,authority,signal)=>{
       const session=app.sessions.record(sessionId),execution=app.sessions.execution(sessionId),context={session,execution,signal,chat:{id:'source-audit-current',sessionId,runtime:'codex'} as AgentToolBridgeContext['chat']};
       const current=await this.captureActual(context,authority,false);try{return current.source;}finally{await this.snapshots.remove(current.snapshot);}
-    },retainSnapshot:async(snapshot,authority)=>{await this.retention.retain(snapshot,authority);},configure:(projectId,profile)=>this.configureProfile(projectId,profile),retireReviewer:run=>this.retireProfileReviewer(run)});
+    },retainSnapshot:async(snapshot,authority)=>{await this.retention.retain(snapshot,authority);},useSnapshot:(id,work,signal)=>this.retention.use(id,work,signal),configure:(projectId,profile)=>this.configureProfile(projectId,profile),retireReviewer:run=>this.retireProfileReviewer(run)});
     if(network)this.profileSync=new NativeProfileSync({app,peers:network.peers,artifacts:this.artifacts,auditOriginal:async id=>{const original=this.profileSetup.original(id),configured=this.profiles(original.audit.projectId).find(profile=>profile.id===original.audit.proposal.profile.id);if(configured?.receipt?.sha256!==original.audit.receipt?.sha256)throw new Error('A newer independently audited profile superseded this source receipt.');return original;},authorityCurrent:authority=>this.authorityCurrent(authority),auditApproved:run=>this.profileSetup.approved(run),configure:(projectId,profile)=>this.configureProfile(projectId,profile)});
   }
   private configureProfile(projectId:string,profile:NativeFixtureProfile):void{const profiles=this.profiles(projectId).filter(current=>current.id!==profile.id);if(profiles.length>=16)throw new Error('The project already has sixteen native fixture profiles.');this.app.store.set('inspection-project-profiles',{id:projectId,profiles:[...profiles,profile]});this.app.emit('inspection-evidence',{projectId,profileId:profile.id,purpose:'native-profile-ready'});this.app.changed();}
@@ -208,11 +208,11 @@ export class InspectionService {
     });
     this.app.serviceActivityHooks.push(()=>{const verifiers=this.app.store.list<InspectionVerificationRun>('inspection-verifier-runs').filter(run=>['preparing','running','unknown'].includes(run.status)||run.status==='waiting'&&Boolean(run.sessionId));const held=this.jobs.listJobs().filter(job=>['preparing','running','waiting','unknown','cancellation-requested'].includes(job.status)),audits=this.profileSetup.list().filter(run=>['queued','preparing','running','unknown'].includes(run.status));return held.length||verifiers.length||audits.length?[`${held.length} inspection job(s), ${verifiers.length} verifier(s) and ${audits.length} source audit(s) have active or unresolved ownership.`]:[];});
     this.app.closers.push(()=>this.close());
-    void this.app.withServiceOperation(async()=>{await this.recoverOwnedSessions();await this.recoverOwnedBuilds();}).catch(error=>this.app.emit('inspection-error',{error:(error as Error).message}));
+    void this.app.withServiceOperation(async signal=>{await this.recoverOwnedSessions();await this.recoverOwnedBuilds();const reconciled=await this.verifier.reconcileRevokedWaiting(run=>this.canRetireVerifier(run),signal);for(const failure of reconciled.errors)this.app.emit('inspection-error',failure);}).catch(error=>this.app.emit('inspection-error',{error:(error as Error).message}));
     this.timer=setInterval(()=>{
       if(this.closing||this.maintaining)return;
-      this.maintaining=this.app.withServiceOperation(async()=>{
-        this.profileSetup.maintain();const outcomes=await Promise.allSettled([this.readiness({prepareHost:'automatic'}),this.recoverOwnedBuilds(),this.retireIdleBrowsers(),this.retention.sweep(),this.retireColdProducts(),this.verifier.sweepCompleted(run=>this.canRetireVerifier(run)),this.syncNativeProfiles()]);
+      this.maintaining=this.app.withServiceOperation(async signal=>{
+        this.profileSetup.maintain();const reconciled=await this.verifier.reconcileRevokedWaiting(run=>this.canRetireVerifier(run),signal);for(const failure of reconciled.errors)this.app.emit('inspection-error',failure);const outcomes=await Promise.allSettled([this.readiness({prepareHost:'automatic'}),this.recoverOwnedBuilds(),this.retireIdleBrowsers(),this.retention.sweep(),this.retireColdProducts(),this.verifier.sweepCompleted(run=>this.canRetireVerifier(run)),this.syncNativeProfiles()]);
         for(const outcome of outcomes)if(outcome.status==='rejected')this.app.emit('inspection-error',{error:(outcome.reason as Error).message});
       }).catch(error=>this.app.emit('inspection-error',{error:(error as Error).message})).finally(()=>{this.maintaining=undefined;});
     },30000);this.timer.unref();
@@ -262,6 +262,7 @@ export class InspectionService {
       this.profileSetup.bindCandidate(authority,input.candidate,source);
       const checked=await this.quality.check({authority,quality:input.quality,source,candidateCommit:input.candidate.commit,checkedCommit:input.checkedCommit});
       if(!checked.passed&&!checked.recovery)return checked;
+      try{await this.profileSetup.recoverSourceCaches(authority,source,input.signal);}catch(error){input.signal?.throwIfAborted();const reason=`Native source audit recovery is waiting: ${(error as Error).message} The successful author and exact candidate remain retained.`;return{...checked,passed:false,exitCode:1,output:reason,recovery:{condition:'inspection-evidence',reason}};}
       const setup=this.profileSetup.pending(authority,source);
       if(setup?.status==='rejected')return{...checked,passed:false,exitCode:1,output:`Native fixture audit ${setup.auditId} rejected this exact source: ${setup.reason}${setup.verdict?` Original judgment artifact ${setup.verdict.id} (${setup.verdict.sha256}).`:''}`,recovery:undefined};
       if(setup){this.profileSetup.maintain();const reason=`Native testing setup is ${setup.status}: ${setup.reason} The successful author and exact candidate remain retained.`;return{...checked,passed:false,exitCode:1,output:reason,recovery:{condition:'inspection-evidence',reason}};}
@@ -270,7 +271,7 @@ export class InspectionService {
       if(run.status==='succeeded'&&run.acceptanceContract&&run.chatId)return this.quality.check({authority,quality:input.quality,source,candidateCommit:input.candidate.commit,checkedCommit:input.checkedCommit,verification:{runId:run.id,chatId:run.chatId,acceptanceContractSha256:inspectionAcceptanceContractSha256(run.acceptanceContract)}});
       if(['failed','canceled'].includes(run.status))return {...checked,passed:false,exitCode:1,output:run.reason||'Independent application verification failed.',recovery:undefined};
       const reason=run.reason||'Independent application verification is waiting for inspection readiness.';return {...checked,passed:false,exitCode:1,output:reason,recovery:{condition:'inspection-evidence',reason}};
-    }finally{await this.snapshots.remove(snapshot);}
+    }finally{await this.retention.releaseTemporary(snapshot);}
   };
   private requestMacPermissions():Promise<{readiness:NativeReadiness;executionTargets:ExecutionTargetAdvertisement[]}>{
     if(this.closing)throw new Error('Inspection service is closing.');
@@ -536,7 +537,7 @@ export class InspectionService {
       const after=await this.canonicalSource(input.goal,input.signal);
       try{if(!inspectionSourceContentMatches(after.source,canonical.source)||after.clean===false||after.checkedCommit!==canonical.checkedCommit)return {ready:false,reason:'The integrated project changed during its final review. Verify the latest source.',evidenceIds:[]};}finally{await this.snapshots.remove(after.snapshot);}
       return checked;
-    }finally{await this.snapshots.remove(canonical.snapshot);if(current)await this.snapshots.remove(current.snapshot);}
+    }finally{await this.retention.releaseTemporary(canonical.snapshot);if(current)await this.snapshots.remove(current.snapshot);}
   };
   private async controllerBridge(context:AgentToolBridgeContext):Promise<AgentToolBridge|undefined>{
     const run=this.app.store.list<ControllerRun>('factory-controller-runs').find(run=>run.chatId===context.chat.id&&run.sessionId===context.session.id);
