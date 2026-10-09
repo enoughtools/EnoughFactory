@@ -374,6 +374,9 @@ test('native exact assertions retain observed equality and distinguish an empty 
   const observationId = String(observed.value!.observationId);
   const assertions = [
     { labelIncludes: 'Message body', valueEquals: 'Original body' },
+    { labelIncludes: 'Message', labelEquals: 'Message body', valueEquals: 'Original body' },
+    { labelIncludes: 'Message', labelEquals: 'Message', valueEquals: 'Original body' },
+    { labelIncludes: 'Message', labelEquals: 'body', valueEquals: 'Original body' },
     { labelIncludes: 'Message body', valueEquals: 'Original' },
     { labelIncludes: 'Message body', valueEquals: 'body' },
     { labelIncludes: 'Message body', valueEquals: 'Original body suffix' },
@@ -383,7 +386,7 @@ test('native exact assertions retain observed equality and distinguish an empty 
   ];
   const checked = await f.execute({ name: 'run-tests', arguments: { sessionId, observationId, assertions } });
   assert.equal(checked.value!.passed, false);
-  assert.deepEqual((checked.value!.results as Array<{ passed: boolean }>).map(result => result.passed), [true, false, false, false, false, true, true]);
+  assert.deepEqual((checked.value!.results as Array<{ passed: boolean }>).map(result => result.passed), [true, true, false, false, false, false, false, false, true, true]);
   const evidence = f.jobs.evidence(jobId).find(item => item.id === checked.value!.evidenceId)!;
   assert.equal(evidence.source.sha256, f.assignment.source.sha256); assert.equal(evidence.metadata?.observationId, observationId);
   const original = JSON.parse((await f.artifacts.read(evidence.artifact)).toString()) as { results: Array<{ condition: unknown }> };
@@ -391,6 +394,7 @@ test('native exact assertions retain observed equality and distinguish an empty 
 
   f.values.set([...f.sessions.keys()][0]!, '');
   const empty = await f.execute({ name: 'observe', arguments: { sessionId } });
+  await assert.rejects(f.execute({ name: 'run-tests', arguments: { sessionId, observationId: empty.value!.observationId, assertions: [{ labelIncludes: 'Message body', labelEquals: 0 }] } }), /text/i);
   await assert.rejects(f.execute({ name: 'run-tests', arguments: { sessionId, observationId: empty.value!.observationId, assertions: [{ labelIncludes: 'Message body', valueEquals: 0 }] } }), /text/i);
   const exactEmpty = await f.execute({ name: 'run-tests', arguments: { sessionId, observationId: empty.value!.observationId, assertions: [{ labelIncludes: 'Message body', valueEquals: '' }] } });
   assert.equal(exactEmpty.value!.passed, true);

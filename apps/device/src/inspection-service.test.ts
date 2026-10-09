@@ -370,6 +370,7 @@ test('local native exact assertions preserve the entire observed value and do no
   Object.assign(f.service.native, {
     observe: async () => ({ observationId: 'backend-exact', elements: [
       { id: 'recipient', label: 'Recipient', value: 'person@example.com' },
+      { id: 'from', label: 'From, owner@example.com', value: null },
       { id: 'body', label: 'Message body', value: 'Complete body' },
       { id: 'empty', label: 'Empty subject', value: '' },
       { id: 'missing', label: 'Save draft' },
@@ -388,6 +389,14 @@ test('local native exact assertions preserve the entire observed value and do no
     assert.equal(evidence.source.sha256, f.source.sha256); assert.equal(evidence.metadata?.observationId, observed.observationId);
     assert.equal(JSON.parse((await f.service.artifacts.read(evidence.artifact)).toString()).condition.valueEquals, valueEquals);
   }
+  for (const [labelEquals, expected] of [['From, owner@example.com', true], ['From, owner', false], ['From, owner@example.com suffix', false]] as const) {
+    const result = value<{ passed: boolean; evidenceId: string }>(await f.call('factory_assert', { sessionId: session.id, observationId: observed.observationId, labelIncludes: 'From', labelEquals }));
+    assert.equal(result.passed, expected, 'Exact read-only text comes from the observed label even when the value is null');
+    const evidence = f.store.get<InspectionEvidence>('inspection-evidence', result.evidenceId)!;
+    assert.equal(evidence.source.sha256, f.source.sha256); assert.equal(evidence.metadata?.observationId, observed.observationId);
+    assert.equal(JSON.parse((await f.service.artifacts.read(evidence.artifact)).toString()).condition.labelEquals, labelEquals);
+  }
+  assert.equal(value<{ passed: boolean }>(await f.call('factory_assert', { sessionId: session.id, observationId: observed.observationId, labelIncludes: 'From', labelEquals: 'From, owner@example.com', valueEquals: '' })).passed, false, 'Exact label does not fabricate an editable value');
   await f.call('factory_observe', { sessionId: session.id, requestId: 'new-exact-observation' });
   await assert.rejects(f.call('factory_assert', { sessionId: session.id, observationId: observed.observationId, labelIncludes: 'Recipient', valueEquals: 'person@example.com' }), /Re-observe|current|stale/i);
 });

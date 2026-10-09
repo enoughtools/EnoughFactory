@@ -1,5 +1,6 @@
 export interface ObservedCondition {
   labelIncludes: string;
+  labelEquals?: string;
   valueIncludes?: string;
   valueEquals?: string;
   absent?: boolean;
@@ -12,11 +13,13 @@ export function evaluateObservedCondition(
   if (typeof condition.labelIncludes !== 'string' || !condition.labelIncludes.trim()) {
     throw new Error('An assertion needs a concrete observed label.');
   }
-  if (condition.valueIncludes !== undefined && typeof condition.valueIncludes !== 'string'
+  if (condition.labelEquals !== undefined && typeof condition.labelEquals !== 'string'
+    || condition.valueIncludes !== undefined && typeof condition.valueIncludes !== 'string'
     || condition.valueEquals !== undefined && typeof condition.valueEquals !== 'string') {
     throw new Error('Assertion values must be text.');
   }
-  const matchesLabel = (element: (typeof elements)[number]) => (element.label || element.identifier || '').includes(condition.labelIncludes);
+  const matchesLabel = (element: (typeof elements)[number]) => (element.label || element.identifier || '').includes(condition.labelIncludes)
+    && (condition.labelEquals === undefined || typeof element.label === 'string' && element.label === condition.labelEquals);
   if (condition.absent === true) return !elements.some(matchesLabel);
   return elements.some(element => matchesLabel(element)
     && (condition.valueIncludes === undefined || (element.value || '').includes(condition.valueIncludes))

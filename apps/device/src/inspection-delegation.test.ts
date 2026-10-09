@@ -299,11 +299,28 @@ test('Linux author builds, inspects, edits, asserts, restarts and stops a native
     const fresh = await f.call('factory_observe', { sessionId: started.sessionId, requestId: `observe-${requestId}` }); imageDelivery(f.author.store, fresh, `image-${requestId}`);
     afterObservation = String(value(fresh, 'observationId')); afterEvidence = String(value(fresh, 'screenshotEvidenceId'));
   }
-  const asserted = await f.call('factory_assert', { sessionId: started.sessionId, requestId: 'assert-body', observationId: afterObservation, labelIncludes: 'Message body', valueEquals: 'Draft edited from Linux' });
+  for (const [requestId, labelEquals] of [['reject-label-prefix', 'Message'], ['reject-label-suffix', 'body']] as const) {
+    const condition = { labelIncludes: 'Message', labelEquals, valueEquals: 'Draft edited from Linux' };
+    const partial = await f.call('factory_assert', { sessionId: started.sessionId, requestId, observationId: afterObservation, ...condition });
+    assert.equal(value(partial, 'passed'), false, 'A delegated exact label cannot silently degrade into the required label selector');
+    const evidence = f.author.plugin.evidenceForAuthority(authority).find(item => item.id === value(partial, 'evidenceId'))!;
+    assert.deepEqual(evidence.source, f.author.plugin.taskInspection(authority.taskId).jobs.find(item => item.id === started.jobId)!.source);
+    assert.equal(evidence.metadata?.passed, false); assert.equal(evidence.metadata?.observationId, afterObservation);
+    const original = JSON.parse((await f.author.artifacts.read(evidence.artifact)).toString('utf8')) as { observationId: string; results: Array<{ condition: unknown; passed: boolean }> };
+    assert.equal(original.observationId, afterObservation); assert.deepEqual(original.results, [{ condition, passed: false }]);
+    const fresh = await f.call('factory_observe', { sessionId: started.sessionId, requestId: `observe-${requestId}` }); imageDelivery(f.author.store, fresh, `image-${requestId}`);
+    afterObservation = String(value(fresh, 'observationId')); afterEvidence = String(value(fresh, 'screenshotEvidenceId'));
+  }
+  const exactCondition = { labelIncludes: 'Message', labelEquals: 'Message body', valueEquals: 'Draft edited from Linux' };
+  const asserted = await f.call('factory_assert', { sessionId: started.sessionId, requestId: 'assert-body', observationId: afterObservation, ...exactCondition });
   assert.equal(value(asserted, 'passed'), true);
+  const assertedEvidence = f.author.plugin.evidenceForAuthority(authority).find(item => item.id === value(asserted, 'evidenceId'))!;
+  const originalAssertion = JSON.parse((await f.author.artifacts.read(assertedEvidence.artifact)).toString('utf8')) as { observationId: string; results: Array<{ condition: unknown; passed: boolean }> };
+  assert.equal(originalAssertion.observationId, afterObservation); assert.deepEqual(originalAssertion.results, [{ condition: exactCondition, passed: true }]);
 
   // The acceptance service consumes the original transferred journal, rather than invented receipt objects.
   const source = f.author.plugin.taskInspection(authority.taskId).jobs.find(item => item.id === started.jobId)!.source;
+  assert.deepEqual(assertedEvidence.source, source);
   const referenceArtifact = await f.author.artifacts.put(await readFile(join(snapshot.roots[1]!.path, 'Tokens.swift')), { ...authority, name: 'Tokens.swift', mime: 'text/plain' });
   assert.match((await f.author.artifacts.read(referenceArtifact)).toString('utf8'), /spacing = 12/);
   f.author.store.set<InspectionReferenceView>('inspection-reference-views', { id: 'tokens-view', referenceId: 'enough-ui', authority, source, artifacts: [referenceArtifact], inspectedAt: new Date().toISOString() });

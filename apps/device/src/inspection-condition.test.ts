@@ -2,6 +2,32 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { evaluateObservedCondition, type ObservedCondition } from './inspection-condition.js';
 
+test('exact observed read-only labels reject prefixes, suffixes, case and whitespace changes', () => {
+  const expected = 'From, owner@example.com';
+  const condition = { labelIncludes: 'From', labelEquals: expected };
+  assert.equal(evaluateObservedCondition([{ label: expected }], condition), true);
+  for (const label of ['From, owner', 'From, owner@example.com suffix', 'Prefix From, owner@example.com', 'From, Owner@example.com', `${expected} `]) {
+    assert.equal(evaluateObservedCondition([{ label }], condition), false, label);
+  }
+});
+
+test('exact labels require an actual observed string and distinguish empty from missing', () => {
+  const condition = { labelIncludes: 'from-field', labelEquals: '' };
+  assert.equal(evaluateObservedCondition([{ label: '', identifier: 'from-field' }], condition), true);
+  assert.equal(evaluateObservedCondition([{ identifier: 'from-field' }], condition), false);
+  assert.equal(evaluateObservedCondition([{ label: undefined, identifier: 'from-field' }], condition), false);
+  assert.equal(evaluateObservedCondition([{ identifier: 'From, owner@example.com' }], { labelIncludes: 'From', labelEquals: 'From, owner@example.com' }), false);
+});
+
+test('exact labels combine with the selector and value predicates on one element', () => {
+  const elements = [{ label: 'From, owner@example.com', value: 'primary' }, { label: 'From, other@example.com', value: 'secondary' }];
+  assert.equal(evaluateObservedCondition(elements, { labelIncludes: 'From', labelEquals: 'From, owner@example.com', valueEquals: 'primary', valueIncludes: 'prim' }), true);
+  assert.equal(evaluateObservedCondition(elements, { labelIncludes: 'From', labelEquals: 'From, owner@example.com', valueEquals: 'secondary' }), false);
+  assert.equal(evaluateObservedCondition(elements, { labelIncludes: 'To', labelEquals: 'From, owner@example.com' }), false);
+  assert.equal(evaluateObservedCondition(elements, { labelIncludes: 'From', labelEquals: 'From, missing@example.com', absent: true }), true);
+  assert.equal(evaluateObservedCondition(elements, { labelIncludes: 'From', labelEquals: 'From, owner@example.com', absent: true }), false);
+});
+
 test('exact observed values reject prefixes, suffixes, case changes and whitespace changes', () => {
   const condition = { labelIncludes: 'Subject', valueEquals: 'Hello' };
   assert.equal(evaluateObservedCondition([{ label: 'Subject field', value: 'Hello' }], condition), true);
@@ -60,7 +86,7 @@ test('conditions require a concrete string label without changing the matched te
 });
 
 test('optional value filters must be strings, including for absence conditions', () => {
-  for (const key of ['valueIncludes', 'valueEquals']) {
+  for (const key of ['labelEquals', 'valueIncludes', 'valueEquals']) {
     for (const value of [null, false, 42, {}]) {
       assert.throws(() => evaluateObservedCondition([], { labelIncludes: 'Subject', absent: true, [key]: value } as ObservedCondition), /values must be text/);
     }
