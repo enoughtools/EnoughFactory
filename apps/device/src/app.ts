@@ -41,7 +41,7 @@ export class DeviceApp {
   device: Device;
   devices: Device[];
   diagnostics: Diagnostics = {docker:{available:false},envmux:{available:false},runtimes:[],networking:{hostedRelay:true}};
-  private sse = new Set<ServerResponse>();
+  private sse = new Map<ServerResponse,{write:(packet:string)=>void;end:()=>void}>();
   private changeTimer?: ReturnType<typeof setTimeout>;
   private closing = false;
   private serviceUpdating = false;
@@ -164,7 +164,7 @@ export class DeviceApp {
   emit(topic: string,data: unknown): void {
     if(this.closing)return;
     const packet=`event: ${topic}\ndata: ${JSON.stringify(data)}\n\n`;
-    for(const res of this.sse){if(res.writableLength>1024*1024){res.end();this.sse.delete(res);}else res.write(packet);}
+    for(const stream of this.sse.values())stream.write(packet);
     for(const listener of this.listeners)listener(topic,data);
   }
   changed(): void {if(this.closing||this.changeTimer)return;this.changeTimer=setTimeout(()=>{this.changeTimer=undefined;if(!this.closing)this.emit('state',this.state());},50);}
@@ -302,13 +302,32 @@ export class DeviceApp {
     if(!url.pathname.startsWith('/api/')){this.static(url,res);return;}
     if(!this.authorized(req,url)){res.writeHead(401,{'Content-Type':'application/json'});res.end(JSON.stringify({error:'Connect to this device with its access token.'}));return;}
     if(url.pathname==='/api/events'){
-      res.writeHead(200,{'Content-Type':'text/event-stream','Cache-Control':'no-store','Connection':'keep-alive'});res.write(`event: state\ndata: ${JSON.stringify(this.state())}\n\n`);this.sse.add(res);
-      const heartbeat=setInterval(()=>res.write(': heartbeat\n\n'),20000);req.on('close',()=>{clearInterval(heartbeat);this.sse.delete(res);});return;
+      this.openEventStream(req,res);return;
     }
     try {
       let body:Record<string,unknown>={};if(['POST','PATCH','PUT'].includes(req.method||'')){const chunks:Buffer[]=[];let size=0;for await(const chunk of req){size+=chunk.length;if(size>8*1024*1024)throw new HttpError(413,'Request too large.');chunks.push(Buffer.from(chunk));}if(size){try {body=JSON.parse(Buffer.concat(chunks).toString());}catch {throw new HttpError(400,'Request must contain valid JSON.');}if(!body||typeof body!=='object'||Array.isArray(body))throw new HttpError(400,'Request must be an object.');}}
       const result=await this.dispatch({method:req.method||'GET',url,body});res.writeHead(200,{'Content-Type':'application/json','Cache-Control':'no-store'});res.end(JSON.stringify(result));
     }catch(error){const e=error as Error;res.writeHead(error instanceof HttpError?error.status:500,{'Content-Type':'application/json'});res.end(JSON.stringify({error:e.message,code:error instanceof HttpError?error.code:undefined,details:error instanceof HttpError?error.details:undefined}));}
+  }
+  private openEventStream(req:IncomingMessage,res:ServerResponse):void{
+    let closed=false,heartbeat:ReturnType<typeof setInterval>|undefined;
+    const cleanup=()=>{
+      if(closed)return;closed=true;if(heartbeat)clearInterval(heartbeat);this.sse.delete(res);
+      req.off('close',cleanup);req.off('aborted',cleanup);res.off('finish',cleanup);res.off('close',cleanup);
+      // An already queued write may still emit its response error after finish.
+      // Keep this response-local listener until the response itself is collected.
+    };
+    const end=()=>{cleanup();if(!res.writableEnded&&!res.destroyed)res.end();};
+    const write=(packet:string)=>{
+      if(closed||res.writableEnded||res.destroyed){cleanup();return;}
+      if(res.writableLength>1024*1024){end();return;}
+      res.write(packet);
+    };
+    req.once('close',cleanup);req.once('aborted',cleanup);res.once('finish',cleanup);res.once('close',cleanup);
+    res.on('error',()=>{cleanup();if(!res.destroyed)res.destroy();});
+    res.writeHead(200,{'Content-Type':'text/event-stream','Cache-Control':'no-store','Connection':'keep-alive'});
+    this.sse.set(res,{write,end});heartbeat=setInterval(()=>write(': heartbeat\n\n'),20000);
+    write(`event: state\ndata: ${JSON.stringify(this.state())}\n\n`);
   }
   private static(url:URL,res:ServerResponse):void{
     const root=process.env.ENOUGHFACTORY_WEB_PATH||path.resolve(process.env.ENOUGHFACTORY_REPO||process.cwd(),'apps/web/dist');
@@ -327,5 +346,5 @@ export class DeviceApp {
     for(const operation of this.serviceOperations.values())operation.controller.abort();
     for(const close of this.closers)await close();
     await Promise.allSettled([...this.serviceOperations.values()].map(operation=>operation.promise));
-    this.sessions.close();for(const res of this.sse)res.end();this.socketServer.close();await new Promise<void>(resolve=>this.server.close(()=>{this.store.close();resolve();}));}
+    this.sessions.close();for(const stream of this.sse.values())stream.end();this.socketServer.close();await new Promise<void>(resolve=>this.server.close(()=>{this.store.close();resolve();}));}
 }
