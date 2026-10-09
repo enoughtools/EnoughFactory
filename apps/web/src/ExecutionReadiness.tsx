@@ -38,7 +38,7 @@ export function DeviceExecutionReadiness({ device, client, run }: { device: Devi
   const message = feedback?.generation === generation ? feedback.message : undefined;
   const pending = !!operation;
   const canRequestPermissions = (target: ExecutionTargetAdvertisement | undefined) => device.platform === 'darwin' && target?.protocolVersion === 1 && target.kind === 'host-macos' && target.capabilities.some(capability => capability.kind === 'macos-app-inspection' && capability.readiness === 'setup-required');
-  const permissionGuidance = <>Mac app testing uses the separate EnoughFactory Native Inspection helper, which needs Accessibility and Screen Recording access. macOS may show EnoughFactory or EnoughFactory Native Inspection depending on how the helper was launched. Follow the permission entry opened by the request on {device.name}. Previously denied access may need to be enabled in System Settings → Privacy &amp; Security, then choose Check again.</>;
+  const permissionGuidance = <>On {device.name}, allow the app named by macOS, normally EnoughFactory, under Privacy &amp; Security → App control (Accessibility / Device Control and Data Access) and Screen &amp; System Audio Recording. If a previous development build’s switch is already on but testing still needs setup, re-enable it or remove the entry and add the current EnoughFactory.app. Then choose Check again.</>;
   async function check(kind: 'checking' | 'permissions') {
     if (flight.current || !device.online || kind === 'permissions' && !targets?.some(canRequestPermissions)) return;
     flight.current = true;
@@ -64,7 +64,7 @@ export function DeviceExecutionReadiness({ device, client, run }: { device: Devi
             setUpdated({ generation: requestGeneration, targets: response.executionTargets });
             if (kind === 'permissions') {
               const mac = response.executionTargets.filter(target => target.kind === 'host-macos').flatMap(target => target.capabilities).find(capability => capability.kind === 'macos-app-inspection');
-              const message = mac?.readiness === 'ready' ? `The native testing helper is ready on ${ownerName}.` : mac ? `Mac app testing on ${ownerName}: ${readinessLabels[mac.readiness].toLowerCase()}.${mac.reason ? ` ${mac.reason}` : ''}${mac.readiness === 'setup-required' ? ' After updating the permission entry opened by the request, choose Check again.' : ''}` : `Mac app testing readiness is unavailable on ${ownerName}. Choose Check again after completing its setup.`;
+              const message = mac?.readiness === 'ready' ? `The native testing helper is ready on ${ownerName}.` : mac ? `Mac app testing on ${ownerName}: ${readinessLabels[mac.readiness].toLowerCase()}.${mac.reason ? ` ${mac.reason}` : ''}${mac.readiness === 'setup-required' ? ' macOS permission prompts may appear asynchronously. After responding or updating System Settings, choose Check again.' : ''}` : `Mac app testing readiness is unavailable on ${ownerName}. Choose Check again after completing its setup.`;
               setFeedback({ generation: requestGeneration, message });
             }
           }

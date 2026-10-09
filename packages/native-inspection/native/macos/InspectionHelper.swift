@@ -60,8 +60,8 @@ final class Session {
         let state = CGSessionCopyCurrentDictionary() as? [String: Any]
         let gui = state != nil && (state?["CGSSessionScreenIsLocked"] as? Bool != true)
         var reasons: [String] = []
-        if !access { reasons.append("Allow EnoughFactory Native Inspection in System Settings > Privacy & Security > Accessibility.") }
-        if !capture { reasons.append("Allow EnoughFactory Native Inspection in System Settings > Privacy & Security > Screen & System Audio Recording.") }
+        if !access { reasons.append("Allow the app named by macOS (normally EnoughFactory) in System Settings > Privacy & Security > App control (Accessibility / Device Control and Data Access).") }
+        if !capture { reasons.append("Allow the app named by macOS (normally EnoughFactory) in System Settings > Privacy & Security > Screen & System Audio Recording.") }
         if !gui { reasons.append("Sign in to an unlocked Mac desktop session.") }
         return ["status": reasons.isEmpty ? "ready" : "setup-required", "reasons": reasons, "accessibility": access, "screenCapture": capture, "guiSession": gui, "bundleIdentifier": Bundle.main.bundleIdentifier ?? "", "protocolVersion": 1]
     }
@@ -81,7 +81,17 @@ final class Session {
         if kind == "readiness" { return readiness() }
         if kind == "requestPermissions" {
             _ = AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary)
-            _ = CGRequestScreenCaptureAccess(); return readiness()
+            _ = CGRequestScreenCaptureAccess()
+            // Accessibility prompting is asynchronous. Report current access, and
+            // only this explicit request may open settings for an outstanding grant.
+            let result = readiness()
+            let pane = result["accessibility"] as? Bool != true ? "Privacy_Accessibility"
+                : result["screenCapture"] as? Bool != true ? "Privacy_ScreenCapture" : nil
+            if result["guiSession"] as? Bool == true, let pane,
+               let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?" + pane) {
+                _ = NSWorkspace.shared.open(url)
+            }
+            return result
         }
         // A restarted service may shut down its prior exact process without adopting it for input.
         // This path deliberately does not require Accessibility or an unlocked desktop.
