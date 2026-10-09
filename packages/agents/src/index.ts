@@ -55,14 +55,14 @@ export class AgentManager {
     const runtime = await this.provisionHostRuntime(signal);
     return { kind: "codex", available: true, version: runtime.version, fullAccess: true, interactiveApprovals: true, resume: true, details: "Pinned Codex in an owned Mac workspace. Same-user full host access; this is not container isolation." };
   }
-  async hostProcesses(): Promise<HostProcessState[]> {
+  async hostProcesses(options: { readOnly?: boolean } = {}): Promise<HostProcessState[]> {
     if (!this.options.hostRuntimeDir) return [];
     const directory = path.join(this.options.hostRuntimeDir, "sessions");
     try {
       const entries = await readdir(directory, { withFileTypes: true });
       let boot: HostBootIdentity | undefined, bootRead = false;
       const readBoot = (): HostBootIdentity | undefined => { if (!bootRead) { bootRead = true; boot = readHostBootIdentity(); } return boot; };
-      return entries.filter(entry => entry.isDirectory() && /^[a-f0-9]{64}$/.test(entry.name)).flatMap(entry => reconcileHostProcesses(path.join(directory, entry.name, "processes"), { readBoot }));
+      return entries.filter(entry => entry.isDirectory() && /^[a-f0-9]{64}$/.test(entry.name)).flatMap(entry => reconcileHostProcesses(path.join(directory, entry.name, "processes"), { readBoot, persistProof: !options.readOnly }));
     } catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return []; throw error; }
   }
   async cancelHostSession(sessionId: string): Promise<void> {

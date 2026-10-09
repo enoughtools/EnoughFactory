@@ -96,6 +96,11 @@ export class WorkspaceManager {
     return candidate;
   }
 
+  /** A retained-check retry must not race executed source or any accepting merge. */
+  hasUnsettledChecks(candidateId: string): boolean {
+    return [...this.unpersistedChecks.values()].some(report => report.candidateId === candidateId) || this.integrations.size > 0;
+  }
+
   /** Call after writers stop and envmux harvests. Providers may create an explicit preservation commit in their private attempt. */
   async capture(input: { workspaceId: string; repositoryPath?: string; reference?: string; workingDirectories?: WorkingDirectoryCapture[] }): Promise<Candidate> {
     const workspace = await this.workspace(input.workspaceId);

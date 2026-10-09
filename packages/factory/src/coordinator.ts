@@ -1,8 +1,9 @@
 import { createHash, randomUUID } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 import type { Attempt, Decision, FactoryTask, Goal, Project } from "@enoughfactory/contracts";
 import type {
   AttemptDetail, CandidateRef, ConfigureGoalInput, ControlRecord, ControllerRecordRequirement, CoordinatorOptions, CreateGoalInput,
-  EvaluationRecord, ExecutionResult, GoalCheckRecord, PlanRecord, PlannedTask, RepositoryEvidence, TaskDetail,
+  EvaluationRecord, ExecutionResult, GoalCheckRecord, PlanRecord, PlannedTask, RepositoryEvidence, TaskDetail, RetainedVerificationRecovery,
 } from "./types.js";
 import { UI_QUALITY_CHECK_COMMAND } from "./types.js";
 import { readCheckCommands, readEvaluation, readJsonObject, readPlan, readTasks, validateDependencies, validateTaskExecution, validateGoalAcceptance } from "./protocol.js";
@@ -31,6 +32,7 @@ export class FactoryCoordinator {
   private readonly lastObservation = new Map<string, number>();
   private readonly operationControllers = new Map<string, AbortController>();
   private readonly cancellations = new Map<string, Promise<void>>();
+  private readonly automaticCheckProbes = new Set<string>();
   private timer?: ReturnType<typeof setInterval>;
   private enabled = false;
   private queued = false;
@@ -142,6 +144,7 @@ export class FactoryCoordinator {
             this.track(this.reconcileAttempt(attempt).finally(() => this.reconciling.delete(attempt.id)));
           }
         }
+        this.recoverInterruptedChecks(goal);
         this.recoverCompletedWork(goal);
         if (goal.status === "paused") continue;
         if (this.busyGoals.has(goal.id)) {
@@ -194,6 +197,7 @@ export class FactoryCoordinator {
   pause(goalId: string): void {
     const goal = this.goal(goalId);
     if (terminalGoals.has(goal.status)) return;
+    this.resetAutomaticCheckProbes(goalId);
     this.options.store.transaction(() => {
       this.writeGoal(goalId, { status: "paused", nextAction: "Paused; already dispatched work may finish" });
       this.decision(goalId, "paused", "New dispatch and integration are paused. Worker execution remains observable.");
@@ -205,6 +209,7 @@ export class FactoryCoordinator {
   resume(goalId: string): void {
     const goal = this.goal(goalId);
     if (terminalGoals.has(goal.status)) throw new Error("A terminal goal cannot be resumed. Create a new goal to continue it.");
+    this.resetAutomaticCheckProbes(goalId);
     const control = this.control(goalId);
     const inspectionWaiting = control.waitingFor === "inspection-evidence" || this.tasks(goalId).some(task => {
       if (task.status !== "review" || !task.currentAttemptId) return false;
@@ -247,6 +252,7 @@ export class FactoryCoordinator {
     if (input.maxAttempts !== undefined && input.maxAttempts !== null && (!Number.isInteger(input.maxAttempts) || input.maxAttempts < 1)) throw new Error("Attempt budget must be a positive integer or null.");
     if (input.concurrency !== undefined && (!Number.isInteger(input.concurrency) || input.concurrency < 1 || input.concurrency > 32)) throw new Error("Concurrency must be between 1 and 32.");
     const execution = validateTaskExecution(input.execution);
+    this.resetAutomaticCheckProbes(goalId);
     this.options.store.transaction(() => {
       this.writeGoal(goalId, {
         ...(input.autonomy === undefined ? {} : { autonomy: input.autonomy }),
@@ -356,6 +362,89 @@ export class FactoryCoordinator {
     this.changed(); await this.acknowledgeCancel(attempt);
   }
 
+  private retainedCheckState(attemptId: string, reserved = false) {
+    if (this.shuttingDown) throw new FactoryOperationError("stale", "The coordinator is shutting down; saved verification remains retained.");
+    const attempt = this.attempt(attemptId), task = this.task(attempt.taskId), goal = this.goal(task.goalId), detail = this.attemptDetail(attempt.id), control = this.control(goal.id);
+    if (goal.coordinatorId !== this.options.deviceId || !this.isCurrent(attempt) || ["draft", "planning"].includes(goal.status) || terminalGoals.has(goal.status)) throw new FactoryOperationError("stale", "The saved check no longer has active coordinator authority.");
+    const limit = this.limitReason(goal); if (limit) throw new Error(limit);
+    if ((!reserved && (this.busyGoals.has(goal.id) || this.busyAttempts.has(attempt.id))) || this.reconciling.has(attempt.id) || this.cancellations.has(attempt.id) || control.operation || control.replanTaskIds?.includes(task.id) || !["dispatch", "diagnose", "wait"].includes(control.stage)) throw new FactoryOperationError("stale", "The goal or saved attempt is coordinating another operation.");
+    if (attempt.status !== "failed" || task.status !== "failed" || detail.phase !== "checking" || detail.cancellation !== "none" || detail.result?.status !== "succeeded" || !detail.contract || !detail.workspace || !detail.candidate || detail.integration || !detail.checks?.some(check => !check.passed)) throw new FactoryOperationError("stale", "Only a saved successful author whose checks failed can retry verification.");
+    if (detail.result.chatId !== attempt.chatId || detail.result.sessionId !== attempt.sessionId) throw new FactoryOperationError("stale", "The original successful author conversation or environment changed.");
+    if (attempt.candidate !== detail.candidate.commit || JSON.stringify(this.taskDetail(task.id).lastCandidate) !== JSON.stringify(detail.candidate) || detail.checks.some(check => check.candidateCommit !== detail.candidate!.commit || check.checkedCommit !== detail.candidate!.commit)) throw new FactoryOperationError("stale", "The saved check candidate or exact-source evidence changed.");
+    if (!this.options.devices().some(device => device.id === attempt.deviceId && device.online)) throw new FactoryOperationError("stale", "The original author device is offline; its execution outcome cannot be confirmed.");
+    const commands = [...new Set([...detail.contract.checks, ...(detail.contract.quality ? [UI_QUALITY_CHECK_COMMAND] : [])])];
+    return { attempt, task, goal, detail, control, commands, fingerprint: createHash("sha256").update(JSON.stringify({ attempt, task, goal, detail, control, taskDetail: this.taskDetail(task.id) })).digest("hex") };
+  }
+
+  private async retainedCheckProof(attemptId: string, reserved = false) {
+    const original = this.retainedCheckState(attemptId, reserved);
+    if (!this.options.workspaces.confirmCheckRecovery) throw new Error("This device cannot authenticate the original verification outcome.");
+    const author = await this.options.runtime.reconcile(original.attempt);
+    const { spend: _legacySpend, ...currentResult } = (author.result ?? {}) as ExecutionResult & { spend?: unknown };
+    if (author.status !== "succeeded" || !isDeepStrictEqual(currentResult, original.detail.result)) throw new Error("The owning author has not positively confirmed its original successful result.");
+    const proof = await this.options.workspaces.confirmCheckRecovery({ project: this.project(original.goal), goal: original.goal, task: original.task, attempt: original.attempt, quality: original.detail.contract!.quality, candidate: original.detail.candidate!, commands: original.commands, previousChecks: original.detail.checks! });
+    const current = this.retainedCheckState(attemptId, reserved);
+    if (current.fingerprint !== original.fingerprint) throw new FactoryOperationError("stale", "The saved authority, source or check contract changed during verification recovery.");
+    if (proof.status !== "settled") throw new Error(proof.reason);
+    if (!proof.evidenceIds.length || proof.evidenceIds.some(id => typeof id !== "string" || !id)) throw new Error("Verification recovery has no authenticated original evidence.");
+    return { ...current, proof };
+  }
+
+  async verificationRecovery(attemptId: string): Promise<RetainedVerificationRecovery | undefined> {
+    const attempt = this.attempt(attemptId), task = this.task(attempt.taskId), goal = this.goal(task.goalId), detail = this.attemptDetail(attempt.id);
+    if (!detail.candidate || detail.result?.status !== "succeeded" || detail.phase !== "checking" || attempt.status !== "failed" || task.currentAttemptId !== attemptId) return undefined;
+    const identity = { goalRevision: goal.revision, attemptId, candidateId: detail.candidate.id, candidateCommit: detail.candidate.commit };
+    try { await this.retainedCheckProof(attemptId); return { ...identity, eligible: true }; }
+    catch (error) { return { ...identity, eligible: false, reason: this.error(error) }; }
+  }
+
+  /** Rechecks saved work under its original author authority; never reinterprets an earlier failure. */
+  async recheckAttempt(attemptId: string, expected: { goalRevision: number; candidateId: string; candidateCommit: string; automatic?: boolean }): Promise<void> {
+    const original = this.retainedCheckState(attemptId);
+    if (expected.automatic && (original.goal.autonomy !== "autonomous" || original.goal.status !== "running")) throw new Error("Automatic verification recovery waits for an active autonomous goal.");
+    if (original.goal.revision !== expected.goalRevision || original.detail.candidate!.id !== expected.candidateId || original.detail.candidate!.commit !== expected.candidateCommit) throw new FactoryOperationError("stale", "The selected saved verification changed. Refresh its current state.");
+    this.busyGoals.add(original.goal.id); this.busyAttempts.add(attemptId);
+    const holdGoal = original.goal.status === "paused";
+    let scheduled = false;
+    try {
+      const current = await this.retainedCheckProof(attemptId, true);
+      if (expected.automatic && (!current.proof.automatic || current.detail.checkRecoveryHistory?.some(item => item.automatic))) throw new Error("This saved outcome needs an explicit verification retry.");
+      this.options.store.transaction(() => {
+        this.options.store.set(TABLE.attemptDetails, { ...current.detail, checks: undefined, verificationWait: undefined, recoveryObservation: undefined,
+          checkRecoveryHistory: [...current.detail.checkRecoveryHistory ?? [], { at: this.now(), automatic: expected.automatic === true, checks: current.detail.checks!, error: current.attempt.error, evidenceIds: current.proof.evidenceIds }] });
+        this.writeAttempt(attemptId, { status: "succeeded", error: undefined });
+        this.writeTask(current.task.id, { status: "review" });
+        this.options.store.set(TABLE.control, { ...current.control, stage: "dispatch", diagnosisTaskId: undefined, waitingFor: undefined, waitReason: undefined, wakeAt: undefined });
+        this.decision(current.goal.id, "verification-retry", "Retry every frozen check against the same saved source; earlier failed evidence remains retained.", { attemptId, taskId: current.task.id, candidateId: current.detail.candidate!.id, candidateCommit: current.detail.candidate!.commit, evidenceIds: current.proof.evidenceIds, automatic: expected.automatic === true });
+        this.writeGoal(current.goal.id, { status: "running", nextAction: "Recheck the saved candidate without repeating its author" });
+      });
+      this.track(this.processResult(this.attempt(attemptId), current.detail.result!).finally(() => {
+        this.busyAttempts.delete(attemptId);
+        if (holdGoal) { this.busyGoals.delete(original.goal.id); this.changed(); }
+      }));
+      scheduled = true;
+    } finally { if (!scheduled || !holdGoal) this.busyGoals.delete(original.goal.id); if (!scheduled) this.busyAttempts.delete(attemptId); }
+    this.changed();
+  }
+
+  private recoverInterruptedChecks(goal: Goal, force = false): void {
+    if (goal.autonomy !== "autonomous" || goal.status !== "running" || this.limitReason(goal)) return;
+    for (const task of this.tasks(goal.id).filter(task => task.status === "failed" && task.currentAttemptId)) {
+      const attempt = this.attempt(task.currentAttemptId!), detail = this.attemptDetail(attempt.id);
+      if (detail.phase !== "checking" || detail.result?.status !== "succeeded" || !detail.candidate || detail.checkRecoveryHistory?.some(item => item.automatic) || !detail.checks?.some(check => check.recovery?.condition === "check-interrupted" || check.appleValidation?.artifact)) continue;
+      const key = `${attempt.id}:${createHash("sha256").update(JSON.stringify(detail.checks)).digest("hex")}`;
+      if (force) this.automaticCheckProbes.delete(key);
+      if (this.automaticCheckProbes.has(key)) continue;
+      try { this.retainedCheckState(attempt.id); } catch { continue; }
+      this.automaticCheckProbes.add(key);
+      this.track(this.recheckAttempt(attempt.id, { goalRevision: goal.revision, candidateId: detail.candidate.id, candidateCommit: detail.candidate.commit, automatic: true }).catch(() => undefined));
+    }
+  }
+
+  private resetAutomaticCheckProbes(goalId: string): void {
+    for (const attempt of this.attempts(goalId)) for (const key of this.automaticCheckProbes) if (key.startsWith(`${attempt.id}:`)) this.automaticCheckProbes.delete(key);
+  }
+
   notifyCondition(condition: string, goalId?: string): void {
     // A receipt can arrive while its pending check is returning. Retain the event
     // before walking waits so that the result handler cannot park behind it.
@@ -382,6 +471,7 @@ export class FactoryCoordinator {
     }
     for (const goal of this.goals()) {
       if (goalId && goal.id !== goalId) continue;
+      if (["inspection-evidence", "execution-capability", "runtime-available"].includes(condition)) this.recoverInterruptedChecks(goal, true);
       const control = this.control(goal.id);
       if (control.waitingFor !== condition || terminalGoals.has(goal.status)) continue;
       if (goal.status === "waiting") this.wake(goal.id, `Condition satisfied: ${condition}`);

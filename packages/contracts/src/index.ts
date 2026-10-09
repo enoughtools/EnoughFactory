@@ -153,7 +153,7 @@ export interface TaskCheck {
   developmentToolchain?: DevelopmentToolchain;
   appleValidation?: AppleValidationMetadata;
   executionTargetKind?: ExecutionTargetKind; hostPermissions?: "full-host";
-  recovery?: { condition: "inspection-evidence"; reason: string };
+  recovery?: { condition: "inspection-evidence" | "check-interrupted"; reason: string };
 }
 export interface AttemptInspection {
   attempt: Attempt; phase?: AttemptPhase; cancellation?: "none" | "requested" | "acknowledged";
@@ -171,6 +171,8 @@ export interface TaskInspection extends TaskOverview {
   wait?: { condition: string; reason: string; since?: string };
   /** Required verifier input names only; coordinator configuration values remain private. */
   verificationInputs?: { missingEnvironment: string[] };
+  /** Owning service proof; retries verification of saved work without another author attempt. */
+  verificationRecovery?: { eligible: boolean; reason?: string; goalRevision: number; attemptId: string; candidateId: string; candidateCommit: string };
   executionBlocker?: { kind: "execution-capability"; readiness: Exclude<ExecutionReadiness, "ready">; reason: string; capabilities?: ExecutionCapability[]; deviceIds?: string[]; targetIds?: string[] };
   checks: string[]; planRevision?: number; repairInstructions?: string; lastError?: string;
   dependencies: FactoryTask[]; dependents: FactoryTask[]; attempts: AttemptInspection[]; artifacts: Artifact[];

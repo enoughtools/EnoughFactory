@@ -90,6 +90,10 @@ async function fixture(t: TestContext, extraFileMode = 0o644) {
         assert.ok(sessions.has(id));
         return { kind: 'host-macos', targetId: 'mac-host', workdir: preparedSources.get(id)!.roots[0]!.path };
       },
+      retainedHostExecution: (id: string) => {
+        assert.ok(sessions.has(id));
+        return { kind: 'host-macos', targetId: 'mac-host', workdir: preparedSources.get(id)!.roots[0]!.path, workspaceId: store.get<Session>('sessions',id)!.verificationRunId };
+      },
       stop: async (id: string) => {
         stopped.push(id);
         if (stopFails) throw new Error('Owned verifier process termination could not be confirmed');
@@ -1337,6 +1341,59 @@ test('supervised continuation refuses incomplete teardown, mismatched ownership 
     f.setHostProcesses([{ ...f.process, pid: 1337, termination: proof }, { ...f.process, processKey: 'decision-owner', sessionId: `${f.run.sessionId}-decision-original`, state: 'unknown' }]);
     assert.deepEqual(await f.recovered.ensure(f.input), f.run); assert.equal(f.calls.length, 1); assert.equal(f.reconciliations(), 0);
   });
+});
+
+test('retained provider eligibility is read-only and requires positive termination rather than idle chat state', async t => {
+  const f = await rebootedVerifierFixture(t), proof = supervisedTerminationProof(f);
+  f.setHostProcesses([{ ...f.process, pid: proof.supervisor.pid, termination: proof }]);
+  let readOnlyProbe = false;
+  f.options.chats.manager.hostProcesses = async options => { readOnlyProbe = options?.readOnly === true; return [{ ...f.process, pid: proof.supervisor.pid, termination: proof }]; };
+  const before = f.store.get(INSPECTION_VERIFIER_RUNS, f.run.id), events = f.store.events('inspection-verifier-reconciliation', f.run.id);
+  assert.deepEqual(await f.recovered.providerSettled(f.run), { ready: true });
+  assert.equal(readOnlyProbe, true); assert.deepEqual(f.store.get(INSPECTION_VERIFIER_RUNS, f.run.id), before);
+  assert.deepEqual(f.store.events('inspection-verifier-reconciliation', f.run.id), events);
+  assert.equal(f.calls.length, 1); assert.equal(f.preparations.length, 1); assert.equal(f.stopped.length, 0); assert.equal(f.reconciliations(), 0);
+  f.options.chats.manager.hostProcesses = async () => [{ ...f.process, pid: 1337, termination: undefined }];
+  assert.equal((await f.recovered.providerSettled(f.run)).ready, false);
+  f.options.chats.manager.hostProcesses = async () => [];
+  f.store.set('chat-turn-failures', { id: f.chat.id, attemptId: f.run.authority.attemptId, agentStarted: false, executionEnded: true });
+  assert.equal((await f.recovered.providerSettled(f.run)).ready, false, 'A contradictory not-started failure cannot erase the original running-provider event');
+  f.store.set('chats', { ...f.store.get<Chat>('chats', f.chat.id)!, status: 'running' });
+  assert.equal((await f.recovered.providerSettled(f.run)).ready, false);
+});
+
+test('retained provider eligibility rejects changed live ownership after awaiting host process receipts', async t => {
+  const f = await rebootedVerifierFixture(t), proof = supervisedTerminationProof(f);
+  const receipt = { ...f.process, pid: proof.supervisor.pid, termination: proof };
+  f.options.chats.manager.hostProcesses = async () => {
+    f.store.set('chats', { ...f.store.get<Chat>('chats', f.chat.id)!, status: 'running' });return [receipt];
+  };
+  assert.equal((await f.recovered.providerSettled(f.run)).ready, false);
+  f.store.set('chats', { ...f.store.get<Chat>('chats', f.chat.id)!, status: 'interrupted' });
+  f.options.chats.manager.hostProcesses = async () => {
+    f.store.set(INSPECTION_VERIFIER_RUNS, { ...f.run, status: 'running' });return [receipt];
+  };
+  assert.equal((await f.recovered.providerSettled(f.run)).ready, false);
+  assert.equal(f.calls.length,1);assert.equal(f.preparations.length,1);
+});
+
+test('retained provider eligibility survives native workspace retirement before a later shell check fails', { skip: process.platform !== 'darwin' }, async t => {
+  const f=await nativeFixture(t);f.setPassed(true);
+  const run=await f.verifier.ensure(f.input),session=f.sessions.record(run.sessionId!),cwd=f.sessions.execution(session.id).workdir;
+  const now=new Date().toISOString(),processKey='original-completed-provider',recordPath='/owned/original-completed-provider.json';
+  const proof:HostSupervisedTermination={schemaVersion:2,kind:'supervised-termination',evidence:'complete-owned-teardown',observedAt:now,currentBoot:{schemaVersion:1,platform:'darwin',machineId:'a'.repeat(64),bootId:'11111111-1111-4111-8111-111111111111',startedAt:now,observedAt:now,uptimeMs:1000},previousStatus:'exited',previousUpdatedAt:now,priorRecordSha256:'b'.repeat(64),processKey,sessionId:session.id,cwd,inventoryComplete:true,supervisor:{pid:1337,path:recordPath.replace(/\.json$/,'.cjs'),identity:`Original supervisor ${recordPath.replace(/\.json$/,'.cjs')} ${processKey}`},children:[],exitCode:null,exitSignal:'SIGKILL'};
+  const process:HostProcessState={processKey,recordPath,sessionId:session.id,pid:1337,cwd,createdAt:run.startedAt,state:'exited',termination:proof};
+  f.setHostProcesses([process]);
+  assert.deepEqual(await f.verifier.providerSettled(run),{ready:true});
+  assert.deepEqual(await f.verifier.sweepCompleted(()=>true),{retiredRunIds:[run.id],errors:[]});
+  assert.throws(()=>f.sessions.execution(session.id),/workspace is unavailable/);
+  assert.ok(f.sessions.retainedHostExecution(session.id).releasedAt);await absent(cwd);
+  f.setCurrent(false); // The author is failed after a subsequent shell check; its tools remain retired.
+  const before=retained(f,run),originalRun=f.store.get(INSPECTION_VERIFIER_RUNS,run.id);
+  assert.deepEqual(await f.verifier.providerSettled(run),{ready:true});
+  assert.deepEqual(retained(f,run),before);assert.deepEqual(f.store.get(INSPECTION_VERIFIER_RUNS,run.id),originalRun);
+  f.setHostProcesses([{...process,state:'unknown',termination:undefined}]);
+  assert.equal((await f.verifier.providerSettled(run)).ready,false,'Retirement never substitutes for positive provider termination');
 });
 
 test('an unconfirmed execution stop overrides a passing gate with unknown ownership', async t => {

@@ -133,6 +133,9 @@ test("a changed kernel boot identity proves termination while preserving unknown
   const f = await interruptedHostReceipt();
   try {
     const original = await readFile(f.filename, "utf8"), boot = laterBoot(f.running.boot);
+    const readOnly = reconcileHostProcesses(f.processDirectory, { readBoot: () => boot, processIdentity: () => undefined, persistProof: false })[0]!;
+    assert.equal(readOnly.termination?.kind, "host-reboot");
+    await assert.rejects(readFile(f.proofPath), { code: "ENOENT" }, "A read-only preflight never persists new process evidence");
     const recovered = reconcileHostProcesses(f.processDirectory, { readBoot: () => boot, processIdentity: () => undefined })[0]!;
     assert.equal(recovered.state, "exited");
     assert.equal(recovered.cwd, f.cwd); assert.equal(recovered.createdAt, f.running.createdAt);

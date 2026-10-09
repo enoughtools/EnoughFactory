@@ -8,7 +8,7 @@ import { FactoryControllerError, FactoryVerificationWaitError } from "./errors.j
 import { readPlan } from "./protocol.js";
 import { CONTROLLER_PROMPT_LIMIT, controllerTaskContract, controllerAttemptContract } from "./controller-evidence.js";
 import type {
-  AttemptDetail, CandidateRef, ControlRecord, EvaluationRecord, EvaluationResponse, ExecutionResult, FactoryRuntimePort,
+  AttemptDetail, CandidateRef, CheckResult, ControlRecord, EvaluationRecord, EvaluationResponse, ExecutionResult, FactoryRuntimePort,
   FactoryStore, FactoryWorkspacePort, PlanRecord, PlanResponse, TaskDetail, TaskCheckInputsConfiguration,
 } from "./types.js";
 import { UI_QUALITY_CHECK_COMMAND } from "./types.js";
@@ -1824,5 +1824,342 @@ test("legacy monetary waits recover while attempt and time limits remain enforce
     await factory.coordinator.tick(); await factory.coordinator.waitForIdle();
     assert.equal(factory.calls.execute, 1);
     assert.equal(factory.calls.integrate, 1);
+  });
+});
+
+/** Exercise a real author/capture/check failure, then authenticate its retained outcome. */
+async function retainedVerificationFailure(interrupted = true) {
+  const worker: Device = { ...device, executionTargets: [{ id: "container", kind: "container", protocolVersion: 1, readiness: "ready",
+    capabilities: [{ kind: "linux-shell", readiness: "ready" }, { kind: "chromium-inspection", readiness: "ready" }] }] };
+  const factory = harness([worker]);
+  const quality = { platforms: ["web" as const], workflows: [{ id: "compose-reopen", platform: "web" as const }], referenceIds: ["primary"] };
+  const commands = ["sh scripts/check-client.sh", "sh scripts/check-release.sh", UI_QUALITY_CHECK_COMMAND];
+  factory.workspaces.qualityChecks = true;
+  factory.planning(async () => ({ ...plan, checks: [], tasks: [{ ...plan.tasks[0]!, checks: commands.slice(0, 2), quality, requiredCheckEnvironment: nativeInputNames }] }));
+  factory.executing(async () => ({ status: "succeeded", text: "The client source is complete", chatId: "original-author-chat", sessionId: "original-author-session" }));
+  let outcome: "interrupted" | "pass" | "defect" | "stale-ui" = interrupted ? "interrupted" : "defect";
+  const originalCheck = factory.workspaces.check;
+  factory.workspaces.check = async (...input) => (await originalCheck(...input)).map((check, index): CheckResult => ({
+    ...check, checkedCommit: outcome === "stale-ui" && check.command === UI_QUALITY_CHECK_COMMAND ? "foreign-source" : input[1].commit,
+    ...(index === 0 && ["interrupted", "defect"].includes(outcome) ? { passed: false, exitCode: 1,
+      output: outcome === "interrupted" ? "The original check owner stopped before publishing its result" : "The compose route returns 503",
+      ...(outcome === "interrupted" ? { recovery: { condition: "check-interrupted" as const, reason: "The original check effect has positively ended" } } : {}) } : {}),
+  }));
+  const goal = await planGoal(factory), task = factory.store.list<FactoryTask>("tasks")[0]!;
+  factory.store.set("factory-task-details", { ...factory.store.get<TaskDetail>("factory-task-details", task.id)!, checkInputs: configuredNativeInputs(goal, nativeInputValues) });
+  await factory.coordinator.tick(); await factory.coordinator.waitForIdle();
+  const attempt = factory.store.get<Attempt>("attempts", factory.store.get<FactoryTask>("tasks", task.id)!.currentAttemptId!)!;
+  const detail = factory.store.get<AttemptDetail>("factory-attempt-details", attempt.id)!;
+  assert.equal(attempt.status, "failed"); assert.equal(detail.phase, "checking"); assert.equal(factory.calls.integrate, 0);
+  factory.reconciling(async () => ({ status: "succeeded", result: structuredClone(detail.result!) }));
+  const proofs: Parameters<NonNullable<FactoryWorkspacePort["confirmCheckRecovery"]>>[0][] = [];
+  factory.workspaces.confirmCheckRecovery = async input => {
+    proofs.push(structuredClone(input));
+    return { status: "settled", automatic: true, evidenceIds: ["original-check-effect", "original-exact-source"] };
+  };
+  const expected = { goalRevision: goal.revision, candidateId: detail.candidate!.id, candidateCommit: detail.candidate!.commit };
+  return { factory, worker, goal, task, attempt, detail, quality, commands, expected, proofs, outcome(value: typeof outcome) { outcome = value; } };
+}
+
+test("retained verification recovery authenticates read-only eligibility and rechecks every frozen input without another author", async () => {
+  const { factory, goal, task, attempt, detail, quality, commands, expected, proofs, outcome } = await retainedVerificationFailure();
+  const tables = ["goals", "tasks", "attempts", "factory-attempt-details", "factory-task-details", "factory-control", "decisions"];
+  const before = tables.map(table => factory.store.list(table));
+  assert.deepEqual(await factory.coordinator.verificationRecovery(attempt.id), { ...expected, attemptId: attempt.id, eligible: true });
+  assert.deepEqual(tables.map(table => factory.store.list(table)), before, "Discovering eligibility cannot rewrite the failed checks, statuses or decisions");
+  assert.deepEqual(proofs[0]!.previousChecks, detail.checks); assert.deepEqual(proofs[0]!.commands, commands);
+  assert.deepEqual(proofs[0]!.candidate, detail.candidate); assert.deepEqual(proofs[0]!.quality, quality);
+  const currentTask = factory.store.get<TaskDetail>("factory-task-details", task.id)!;
+  factory.store.set("factory-task-details", { ...currentTask, checks: ["sh scripts/new-unrelated-check.sh"],
+    checkInputs: { ...currentTask.checkInputs!, configurationRevision: 2, environment: { ENOUGH_EVIDENCE_ROOT: "/different/input" } } });
+  outcome("pass");
+  await factory.coordinator.recheckAttempt(attempt.id, expected); await factory.coordinator.waitForIdle();
+  const accepted = factory.store.get<Attempt>("attempts", attempt.id)!, saved = factory.store.get<AttemptDetail>("factory-attempt-details", attempt.id)!;
+  assert.equal(factory.store.get<FactoryTask>("tasks", task.id)!.status, "completed");
+  assert.equal(factory.store.get<FactoryTask>("tasks", task.id)!.currentAttemptId, attempt.id);
+  for (const key of ["id", "generation", "deviceId", "chatId", "sessionId", "candidate", "startedAt"] as const) assert.equal(accepted[key], attempt[key]);
+  assert.deepEqual(saved.result, detail.result); assert.deepEqual(saved.contract, detail.contract);
+  assert.deepEqual(saved.workspace, detail.workspace); assert.deepEqual(saved.candidate, detail.candidate); assert.deepEqual(saved.checkInputs, detail.checkInputs);
+  assert.deepEqual(saved.checkRecoveryHistory!.map(({ at: _at, ...history }) => history), [{ automatic: false, checks: detail.checks, error: attempt.error,
+    evidenceIds: ["original-check-effect", "original-exact-source"] }]);
+  assert.deepEqual(factory.candidateCommands, [commands, commands]); assert.deepEqual(factory.integrationCommands, [commands]);
+  assert.ok(saved.integration!.checks.every(check => check.candidateCommit === expected.candidateCommit && check.checkedCommit === saved.integration!.commit));
+  assert.equal(factory.calls.execute, 1); assert.equal(factory.calls.prepare, 1); assert.equal(factory.calls.capture, 1);
+  assert.equal(factory.store.list<Attempt>("attempts").length, 1); assert.equal(factory.calls.diagnosis, 0);
+  assert.equal(factory.store.get<Goal>("goals", goal.id)!.revision, goal.revision);
+  assert.equal(await factory.coordinator.verificationRecovery(attempt.id), undefined, "Accepted work cannot acquire another recovery action");
+});
+
+test("retained verification recovery cannot accept a new defect or UI evidence for another candidate or combined source", async t => {
+  for (const outcomeName of ["defect", "stale-ui", "combined-defect", "combined-ui"] as const) await t.test(outcomeName, async () => {
+    const { factory, task, attempt, detail, expected, commands, outcome } = await retainedVerificationFailure();
+    const combined = outcomeName.startsWith("combined");
+    outcome(combined ? "pass" : outcomeName as "defect" | "stale-ui");
+    if (combined) {
+      const originalIntegration = factory.workspaces.integrate;
+      factory.workspaces.integrate = async (...input) => {
+        const integration = await originalIntegration(...input);
+        integration.checks = integration.checks.map((check, index) => outcomeName === "combined-defect" && index === 0 ? { ...check, passed: false, output: "The combined compose route returns 503" }
+          : outcomeName === "combined-ui" && check.command === UI_QUALITY_CHECK_COMMAND ? { ...check, checkedCommit: input[1].commit } : check);
+        return integration;
+      };
+    }
+    await factory.coordinator.recheckAttempt(attempt.id, expected); await factory.coordinator.waitForIdle();
+    const failed = factory.store.get<Attempt>("attempts", attempt.id)!, saved = factory.store.get<AttemptDetail>("factory-attempt-details", attempt.id)!;
+    assert.equal(failed.status, combined ? "unknown" : "failed"); assert.equal(factory.store.get<FactoryTask>("tasks", task.id)!.status, combined ? "review" : "failed");
+    assert.match(failed.error!, outcomeName === "defect" ? /compose route returns 503/ : outcomeName === "stale-ui" ? /exact saved candidate/
+      : outcomeName === "combined-defect" ? /combined repository did not pass/ : /actual combined integration source/);
+    assert.deepEqual(saved.checkRecoveryHistory![0]!.checks, detail.checks);
+    assert.deepEqual(saved.candidate, detail.candidate); assert.deepEqual(saved.contract, detail.contract);
+    assert.deepEqual(factory.candidateCommands, [commands, commands]); assert.equal(factory.calls.integrate, combined ? 1 : 0);
+    assert.equal(saved.integration, undefined, "A possibly written combined result requires reconciliation rather than an accepted merge record");
+    assert.equal(factory.calls.execute, 1); assert.equal(factory.calls.capture, 1);
+  });
+});
+
+test("retained verification recovery rejects stale ownership, uncertain effects and exhausted limits without changing failed work", async t => {
+  for (const scenario of ["selected-revision", "selected-candidate", "frozen-revision", "task-owner", "candidate-record", "task-source", "checked-source", "unchecked-source", "offline",
+    "cancellation", "integrated", "missing-port", "unknown-author", "different-author-result", "unknown-proof", "empty-proof", "attempt-budget", "time-budget", "automatic-paused", "automatic-manual", "automatic-proof-denied"] as const) await t.test(scenario, async () => {
+    const fixture = await retainedVerificationFailure(), { factory, worker, goal, task, attempt, detail } = fixture;
+    let expected = { ...fixture.expected }, automatic = false;
+    switch (scenario) {
+      case "selected-revision": expected.goalRevision++; break;
+      case "selected-candidate": expected.candidateId = "different-candidate"; break;
+      case "frozen-revision": factory.store.set("factory-attempt-details", { ...detail, goalRevision: goal.revision + 1 }); break;
+      case "task-owner": factory.store.set("tasks", { ...factory.store.get<FactoryTask>("tasks", task.id)!, currentAttemptId: "replacement-author" }); break;
+      case "candidate-record": factory.store.set("attempts", { ...attempt, candidate: "different-source" }); break;
+      case "task-source": factory.store.set("factory-task-details", { ...factory.store.get<TaskDetail>("factory-task-details", task.id)!, lastCandidate: { ...detail.candidate!, commit: "different-source" } }); break;
+      case "checked-source": factory.store.set("factory-attempt-details", { ...detail, checks: detail.checks!.map(check => ({ ...check, checkedCommit: "different-source" })) }); break;
+      case "unchecked-source": factory.store.set("factory-attempt-details", { ...detail, checks: detail.checks!.map(check => ({ ...check, checkedCommit: undefined })) }); break;
+      case "offline": worker.online = false; break;
+      case "cancellation": factory.store.set("factory-attempt-details", { ...detail, cancellation: "requested" }); break;
+      case "integrated": factory.store.set("factory-attempt-details", { ...detail, integration: { commit: "already-integrated", previousHead: "initial-head", candidateCommit: detail.candidate!.commit, checks: [] } }); break;
+      case "missing-port": factory.workspaces.confirmCheckRecovery = undefined; break;
+      case "unknown-author": factory.reconciling(async () => ({ status: "unknown" })); break;
+      case "different-author-result": factory.reconciling(async () => ({ status: "succeeded", result: { ...detail.result!, chatId: "different-author-chat" } })); break;
+      case "unknown-proof": factory.workspaces.confirmCheckRecovery = async () => ({ status: "unknown", reason: "The owning check effect is still active" }); break;
+      case "empty-proof": factory.workspaces.confirmCheckRecovery = async () => ({ status: "settled", automatic: true, evidenceIds: [] }); break;
+      case "attempt-budget": factory.coordinator.configure(goal.id, { maxAttempts: 1 }); break;
+      case "time-budget": factory.store.set("factory-control", { ...factory.store.get<ControlRecord>("factory-control", goal.id)!, maxDurationMs: 0 }); break;
+      case "automatic-paused": factory.coordinator.pause(goal.id); automatic = true; break;
+      case "automatic-manual": factory.coordinator.configure(goal.id, { autonomy: "manual" }); automatic = true; break;
+      case "automatic-proof-denied": factory.workspaces.confirmCheckRecovery = async () => ({ status: "settled", automatic: false, evidenceIds: ["manual-proof"] }); automatic = true; break;
+    }
+    const savedAttempt = factory.store.get<Attempt>("attempts", attempt.id), savedDetail = factory.store.get<AttemptDetail>("factory-attempt-details", attempt.id);
+    await assert.rejects(factory.coordinator.recheckAttempt(attempt.id, { ...expected, automatic }));
+    await factory.coordinator.waitForIdle();
+    assert.deepEqual(factory.store.get("attempts", attempt.id), savedAttempt); assert.deepEqual(factory.store.get("factory-attempt-details", attempt.id), savedDetail);
+    assert.equal(factory.calls.check, 1); assert.equal(factory.calls.integrate, 0); assert.equal(factory.calls.execute, 1); assert.equal(factory.calls.capture, 1);
+    assert.equal(factory.store.list<Decision>("decisions").some(decision => decision.kind === "verification-retry"), false);
+  });
+});
+
+test("retained verification recovery reserves author and controller while proof is pending and rejects duplicate retries", async () => {
+  const { factory, goal, attempt, expected, outcome } = await retainedVerificationFailure();
+  const entered = deferred<void>(), proof = deferred<{ status: "settled"; automatic: boolean; evidenceIds: string[] }>();
+  let confirmations = 0;
+  factory.workspaces.confirmCheckRecovery = async () => { confirmations++; entered.resolve(); return proof.promise; };
+  outcome("pass"); const recovery = factory.coordinator.recheckAttempt(attempt.id, expected); await entered.promise;
+  await assert.rejects(factory.coordinator.recheckAttempt(attempt.id, expected), /another operation/);
+  assert.equal((await factory.coordinator.verificationRecovery(attempt.id))!.eligible, false);
+  for (let tick = 0; tick < 2; tick++) await factory.coordinator.tick();
+  assert.equal(factory.calls.diagnosis, 0, "A diagnosis cannot replace the author while authenticated recovery holds its goal");
+  assert.equal(factory.calls.check, 1); assert.equal(factory.calls.execute, 1);
+  assert.equal(factory.store.get<Goal>("goals", goal.id)!.status, "running");
+  proof.resolve({ status: "settled", automatic: true, evidenceIds: ["settled-original-effect"] });
+  await recovery; await factory.coordinator.waitForIdle();
+  assert.equal(confirmations, 1); assert.equal(factory.calls.check, 2); assert.equal(factory.calls.integrate, 1);
+  assert.equal(factory.store.get<AttemptDetail>("factory-attempt-details", attempt.id)!.checkRecoveryHistory!.length, 1);
+});
+
+test("retained verification recovery revalidates authority after asynchronous owning proof", async t => {
+  for (const change of ["steer", "retire", "pause", "contract", "budget"] as const) await t.test(change, async () => {
+    const { factory, goal, attempt, detail, expected } = await retainedVerificationFailure();
+    const entered = deferred<void>(), proof = deferred<{ status: "settled"; automatic: boolean; evidenceIds: string[] }>();
+    factory.workspaces.confirmCheckRecovery = async () => { entered.resolve(); return proof.promise; };
+    const recovery = assert.rejects(factory.coordinator.recheckAttempt(attempt.id, expected)); await entered.promise;
+    if (change === "steer") await factory.coordinator.steer(goal.id, { context: "Change the acceptance scope" });
+    else if (change === "retire") await factory.coordinator.retireAttempt(attempt.id);
+    else if (change === "pause") factory.coordinator.pause(goal.id);
+    else if (change === "contract") factory.store.set("factory-attempt-details", { ...detail, contract: { ...detail.contract!, checks: ["changed-check"] } });
+    else factory.coordinator.configure(goal.id, { maxAttempts: 1 });
+    proof.resolve({ status: "settled", automatic: true, evidenceIds: ["old-proof"] });
+    await recovery; await factory.coordinator.waitForIdle();
+    assert.equal(factory.calls.check, 1); assert.equal(factory.calls.integrate, 0); assert.equal(factory.calls.execute, 1); assert.equal(factory.calls.capture, 1);
+    assert.equal(factory.store.get<AttemptDetail>("factory-attempt-details", attempt.id)!.checkRecoveryHistory, undefined);
+    assert.notEqual(factory.store.get<FactoryTask>("tasks", attempt.taskId)!.status, "completed");
+  });
+});
+
+test("retained verification recovery explicitly resumes a paused goal only after proof in one transition", async () => {
+  const { factory, goal, task, attempt, detail, expected, outcome } = await retainedVerificationFailure();
+  factory.coordinator.pause(goal.id);
+  const entered = deferred<void>(), proof = deferred<{ status: "settled"; automatic: boolean; evidenceIds: string[] }>();
+  factory.workspaces.confirmCheckRecovery = async () => { entered.resolve(); return proof.promise; };
+  const checked = deferred<void>(), finishCheck = deferred<void>();
+  factory.beforeCheck(async () => { checked.resolve(); await finishCheck.promise; }); outcome("pass");
+  const recovery = factory.coordinator.recheckAttempt(attempt.id, expected); await entered.promise;
+  assert.equal(factory.store.get<Goal>("goals", goal.id)!.status, "paused");
+  assert.deepEqual(factory.store.get<AttemptDetail>("factory-attempt-details", attempt.id)!.checks, detail.checks);
+  proof.resolve({ status: "settled", automatic: false, evidenceIds: ["explicit-recovery-proof"] });
+  await recovery; await checked.promise;
+  assert.equal(factory.store.get<Goal>("goals", goal.id)!.status, "running");
+  assert.equal(factory.store.get<FactoryTask>("tasks", task.id)!.status, "review");
+  assert.equal(factory.store.get<Attempt>("attempts", attempt.id)!.status, "succeeded");
+  const saved = factory.store.get<AttemptDetail>("factory-attempt-details", attempt.id)!;
+  assert.equal(saved.checks, undefined); assert.deepEqual(saved.checkRecoveryHistory![0]!.checks, detail.checks);
+  assert.equal(factory.store.get<ControlRecord>("factory-control", goal.id)!.stage, "dispatch");
+  finishCheck.resolve(); await factory.coordinator.waitForIdle();
+  assert.equal(factory.store.get<FactoryTask>("tasks", task.id)!.status, "completed");
+  assert.equal(factory.calls.execute, 1); assert.equal(factory.calls.capture, 1);
+});
+
+test("retained verification recovery automatically retries an interrupted check once but never loops on a genuine defect", async () => {
+  const { factory, goal, task, attempt, detail, outcome, proofs } = await retainedVerificationFailure();
+  outcome("defect");
+  await factory.coordinator.tick(); await factory.coordinator.waitForIdle();
+  const saved = factory.store.get<AttemptDetail>("factory-attempt-details", attempt.id)!;
+  assert.equal(factory.store.get<Attempt>("attempts", attempt.id)!.status, "failed");
+  assert.deepEqual(saved.checkRecoveryHistory![0]!.checks, detail.checks); assert.equal(saved.checkRecoveryHistory![0]!.automatic, true);
+  assert.equal(factory.calls.check, 2); assert.equal(factory.calls.diagnosis, 0); assert.equal(proofs.length, 1);
+  assert.equal(factory.calls.execute, 1); assert.equal(factory.calls.capture, 1); assert.equal(factory.calls.integrate, 0);
+  factory.store.set("factory-task-details", { ...factory.store.get<TaskDetail>("factory-task-details", task.id)!, waitingFor: "external-condition" });
+  for (const condition of ["inspection-evidence", "runtime-available", "execution-capability"]) factory.coordinator.notifyCondition(condition, goal.id);
+  for (let tick = 0; tick < 2; tick++) { await factory.coordinator.tick(); await factory.coordinator.waitForIdle(); }
+  assert.equal(factory.calls.check, 2); assert.equal(proofs.length, 1, "Later capability signals cannot repeat the same automatic recovery");
+  const recovered = factory.recover();
+  recovered.notifyCondition("runtime-available", goal.id);
+  for (let tick = 0; tick < 2; tick++) { await recovered.tick(); await recovered.waitForIdle(); }
+  assert.equal(factory.calls.check, 2); assert.equal(proofs.length, 1, "Durable automatic history survives a coordinator restart");
+  const realFailure = await retainedVerificationFailure(false);
+  realFailure.factory.store.set("factory-task-details", { ...realFailure.factory.store.get<TaskDetail>("factory-task-details", realFailure.task.id)!, waitingFor: "external-condition" });
+  for (let tick = 0; tick < 2; tick++) { await realFailure.factory.coordinator.tick(); await realFailure.factory.coordinator.waitForIdle(); }
+  realFailure.factory.coordinator.notifyCondition("inspection-evidence", realFailure.goal.id); await realFailure.factory.coordinator.waitForIdle();
+  assert.equal(realFailure.proofs.length, 0); assert.equal(realFailure.factory.calls.check, 1);
+  assert.equal(realFailure.factory.store.get<AttemptDetail>("factory-attempt-details", realFailure.attempt.id)!.checkRecoveryHistory, undefined);
+});
+
+test("retained verification recovery caches unknown automatic proof until a relevant owner signal", async () => {
+  const { factory, goal, task, attempt, outcome } = await retainedVerificationFailure();
+  factory.store.set("factory-task-details", { ...factory.store.get<TaskDetail>("factory-task-details", task.id)!, waitingFor: "external-condition" });
+  let confirmations = 0, ready = false;
+  factory.workspaces.confirmCheckRecovery = async () => {
+    confirmations++;
+    return ready ? { status: "settled", automatic: true, evidenceIds: ["now-settled-effect"] } : { status: "unknown", reason: "Check owner remains disconnected" };
+  };
+  for (let tick = 0; tick < 3; tick++) { await factory.coordinator.tick(); await factory.coordinator.waitForIdle(); }
+  assert.equal(confirmations, 1); assert.equal(factory.calls.check, 1);
+  factory.coordinator.notifyCondition("unrelated-condition", goal.id); await factory.coordinator.waitForIdle();
+  assert.equal(confirmations, 1);
+  ready = true; outcome("pass"); factory.coordinator.notifyCondition("runtime-available", goal.id); await factory.coordinator.waitForIdle();
+  assert.equal(confirmations, 2); assert.equal(factory.calls.check, 2); assert.equal(factory.calls.execute, 1); assert.equal(factory.calls.capture, 1);
+  assert.equal(factory.store.get<FactoryTask>("tasks", task.id)!.status, "completed");
+  assert.equal(factory.store.get<AttemptDetail>("factory-attempt-details", attempt.id)!.checkRecoveryHistory![0]!.automatic, true);
+});
+
+test("retained verification recovery ignores only obsolete owner spend while preserving exact original results", async t => {
+  for (const scenario of ["legacy-spend", "changed-text", "additional-owner-field"] as const) await t.test(scenario, async () => {
+    const { factory, task, attempt, detail, expected, outcome, proofs } = await retainedVerificationFailure();
+    const legacyResult = { spend: 12.34, sessionId: detail.result!.sessionId, chatId: detail.result!.chatId, text: detail.result!.text, status: detail.result!.status,
+      ...(scenario === "changed-text" ? { text: "A different author outcome" } : {}), ...(scenario === "additional-owner-field" ? { newExecutionId: "different-provider-run" } : {}) };
+    factory.reconciling(async () => ({ status: "succeeded", result: legacyResult }));
+    outcome("pass");
+    if (scenario === "legacy-spend") {
+      await factory.coordinator.recheckAttempt(attempt.id, expected); await factory.coordinator.waitForIdle();
+      assert.equal(factory.store.get<FactoryTask>("tasks", task.id)!.status, "completed");
+      const saved = factory.store.get<AttemptDetail>("factory-attempt-details", attempt.id)!;
+      assert.deepEqual(saved.result, detail.result); assert.equal(Object.hasOwn(saved.result!, "spend"), false);
+      assert.deepEqual(saved.checkRecoveryHistory![0]!.checks, detail.checks); assert.equal(proofs.length, 1);
+      assert.equal(factory.calls.check, 2); assert.equal(factory.calls.integrate, 1);
+    } else {
+      await assert.rejects(factory.coordinator.recheckAttempt(attempt.id, expected), /original successful result/);
+      assert.deepEqual(factory.store.get<AttemptDetail>("factory-attempt-details", attempt.id), detail);
+      assert.equal(proofs.length, 0); assert.equal(factory.calls.check, 1); assert.equal(factory.calls.integrate, 0);
+    }
+    assert.equal(factory.calls.execute, 1); assert.equal(factory.calls.capture, 1);
+  });
+});
+
+test("retained verification recovery reprobes unknown effects after resume or configuration without automatically unpausing", async t => {
+  for (const change of ["pause-resume", "configuration", "configuration-while-paused"] as const) await t.test(change, async () => {
+    const { factory, goal, task, attempt, outcome } = await retainedVerificationFailure();
+    factory.store.set("factory-task-details", { ...factory.store.get<TaskDetail>("factory-task-details", task.id)!, waitingFor: "external-condition" });
+    let confirmations = 0, ready = false;
+    factory.workspaces.confirmCheckRecovery = async () => {
+      confirmations++;
+      return ready ? { status: "settled", automatic: true, evidenceIds: ["resumed-owning-effect"] } : { status: "unknown", reason: "The check outcome has not settled" };
+    };
+    for (let tick = 0; tick < 3; tick++) { await factory.coordinator.tick(); await factory.coordinator.waitForIdle(); }
+    assert.equal(confirmations, 1); assert.equal(factory.calls.check, 1);
+    ready = true; outcome("pass");
+    if (change === "configuration") factory.coordinator.configure(goal.id, { concurrency: 2 });
+    else {
+      factory.coordinator.pause(goal.id);
+      if (change === "configuration-while-paused") factory.coordinator.configure(goal.id, { concurrency: 2 });
+      for (let tick = 0; tick < 2; tick++) { await factory.coordinator.tick(); await factory.coordinator.waitForIdle(); }
+      assert.equal(factory.store.get<Goal>("goals", goal.id)!.status, "paused");
+      assert.equal(confirmations, 1, "Resetting a probe cannot dispatch verification for a paused goal");
+      assert.equal(factory.calls.check, 1);
+      factory.coordinator.resume(goal.id);
+    }
+    await factory.coordinator.tick(); await factory.coordinator.waitForIdle();
+    assert.equal(confirmations, 2); assert.equal(factory.calls.check, 2); assert.equal(factory.calls.integrate, 1);
+    assert.equal(factory.store.get<FactoryTask>("tasks", task.id)!.status, "completed");
+    const saved = factory.store.get<AttemptDetail>("factory-attempt-details", attempt.id)!;
+    assert.equal(saved.checkRecoveryHistory!.length, 1); assert.equal(saved.checkRecoveryHistory![0]!.automatic, true);
+    assert.equal(factory.calls.execute, 1); assert.equal(factory.calls.capture, 1); assert.equal(factory.store.list<Attempt>("attempts").length, 1);
+  });
+});
+
+test("retained verification recovery rejects owning proof returned after coordinator shutdown without allocating checks", async () => {
+  const { factory, attempt, expected } = await retainedVerificationFailure();
+  const entered = deferred<void>(), proof = deferred<{ status: "settled"; automatic: boolean; evidenceIds: string[] }>();
+  factory.workspaces.confirmCheckRecovery = async () => { entered.resolve(); return proof.promise; };
+  const rejected = assert.rejects(factory.coordinator.recheckAttempt(attempt.id, expected), /shutting down/);
+  await entered.promise;
+  const tables = ["goals", "tasks", "attempts", "factory-attempt-details", "factory-task-details", "factory-control", "decisions"];
+  const before = tables.map(table => factory.store.list(table));
+  factory.coordinator.stop();
+  proof.resolve({ status: "settled", automatic: true, evidenceIds: ["late-owning-effect"] });
+  await rejected; await factory.coordinator.waitForIdle();
+  assert.deepEqual(tables.map(table => factory.store.list(table)), before);
+  assert.equal(factory.calls.check, 1); assert.equal(factory.calls.integrate, 0); assert.equal(factory.calls.execute, 1); assert.equal(factory.calls.capture, 1);
+  assert.deepEqual(factory.coordinator.serviceActivity(), { controllers: 0, attempts: 0, reconciliation: 0, pending: 0 });
+});
+
+test("retained verification recovery holds a paused goal until saved verification completes or reaches a typed wait", async t => {
+  for (const result of ["completed", "inspection-wait"] as const) await t.test(result, async () => {
+    const { factory, goal, task, attempt, detail, expected, outcome } = await retainedVerificationFailure();
+    factory.coordinator.pause(goal.id);
+    const independent: FactoryTask = { ...task, id: "independent-recovery-work", title: "Write independent release notes", description: "Deliver unrelated documentation",
+      status: "queued", dependsOn: [], quality: undefined, writePaths: ["docs/release-notes"], currentAttemptId: undefined, sessionId: undefined };
+    factory.store.set("tasks", independent);
+    factory.store.set<TaskDetail>("factory-task-details", { id: independent.id, key: "independent-recovery-work", checks: ["sh scripts/check-release-notes.sh"],
+      planRevision: detail.contract!.planRevision, planChecks: [], selected: false, failureSignatures: [] });
+    const entered = deferred<void>(), completeCheck = deferred<void>();
+    factory.beforeCheck(async () => { entered.resolve(); await completeCheck.promise; });
+    outcome("pass");
+    const originalCheck = factory.workspaces.check;
+    factory.workspaces.check = async (...input) => (await originalCheck(...input)).map(check =>
+      result === "inspection-wait" && input[3]!.attempt.id === attempt.id && check.command === UI_QUALITY_CHECK_COMMAND ? { ...check, passed: false,
+        recovery: { condition: "inspection-evidence" as const, reason: "The exact-source screenshot receipt has not arrived" } } : check);
+    await factory.coordinator.recheckAttempt(attempt.id, expected); await entered.promise;
+    assert.equal(factory.store.get<Goal>("goals", goal.id)!.status, "running");
+    assert.equal(factory.coordinator.serviceActivity().controllers, 1, "An explicit paused retry keeps the goal reservation through its asynchronous check");
+    for (let tick = 0; tick < 3; tick++) await factory.coordinator.tick();
+    assert.equal(factory.calls.execute, 1); assert.equal(factory.calls.capture, 1);
+    assert.equal(factory.store.get<FactoryTask>("tasks", independent.id)!.currentAttemptId, undefined, "Unrelated author work cannot start before the saved verification returns");
+    assert.equal(factory.calls.diagnosis, 0);
+    completeCheck.resolve(); await factory.coordinator.waitForIdle();
+    assert.equal(factory.coordinator.serviceActivity().controllers, 0, "Completed verification and typed waits both release the goal reservation");
+    const saved = factory.store.get<AttemptDetail>("factory-attempt-details", attempt.id)!;
+    assert.deepEqual(saved.candidate, detail.candidate); assert.deepEqual(saved.contract, detail.contract);
+    assert.equal(saved.checkRecoveryHistory!.length, 1);
+    assert.equal(factory.store.get<FactoryTask>("tasks", task.id)!.status, result === "completed" ? "completed" : "review");
+    assert.equal(saved.verificationWait?.condition, result === "completed" ? undefined : "inspection-evidence");
+    await factory.coordinator.tick(); await factory.coordinator.waitForIdle();
+    assert.equal(factory.calls.execute, 2); assert.equal(factory.calls.capture, 2);
+    assert.equal(factory.store.get<FactoryTask>("tasks", independent.id)!.status, "completed", "Normal dispatch resumes after the verification reservation ends");
+    assert.equal(factory.store.list<Attempt>("attempts").filter(item => item.taskId === task.id).length, 1, "The saved source still has its original author only");
   });
 });

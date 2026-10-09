@@ -3,7 +3,7 @@ import { readFile, realpath } from 'node:fs/promises';
 import { cpus, totalmem } from 'node:os';
 import path from 'node:path';
 import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
+import { isDeepStrictEqual, promisify } from 'node:util';
 import type { Attempt, ControllerRun, ExecutionCapability, ExecutionTargetAdvertisement, FactoryTask, Goal, InspectionAuthority, InspectionJob, InspectionSourceIdentity, InspectionVerificationRun, Project, TaskQualityRequirements } from '@enoughfactory/contracts';
 import { readJsonObject, type AttemptDetail } from '@enoughfactory/factory';
 import { ArtifactStore, InspectionSnapshotManager, WorkspaceManager, exportInspectionContainerRoots, exportInspectionSnapshot, type ArtifactManifest, type InspectionSnapshot } from '@enoughfactory/workspaces';
@@ -21,7 +21,7 @@ import { createContainerInspectionBridge, createHostInspectionBridge, inspection
 import { NativeInspectionAdapter, type NativeFixtureProfile, type NativeInspectionBuild } from './inspection-native.ts';
 import { NativeBuildRunner } from './inspection-build-runner.ts';
 import { InspectionQualityService, inspectionSourceContentMatches } from './inspection-quality.ts';
-import { InspectionVerifier } from './inspection-verifier.ts';
+import { InspectionVerifier, inspectionQualityPolicySha256, inspectionVerificationKey } from './inspection-verifier.ts';
 import { evaluateObservedCondition } from './inspection-condition.ts';
 import { NativeProfileSetup } from './inspection-profile-setup.ts';
 import { NativeProfileSync } from './inspection-profile-sync.ts';
@@ -35,9 +35,16 @@ const text=(value:unknown)=>({type:'text',text:JSON.stringify(value)});
 const result=(value:unknown)=>({content:[text(value)]});
 const objectSchema=(properties:Record<string,unknown>,required:string[]=[])=>({type:'object',properties,required,additionalProperties:false});
 const string={type:'string'};
+const nativeProfileSchema=objectSchema({
+  id:{type:'string',pattern:'^[A-Za-z0-9_-]{1,64}$',description:'Stable profile identity. The platform belongs inside build, not on the profile.'},
+  build:objectSchema({tool:{type:'string',enum:['xcodebuild']},project:{type:'string',description:'Relative .xcodeproj or .xcworkspace path in the primary captured source.'},scheme:string,platform:{type:'string',enum:['macos','ios-simulator']},configuration:{type:'string',enum:['Debug','Release'],description:'Defaults to Debug.'}},['tool','project','scheme','platform']),
+  launchArguments:{type:'array',minItems:1,maxItems:32,items:{type:'string'},description:'Exact fixture invocation. Must request fixture mode and include a unique {runId} namespace; the source audit checks early routing and rejects production fallback for malformed fixture invocations.'},
+  fixtureExpectedDataRoot:{type:'string',description:'For macos, fresh /tmp/enoughfactory-fixtures/{runId} (or /private/tmp equivalent), optionally followed by safe namespace segments. Omit for ios-simulator: its fresh owned app sandbox is audited instead.'},
+  bundleIdentifier:{type:'string',description:'Optional exact product bundle identifier.'},
+},['id','build','launchArguments']);
 const tools=[
   {name:'factory_capabilities',description:'Get actual execution and inspection readiness and configured native profiles.',inputSchema:objectSchema({})},
-  {name:'factory_native_profile_propose',description:'Set up testing for a new native app. Propose a fixed build and isolated fixture; Factory independently audits actual immutable source before issuing its profile receipt. No manual receipt or host SDK is needed for the source review. Poll factory_native_profile_status. Any source edit requires a fresh audit.',inputSchema:objectSchema({requestId:string,profile:{type:'object'},auditPaths:{type:'array',items:objectSchema({rootId:string,path:string,purposes:{type:'array',items:{type:'string',enum:['entry','storage','credentials','providers','preferences','notifications','build']}}},['rootId','path','purposes'])}},['requestId','profile','auditPaths'])},
+  {name:'factory_native_profile_propose',description:'Set up testing for a new native app. Propose a fixed build and isolated fixture using the exact profile schema (platform is build.platform); Factory independently audits actual immutable source before issuing its profile receipt. No manual receipt or host SDK is needed for the source review. Poll factory_native_profile_status. Any source edit requires a fresh audit.',inputSchema:objectSchema({requestId:string,profile:nativeProfileSchema,auditPaths:{type:'array',minItems:1,maxItems:128,items:objectSchema({rootId:{type:'string',description:'Declared source root ID from factory_capabilities; primary for the app source.'},path:{type:'string',description:'Relative original source file path in that root.'},purposes:{type:'array',minItems:1,items:{type:'string',enum:['entry','storage','credentials','providers','preferences','notifications','build']}}},['rootId','path','purposes'])}},['requestId','profile','auditPaths'])},
   {name:'factory_native_profile_status',description:'Read your independent native setup audit and concrete findings. Waiting preserves your source and author; unknown ownership is reconciled before the same review continues.',inputSchema:objectSchema({auditId:string,waitSeconds:{type:'integer',minimum:0,maximum:30}},['auditId'])},
   {name:'factory_native_build',description:'Capture your dirty/untracked source and build an exact private native product using a configured profile. Returns a durable job; poll it before launching.',inputSchema:objectSchema({profileId:string,requestId:string},['profileId','requestId'])},
   {name:'factory_job_status',description:'Read your durable build/session job. Waiting does not create another author attempt.',inputSchema:objectSchema({jobId:string,waitSeconds:{type:'integer',minimum:0,maximum:30}},['jobId'])},
@@ -194,6 +201,36 @@ export class InspectionService {
     await this.readiness();
   }
   profiles(projectId:string):NativeFixtureProfile[]{return this.app.store.get<{id:string;profiles:NativeFixtureProfile[]}>('inspection-project-profiles',projectId)?.profiles||[];}
+  /** Public recheck preflight reads ownership only; it never stops or resumes work. */
+  retainedVerificationSettled:NonNullable<FactoryInspectionPorts['retainedVerificationSettled']>=async input=>{
+    const unavailable=(reason:string)=>({ready:false,reason});
+    const current=()=>{
+      const goal=this.app.store.get<Goal>('goals',input.goal.id),task=this.app.store.get<FactoryTask>('tasks',input.task.id),attempt=this.app.store.get<Attempt>('attempts',input.attempt.id),detail=this.app.store.get<AttemptDetail>('factory-attempt-details',input.attempt.id);
+      const quality=detail?.contract?detail.contract.quality:task?.quality,revision=detail?.assignmentGoalRevision??detail?.goalRevision??goal?.revision;
+      const qualityMatches=quality&&input.quality?inspectionQualityPolicySha256(quality)===inspectionQualityPolicySha256(input.quality):quality===undefined&&input.quality===undefined;
+      const authority:InspectionAuthority={goalId:input.goal.id,goalRevision:revision??-1,taskId:input.task.id,attemptId:input.attempt.id,authorityGeneration:input.attempt.generation,policyRevision:revision??-1};
+      // A successful author is marked failed when its later checks fail. This
+      // read-only exception does not reactivate its retired tool authority.
+      return !this.closing&&!!goal&&goal.coordinatorId===this.app.device.id&&goal.revision===input.goal.revision&&!['draft','planning','completed','failed','canceled'].includes(goal.status)&&!!task&&task.goalId===goal.id&&task.currentAttemptId===input.attempt.id&&task.status==='failed'&&!!attempt&&attempt.taskId===task.id&&attempt.generation===input.attempt.generation&&attempt.status==='failed'&&!!detail&&!!detail.contract&&detail.phase==='checking'&&detail.result?.status==='succeeded'&&detail.cancellation==='none'&&!detail.integration&&isDeepStrictEqual(detail.candidate,input.candidate)&&attempt.candidate===input.candidate.commit&&detail.checks?.some(check=>!check.passed)&&detail.checks.every(check=>check.candidateCommit===input.candidate.commit&&check.checkedCommit===input.candidate.commit)&&qualityMatches&&isDeepStrictEqual(goal,input.goal)&&isDeepStrictEqual(task,input.task)&&isDeepStrictEqual(attempt,input.attempt)?{authority,quality,goal,task,attempt,detail}:undefined;
+    };
+    const selected=current();if(!selected)return unavailable('The original author candidate, requirements or task authority changed.');
+    const runs=this.app.store.list<InspectionVerificationRun>('inspection-verifier-runs').filter(run=>run.authority.attemptId===input.attempt.id);
+    if([...this.contexts.values()].some(context=>!context.signal.aborted&&(context.attemptId===input.attempt.id||runs.some(run=>run.id===context.verificationRunId))))return unavailable('The original candidate still has an active inspection conversation.');
+    const qualityDigest=selected.quality?inspectionQualityPolicySha256(selected.quality):undefined;
+    for(const run of runs){
+      if(run.authority.goalId!==selected.authority.goalId||run.authority.taskId!==selected.authority.taskId||run.authority.goalRevision!==selected.authority.goalRevision||run.authority.authorityGeneration!==selected.authority.authorityGeneration||run.authority.policyRevision!==selected.authority.policyRevision||run.purpose==='goal-final'||run.source.candidateId!==input.candidate.id||run.source.candidateCommit!==input.candidate.commit||run.policySha256!==qualityDigest||run.policySha256!==inspectionQualityPolicySha256(run.quality)||run.id!==inspectionVerificationKey(run))return unavailable('A retained verifier no longer matches this exact candidate and frozen requirements.');
+      const provider=await this.verifier.providerSettled(run);if(!provider.ready)return provider;
+      if(!this.canRetireVerifier(run))return unavailable('The original candidate still has active or uncertain inspection jobs, sessions or resource leases.');
+    }
+    // An author may have inspected before a verifier was allocated. Those jobs
+    // must also have honest terminal outcomes and positively released resources.
+    const related=this.jobs.listJobs().filter(job=>job.authority.attemptId===input.attempt.id);
+    if(related.some(job=>this.inspectionJobActive(job)||!['succeeded','failed','canceled'].includes(job.status)||this.jobs.sessions(job.id).some(session=>session.status!=='stopped')||this.jobs.leases(job.id).some(lease=>lease.status==='held')))return unavailable('Original author inspection effects remain active or unresolved.');
+    if(this.profileSetup.list().some(run=>run.authority.attemptId===input.attempt.id&&['queued','preparing','running','waiting','unknown'].includes(run.status)))return unavailable('The original native testing audit still has pending or uncertain ownership.');
+    const latestRuns=this.app.store.list<InspectionVerificationRun>('inspection-verifier-runs').filter(run=>run.authority.attemptId===input.attempt.id);
+    if(latestRuns.length!==runs.length||runs.some(run=>!isDeepStrictEqual(latestRuns.find(latest=>latest.id===run.id),run)||!this.verifier.providerOwnerCurrent(run)||!this.canRetireVerifier(run))||[...this.contexts.values()].some(context=>!context.signal.aborted&&(context.attemptId===input.attempt.id||runs.some(run=>run.id===context.verificationRunId))))return unavailable('Verifier ownership changed during the inspection preflight.');
+    return isDeepStrictEqual(current(),selected)?{ready:true}:unavailable('Task authority changed during the inspection preflight.');
+  };
   qualityCheck:NonNullable<FactoryInspectionPorts['qualityCheck']>=async input=>{
     const roots=[{id:'primary',name:'primary',path:input.path},...(input.workingDirectories||[]).map(root=>{
       const captured=input.candidate.workingDirectories?.find(item=>item.containerPath===root.containerPath);

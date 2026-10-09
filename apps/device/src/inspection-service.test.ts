@@ -12,6 +12,7 @@ import { InspectionService } from './inspection-service.ts';
 import type { InspectionQualityRecord, InspectionReferenceView } from './inspection-quality.ts';
 import type { QualityEvidenceReport } from './factory-quality.ts';
 import { Store } from './store.ts';
+import { inspectionQualityPolicySha256, inspectionVerificationKey } from './inspection-verifier.ts';
 
 const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO5Wj4sAAAAASUVORK5CYII=', 'base64');
 interface ToolResult { content: Array<{ type: string; text?: string; data?: string; mimeType?: string }>; }
@@ -73,6 +74,73 @@ async function fixture(t: TestContext, platform: 'macos' | 'web' = 'macos') {
   };
   return { directory, workdir, referencePath, store, authority, quality, source, service, seam, context, token, call, createSession, deliver, events };
 }
+
+function retainedCandidateInput(f: Awaited<ReturnType<typeof fixture>>) {
+  const candidate={id:'retained-author-C',commit:'c'.repeat(40),baseCommit:'b'.repeat(40)};
+  const goal={...f.store.get<Record<string,unknown>>('goals','goal')!,id:'goal',coordinatorId:'mac'};
+  const attempt={...f.store.get<Record<string,unknown>>('attempts','attempt')!,id:'attempt',status:'failed',candidate:candidate.commit};
+  const task={...f.store.get<Record<string,unknown>>('tasks','task')!,id:'task',status:'failed'};
+  f.store.set('goals',goal);f.store.set('attempts',attempt);f.store.set('tasks',task);
+  f.store.set('factory-attempt-details',{...f.store.get<Record<string,unknown>>('factory-attempt-details','attempt')!,id:'attempt',candidate,cancellation:'none',phase:'checking',result:{status:'succeeded'},checks:[{command:'original-check',passed:false,candidateCommit:candidate.commit,checkedCommit:candidate.commit}]});
+  return {goal,task:f.store.get('tasks','task'),attempt,candidate,quality:f.quality} as Parameters<typeof f.service.retainedVerificationSettled>[0];
+}
+function retainUnknownVerifier(f: Awaited<ReturnType<typeof fixture>>, input: ReturnType<typeof retainedCandidateInput>): InspectionVerificationRun {
+  const source={...f.source,candidateId:input.candidate.id,candidateCommit:input.candidate.commit,checkedCommit:input.candidate.commit};
+  const run:InspectionVerificationRun={id:inspectionVerificationKey({authority:f.authority,source,quality:f.quality}),authority:f.authority,source,quality:f.quality,policySha256:inspectionQualityPolicySha256(f.quality),ownerDeviceId:'mac',executionTargetKind:'host-macos',executionTargetId:'mac-host',status:'unknown',sessionId:'original-verifier-session',chatId:'original-verifier-chat',startedAt:new Date().toISOString(),createdAt:new Date().toISOString(),updatedAt:new Date().toISOString(),deadlineAt:new Date().toISOString()};
+  f.store.set('inspection-verifier-runs',run);return run;
+}
+
+test('retained candidate preflight only reads exact ended ownership and preserves unknown verification history',async t=>{
+  const f=await fixture(t),{job,session}=f.createSession(),input=retainedCandidateInput(f),run=retainUnknownVerifier(f,input);
+  let providerChecks=0;
+  Object.assign(f.service.verifier,{providerSettled:async()=>{providerChecks++;return{ready:true};},providerOwnerCurrent:()=>true,ensure:async()=>{throw new Error('Preflight must never dispatch a verifier');}});
+  f.seam.recoverOwnedSessions=async()=>{throw new Error('Preflight must never stop an inspection');};
+  assert.equal(f.service.authorityCurrent(f.authority),false,'Failed-check recovery cannot reactivate author tool authority');
+  assert.equal((await f.service.retainedVerificationSettled(input)).ready,false,'A stopped provider cannot erase active native inspection ownership');
+  f.service.jobs.confirmSessionStopped(session.id);f.service.jobs.reconcileJob(job.id,{status:'failed',reason:'The injected owned backend positively stopped; its old workflow did not pass.',releaseConfirmed:true});
+  const before={run:f.store.get('inspection-verifier-runs',run.id),events:f.store.events('inspection-verifier-reconciliation',run.id),notices:f.events.length,jobs:f.service.jobs.listJobs()};
+  assert.deepEqual(await f.service.retainedVerificationSettled(input),{ready:true});assert.equal(providerChecks,2);
+  assert.deepEqual(f.store.get('inspection-verifier-runs',run.id),before.run);assert.deepEqual(f.store.events('inspection-verifier-reconciliation',run.id),before.events);
+  assert.equal(f.events.length,before.notices);assert.deepEqual(f.service.jobs.listJobs(),before.jobs);
+  assert.equal(f.store.get<InspectionVerificationRun>('inspection-verifier-runs',run.id)!.status,'unknown');
+});
+
+test('retained candidate preflight refuses stale source/policy, active providers and unresolved original effects',async t=>{
+  const f=await fixture(t),input=retainedCandidateInput(f),run=retainUnknownVerifier(f,input);
+  let providerReady=true;
+  Object.assign(f.service.verifier,{providerSettled:async()=>({ready:providerReady,reason:providerReady?undefined:'Original provider termination is unconfirmed.'}),providerOwnerCurrent:()=>true});
+  providerReady=false;assert.equal((await f.service.retainedVerificationSettled(input)).ready,false);providerReady=true;
+  for(const changed of [
+    {...run,source:{...run.source,candidateId:'another-C'}},
+    {...run,source:{...run.source,candidateCommit:'d'.repeat(40)}},
+    {...run,policySha256:'0'.repeat(64)},
+    {...run,authority:{...run.authority,authorityGeneration:3}},
+  ]){f.store.set('inspection-verifier-runs',changed);assert.equal((await f.service.retainedVerificationSettled(input)).ready,false);}
+  f.store.set('inspection-verifier-runs',run);
+  assert.equal((await f.service.retainedVerificationSettled({...input,candidate:{...input.candidate,commit:'d'.repeat(40)}})).ready,false);
+  assert.equal((await f.service.retainedVerificationSettled({...input,quality:{...f.quality,referenceIds:[]}})).ready,false);
+  f.seam.contexts.set('original-active-context',f.context);assert.equal((await f.service.retainedVerificationSettled(input)).ready,false);f.seam.contexts.clear();
+  const unresolved=await fixture(t),{job}=unresolved.createSession();unresolved.service.jobs.markUnknown(job.id,'A native backend outcome is genuinely unresolved.');
+  const unresolvedInput=retainedCandidateInput(unresolved),unknown=unresolved.service.jobs.getJob(job.id);
+  assert.equal((await unresolved.service.retainedVerificationSettled(unresolvedInput)).ready,false);assert.deepEqual(unresolved.service.jobs.getJob(job.id),unknown,'No GET-side reconciliation rewrites unknown effects');
+});
+
+test('retained candidate preflight rechecks authority after reading provider evidence',async t=>{
+  const f=await fixture(t),input=retainedCandidateInput(f);retainUnknownVerifier(f,input);
+  Object.assign(f.service.verifier,{providerSettled:async()=>{f.store.set('attempts',{id:'attempt',taskId:'task',generation:3,status:'failed'});return{ready:true};},providerOwnerCurrent:()=>true});
+  assert.equal((await f.service.retainedVerificationSettled(input)).ready,false);
+});
+
+test('retained candidate preflight refuses a newly admitted or restarted verifier during provider inspection',async t=>{
+  const f=await fixture(t),input=retainedCandidateInput(f),run=retainUnknownVerifier(f,input);
+  Object.assign(f.service.verifier,{providerOwnerCurrent:()=>false,providerSettled:async()=>({ready:true})});
+  assert.equal((await f.service.retainedVerificationSettled(input)).ready,false,'A late live provider cannot reuse the earlier ended receipt');
+  Object.assign(f.service.verifier,{providerOwnerCurrent:()=>true,providerSettled:async()=>{
+    const source={...run.source,sha256:'d'.repeat(64)};
+    f.store.set('inspection-verifier-runs',{...run,id:inspectionVerificationKey({...run,source}),source});return{ready:true};
+  }});
+  assert.equal((await f.service.retainedVerificationSettled(input)).ready,false,'A newly admitted run invalidates the original provider inventory');
+});
 
 test('inspection service respects frozen assignment authority and rejects a retired author before any effect', async t => {
   const f = await fixture(t);

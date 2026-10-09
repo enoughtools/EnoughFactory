@@ -54,9 +54,11 @@ const sourceMatches = (a: InspectionSourceIdentity, b: InspectionSourceIdentity)
 
 export function validateNativeProfileProposal(value: unknown, snapshot: InspectionSnapshot): NativeProfileProposal {
   const proposed = structuredClone(value) as NativeProfileProposal;
-  if (!proposed || !proposed.profile || Object.keys(proposed).some(key => !['profile','auditPaths'].includes(key))) throw new Error('Supply a profile and explicit fixture audit starting paths.');
+  if (!proposed || typeof proposed!=='object' || Array.isArray(proposed) || !proposed.profile || typeof proposed.profile!=='object' || Array.isArray(proposed.profile) || Object.keys(proposed).some(key => !['profile','auditPaths'].includes(key))) throw new Error('Supply profile as an object with id, build and launchArguments, plus explicit auditPaths.');
   const profile = proposed.profile;
-  if (Object.keys(profile).some(key => !['id','build','launchArguments','fixtureExpectedDataRoot','bundleIdentifier'].includes(key)) || !/^[A-Za-z0-9_-]{1,64}$/.test(profile.id)) throw new Error('Invalid proposed native profile. Audit receipts are issued only by the service.');
+  const unexpected=Object.keys(profile).filter(key=>!['id','build','launchArguments','fixtureExpectedDataRoot','bundleIdentifier'].includes(key));
+  if(unexpected.length)throw new Error(`Unknown profile fields: ${unexpected.join(', ')}. Profile accepts only id, build, launchArguments, fixtureExpectedDataRoot and bundleIdentifier. Put platform inside build.platform; audit receipts are issued only by the service.`);
+  if(typeof profile.id!=='string'||!/^[A-Za-z0-9_-]{1,64}$/.test(profile.id))throw new Error('Profile id must contain 1–64 letters, digits, underscores or hyphens. Supply build={tool:"xcodebuild",project,scheme,platform:"macos"|"ios-simulator",configuration?:"Debug"|"Release"} and launchArguments separately.');
   profile.build = parseAppleCheckCommand(`${APPLE_CHECK_PREFIX} ${JSON.stringify(profile.build)}`);
   if (profile.build.tool !== 'xcodebuild') throw new Error('Native app setup requires a fixed xcodebuild recipe.');
   if (!snapshot.manifest.roots[0]?.entries.some(entry => entry.path.startsWith(`${profile.build.tool === 'xcodebuild' ? profile.build.project : ''}/`))) throw new Error('The proposed Xcode project is absent from the captured primary source.');

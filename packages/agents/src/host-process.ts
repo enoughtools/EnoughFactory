@@ -51,7 +51,7 @@ export interface HostProcessState {
   state: "active" | "exited" | "unknown"; recordPath: string; termination?: HostProcessTermination;
 }
 /** Trusted OS probes may be injected by process recovery tests; no request data belongs here. */
-export interface HostProcessRecoveryProbes { readBoot?: () => HostBootIdentity | undefined; processIdentity?: (pid: number) => string | undefined; }
+export interface HostProcessRecoveryProbes { readBoot?: () => HostBootIdentity | undefined; processIdentity?: (pid: number) => string | undefined; persistProof?: boolean; }
 export interface HostProcessOptions {
   cwd: string; environment: NodeJS.ProcessEnv; processDirectory: string; sessionId: string;
   spawnProcess?: SpawnProcess;
@@ -190,7 +190,7 @@ export function attestLegacyHostReboot(directory: string, input: HostObservedReb
   return proof;
 }
 
-function rebootTermination(directory: string, filename: string, record: HostProcessRecord, boot: HostBootIdentity | undefined, identity: string | undefined, probeIdentity: (pid: number) => string | undefined): HostProcessTermination | undefined {
+function rebootTermination(directory: string, filename: string, record: HostProcessRecord, boot: HostBootIdentity | undefined, identity: string | undefined, probeIdentity: (pid: number) => string | undefined, persistProof: boolean): HostProcessTermination | undefined {
   if (!boot || !validBoot(boot) || ownedIdentity(record, identity) || !ownedReceipt(directory, filename, record)) return undefined;
   const digest = createHash("sha256").update(readFileSync(filename)).digest("hex"), proofPath = path.join(directory, `${record.processKey}.reboot.json`);
   try { if ((record.children ?? []).some(child => probeIdentity(child.pid) === child.identity)) return undefined; }
@@ -210,6 +210,7 @@ function rebootTermination(directory: string, filename: string, record: HostProc
   // can also move kern.boottime past that timestamp without ending any process.
   if (!validBoot(record.boot) || record.boot.machineId !== boot.machineId || record.boot.platform !== boot.platform || record.boot.bootId === boot.bootId) return undefined;
   const proof: HostKernelRebootTermination = { schemaVersion: 2, kind: "host-reboot", evidence: "boot-identity-change", observedAt: boot.observedAt, currentBoot: boot, previousBoot: record.boot, previousStatus: record.status, previousUpdatedAt: record.updatedAt, priorRecordSha256: digest };
+  if (!persistProof) return proof;
   // Keep the original running/unknown receipt byte-for-byte for audit. The
   // separate positive termination proof fences retries without fabricating EOF.
   try { writeFileSync(proofPath, JSON.stringify(proof), { flag: "wx", mode: 0o600 }); }
@@ -314,7 +315,7 @@ export function reconcileHostProcesses(directory: string, probes: HostProcessRec
     if (!bootRead) { bootRead = true; boot = (probes.readBoot ?? readHostBootIdentity)(); }
     let identity: string | undefined;
     try { if (record.pid) identity = probeIdentity(record.pid); } catch { return { ...state, state: "unknown" }; }
-    const termination = rebootTermination(directory, filename, record, boot, identity, probeIdentity);
+    const termination = rebootTermination(directory, filename, record, boot, identity, probeIdentity, probes.persistProof !== false);
     if (termination) return { ...state, state: "exited", termination };
     return { ...state, state: ownedIdentity(record, identity) ? "active" : "unknown" };
   });

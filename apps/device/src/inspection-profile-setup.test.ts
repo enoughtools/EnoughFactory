@@ -197,6 +197,32 @@ test('native setup rejects absent roots, escaped build paths and reusable fixtur
   assert.equal(f.configured.length, 0);
 });
 
+test('native profile validator accepts the original recipe and explains misplaced platform with exact profile fields', async t => {
+  const f = await fixture(t);
+  const accepted = validateNativeProfileProposal(f.proposal, f.snapshot);
+  assert.equal(accepted.profile.id, f.proposal.profile.id); assert.deepEqual(accepted.profile.build, f.proposal.profile.build);
+  assert.deepEqual(accepted.profile.launchArguments, f.proposal.profile.launchArguments); assert.deepEqual(accepted.auditPaths, f.proposal.auditPaths);
+  const misplaced = { ...f.proposal, profile: { ...f.proposal.profile, platform: 'macos' } };
+  assert.throws(() => validateNativeProfileProposal(misplaced, f.snapshot), (error: unknown) => {
+    assert(error instanceof Error); assert(!(error instanceof TypeError));
+    assert.match(error.message, /Unknown profile fields: platform\./);
+    assert.match(error.message, /Profile accepts only id, build, launchArguments, fixtureExpectedDataRoot and bundleIdentifier\./);
+    assert.match(error.message, /Put platform inside build\.platform/); return true;
+  });
+  assert.equal(f.store.list(PROFILE_AUDITS).length, 0); assert.equal(f.calls.length, 0); assert.equal(f.configured.length, 0);
+});
+
+test('native profile validator rejects malformed profile values with a clean object-shape instruction', async t => {
+  const f = await fixture(t);
+  for (const profile of [null, 'macos', [], ['macos']]) {
+    assert.throws(() => validateNativeProfileProposal({ ...f.proposal, profile }, f.snapshot), (error: unknown) => {
+      assert(error instanceof Error); assert(!(error instanceof TypeError));
+      assert.match(error.message, /Supply profile as an object with id, build and launchArguments, plus explicit auditPaths\./); return true;
+    });
+  }
+  assert.equal(f.store.list(PROFILE_AUDITS).length, 0); assert.equal(f.calls.length, 0); assert.equal(f.configured.length, 0);
+});
+
 test('native setup cannot bind another project or source session to an author authority', async t => {
   const f = await fixture(t);
   f.store.set('projects', { id: 'foreign-project', deviceId: 'mac', path: f.design });

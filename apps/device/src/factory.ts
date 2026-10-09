@@ -18,6 +18,7 @@ import type { SessionController } from './sessions.ts';
 import { exec, HttpError, now } from './util.ts';
 import { inspectAttempt, inspectGoal, inspectTask, taskControlReason, taskDispatchBlocker } from './task-inspection.ts';
 import { factoryChatBinding } from './factory-chat.ts';
+import { confirmRetainedCheckRecovery } from './factory-check-recovery.ts';
 import { goalAgentCount } from './factory-agent-capacity.ts';
 import { controllerError } from './factory-controller-error.ts';
 import { releaseControllerInputs } from './factory-controller-inputs.ts';
@@ -106,6 +107,7 @@ export interface FactoryInspectionPorts {
   prepareControllerReview?: (input:{goal:Goal;run:ControllerRun;signal?:AbortSignal})=>Promise<void>;
   reviewController?: (input:{goal:Goal;run:ControllerRun;resultText:string;signal?:AbortSignal})=>Promise<{ready:boolean;reason?:string;evidenceIds:string[]}>;
   qualityCheck?: (input:FactoryVerificationContext & {candidate:Candidate;quality:TaskQualityRequirements;path:string;workingDirectories?:Array<{path:string;containerPath:string;commit:string}>;checkedCommit:string;signal?:AbortSignal})=>Promise<CheckResult>;
+  retainedVerificationSettled?: (input:FactoryVerificationContext & {candidate:CandidateRef})=>Promise<{ready:boolean;reason?:string}>;
 }
 export async function initializeFactory(app: DeviceApp, chats: ChatController, network?: { peers: PeerManager }, inspection:FactoryInspectionPorts={}) {
   const hostDisk = new HostDiskAdmission(() => [app.dataDir, ...(app.diagnostics.containerRuntime?.dataDirectory ? [app.diagnostics.containerRuntime.dataDirectory] : [])], () => app.device.name);
@@ -634,6 +636,19 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
       return checkResults(report, candidate.commit);
       }, candidate);
     },
+    async confirmCheckRecovery(input) {
+      if(local(input.attempt.deviceId)){
+        const record=worker(input.attempt.id),result=record.chatId?app.store.get<{id:string;attemptId?:string;result:TurnResult}>('chat-results',record.chatId):undefined;
+        if(record.status!=='succeeded'||jobs.has(record.id)||captureJobs.has(record.id)||!record.chatId||chats.isRunning(record.chatId)||result?.attemptId!==record.id||result.result.text!==record.result?.text)return {status:'unknown',reason:'The original author has no positively completed owned provider result.'};
+      }
+      if(input.quality){
+        if(!inspection.retainedVerificationSettled)return {status:'unknown',reason:'This device cannot confirm the original UI verification effects are stopped.'};
+        const settled=await inspection.retainedVerificationSettled(input);if(!settled.ready)return {status:'unknown',reason:settled.reason||'The original UI verification effects remain unsettled.'};
+      }
+      const proof=await confirmRetainedCheckRecovery({workspaces,dataDir:app.dataDir,deviceId:app.device.id,candidate:input.candidate,verification:input,previousChecks:input.previousChecks,commands:input.commands});
+      if(proof.status==='settled'&&input.quality){const settled=await inspection.retainedVerificationSettled!(input);if(!settled.ready)return {status:'unknown',reason:settled.reason||'UI verification ownership changed during source recovery.'};}
+      return proof;
+    },
     async integrate(project, candidate, input) {
       return withCheckCapacity(async () => {
       const result = await workspaces.integrate({ candidateId: candidate.id, projectPath: project.path, commands: input.checks, isCurrent: input.isCurrent,verification:input.verification });
@@ -992,7 +1007,20 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
     const taskInspectionRoute = route.match(/^\/api\/tasks\/([^/]+)$/);
     if (method === 'GET' && taskInspectionRoute) {
       const task = app.store.get<FactoryTask>('tasks', taskInspectionRoute[1]); if (!task) throw new HttpError(404, 'Task not found.');
-      return inspectTask(app.store, app.devices, task);
+      const inspection=inspectTask(app.store, app.devices, task);
+      if(task.currentAttemptId)inspection.verificationRecovery=await coordinator.verificationRecovery(task.currentAttemptId);
+      return inspection;
+    }
+    const recheckRoute=route.match(/^\/api\/tasks\/([^/]+)\/recheck$/);
+    if(method==='POST'&&recheckRoute){
+      if(call.peerId)throw new HttpError(403,'Saved verification must be retried on its owning local coordinator.');
+      const keys=['expectedGoalRevision','expectedAttemptId','expectedCandidateId','expectedCandidateCommit'];
+      if(Object.keys(body).some(key=>!keys.includes(key))||!Number.isInteger(body.expectedGoalRevision)||Number(body.expectedGoalRevision)<1||keys.slice(1).some(key=>typeof body[key]!=='string'||!String(body[key]).trim()||String(body[key]).length>512))throw new HttpError(400,'Pin the current goal revision, original attempt and saved candidate before retrying verification.');
+      const task=app.store.get<FactoryTask>('tasks',recheckRoute[1]);if(!task)throw new HttpError(404,'Task not found.');
+      if(task.currentAttemptId!==body.expectedAttemptId)throw new HttpError(409,'The selected author attempt changed. Refresh its saved verification.');
+      try{await coordinator.recheckAttempt(String(body.expectedAttemptId),{goalRevision:Number(body.expectedGoalRevision),candidateId:String(body.expectedCandidateId),candidateCommit:String(body.expectedCandidateCommit)});}
+      catch(error){throw new HttpError(409,(error as Error).message);}
+      return {ok:true,attemptId:body.expectedAttemptId,candidateId:body.expectedCandidateId,candidateCommit:body.expectedCandidateCommit};
     }
     const attemptInspectionRoute = route.match(/^\/api\/attempts\/([^/]+)$/);
     if (method === 'GET' && attemptInspectionRoute) {
@@ -1284,6 +1312,9 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
   app.listeners.add(cleanupRuntimeReady);
   app.closers.unshift(async()=>{coordinator.stop();app.listeners.delete(cleanupRuntimeReady);const index=app.sessions.afterTerminal.indexOf(requestCleanup);if(index>=0)app.sessions.afterTerminal.splice(index,1);await archiveImportJob;await terminalCleanup?.close();});
   terminalCleanup.start();
+  // A crash can precede ControllerRun publication after inputs claimed a goal slot.
+  // Retire only that exact service-owned pre-admission context before releasing its claim.
+  for(const input of app.store.list<{id:string;goalId:string;sessionId?:string;status:string}>('factory-controller-inputs'))if(['preparing','prepared'].includes(input.status)&&!app.store.get('factory-controller-runs',input.id)){const goal=app.store.get<Goal>('goals',input.goalId);await app.withServiceOperation(()=>releaseController(input.id,input.sessionId,goal?.runtime??'codex'));}
   await coordinator.start();
   return { coordinator, workspaces, runtime, workspacePort };
 }
@@ -1330,7 +1361,7 @@ function checkResults(report: CheckReport, candidateCommit: string): CheckResult
       if(quality&&typeof quality==='object'&&!Array.isArray(quality)&&quality.command===UI_QUALITY_CHECK_COMMAND&&quality.candidateCommit===candidateCommit&&quality.checkedCommit===report.commit)return {...quality,passed:quality.passed===true&&command.exitCode===0&&!command.timedOut};
       return {command:command.command,passed:false,output:'Recorded UI quality evidence does not identify the exact checked source.',exitCode:1,candidateCommit,checkedCommit:report.commit};
     }
-    return {command:command.command,passed:command.exitCode===0&&!command.timedOut,output:`${command.stdout}${command.stderr}`,exitCode:command.exitCode,candidateCommit,checkedCommit:report.commit,developmentToolchain:command.developmentToolchain,executionTargetKind:command.executionTargetKind,hostPermissions:command.hostPermissions,...((command as Partial<AppleCheckResult>).appleValidation?{appleValidation:(command as AppleCheckResult).appleValidation}:{})};
+    return {command:command.command,passed:command.exitCode===0&&!command.timedOut,output:`${command.stdout}${command.stderr}`,exitCode:command.exitCode,candidateCommit,checkedCommit:report.commit,developmentToolchain:command.developmentToolchain,executionTargetKind:command.executionTargetKind,hostPermissions:command.hostPermissions,...((command as Partial<AppleCheckResult>).appleValidation?{appleValidation:(command as AppleCheckResult).appleValidation}:{}),...(command.timedOut||report.status==='canceled'?{recovery:{condition:'check-interrupted' as const,reason:'The original verification was interrupted; saved work can be rechecked only after its owning effects and source are confirmed settled.'}}:{})};
   });
   if (['failed', 'canceled'].includes(report.status) && results.every(result => result.passed)) {
     results.push({ command: 'Repository integrity after checks', passed: false, output: 'Checks changed the tracked candidate or were canceled.', exitCode: 1, candidateCommit, checkedCommit: report.commit });

@@ -289,6 +289,12 @@ export class SessionController {
     await job;
     return this.record(record.id);
   }
+  /** Historical identity only. It never grants access to a released workspace. */
+  retainedHostExecution(sessionId:string):SessionExecutionContext & {workspaceId:string;releasedAt?:string} {
+    const record=this.record(sessionId),host=this.store.get<HostSessionRecord>('session-host',sessionId);
+    if(record.executionTargetKind!=='host-macos'||!host||host.id!==record.id||host.deviceId!==this.deviceId||record.deviceId!==this.deviceId||!Number.isSafeInteger(host.generation)||host.generation<1||host.prepared?.sessionId!==record.id||!host.prepared.workspaceId||!path.isAbsolute(host.prepared.cwd)||host.prepared.root!==path.join(path.resolve(this.workspaceDataDir),'host-sessions',sessionId)||host.releasedAt!==undefined&&(!Number.isFinite(Date.parse(host.releasedAt))||record.status!=='stopped'))throw new HttpError(409,'The retained native workspace identity is unavailable.','HOST_WORKSPACE_UNAVAILABLE');
+    return {kind:'host-macos',targetId:record.executionTargetId,workdir:host.prepared.cwd,workspaceId:host.prepared.workspaceId,...(host.releasedAt?{releasedAt:host.releasedAt}:{})};
+  }
   execution(sessionId:string):SessionExecutionContext {
     const record=this.assertWorkAvailable(sessionId);
     if(record.executionTargetKind==='host-macos'){

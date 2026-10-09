@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { chmod, cp, lchmod, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import type { Chat, ChatEvent, ExecutionCapability, ExecutionTargetAdvertisement, Goal, InspectionAuthority, InspectionSourceIdentity, InspectionVerificationRun, Project, Session, TaskQualityRequirements } from '@enoughfactory/contracts';
+import type { HostProcessState } from '@enoughfactory/agents';
 import { ArtifactStore, InspectionSnapshotManager, WorkspaceManager, exportInspectionContainerRoots, exportInspectionSnapshot, importInspectionSnapshot, verifyInspectionSnapshotContents, writeAtomic, type InspectionSnapshot, type InspectionSnapshotTransfer, type WorkspaceRecord } from '@enoughfactory/workspaces';
 import { dockerInvocation } from '@enoughfactory/runtime';
 import type { DeviceApp } from './app.ts';
@@ -88,6 +89,20 @@ export function inspectionVerificationKey(input: Pick<VerificationInput, 'author
   return `verify-${digest({ version: 1, authority: input.authority, ...(input.purpose === 'goal-final' ? { purpose: input.purpose, goalRevision: input.goalRevision } : {}), source: { sha256: input.source.sha256, roots: (input.source.roots ?? []).map(({ id, sha256 }) => ({ id, sha256 })).sort((a, b) => a.id.localeCompare(b.id)) }, quality: input.quality })}`;
 }
 
+function hostProofMatchesVerifier(process: HostProcessState, run: InspectionVerificationRun, workdir: string): boolean {
+  const proof = process.termination;
+  if (process.state !== 'exited' || proof?.schemaVersion !== 2) return false;
+  if (proof.kind === 'host-reboot') return proof.evidence === 'boot-identity-change' && proof.previousBoot?.platform === proof.currentBoot.platform && proof.previousBoot.machineId === proof.currentBoot.machineId && proof.previousBoot.bootId !== proof.currentBoot.bootId;
+  if (proof.kind === 'supervised-termination') return proof.evidence === 'complete-owned-teardown' && proof.previousStatus === 'exited' && proof.inventoryComplete === true && proof.exitCode === null && proof.exitSignal === 'SIGKILL'
+    && proof.processKey === process.processKey && proof.sessionId === run.sessionId && proof.cwd === workdir && sha.test(proof.priorRecordSha256)
+    && proof.supervisor?.pid === process.pid && Number.isSafeInteger(proof.supervisor.pid) && proof.supervisor.pid >= 2 && typeof proof.supervisor.identity === 'string'
+    && proof.supervisor.path === process.recordPath.replace(/\.json$/, '.cjs') && proof.supervisor.identity.includes(proof.supervisor.path) && proof.supervisor.identity.includes(process.processKey)
+    && Array.isArray(proof.children) && proof.children.length <= 2048 && proof.children.every(child => Number.isSafeInteger(child.pid) && child.pid >= 2 && typeof child.identity === 'string' && !!child.identity)
+    && Number.isFinite(Date.parse(proof.observedAt)) && Date.parse(proof.observedAt) >= Date.parse(process.createdAt!);
+  if (proof.kind !== 'operator-attested-reboot' || proof.evidence !== 'operator-observed-os-restart' || !proof.actor?.trim() || proof.actor.length > 256 || proof.verificationRunId !== run.id || proof.chatId !== run.chatId || proof.sessionId !== run.sessionId || proof.cwd !== workdir || proof.processKey !== process.processKey || !sha.test(proof.priorRecordSha256)) return false;
+  return [proof.beforeWitness, proof.afterWitness].every(witness => !!witness && path.isAbsolute(witness.path) && sha.test(witness.sha256) && typeof witness.content === 'string' && witness.sha256 === createHash('sha256').update(witness.content).digest('hex')) && proof.beforeWitness.sha256 !== proof.afterWitness.sha256;
+}
+
 /** A service-owned reviewer, separate from an ended author and its attempt budget. */
 export class InspectionVerifier {
   private readonly artifacts: ArtifactStore;
@@ -113,6 +128,47 @@ export class InspectionVerifier {
     this.options.app.emit('inspection-verifier', run);
     this.options.app.changed();
     return run;
+  }
+  /** Synchronous ownership fence after awaited read-only process inspection. */
+  providerOwnerCurrent(run: InspectionVerificationRun): boolean {
+    if (this.closing || this.active.has(run.id) || canonical(this.options.app.store.get(INSPECTION_VERIFIER_RUNS, run.id)) !== canonical(run) || run.ownerDeviceId !== this.options.app.device.id || run.id !== inspectionVerificationKey(run) || run.policySha256 !== inspectionQualityPolicySha256(run.quality)) return false;
+    if (!run.chatId) return !run.sessionId && !run.startedAt;
+    const chat = this.options.app.store.get<Chat>('chats', run.chatId);
+    return !!chat && chat.sessionId === run.sessionId && chat.verificationRunId === run.id && chat.deviceId === run.ownerDeviceId && chat.runtime === 'codex' && !['running', 'waiting'].includes(chat.status) && !this.options.chats.isRunning(chat.id);
+  }
+  /** Read-only admission for rechecking the same retained author candidate. */
+  async providerSettled(run: InspectionVerificationRun): Promise<{ ready: boolean; reason?: string }> {
+    const unavailable = (reason: string) => ({ ready: false, reason });
+    if (!this.providerOwnerCurrent(run)) return unavailable('The original independent verifier still has an active or changed owner.');
+    if (!run.sessionId && !run.chatId && !run.startedAt) return { ready: true };
+    if (!run.sessionId || !run.chatId || !run.startedAt) return unavailable('The verifier provider admission is not completely recorded.');
+    const chat = this.options.app.store.get<Chat>('chats', run.chatId);
+    if (!chat || chat.sessionId !== run.sessionId || chat.verificationRunId !== run.id || chat.deviceId !== run.ownerDeviceId || chat.runtime !== 'codex' || ['running', 'waiting'].includes(chat.status) || this.options.chats.isRunning(chat.id)) return unavailable('The original verifier conversation still has active or unresolved execution.');
+    try {
+      const session = this.options.app.sessions.record(run.sessionId);
+      if (session.verificationRunId !== run.id || session.deviceId !== run.ownerDeviceId || !this.options.app.sessions.owns(session.id) || (session.executionTargetKind ?? 'container') !== run.executionTargetKind) return unavailable('The original verifier session ownership changed.');
+      if (run.executionTargetKind === 'container') {
+        const archive = this.options.app.sessions.archivedEnvironment(session.id);
+        return session.status === 'stopped' && archive?.status === 'removed' && archive.receipt?.version === 2 && archive.receipt.status === 'removed' && archive.receipt.identity.sessionId === session.id && archive.receipt.containerId === archive.containerId
+          ? { ready: true } : unavailable('The original container verifier has no positive stopped-execution receipt.');
+      }
+      const execution = this.options.app.sessions.retainedHostExecution(session.id);
+      if (execution.kind !== 'host-macos') return unavailable('The original native verifier source owner changed.');
+      if (execution.releasedAt) {
+        const inputs = this.options.app.store.get<VerificationInputs>(INPUTS, run.id), workspace = inputs?.retirement?.workspace;
+        if (!['succeeded', 'failed', 'canceled'].includes(run.status) || session.status !== 'stopped' || inputs?.transfer.snapshotId !== run.source.snapshotId || inputs.transfer.sourceDigest !== run.source.sha256 || !inputs.retirement?.primarySource || workspace?.id !== run.id || workspace.attemptId !== run.id || workspace.goalId !== run.authority.goalId || workspace.taskId !== run.authority.taskId || workspace.deviceId !== run.ownerDeviceId || workspace.provider !== 'git' || workspace.path !== execution.workdir || execution.workspaceId !== run.id || workspace.path !== path.join(this.options.app.dataDir, 'workspace-data', 'workspaces', run.id, 'repository')) return unavailable('The retired verifier has no exact retained source and ownership receipt.');
+      }
+      const processes = (await this.options.chats.manager.hostProcesses({ readOnly: true })).filter(process => process.sessionId === session.id || process.sessionId.startsWith(`${session.id}-decision-`));
+      if (!this.providerOwnerCurrent(run) || canonical(this.options.app.store.get('chats', chat.id)) !== canonical(chat) || canonical(this.options.app.sessions.record(session.id)) !== canonical(session) || canonical(this.options.app.sessions.retainedHostExecution(session.id)) !== canonical(execution)) return unavailable('The original verifier owner changed during process inspection.');
+      const original = processes.filter(process => process.sessionId === session.id && process.cwd === execution.workdir && Date.parse(process.createdAt ?? '') >= Date.parse(run.startedAt!));
+      if (!processes.length) {
+        const failure = this.options.app.store.get<{ attemptId?: string; agentStarted?: boolean; executionEnded?: boolean }>('chat-turn-failures', chat.id);
+        const dispatched = !!chat.threadId || this.options.app.store.events<ChatEvent>('chat', chat.id).some(event => event.value.kind === 'tool' || event.value.role === 'assistant' || event.value.kind === 'status' && event.value.data?.status === 'running');
+        if (!dispatched && failure?.attemptId === run.authority.attemptId && failure.agentStarted === false && failure.executionEnded === true) return { ready: true };
+      }
+      if (!original.length || processes.some(process => process.state !== 'exited' || !!process.pid && !process.termination) || !original.every(process => hostProofMatchesVerifier(process, run, execution.workdir))) return unavailable('The original verifier provider or one of its owned tools has unconfirmed termination.');
+      return { ready: true };
+    } catch { return unavailable('The original verifier execution evidence is unavailable.'); }
   }
   private assertCurrent(run: InspectionVerificationRun, signal?: AbortSignal): void {
     signal?.throwIfAborted();
@@ -198,22 +254,7 @@ export class InspectionVerifier {
       const processes = (await this.options.chats.manager.hostProcesses()).filter(process => process.sessionId === original.sessionId || process.sessionId.startsWith(`${original.sessionId}-decision-`));
       const originalProcesses = processes.filter(process => process.sessionId === original.sessionId && process.cwd === execution.workdir && Date.parse(process.createdAt ?? '') >= Date.parse(original.startedAt!));
       // Empty inventories and same-boot missing/recycled PIDs are not evidence.
-      if (!originalProcesses.length || processes.some(process => process.state !== 'exited') || !originalProcesses.every(process => {
-        const proof = process.termination;
-        if (proof?.schemaVersion !== 2) return false;
-        if (proof.kind === 'host-reboot') return proof.evidence === 'boot-identity-change' && proof.previousBoot?.platform === proof.currentBoot.platform && proof.previousBoot.machineId === proof.currentBoot.machineId && proof.previousBoot.bootId !== proof.currentBoot.bootId;
-        if (proof.kind === 'supervised-termination') return proof.evidence === 'complete-owned-teardown' && proof.previousStatus === 'exited' && proof.inventoryComplete === true && proof.exitCode === null && proof.exitSignal === 'SIGKILL'
-          && proof.processKey === process.processKey && proof.sessionId === original.sessionId && proof.cwd === execution.workdir && sha.test(proof.priorRecordSha256)
-          && proof.supervisor?.pid === process.pid && Number.isSafeInteger(proof.supervisor.pid) && proof.supervisor.pid >= 2 && typeof proof.supervisor.identity === 'string'
-          && proof.supervisor.path === process.recordPath.replace(/\.json$/, '.cjs') && proof.supervisor.identity.includes(proof.supervisor.path) && proof.supervisor.identity.includes(process.processKey)
-          && Array.isArray(proof.children) && proof.children.length <= 2048 && proof.children.every(child => Number.isSafeInteger(child.pid) && child.pid >= 2 && typeof child.identity === 'string' && !!child.identity)
-          && Number.isFinite(Date.parse(proof.observedAt)) && Date.parse(proof.observedAt) >= Date.parse(process.createdAt!);
-        // Legacy receipts lack their old kernel UUID. Only a separate privileged
-        // operator attestation may bridge that history, scoped to this exact
-        // provider, verifier conversation and independently retained witnesses.
-        if (proof.kind !== 'operator-attested-reboot' || proof.evidence !== 'operator-observed-os-restart' || !proof.actor?.trim() || proof.actor.length > 256 || proof.verificationRunId !== original.id || proof.chatId !== original.chatId || proof.sessionId !== original.sessionId || proof.cwd !== execution.workdir || proof.processKey !== process.processKey || !sha.test(proof.priorRecordSha256)) return false;
-        return [proof.beforeWitness, proof.afterWitness].every(witness => !!witness && path.isAbsolute(witness.path) && sha.test(witness.sha256) && typeof witness.content === 'string' && witness.sha256 === createHash('sha256').update(witness.content).digest('hex')) && proof.beforeWitness.sha256 !== proof.afterWitness.sha256;
-      })) return false;
+      if (!originalProcesses.length || processes.some(process => process.state !== 'exited') || !originalProcesses.every(process => hostProofMatchesVerifier(process, original, execution.workdir))) return false;
       const bindings = this.options.app.store.events<ChatEvent>('chat', original.chatId!).map(event => event.value).filter(event => event.kind === 'status' && event.data?.status === 'running' && typeof event.data.threadId === 'string').map(event => event.data!.threadId as string);
       const threadIds = new Set([...(originalChat!.threadId ? [originalChat!.threadId] : []), ...bindings]);
       if (threadIds.size !== 1) return false;

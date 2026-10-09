@@ -250,6 +250,8 @@ test('retained native inputs cannot restart during release and disposal leaves s
   finally { release(); }
   await releasing;
   assert.throws(() => f.sessions.execution(session.id), /workspace is unavailable/);
+  const historical=f.sessions.retainedHostExecution(session.id);
+  assert.equal(historical.workdir,f.workspace.path);assert.equal(historical.workspaceId,f.workspace.id);assert.ok(historical.releasedAt);
   await assert.rejects(f.sessions.restart(session.id), /owner is unavailable/);
   await assert.rejects(readFile(path.join(session.workingDirectories![0]!.path, 'output.txt')), /ENOENT/);
   assert.equal(await readFile(path.join(f.workspace.path, 'source.txt'), 'utf8'), 'user source\n');

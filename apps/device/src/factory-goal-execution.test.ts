@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { randomUUID } from 'node:crypto';
 import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
@@ -6,7 +7,7 @@ import path from 'node:path';
 import test, { type TestContext } from 'node:test';
 import type { Attempt, ControllerRun, ExecutionTargetAdvertisement, FactoryTask, Goal, Project, Session } from '@enoughfactory/contracts';
 import type { TurnInput, TurnResult } from '@enoughfactory/agents';
-import type { AttemptDetail, ControlRecord } from '@enoughfactory/factory';
+import type { AttemptDetail, CandidateRef, ControlRecord, ExecutionResult, TaskDetail } from '@enoughfactory/factory';
 import { git } from '../../../packages/workspaces/src/process.ts';
 import { DeviceApp } from './app.ts';
 import { ChatController } from './chats.ts';
@@ -20,7 +21,7 @@ const plan = JSON.stringify({ summary: 'Implement the native product', criteria:
   kind: 'feature', acceptanceCriteria: [criterion], expectedOutputs: ['Saved native source'], dependsOn: [], checks: [],
 }] });
 
-async function fixture(t: TestContext, inspection: FactoryInspectionPorts = {}) {
+async function fixture(t: TestContext, inspection: FactoryInspectionPorts = {}, preInitialize?: (app: DeviceApp, project: Project) => void | Promise<void>) {
   const directory = await realpath(await mkdtemp(path.join(tmpdir(), 'enough-goal-execution-')));
   const state = new Store(directory);
   state.set('private', { id: 'runtime-control', suspended: true }); state.close();
@@ -69,6 +70,7 @@ async function fixture(t: TestContext, inspection: FactoryInspectionPorts = {}) 
     assert.equal(await readFile(path.join(input.cwd, 'source.txt'), 'utf8'), 'actual project source\n');
     return respond(input);
   });
+  await preInitialize?.(app, project);
   const factory = await initializeFactory(app, chats, undefined, inspection); factory.coordinator.stop();
   await new Promise<void>(resolve => app.server.listen(0, '127.0.0.1', resolve));
   const origin = `http://127.0.0.1:${(app.server.address() as AddressInfo).port}`;
@@ -111,6 +113,52 @@ test('an explicitly native goal plans from zero tasks with the private container
   assert.equal(session.executionTargetId, f.host.id); assert.equal(session.executionTargetKind, 'host-macos');
   assert.equal(session.containerId, undefined); assert.equal(session.status, 'stopped');
   assert.equal(await readFile(path.join(f.primary, 'source.txt'), 'utf8'), 'actual project source\n');
+});
+
+function coldStartGoal(app: DeviceApp, project: Project): Goal {
+  const at = new Date().toISOString();
+  const goal: Goal = { id: randomUUID(), projectId: project.id, coordinatorId: app.device.id, title: 'Cold-start native product', objective: 'Build the requested native product', criteria: [criterion],
+    status: 'draft', autonomy: 'manual', approvalMode: 'approve-all', runtime: 'codex', concurrency: 1, revision: 1, createdAt: at, updatedAt: at, execution: { target: 'host-macos' } };
+  app.store.set('goals', goal);
+  app.store.set<ControlRecord>('factory-control', { id: goal.id, stage: 'plan', startedAt: at, steering: [] });
+  return goal;
+}
+
+test('cold-start orphan controller preparation releases its reservation before normal single-agent planning', { ...nativeMac, timeout: 60000 }, async t => {
+  let goal!: Goal;
+  const operation = randomUUID();
+  const f = await fixture(t, {}, (app, project) => {
+    goal = coldStartGoal(app, project);
+    app.store.set('factory-controller-inputs', { id: operation, goalId: goal.id, role: 'planner', status: 'preparing', updatedAt: goal.updatedAt });
+  });
+  assert.equal(f.app.store.get<{ status: string }>('factory-controller-inputs', operation)!.status, 'released');
+  assert.equal(f.app.store.get('factory-controller-cleanup', operation), undefined);
+  assert.equal(f.app.store.list('sessions').length, 0); assert.equal(f.app.store.list('factory-controller-runs').length, 0);
+  assert.equal(f.turns.length, 0); assert.deepEqual(f.counts(), { containerStarts: 0, hostProvisions: 0 });
+  f.factory.coordinator.requestPlan(goal.id);
+  await f.factory.coordinator.start(); await f.factory.coordinator.waitForIdle(); f.factory.coordinator.stop();
+  assert.equal(f.app.store.get<Goal>('goals', goal.id)!.status, 'running'); assert.equal(f.turns.length, 1);
+  assert.equal(f.app.store.list<FactoryTask>('tasks').filter(task => task.goalId === goal.id).length, 1);
+  assert.equal(f.app.store.get<ControlRecord>('factory-control', goal.id)!.waitingFor, undefined);
+  assert.equal(f.app.store.get<ControlRecord>('factory-control', goal.id)!.controllerFailures, undefined); assert.equal(f.counts().containerStarts, 0);
+});
+
+test('cold-start controller ownership ambiguity retains its reservation and admits no replacement provider', { ...nativeMac, timeout: 60000 }, async t => {
+  let goal!: Goal;
+  const operation = randomUUID(), saved: Session[] = [];
+  const f = await fixture(t, {}, (app, project) => {
+    goal = coldStartGoal(app, project);
+    app.store.set('factory-controller-inputs', { id: operation, goalId: goal.id, role: 'planner', status: 'prepared', updatedAt: goal.updatedAt });
+    for (const id of ['orphan-original-session', 'orphan-ambiguous-session']) {
+      const session: Session = { id, projectId: `workspace-${operation}`, deviceId: app.device.id, name: 'retained-controller', status: 'unknown', createdAt: goal.createdAt, updatedAt: goal.updatedAt, services: [] };
+      saved.push(session); app.store.set('sessions', session);
+    }
+  });
+  assert.equal(f.app.store.get<{ status: string }>('factory-controller-inputs', operation)!.status, 'prepared');
+  assert.match(f.app.store.get<{ error: string }>('factory-controller-cleanup', operation)!.error, /ownership is ambiguous/);
+  await assert.rejects(f.complete(goal), (error: unknown) => { assert.equal((error as { recovery?: string }).recovery, 'inspection-evidence'); return true; });
+  assert.deepEqual(f.app.store.list('sessions'), saved); assert.equal(f.app.store.list('factory-controller-runs').length, 0);
+  assert.equal(f.turns.length, 0); assert.deepEqual(f.counts(), { containerStarts: 0, hostProvisions: 0 });
 });
 
 test('goal creation persists explicit application acceptance and rejects unavailable references as client input', nativeMac, async t => {
@@ -269,4 +317,66 @@ test('a source audit capacity wait preserves the original retained evaluator con
   assert.deepEqual(result, { text: decision, chatId: original.chatId }); assert.equal(f.turns.length, 2, 'A finished evaluator decision cannot be rerun to bypass the occupied slot.');
   assert.equal(f.app.store.list<ControllerRun>('factory-controller-runs').length, 1); assert.equal(f.app.store.get<ControllerRun>('factory-controller-runs', original.id)!.status, 'completed');
   assert.equal(f.app.store.get('factory-controller-reviews', original.id), undefined); assert.equal(f.counts().containerStarts, 0);
+});
+
+/** HTTP recovery exercises the real coordinator; proof/check effects are typed owning-port fixtures. */
+async function savedVerificationFixture(t: TestContext) {
+  const f = await fixture(t), requested = await f.create({ target: 'host-macos' });
+  const at = new Date().toISOString(), candidate: CandidateRef = { id: 'retained-candidate', commit: 'c'.repeat(40), baseCommit: 'b'.repeat(40) };
+  const goal: Goal = { ...requested, status: 'paused' };
+  const task: FactoryTask = { id: 'saved-task', goalId: goal.id, title: 'Saved native implementation', description: 'Original frozen task', kind: 'feature', status: 'failed', dependsOn: [], currentAttemptId: 'saved-author', createdAt: at, updatedAt: at };
+  const attempt: Attempt = { id: 'saved-author', taskId: task.id, generation: 3, status: 'failed', deviceId: f.app.device.id, startedAt: at, endedAt: at, candidate: candidate.commit, chatId: 'saved-chat', sessionId: 'saved-session', executionTargetKind: 'host-macos', error: 'Original canceled verification' };
+  const result: ExecutionResult = { status: 'succeeded', text: 'Original completed author', chatId: attempt.chatId, sessionId: attempt.sessionId };
+  const commands = ['frozen-first', 'frozen-second'];
+  const detail: AttemptDetail = { id: attempt.id, goalId: goal.id, goalRevision: goal.revision, assignmentGoalRevision: goal.revision, phase: 'checking', cancellation: 'none', workspace: { id: attempt.id, provider: 'git', path: f.primary, baseCommit: candidate.baseCommit }, candidate, result,
+    contract: { title: task.title, description: task.description, dependsOn: [], checks: commands, planRevision: goal.revision },
+    checks: [{ command: commands[0]!, passed: false, output: 'Canceled original check', exitCode: 130, candidateCommit: candidate.commit, checkedCommit: candidate.commit }] };
+  f.app.store.set('goals', goal); f.app.store.set('tasks', task); f.app.store.set('attempts', attempt); f.app.store.set('factory-attempt-details', detail);
+  f.app.store.set<TaskDetail>('factory-task-details', { id: task.id, key: 'saved', checks: ['changed-current-task-check'], planRevision: goal.revision, selected: false, failureSignatures: ['original-failure'], lastCandidate: candidate, lastError: attempt.error });
+  f.app.store.set<ControlRecord>('factory-control', { id: goal.id, stage: 'diagnose', diagnosisTaskId: task.id, startedAt: at, steering: [] });
+  let settled = true, proofs = 0, checks = 0;
+  const observedCommands: string[][] = [];
+  t.mock.method(f.factory.runtime, 'reconcile', async () => ({ status: 'succeeded', result }));
+  f.factory.workspacePort.confirmCheckRecovery = async () => { proofs++; return settled ? { status: 'settled', automatic: true, evidenceIds: ['original-owned-report'] } : { status: 'unknown', reason: 'Original verifier still owns an unsettled process.' }; };
+  f.factory.workspacePort.check = async (_project, current, selected) => { checks++; observedCommands.push([...selected]); return selected.map(command => ({ command, passed: false, output: 'Rechecked outcome remains a real failure', exitCode: 1, candidateCommit: current.commit, checkedCommit: current.commit })); };
+  t.mock.method(f.factory.workspacePort, 'prepare', async () => assert.fail('Saved verification must not allocate another author'));
+  t.mock.method(f.factory.workspacePort, 'capture', async () => assert.fail('Saved verification must not recapture its candidate'));
+  t.mock.method(f.factory.workspacePort, 'integrate', async () => assert.fail('A rechecked failure cannot integrate'));
+  const pinned = { expectedGoalRevision: goal.revision, expectedAttemptId: attempt.id, expectedCandidateId: candidate.id, expectedCandidateCommit: candidate.commit };
+  await f.factory.coordinator.start();
+  return { ...f, goal, task, attempt, detail, pinned, observedCommands, settle: (value: boolean) => { settled = value; }, counts: () => ({ proofs, checks }) };
+}
+
+test('pinned HTTP verification recovery resumes paused saved work and preserves the original failed report', nativeMac, async t => {
+  const f = await savedVerificationFixture(t);
+  const response = await fetch(`http://127.0.0.1:${(f.app.server.address() as AddressInfo).port}/api/tasks/${f.task.id}`, { headers: { authorization: `Bearer ${f.app.token}` } });
+  assert.equal(response.status, 200);
+  const view = await response.json() as { verificationRecovery: { eligible: boolean; attemptId: string; candidateCommit: string } };
+  assert.equal(view.verificationRecovery.eligible, true); assert.equal(view.verificationRecovery.attemptId, f.attempt.id); assert.equal(view.verificationRecovery.candidateCommit, f.pinned.expectedCandidateCommit);
+  const retried = await f.request('POST', `/api/tasks/${f.task.id}/recheck`, f.pinned);
+  assert.equal(retried.status, 200, await retried.clone().text()); await f.factory.coordinator.waitForIdle();
+  assert.deepEqual(f.observedCommands, [f.detail.contract!.checks]); assert.equal(f.turns.length, 0);
+  assert.equal(f.app.store.get<Goal>('goals', f.goal.id)!.status, 'running');
+  assert.equal(f.app.store.list<Attempt>('attempts').length, 1);
+  assert.equal(f.app.store.get<Attempt>('attempts', f.attempt.id)!.generation, 3); assert.equal(f.app.store.get<Attempt>('attempts', f.attempt.id)!.status, 'failed');
+  const retained = f.app.store.get<AttemptDetail>('factory-attempt-details', f.attempt.id)!;
+  assert.deepEqual(retained.candidate, f.detail.candidate); assert.deepEqual(retained.result, f.detail.result); assert.deepEqual(retained.contract, f.detail.contract);
+  assert.deepEqual(retained.checkRecoveryHistory![0]!.checks, f.detail.checks); assert.equal(retained.checkRecoveryHistory![0]!.error, f.attempt.error);
+  assert.deepEqual(f.app.store.get<TaskDetail>('factory-task-details', f.task.id)!.failureSignatures[0], 'original-failure');
+});
+
+test('HTTP saved verification rejects stale identities, supplied replacements and unknown effects without changing the author', nativeMac, async t => {
+  const f = await savedVerificationFixture(t);
+  const variants: Array<[Record<string, unknown>, number]> = [
+    [{ ...f.pinned, expectedGoalRevision: f.goal.revision + 1 }, 409], [{ ...f.pinned, expectedAttemptId: 'another-author' }, 409],
+    [{ ...f.pinned, expectedCandidateId: 'another-candidate' }, 409], [{ ...f.pinned, expectedCandidateCommit: 'd'.repeat(40) }, 409],
+    [{ ...f.pinned, commands: ['replace-frozen-checks'] }, 400], [{ expectedGoalRevision: f.goal.revision }, 400],
+  ];
+  for (const [body, status] of variants) {
+    const response = await f.request('POST', `/api/tasks/${f.task.id}/recheck`, body); assert.equal(response.status, status, await response.clone().text());
+  }
+  f.settle(false);
+  const rejected = await f.request('POST', `/api/tasks/${f.task.id}/recheck`, f.pinned); assert.equal(rejected.status, 409); assert.match(await rejected.text(), /unsettled process/);
+  assert.equal(f.counts().checks, 0); assert.deepEqual(f.app.store.get('attempts', f.attempt.id), f.attempt); assert.deepEqual(f.app.store.get('factory-attempt-details', f.attempt.id), f.detail);
+  assert.equal(f.app.store.get<Goal>('goals', f.goal.id)!.status, 'paused'); assert.equal(f.turns.length, 0);
 });
