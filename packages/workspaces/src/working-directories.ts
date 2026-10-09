@@ -188,7 +188,7 @@ export class WorkingDirectoryManager {
       await ownGit(path, "reset", "--mixed", sourceCommit);
       // Keep all cloned history but remove the private source location from local config.
       const references = await ownGit(path, "for-each-ref", "--format=%(objectname)", "refs/remotes/origin");
-      for (const commit of references.split("\n").filter(Boolean)) await ownGit(path, "update-ref", `refs/enoughfactory/original/${randomUUID()}`, commit);
+      for (const commit of references.split("\n").filter(Boolean)) await ownGit(path, "update-ref", `refs/enoughfactory/original/${commit}`, commit);
       await ownGit(path, "remote", "remove", "origin");
     } else {
       await command(["init", "--quiet", path]);
@@ -196,7 +196,12 @@ export class WorkingDirectoryManager {
     }
     await replaceTree(source.path, path);
     await ownGit(path, "add", "--all", "--force", "--", ".");
-    await ownGit(path, "commit", "--allow-empty", "--no-verify", "-m", "EnoughFactory working directory baseline");
+    // Baselines describe immutable inputs, not an attempt's time. Include the
+    // directory inventory Git omits, so identical inputs share their CAS bundle.
+    const emptyDirectoriesSha256 = inventoryHash(await workingDirectoryEmptyDirectories(path));
+    await command(["commit", "--allow-empty", "--no-verify", "-m", `EnoughFactory working directory baseline\n\nEmpty directories: ${emptyDirectoriesSha256}`], path, false, {
+      GIT_AUTHOR_DATE: "2000-01-01T00:00:00Z", GIT_COMMITTER_DATE: "2000-01-01T00:00:00Z",
+    });
     const baseCommit = await ownGit(path, "rev-parse", "HEAD");
     const sourceArtifact = await this.bundle(path, baseCommit, baseCommit, source.id, "source", true);
     return { id: source.id, name: source.name, kind: isGit ? "git" : "folder", containerPath: `/workspaces/${source.name}`, baseCommit, sourceCommit, sourceArtifact };
@@ -280,7 +285,7 @@ export class WorkingDirectoryManager {
   }
 
   private async bundle(path: string, commit: string, baseCommit: string, id: string, purpose: "source" | "output", all = false, context: { goalId?: string; taskId?: string; attemptId?: string } = {}): Promise<ArtifactManifest> {
-    const ref = `refs/enoughfactory/working-directories/${purpose}/${randomUUID()}`;
+    const ref = `refs/enoughfactory/working-directories/${purpose}/${purpose === "source" ? commit : randomUUID()}`;
     const temporary = join(dirname(path), `${randomUUID()}.bundle`);
     await ownGit(path, "update-ref", ref, commit);
     try {
@@ -375,8 +380,8 @@ function gitEnvironment(): NodeJS.ProcessEnv {
   return { ...env, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null", GIT_OPTIONAL_LOCKS: "0", GIT_TERMINAL_PROMPT: "0" };
 }
 const gitOptions = ["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "core.attributesFile=/dev/null", "-c", "core.autocrlf=false", "-c", "commit.gpgsign=false", "-c", "init.templateDir=", "-c", "core.protectHFS=true", "-c", "core.protectNTFS=true"];
-async function command(args: string[], path?: string, rawOutput = false): Promise<string> {
-  const result = await run("git", [...gitOptions, ...(path ? ["-C", path] : []), ...args], { env: gitEnvironment(), inheritEnv: false, timeoutMs: 120_000 });
+async function command(args: string[], path?: string, rawOutput = false, envOverrides: NodeJS.ProcessEnv = {}): Promise<string> {
+  const result = await run("git", [...gitOptions, ...(path ? ["-C", path] : []), ...args], { env: { ...gitEnvironment(), ...envOverrides }, inheritEnv: false, timeoutMs: 120_000 });
   if (result.exitCode !== 0) throw new Error(`Working directory Git ${args[0]} failed: ${result.stderr.trim() || result.stdout.trim()}`);
   return rawOutput ? result.stdout : result.stdout.trim();
 }

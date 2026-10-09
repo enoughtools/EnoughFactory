@@ -3,10 +3,102 @@ import { createHash } from "node:crypto";
 import { chmod, cp, lstat, mkdtemp, mkdir, readFile, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { setTimeout } from "node:timers/promises";
 import test from "node:test";
 import { ArtifactStore } from "./artifacts.ts";
 import { git } from "./process.ts";
 import { fingerprintWorkingDirectories, validateWorkingDirectories, workingDirectoryEmptyDirectories, WorkingDirectoryManager } from "./working-directories.ts";
+
+test("unchanged Git and folder inputs share CAS bundles across independent attempt identities while outputs retain separate receipts", async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "enough-working-dedup-")));
+  try {
+    const source = join(root, "source"), folder = join(root, "folder"), owned = join(root, "owned");
+    await mkdir(source); await mkdir(folder); await mkdir(owned);
+    await git(source, "init", "--quiet");
+    await git(source, "config", "user.name", "Fixture"); await git(source, "config", "user.email", "fixture@example.test");
+    await writeFile(join(source, "tracked.txt"), "history\n");
+    await git(source, "add", "."); await git(source, "commit", "-m", "original");
+    const ancestor = await git(source, "rev-parse", "HEAD");
+    await git(source, "branch", "earlier", ancestor); await git(source, "tag", "original", ancestor);
+    await writeFile(join(source, "tracked.txt"), "current source\n");
+    await git(source, "add", "."); await git(source, "commit", "-m", "current");
+    await writeFile(join(source, "untracked.txt"), "untracked input\n");
+    await writeFile(join(folder, "notes.txt"), "folder input\n");
+    await mkdir(join(folder, "empty"), { mode: 0o750 }); await chmod(join(folder, "empty"), 0o750);
+    const sources = [{ id: "git", name: "reference", path: source }, { id: "folder", name: "notes", path: folder }];
+    const sourceRefs = await git(source, "show-ref"), sourceStatus = await git(source, "status", "--porcelain=v1", "--untracked-files=all");
+    const artifacts = new ArtifactStore(join(owned, "artifacts"), "fixture-device");
+    const manager = new WorkingDirectoryManager({ dataDir: owned, artifacts });
+    const first = await manager.prepare({ identity: "first", sources });
+    // Cross a Git timestamp boundary as well as changing the attempt identity.
+    await setTimeout(1_100);
+    const second = await manager.prepare({ identity: "second", sources });
+    for (let index = 0; index < first.length; index++) {
+      const before = first[index]!, after = second[index]!;
+      assert.notEqual(before.path, after.path);
+      assert.notEqual(before.sourceArtifact.id, after.sourceArtifact.id);
+      assert.equal(before.baseCommit, after.baseCommit);
+      assert.equal(before.sourceArtifact.sha256, after.sourceArtifact.sha256);
+      assert.equal(await artifacts.path(before.sourceArtifact), await artifacts.path(after.sourceArtifact));
+      assert.deepEqual(await artifacts.read(before.sourceArtifact), await artifacts.read(after.sourceArtifact));
+    }
+    await git(first[0]!.path, "merge-base", "--is-ancestor", ancestor, first[0]!.baseCommit);
+    assert.equal(await git(source, "show-ref"), sourceRefs);
+    assert.equal(await git(source, "status", "--porcelain=v1", "--untracked-files=all"), sourceStatus);
+
+    const exported = join(owned, "exported"); await cp(first[1]!.path, exported, { recursive: true });
+    await writeFile(join(exported, "notes.txt"), "author output\n");
+    const outputOne = await manager.captureFromPath(first[1]!, exported, { attemptId: "attempt-one" });
+    const outputTwo = await manager.captureFromPath(second[1]!, exported, { attemptId: "attempt-two" });
+    assert.notEqual(outputOne.bundleArtifact.id, outputTwo.bundleArtifact.id);
+    assert.notEqual(outputOne.bundleArtifact.metadata?.ref, outputTwo.bundleArtifact.metadata?.ref);
+    assert.equal(outputOne.bundleArtifact.attemptId, "attempt-one");
+    assert.equal(outputTwo.bundleArtifact.attemptId, "attempt-two");
+    await writeFile(join(first[1]!.path, "notes.txt"), "private attempt edit\n");
+    assert.equal(await readFile(join(second[1]!.path, "notes.txt"), "utf8"), "folder input\n");
+    const { path: _privatePath, ...transferred } = first[1]!;
+    const restored = (await manager.prepare({ identity: "restored", transferred: [transferred] }))[0]!;
+    assert.equal(await readFile(join(restored.path, "notes.txt"), "utf8"), "folder input\n");
+    assert.equal((await lstat(join(restored.path, "empty"))).mode & 0o777, 0o750);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("baseline dedup distinguishes file bytes, executable modes, symlink targets and empty directory inventories", async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "enough-working-dedup-inputs-")));
+  try {
+    const source = join(root, "source"), owned = join(root, "owned"); await mkdir(source); await mkdir(owned);
+    await writeFile(join(source, "input.txt"), "original bytes\n"); await chmod(join(source, "input.txt"), 0o644);
+    await symlink("target-one", join(source, "link"));
+    await mkdir(join(source, "empty"), { mode: 0o750 }); await chmod(join(source, "empty"), 0o750);
+    const sources = [{ id: "input", name: "input", path: source }];
+    const artifacts = new ArtifactStore(join(owned, "artifacts"), "fixture-device");
+    const manager = new WorkingDirectoryManager({ dataDir: owned, artifacts });
+    let identity = 0;
+    const snapshot = async () => (await manager.prepare({ identity: `input-${identity++}`, sources }))[0]!;
+    const original = await snapshot();
+    const differs = async () => {
+      const changed = await snapshot();
+      assert.notEqual(changed.baseCommit, original.baseCommit);
+      assert.notEqual(changed.sourceArtifact.sha256, original.sourceArtifact.sha256);
+      return changed;
+    };
+    await writeFile(join(source, "input.txt"), "changed bytes\n"); await differs();
+    await writeFile(join(source, "input.txt"), "original bytes\n");
+    await chmod(join(source, "input.txt"), 0o755); await differs(); await chmod(join(source, "input.txt"), 0o644);
+    await rm(join(source, "link")); await symlink("target-two", join(source, "link")); await differs();
+    await rm(join(source, "link")); await symlink("target-one", join(source, "link"));
+    await chmod(join(source, "empty"), 0o700); await differs(); await chmod(join(source, "empty"), 0o750);
+    await mkdir(join(source, "new-empty"));
+    const addedDirectory = await differs();
+    const { path: _privatePath, ...transferred } = addedDirectory;
+    const restored = (await manager.prepare({ identity: "changed-inventory-transfer", transferred: [transferred] }))[0]!;
+    assert.deepEqual(await workingDirectoryEmptyDirectories(restored.path), await workingDirectoryEmptyDirectories(source));
+    await rm(join(source, "new-empty"), { recursive: true });
+    const reverted = await snapshot();
+    assert.equal(reverted.baseCommit, original.baseCommit);
+    assert.equal(reverted.sourceArtifact.sha256, original.sourceArtifact.sha256);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
 
 test("extra roots retain ignored/untracked files, isolate identities, and reconstruct exact output without original or agent Git writes", async () => {
   const root = await realpath(await mkdtemp(join(tmpdir(), "enough-working-roots-")));

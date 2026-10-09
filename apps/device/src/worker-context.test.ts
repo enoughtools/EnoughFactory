@@ -4,7 +4,7 @@ import { cp, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/pr
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import type { Attempt, Chat, FactoryTask, Goal, Project } from '@enoughfactory/contracts';
-import type { AttemptDetail, PlanRecord, TaskDetail } from '@enoughfactory/factory';
+import type { AttemptDetail, ControlRecord, PlanRecord, TaskDetail } from '@enoughfactory/factory';
 import { EnvmuxSession, type EnvmuxReady, type EnvmuxState } from '@enoughfactory/envmux';
 import type { TurnInput } from '@enoughfactory/agents';
 import { DeviceApp, type ApiCall } from './app.ts';
@@ -47,11 +47,13 @@ async function fixture(t: TestContext) {
   await git(oldWorkspace.path,'add','.');await git(oldWorkspace.path,'commit','-qm','Retained integration candidate');
   const candidate=await factory.workspaces.capture({workspaceId:oldWorkspace.id});
   app.store.set('projects',project);app.store.set('goals',goal);app.store.set('tasks',task);app.store.set('attempts',attempt);app.store.set('factory-attempt-details',detail);
+  app.store.set<ControlRecord>('factory-control',{id:goal.id,stage:'dispatch',startedAt:at,steering:[]});
   const oldTask:FactoryTask={...task,id:'old-integration',title:'Integration repair',description:'Retained shared package',dependsOn:[],status:'failed',currentAttemptId:'old-attempt',writePaths:['ClientIntegration/Other.swift']};
   app.store.set('tasks',oldTask);app.store.set('attempts',{...attempt,id:'old-attempt',taskId:oldTask.id,status:'failed'});
   app.store.set('factory-attempt-details',{...detail,id:'old-attempt',candidate,phase:'done'});
   app.store.set<TaskDetail>('factory-task-details',{id:oldTask.id,key:'integration',checks:[],planRevision:1,selected:false,failureSignatures:[],lastCandidate:{...candidate}});
   for(const id of task.dependsOn)app.store.set('tasks',{...oldTask,id,currentAttemptId:undefined,status:'completed',title:id});
+  for(const id of [task.id,...task.dependsOn])app.store.set<TaskDetail>('factory-task-details',{id,key:id,checks:[],planRevision:goal.revision,selected:false,failureSignatures:[]});
   app.store.set<PlanRecord>('factory-plans',{id:goal.id,goalId:goal.id,revision:goal.revision,summary:`Restore exact retained integration candidate ${candidate.id} commit ${candidate.commit}; it is reference material, not accepted source.`,checks:[],taskKeys:{reading:task.id},createdAt:at});
   let beforeReferenceCopy:()=>Promise<void>=async()=>{};
   const engine=()=>{

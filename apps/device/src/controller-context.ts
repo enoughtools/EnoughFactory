@@ -43,8 +43,9 @@ interface ContextManifest {
   candidates: Array<{
     id: string; taskId: string; title: string; taskStatus: string; commit: string; baseCommit: string;
     repository?: string; sourceBundle?: string; bundleRef?: string; bundleSha256?: string; unavailable?: string;
+    retainedBundle?: { artifactId: string; sha256: string; size: number };
     caseCollisions?: string[][];
-    workingDirectories?: Array<{ id: string; name: string; path?: string; sourceBundle: string; bundleRef: string; commit: string; baseCommit: string; bundleSha256: string; caseCollisions?: string[][];
+    workingDirectories?: Array<{ id: string; name: string; path?: string; sourceBundle?: string; bundleRef: string; commit: string; baseCommit: string; bundleSha256: string; retainedBundle: { artifactId: string; sha256: string; size: number }; caseCollisions?: string[][];
       emptyDirectories: Array<{ path: string; mode: number }>; emptyDirectoriesSha256: string }>;
   }>;
 }
@@ -142,10 +143,15 @@ export async function prepareControllerContext(input: {
         const bundleRef = String(candidate.bundleArtifact.metadata?.ref ?? '');
         const collisions = await bundleCaseCollisions(bundle, bundleRef, candidate.commit, candidate.baseCommit, path.join(staging, 'objects', candidate.id, 'primary.git'));
         await mkdir(path.join(contents, relative), { recursive: true, mode: 0o700 });
-        await copyFile(bundle, path.join(contents, relative, 'source.bundle'), constants.COPYFILE_FICLONE);
-        entry.sourceBundle = `${candidateRoot}/source.bundle`;
         entry.bundleRef = bundleRef;
         entry.bundleSha256 = candidate.bundleArtifact.sha256;
+        entry.retainedBundle = { artifactId: candidate.bundleArtifact.id, sha256: candidate.bundleArtifact.sha256, size: candidate.bundleArtifact.size };
+        // The immutable original already lives in CAS. Ordinary controllers need
+        // its reconstructed tree, not another packed copy inside every context.
+        if (collisions.length || input.bundlesOnly) {
+          await copyFile(bundle, path.join(contents, relative, 'source.bundle'), constants.COPYFILE_FICLONE);
+          entry.sourceBundle = `${candidateRoot}/source.bundle`;
+        }
         if (collisions.length) entry.caseCollisions = collisions;
         else if (!input.bundlesOnly) {
           const imported = path.join(staging, 'imports', candidate.id, 'repository');
@@ -160,11 +166,14 @@ export async function prepareControllerContext(input: {
           const inventory = retainedDirectoryInventory(capture.bundleArtifact.metadata);
           const extraBundle = await input.workspaces.artifacts.path(capture.bundleArtifact), extraRef = String(capture.bundleArtifact.metadata?.ref ?? '');
           const extraCollisions = await bundleCaseCollisions(extraBundle, extraRef, capture.commit, capture.baseCommit, path.join(staging, 'objects', candidate.id, 'working-directories', `${capture.id}.git`));
-          await mkdir(path.join(contents, relative, 'bundles'), { recursive: true, mode: 0o700 });
-          await copyFile(extraBundle, path.join(contents, relative, 'bundles', `${capture.id}.bundle`), constants.COPYFILE_FICLONE);
           const extra: NonNullable<typeof entry.workingDirectories>[number] = { id: capture.id, name: capture.name,
-            sourceBundle: `${candidateRoot}/bundles/${capture.id}.bundle`, bundleRef: extraRef,
+            bundleRef: extraRef, retainedBundle: { artifactId: capture.bundleArtifact.id, sha256: capture.bundleArtifact.sha256, size: capture.bundleArtifact.size },
             commit: capture.commit, baseCommit: capture.baseCommit, bundleSha256: capture.bundleArtifact.sha256, ...inventory };
+          if (extraCollisions.length || input.bundlesOnly) {
+            await mkdir(path.join(contents, relative, 'bundles'), { recursive: true, mode: 0o700 });
+            await copyFile(extraBundle, path.join(contents, relative, 'bundles', `${capture.id}.bundle`), constants.COPYFILE_FICLONE);
+            extra.sourceBundle = `${candidateRoot}/bundles/${capture.id}.bundle`;
+          }
           if (extraCollisions.length) extra.caseCollisions = extraCollisions;
           else if (!input.bundlesOnly) {
             const retained = path.join(staging, 'imports', candidate.id, 'working-directories', capture.id);
@@ -193,7 +202,7 @@ export async function prepareControllerContext(input: {
     const colliding = manifest.candidates.filter(candidate => candidate.caseCollisions?.length || candidate.workingDirectories?.some(root => root.caseCollisions?.length)).map(candidate => candidate.id);
     return {
       workingDirectorySources: [...(aggregateProjectRoots ? [] : publicSources(roots)), ...publicSources(evidence)],
-      instructions: `${input.role === 'worker' ? '' : `Full stored execution/check evidence is available through the records entries in ${containerRoot}/manifest.json (${records.length} records). Match coordinator record IDs such as factory-attempt-details/<id> and factory-goal-checks/<id> to each listed JSON path, SHA-256 and byte size. Check entries retain exact record paths, commands, outcomes and candidate/checked commits; their JSON files contain full stored outputs. This is an isolated snapshot at goal revision ${goal?.revision ?? 'unavailable'}, not a live journal. Artifact fields are references only: external report/log artifact bodies were not copied and must not be claimed inspected. An absent record is unavailable evidence, never proof of success. `}${unavailable.length ? `Unavailable retained source: ${unavailable.join(', ')}. Missing evidence was not inspected and cannot prove completion; use the manifest to distinguish available trees from missing inputs. ` : ''}${colliding.length ? `Native tree reconstruction was skipped for case/Unicode-colliding Git paths in candidates: ${colliding.join(', ')}. The manifest lists the exact conflicting paths. Their verified raw bundles are available: reconstruct them in this Linux container for faithful inspection, rather than inspecting a case-folded Mac tree. ` : ''}Inspect ${containerRoot}/manifest.json for the exact retained candidate IDs, commits, source locations and project folder locations. Each sourceBundle retains the exact Git objects: in a fresh container directory use git init, git fetch <sourceBundle> <bundleRef>, then git checkout --detach <commit>. For captured extra folders, also restore each emptyDirectories entry under that checkout and apply its recorded mode; their validated inventory/hash preserves directories Git omits. Candidate trees are isolated copies of retained output, not the current integrated repository or live worker environments. Their original Git metadata is omitted; the manifest records the verified bundle identity. The main working directory remains the current project snapshot. Use candidate evidence to preserve useful work and diagnose failures, never to claim it was integrated. Changes to these ${input.role === 'worker' ? 'reference' : 'controller'} folders are not integrated or used to change a retained candidate.`,
+      instructions: `${input.role === 'worker' ? '' : `Full stored execution/check evidence is available through the records entries in ${containerRoot}/manifest.json (${records.length} records). Match coordinator record IDs such as factory-attempt-details/<id> and factory-goal-checks/<id> to each listed JSON path, SHA-256 and byte size. Check entries retain exact record paths, commands, outcomes and candidate/checked commits; their JSON files contain full stored outputs. This is an isolated snapshot at goal revision ${goal?.revision ?? 'unavailable'}, not a live journal. Artifact fields are references only: external report/log artifact bodies were not copied and must not be claimed inspected. An absent record is unavailable evidence, never proof of success. `}${unavailable.length ? `Unavailable retained source: ${unavailable.join(', ')}. Missing evidence was not inspected and cannot prove completion; use the manifest to distinguish available trees from missing inputs. ` : ''}${colliding.length ? `Native tree reconstruction was skipped for case/Unicode-colliding Git paths in candidates: ${colliding.join(', ')}. The manifest lists the exact conflicting paths. Their verified raw bundles are available: reconstruct them in this Linux container for faithful inspection, rather than inspecting a case-folded Mac tree. ` : ''}Inspect ${containerRoot}/manifest.json for the exact retained candidate IDs, commits, source locations and project folder locations. Inspect each listed repository or working-directory path for reconstructed source. retainedBundle identifies the immutable original in the coordinator artifact store; it is a reference, not a local file. A sourceBundle is included only when raw Git objects are needed instead of a reconstructed tree: in a fresh container directory use git init, git fetch <sourceBundle> <bundleRef>, then git checkout --detach <commit>. For raw captured extra folders, also restore each emptyDirectories entry under that checkout and apply its recorded mode; their validated inventory/hash preserves directories Git omits. Candidate trees are isolated copies of retained output, not the current integrated repository or live worker environments. Their original Git metadata is omitted; the manifest records the verified bundle identity. The main working directory remains the current project snapshot. Use candidate evidence to preserve useful work and diagnose failures, never to claim it was integrated. Changes to these ${input.role === 'worker' ? 'reference' : 'controller'} folders are not integrated or used to change a retained candidate.`,
     };
   } catch (error) {
     if (snapshotPrepared) await rm(path.join(input.dataDir, 'workspace-data', 'working-directories', `${input.operation}-evidence-context`), { recursive: true, force: true });

@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { mkdtemp, mkdir, readFile, readdir, rm, symlink, readlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -66,10 +66,17 @@ test('controller context preserves exact candidate and attached inputs separatel
   const manifest = JSON.parse(await readFile(path.join(evidence.path, 'manifest.json'), 'utf8'));
   assert.equal(manifest.candidates[0].id, f.candidate.id); assert.equal(manifest.candidates[0].commit, f.candidate.commit);
   assert.equal(manifest.candidates[0].bundleSha256, f.candidate.bundleArtifact.sha256);
+  assert.deepEqual(manifest.candidates[0].retainedBundle, { artifactId: f.candidate.bundleArtifact.id, sha256: f.candidate.bundleArtifact.sha256, size: f.candidate.bundleArtifact.size });
   assert.deepEqual(manifest.candidates[0].workingDirectories[0].emptyDirectories, f.candidate.workingDirectories![0]!.bundleArtifact.metadata!.emptyDirectories);
   assert.equal(manifest.candidates[0].workingDirectories[0].emptyDirectoriesSha256, f.candidate.workingDirectories![0]!.bundleArtifact.metadata!.emptyDirectoriesSha256);
   const candidatePath = path.join(evidence.path, 'candidates', f.candidate.id);
-  assert.deepEqual(await readFile(path.join(candidatePath, 'source.bundle')), await readFile(await f.workspaces.artifacts.path(f.candidate.bundleArtifact)));
+  assert.equal(manifest.candidates[0].sourceBundle, undefined);
+  assert.equal(manifest.candidates[0].workingDirectories[0].sourceBundle, undefined);
+  assert.deepEqual(manifest.candidates[0].workingDirectories[0].retainedBundle, { artifactId: f.candidate.workingDirectories![0]!.bundleArtifact.id, sha256: f.candidate.workingDirectories![0]!.bundleArtifact.sha256, size: f.candidate.workingDirectories![0]!.bundleArtifact.size });
+  await assert.rejects(readFile(path.join(candidatePath, 'source.bundle')), /ENOENT/);
+  await assert.rejects(readFile(path.join(candidatePath, 'bundles', 'reference.bundle')), /ENOENT/);
+  assert.ok(!((await git(evidence.path, 'ls-tree', '-r', '--name-only', evidence.baseCommit)).split('\n').some(filename => filename.endsWith('.bundle'))), 'The retained controller snapshot must not re-pack original bundles beside reconstructed source');
+  assert.ok(await f.workspaces.artifacts.path(f.candidate.bundleArtifact), 'The original immutable source remains available separately');
   assert.equal(await readFile(path.join(candidatePath, 'repository', 'ARCHITECTURE.md'), 'utf8'), 'Retained architecture deliverable\n');
   await assert.rejects(readFile(path.join(candidatePath, 'repository', '.git', 'config')), /ENOENT/);
   assert.equal(await readFile(path.join(candidatePath, 'working-directories', 'reference', 'reference.txt'), 'utf8'), 'Retained attached-folder output\n');
@@ -98,6 +105,30 @@ test('controller candidate selection follows diagnosis, replan scope and accepte
   assert.deepEqual(controllerCandidates(store, 'goal', 'planner').map(item => item.candidate.id), ['affected-retained']);
   assert.deepEqual(controllerCandidates(store, 'goal', 'diagnosis').map(item => item.candidate.id), ['affected-retained']);
   assert.deepEqual(controllerCandidates(store, 'goal', 'evaluator').map(item => item.candidate.id), ['integrated-accepted']);
+});
+
+test('materialized controller contexts omit packed history while bundle-only references retain exact objects', async t => {
+  const f = await fixture(t);
+  // A deleted historical payload is still necessary in the original candidate
+  // bundle, but has no place in each ordinary controller's source tree.
+  const historicalFile = path.join(f.workspace.path, 'historical-payload.bin');
+  await writeFile(historicalFile, randomBytes(128 * 1024));
+  await git(f.workspace.path, 'add', '.'); await git(f.workspace.path, 'commit', '-m', 'Historical source');
+  await rm(historicalFile); await git(f.workspace.path, 'add', '.'); await git(f.workspace.path, 'commit', '-m', 'Remove historical payload');
+  const candidate = await f.workspaces.capture({ workspaceId: f.workspace.id, workingDirectories: f.candidate.workingDirectories });
+  f.store.set('factory-task-details', { id: 'architecture', lastCandidate: candidate });
+  const materialized = await prepareControllerContext({ ...f, operation: 'materialized', goalId: 'goal', role: 'planner' });
+  const raw = await prepareControllerContext({ ...f, operation: 'raw-bundles', goalId: 'goal', role: 'planner', bundlesOnly: true });
+  const source = materialized.workingDirectorySources.at(-1)!, rawSource = raw.workingDirectorySources.at(-1)!;
+  assert.ok(rawSource.sourceArtifact.size > source.sourceArtifact.size + 64 * 1024, 'A source inspection must not retain another full historical bundle');
+  const transferred = await f.directoryManager.prepare({ identity: 'raw-controller-session', transferred: raw.workingDirectorySources });
+  const evidence = transferred.at(-1)!, manifest = JSON.parse(await readFile(path.join(evidence.path, 'manifest.json'), 'utf8'));
+  const entry = manifest.candidates[0], root = path.join(evidence.path, 'candidates', candidate.id);
+  assert.equal(entry.repository, undefined);
+  assert.equal(entry.workingDirectories[0].path, undefined);
+  assert.deepEqual(await readFile(path.join(root, 'source.bundle')), await readFile(await f.workspaces.artifacts.path(candidate.bundleArtifact)));
+  assert.deepEqual(await readFile(path.join(root, 'bundles', 'reference.bundle')), await readFile(await f.workspaces.artifacts.path(candidate.workingDirectories![0]!.bundleArtifact)));
+  assert.ok(await f.workspaces.artifacts.path(candidate.bundleArtifact), 'Frozen original bytes remain available outside the controller context');
 });
 
 test('controllers receive complete isolated same-goal execution/check JSON even without retained source candidates', async t => {
