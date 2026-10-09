@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { chmod, mkdir, mkdtemp, readFile, rm, rmdir, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, rmdir, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { WorkspaceManager } from "../src/manager.ts";
@@ -99,6 +99,57 @@ test("unconfirmed release retains both snapshots and returns durable original fa
   } finally { await rm(f.root, { recursive: true, force: true }); }
 });
 
+test("source audit errors save command evidence and retain the failed snapshot before retirement", async () => {
+  let checkPath = "";
+  const expected = commandResult("check source audit");
+  const executor: CheckExecutor = async context => { checkPath = context.path; await rm(join(checkPath, ".git", "HEAD")); return expected; };
+  const f = await fixture(executor);
+  try {
+    const report = await f.manager.verify({ candidateId: f.candidate.id, commands: [expected.command] });
+    assert.equal(report.status, "failed"); assert.deepEqual(report.commands, [expected]);
+    assert.match(report.cleanupErrors![0]!, /Could not audit check source/);
+    const evidence = JSON.parse((await f.manager.artifacts.read(report.logArtifact)).toString());
+    assert.equal(evidence.retainedCheckPath, checkPath);
+    assert.match(evidence.sourceAuditSkipped, /could not be audited/);
+    assert.equal(await readFile(join(checkPath, "candidate.txt"), "utf8"), "retained candidate\n");
+    assert.deepEqual(evidence.commands, [expected]);
+  } finally { await rm(f.root, { recursive: true, force: true }); }
+});
+
+for (const operation of ["verify", "integrate"] as const) for (const failure of ["artifact", "report"] as const) {
+  test(`${operation} preserves executed source and original command evidence when ${failure} persistence fails`, async () => {
+    let checkPath = "";
+    const expected = commandResult("check persistence");
+    const executor: CheckExecutor = async context => { checkPath = context.path; return expected; };
+    const f = await fixture(executor);
+    const put = f.manager.artifacts.put.bind(f.manager.artifacts);
+    f.manager.artifacts.put = async (contents, identity) => {
+      if (!identity.name?.startsWith("checks-")) return put(contents, identity);
+      if (failure === "artifact") throw new Error("deliberate artifact persistence failure");
+      const artifact = await put(contents, identity);
+      // Block atomic report publication after its original artifact was saved.
+      await mkdir(join(f.dataDir, "reports", identity.name.slice("checks-".length)), { recursive: true });
+      return artifact;
+    };
+    try {
+      const before = await git(f.project, "rev-parse", "HEAD");
+      const action = operation === "verify"
+        ? f.manager.verify({ candidateId: f.candidate.id, commands: [expected.command] })
+        : f.manager.integrate({ candidateId: f.candidate.id, projectPath: f.project, commands: [expected.command], isCurrent: () => true });
+      await assert.rejects(action, error => {
+        const retained = error as Error & { report: { commands: CommandResult[] }; retainedCheckPath: string };
+        assert.match(retained.message, /Could not preserve check evidence; executed source was retained/);
+        assert.ok(retained.cause); assert.equal(retained.retainedCheckPath, checkPath);
+        assert.deepEqual(retained.report.commands, [expected]);
+        return true;
+      });
+      assert.equal(await readFile(join(checkPath, "candidate.txt"), "utf8"), "retained candidate\n");
+      assert.equal(await git(f.project, "rev-parse", "HEAD"), before, "failed evidence publication must never accept integration");
+      await assert.rejects(readFile(join(f.project, "candidate.txt")), /ENOENT/);
+    } finally { await rm(f.root, { recursive: true, force: true }); }
+  });
+}
+
 test("report release removes stable mountpoints before secondary source and empty-directory audits", async () => {
   const events: string[] = [];
   let checkPath = "", secondaryPath = "", mountpoint = "", inode: number | undefined;
@@ -166,6 +217,36 @@ test("healthy integration releases once, preserves command evidence and accepts 
     assert.deepEqual(evidence.commands, [expected]);
     assert.equal(evidence.actualHead, result.commit);
   } finally { await rm(f.root, { recursive: true, force: true }); }
+});
+
+test("readonly scratch is made removable only after durable evidence and retirement never follows source symlinks", async () => {
+  let checkPath = "", scratch = "", outside = "";
+  const expected = commandResult("check readonly scratch", { stdout: "scratch retained with mode 500" });
+  const executor: CheckExecutor = async context => {
+    checkPath = context.path; scratch = join(checkPath, "generated");
+    await mkdir(scratch); await writeFile(join(scratch, "output"), "useful output\n");
+    await chmod(scratch, 0o500); await symlink(outside, join(checkPath, "external-link"));
+    return expected;
+  };
+  const f = await fixture(executor);
+  outside = join(f.root, "external"); await mkdir(outside); await writeFile(join(outside, "sentinel"), "untouched\n"); await chmod(outside, 0o500);
+  const put = f.manager.artifacts.put.bind(f.manager.artifacts);
+  let evidenceSaved = false;
+  f.manager.artifacts.put = async (contents, identity) => {
+    if (identity.name?.startsWith("checks-")) {
+      assert.equal((await stat(scratch)).mode & 0o777, 0o500, "retirement must not change source metadata before saving the report");
+      evidenceSaved = true;
+    }
+    return put(contents, identity);
+  };
+  try {
+    const report = await f.manager.verify({ candidateId: f.candidate.id, commands: [expected.command] });
+    assert.equal(report.status, "passed"); assert.equal(evidenceSaved, true);
+    assert.deepEqual(JSON.parse((await f.manager.artifacts.read(report.logArtifact)).toString()).commands, [expected]);
+    await assert.rejects(stat(checkPath), /ENOENT/);
+    assert.equal((await stat(outside)).mode & 0o777, 0o500);
+    assert.equal(await readFile(join(outside, "sentinel"), "utf8"), "untouched\n");
+  } finally { await chmod(outside, 0o700); await rm(f.root, { recursive: true, force: true }); }
 });
 
 test("snapshot cleanup failures update durable evidence before integration acceptance", { skip: process.getuid?.() === 0 }, async () => {

@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { dirname, resolve } from "node:path";
+import { lstat, readdir } from "node:fs/promises";
+import { dirname, join, resolve } from "node:path";
 import { prepareToolchain, validatePreparedToolchain, verifyPreparedToolchain } from "@enoughfactory/runtime";
 import { resolveDockerRuntime, runManagedDocker, type DockerRuntimeEndpoint } from "./docker.ts";
 import { discoverSwiftBuildCaches, prepareSwiftBuildMountpoint, removeSwiftBuildMountpoints, type SwiftBuildCache, type SwiftBuildMountpoint } from "./swift-check-cache.ts";
@@ -9,6 +10,44 @@ import type { Candidate, CheckExecutor, CommandResult, DevelopmentToolchain, Fro
 const checkPathEnvironment = new Set(["ENOUGH_EVIDENCE_ROOT", "ENOUGH_NATIVE_UI_RECEIPT_DESCRIPTOR"]);
 const checkDigestEnvironment = new Set(["ENOUGH_NATIVE_INDEX_SHA256", "ENOUGH_ACCEPTANCE_INDEX_SHA256"]);
 const checkMountPattern = /^\/workspaces\/[a-zA-Z0-9][a-zA-Z0-9._-]{0,47}$/;
+
+type SourceMode = { kind: "directory" | "file" | "symlink"; mode: number };
+
+/** The check owns these private copies; never follow authored links while attesting them. */
+async function sourceModes(roots: readonly { path: string; containerPath: string }[], expected?: ReadonlyMap<string, SourceMode>): Promise<Map<string, SourceMode>> {
+  const modes = new Map<string, SourceMode>();
+  for (const root of roots) {
+    if (!(await lstat(root.path)).isDirectory()) throw new Error("Check source root identity changed");
+    const visit = async (path: string, relative: string): Promise<void> => {
+      const key = `${root.containerPath}/${relative}`;
+      // Newly generated dependency/build trees are not original inputs to attest.
+      if (expected && !expected.has(key)) return;
+      const state = await lstat(path);
+      const kind = state.isSymbolicLink() ? "symlink" : state.isDirectory() ? "directory" : state.isFile() ? "file" : undefined;
+      if (!kind) throw new Error(`Check source contains a special file: ${root.containerPath}/${relative}`);
+      if (modes.size >= 100_000) throw new Error("Check source mode inventory exceeded its entry limit");
+      modes.set(key, { kind, mode: state.mode & 0o777 });
+      if (kind === "directory") {
+        let names: string[];
+        try { names = await readdir(path); }
+        catch (error) { throw new Error(`Check source metadata is unreadable: ${key} (observed mode ${(state.mode & 0o777).toString(8)}${expected?.has(key) ? `, expected ${expected.get(key)!.mode.toString(8)}` : ""}): ${error instanceof Error ? error.message : String(error)}`); }
+        for (const name of names.sort()) if (name.toLowerCase() !== ".git") await visit(join(path, name), relative ? `${relative}/${name}` : name);
+      }
+    };
+    await visit(root.path, "");
+  }
+  return modes;
+}
+
+function changedSourceModes(before: Map<string, SourceMode>, after: Map<string, SourceMode>): string[] {
+  const changes: string[] = [];
+  for (const [path, expected] of before) {
+    const actual = after.get(path);
+    if (actual && actual.kind === expected.kind && actual.mode === expected.mode) continue;
+    changes.push(`${path}: expected ${expected.kind} mode ${expected.mode.toString(8)}, observed ${actual ? `${actual.kind} mode ${actual.mode.toString(8)}` : "missing"}`);
+  }
+  return changes;
+}
 
 function plainRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value) && [Object.prototype, null].includes(Object.getPrototypeOf(value));
@@ -145,6 +184,7 @@ export function dockerCheckExecutor(options: { image?: string; dockerRuntime?: D
         if (destinations.has(root.containerPath.toLowerCase())) throw new Error("Duplicate check working-directory destination");
         destinations.add(root.containerPath.toLowerCase());
       }
+      const originalModes = await sourceModes(roots);
       const name = `enough-check-${randomUUID()}`;
       const reportContainers = containers.get(context.path) ?? new Set<string>();
       containers.set(context.path, reportContainers);
@@ -160,7 +200,6 @@ export function dockerCheckExecutor(options: { image?: string; dockerRuntime?: D
         const mounts: string[] = [];
         const initialization: string[] = [];
         const emptyDirectoryChecks: string[] = [];
-        const emptyDirectoryRestorations: string[] = [];
         const environment = ["--env", `GIT_CONFIG_COUNT=${roots.length}`];
         for (const [key, value] of Object.entries(checkInputs?.environment ?? {})) environment.push(`--env=${key}=${value}`);
         let caches = buildCaches.get(context.path);
@@ -186,10 +225,8 @@ export function dockerCheckExecutor(options: { image?: string; dockerRuntime?: D
             if (!entry || typeof entry.path !== "string" || !entry.path || entry.path.includes("\0") || entry.path.includes("\\") || entry.path.startsWith("/") || entry.path.split("/").some((part: string) => !part || part === "." || part === ".." || part.toLowerCase() === ".git") || !Number.isInteger(entry.mode) || entry.mode < 0 || entry.mode > 0o777) throw new Error("Invalid captured empty-directory path or mode");
             const path = shellLiteral(`${root.containerPath}/${entry.path}`);
             const mode = entry.mode.toString(8);
-            const flag = `preserve_empty_${emptyDirectoryChecks.length}`;
             const diagnostic = shellLiteral(`Captured empty directory changed: ${root.containerPath}/${entry.path} (expected mode ${mode})`);
-            emptyDirectoryChecks.push(`${flag}=0; if [ ! -L ${path} ] && [ -d ${path} ] && [ "$(stat -c '%a' -- ${path} 2>/dev/null)" = '${mode}' ]; then ${flag}=1; else printf '%s\\n' ${diagnostic} >&2; if [ "$command_status" -eq 0 ]; then command_status=1; fi; fi`);
-            emptyDirectoryRestorations.push(`if [ "$${flag}" -eq 1 ] && [ ! -L ${path} ] && [ -d ${path} ]; then chmod '${mode}' -- ${path} 2>/dev/null || true; fi`);
+            emptyDirectoryChecks.push(`if [ -L ${path} ] || [ ! -d ${path} ] || [ "$(stat -c '%a' -- ${path} 2>/dev/null)" != '${mode}' ]; then printf '%s\\n' ${diagnostic} >&2; if [ "$command_status" -eq 0 ]; then command_status=1; fi; fi`);
           }
         }
         // Keep nested cache mounts after their source binds. These fresh, per-package volumes
@@ -200,9 +237,9 @@ export function dockerCheckExecutor(options: { image?: string; dockerRuntime?: D
         // read-only seed, overlaid by a volume at each root's .git. Checks can configure their Git
         // without changing the metadata used by the host's post-check inspection. All writable
         // source mounts are private exact candidate copies, never the original source folders.
-        // Attest captured modes before accessibility cleanup. Restore only directories that
-        // matched then; real mode edits fail the command and remain visible in final evidence.
-        const cleanup = `cleanup() { command_status=$?; ${emptyDirectoryChecks.join("; ")}${emptyDirectoryChecks.length ? "; " : ""}chmod -R a+rwX ${roots.map(root => root.containerPath).join(" ")} 2>/dev/null || true; ${emptyDirectoryRestorations.join("; ")}${emptyDirectoryRestorations.length ? "; " : ""}trap - EXIT; exit "$command_status"; }`;
+        // Do not widen source permissions for cleanup: inspection binds their full modes.
+        // Accessibility changes belong to retirement, after source/report evidence is saved.
+        const cleanup = `cleanup() { command_status=$?; ${emptyDirectoryChecks.join("; ")}${emptyDirectoryChecks.length ? "; " : ""}trap - EXIT; exit "$command_status"; }`;
         const compatibility = process.platform === "darwin" && toolchain?.id === "swift-6.0.3" ? swiftCheckCompatibilityBootstrap() : undefined;
         const wrapper = `${initialization.join("; ")}; ${cleanup}; trap cleanup EXIT; ${compatibility?.preparation ?? ""}${compatibility?.invocation ?? `${toolchain ? "bash" : "sh"} -lc "$1"`}`;
         const output = await runManagedDocker(dockerRuntime, ["run", "--name", name, "--rm", "--user", "0:0", "--label", "enoughfactory.role=check", ...mounts, ...environment, "--workdir", "/work", toolchain?.image ?? options.image ?? "node:22-bookworm", "sh", "-c", wrapper, "enoughfactory-check", context.command], { timeoutMs: context.timeoutMs, signal: context.signal });
@@ -221,6 +258,15 @@ export function dockerCheckExecutor(options: { image?: string; dockerRuntime?: D
           const removed = await runManagedDocker(dockerRuntime, ["rm", "--force", name], { timeoutMs: 30_000 });
           if (removed.timedOut || removed.exitCode !== 0 && !/no such container/i.test(removed.stderr)) throw new Error(removed.timedOut ? "Check container removal timed out; termination is unconfirmed" : removed.stderr.trim() || "Could not terminate check container");
           reportContainers.delete(name);
+          // A stopped, removed exact container cannot race this read-only attestation.
+          const changed = changedSourceModes(originalModes, await sourceModes(roots, originalModes));
+          if (changed.length) {
+            const detail = `Check changed source metadata:\n${changed.slice(0, 100).join("\n")}${changed.length > 100 ? `\n${changed.length - 100} more entries changed` : ""}`;
+            passed = false;
+            failureDetail = `${failureDetail ? `${failureDetail}\n` : ""}${detail}`;
+            if (completed) { completed.exitCode = completed.exitCode || 1; completed.stderr = failureDetail; }
+            else throw new Error(detail);
+          }
         } catch (error) {
           passed = false;
           failureDetail = `${failureDetail ? `${failureDetail}\n` : ""}Check cleanup failed: ${error instanceof Error ? error.message : String(error)}`;

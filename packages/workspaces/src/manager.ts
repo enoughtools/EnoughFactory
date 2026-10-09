@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, mkdtemp, readFile, writeFile, copyFile, rm, access, readdir } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, writeFile, copyFile, rm, access, readdir, lstat, chmod } from "node:fs/promises";
 import { join, resolve, dirname, isAbsolute } from "node:path";
 import { ArtifactStore, writeAtomic } from "./artifacts.ts";
 import { candidateCheckInputs, candidateDevelopmentToolchain, dockerCheckExecutor, frozenDevelopmentToolchain, sameDevelopmentRecipe, validateCheckInputs } from "./checks.ts";
@@ -23,6 +23,7 @@ export class WorkspaceManager {
   private readonly executor: CheckExecutor;
   private readonly workingDirectories: WorkingDirectoryManager;
   private readonly integrations = new Map<string, Promise<unknown>>();
+  private readonly unpersistedChecks = new Map<string, CheckReport>();
 
   constructor(private readonly options: WorkspaceManagerOptions) {
     this.root = resolve(options.dataDir);
@@ -258,10 +259,14 @@ export class WorkspaceManager {
   private async releaseCheck(path: string, report?: CheckReport): Promise<boolean> {
     // Completed reports already released their runtime before auditing source. Never
     // delete snapshots that may still be mounted or contain unresolved cleanup evidence.
-    if (report?.cleanupErrors?.length) return false;
+    if (report?.cleanupErrors?.length || this.unpersistedChecks.has(path)) return false;
     if (!report) await this.executor.release?.(path);
     try {
+      // Source and command evidence have already been preserved. Only these exact private
+      // snapshots are now being retired; readonly generated directories must not leak them.
+      await makeRetiredCheckRemovable(path);
       await rm(path, { recursive: true, force: true });
+      await makeRetiredCheckRemovable(`${path}-working-directories`);
       await rm(`${path}-working-directories`, { recursive: true, force: true });
       return true;
     } catch (error) {
@@ -301,6 +306,9 @@ export class WorkspaceManager {
       if (signal?.aborted) { report.status = "canceled"; break; }
       let result;
       try {
+        // A dispatched executor can have effects even if it throws. Until both report and
+        // artifact are durable, this is executed source rather than disposable preparation.
+        this.unpersistedChecks.set(path, report);
         result = await this.executor({ path, commit, candidate, workingDirectories, command, timeoutMs: this.options.checkTimeoutMs ?? 15 * 60 * 1000, signal, executionTargetKind: candidate.executionTargetKind, verification });
         const actualToolchain = frozenDevelopmentToolchain(result.developmentToolchain);
         if (actualToolchain) {
@@ -319,7 +327,7 @@ export class WorkspaceManager {
       }
       if (result.exitCode !== 0 || result.timedOut) { report.status = signal?.aborted ? "canceled" : "failed"; break; }
     }
-    let sourceAuditSkipped: string | undefined;
+    let sourceAuditSkipped = report.cleanupErrors?.length ? "Command cleanup or source attestation failed; private snapshots were retained without further source inspection" : undefined;
     try { await this.executor.release?.(path); }
     catch (error) {
       report.cleanupErrors = [...report.cleanupErrors ?? [], `Could not release check resources: ${error instanceof Error ? error.message : String(error)}`];
@@ -327,22 +335,37 @@ export class WorkspaceManager {
       sourceAuditSkipped = "Check resource release was not confirmed; private snapshots were retained without inspecting potentially active mounts";
     }
     // Checks that edit tracked files cannot attest the original candidate after those edits.
-    const dirty = sourceAuditSkipped ? undefined : await git(path, "status", "--porcelain", "--untracked-files=no");
-    const actualHead = sourceAuditSkipped ? undefined : await git(path, "rev-parse", "HEAD");
-    const rootStates = sourceAuditSkipped ? undefined : await Promise.all(workingDirectories.map(async (root, index) => {
-      const expectedEmptyDirectories = candidate.workingDirectories![index]!.bundleArtifact.metadata?.emptyDirectories ?? [];
-      const emptyDirectories = await workingDirectoryEmptyDirectories(root.path);
-      return { containerPath: root.containerPath, commit: root.commit, dirty: await workingDirectoryGit(root.path, "status", "--porcelain", "--untracked-files=all"), actualHead: await workingDirectoryGit(root.path, "rev-parse", "HEAD"), emptyDirectories, expectedEmptyDirectories, emptyDirectoriesMatch: JSON.stringify(emptyDirectories) === JSON.stringify(expectedEmptyDirectories) };
-    }));
+    let dirty: string | undefined, actualHead: string | undefined;
+    let rootStates: Array<{ containerPath: string; commit: string; dirty: string; actualHead: string; emptyDirectories: unknown; expectedEmptyDirectories: unknown; emptyDirectoriesMatch: boolean }> | undefined;
     const unresolved: string[] = [];
-    for (const file of sourceAuditSkipped ? [] : candidate.repairConflicts ?? []) {
-      // Read the immutable Git object; a candidate symlink must never cause a host filesystem read.
-      const blob = await run("git", ["-C", path, "show", `${commit}:${file}`]);
-      const contents = blob.exitCode === 0 ? blob.stdout : "";
-      if (/^<{7} /m.test(contents) && /^>{7} /m.test(contents)) unresolved.push(file);
+    if (!sourceAuditSkipped) try {
+      dirty = await git(path, "status", "--porcelain", "--untracked-files=no");
+      actualHead = await git(path, "rev-parse", "HEAD");
+      rootStates = await Promise.all(workingDirectories.map(async (root, index) => {
+        const expectedEmptyDirectories = candidate.workingDirectories![index]!.bundleArtifact.metadata?.emptyDirectories ?? [];
+        const emptyDirectories = await workingDirectoryEmptyDirectories(root.path);
+        return { containerPath: root.containerPath, commit: root.commit, dirty: await workingDirectoryGit(root.path, "status", "--porcelain", "--untracked-files=all"), actualHead: await workingDirectoryGit(root.path, "rev-parse", "HEAD"), emptyDirectories, expectedEmptyDirectories, emptyDirectoriesMatch: JSON.stringify(emptyDirectories) === JSON.stringify(expectedEmptyDirectories) };
+      }));
+      for (const file of candidate.repairConflicts ?? []) {
+        // Read the immutable Git object; a candidate symlink must never cause a host filesystem read.
+        const blob = await run("git", ["-C", path, "show", `${commit}:${file}`]);
+        const contents = blob.exitCode === 0 ? blob.stdout : "";
+        if (/^<{7} /m.test(contents) && /^>{7} /m.test(contents)) unresolved.push(file);
+      }
+    } catch (error) {
+      report.cleanupErrors = [...report.cleanupErrors ?? [], `Could not audit check source: ${error instanceof Error ? error.message : String(error)}`];
+      report.status = "failed";
+      sourceAuditSkipped = "Check source could not be audited; original command evidence and private snapshots were retained";
+      dirty = undefined; actualHead = undefined; rootStates = undefined;
     }
     if (!sourceAuditSkipped && (dirty || actualHead !== commit || unresolved.length || rootStates?.some(root => root.dirty || root.actualHead !== root.commit || !root.emptyDirectoriesMatch))) report.status = "failed";
-    await this.saveCheckReport(report, { dirty, actualHead, unresolved: sourceAuditSkipped ? undefined : unresolved, workingDirectories: rootStates, sourceAuditSkipped, retainedCheckPath: report.cleanupErrors?.length ? path : undefined }, candidate);
+    try {
+      await this.saveCheckReport(report, { dirty, actualHead, unresolved: sourceAuditSkipped ? undefined : unresolved, workingDirectories: rootStates, sourceAuditSkipped, retainedCheckPath: report.cleanupErrors?.length ? path : undefined }, candidate);
+      this.unpersistedChecks.delete(path);
+    } catch (cause) {
+      if (!this.unpersistedChecks.has(path)) throw cause;
+      throw Object.assign(new Error(`Could not preserve check evidence; executed source was retained at ${path}: ${cause instanceof Error ? cause.message : String(cause)}`, { cause }), { report, retainedCheckPath: path });
+    }
     return report;
   }
 
@@ -485,6 +508,15 @@ export class WorkspaceManager {
     // Retain source/candidate/artifact evidence. Explicit cleanup removes only the author workspace.
     await rm(join(this.root, "workspaces", safeId(workspaceId)), { recursive: true, force: true });
   }
+}
+
+async function makeRetiredCheckRemovable(path: string): Promise<void> {
+  let entry;
+  try { entry = await lstat(path); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return; throw error; }
+  if (!entry.isDirectory() || entry.isSymbolicLink()) return;
+  await chmod(path, (entry.mode & 0o777) | 0o700);
+  for (const name of await readdir(path)) await makeRetiredCheckRemovable(join(path, name));
 }
 
 async function exists(path: string): Promise<boolean> { try { await access(path); return true; } catch { return false; } }
