@@ -34,7 +34,13 @@ export interface HostOperatorRebootTermination extends HostProcessTerminationBas
   actor: string; verificationRunId: string; chatId: string; sessionId: string; cwd: string; processKey: string;
   beforeWitness: HostRebootWitness; afterWitness: HostRebootWitness;
 }
-export type HostProcessTermination = HostKernelRebootTermination | HostOperatorRebootTermination;
+export interface HostSupervisedTermination extends HostProcessTerminationBase {
+  kind: "supervised-termination"; evidence: "complete-owned-teardown";
+  processKey: string; sessionId: string; cwd: string; inventoryComplete: true;
+  supervisor: { pid: number; identity: string; path: string };
+  children: Array<{ pid: number; identity: string }>; exitCode: null; exitSignal: "SIGKILL";
+}
+export type HostProcessTermination = HostKernelRebootTermination | HostOperatorRebootTermination | HostSupervisedTermination;
 export interface HostObservedRebootInput {
   processKey: string; sessionId: string; cwd: string; priorRecordSha256: string; currentBootId: string;
   actor: string; verificationRunId: string; chatId: string;
@@ -211,6 +217,21 @@ function rebootTermination(directory: string, filename: string, record: HostProc
   return proof;
 }
 
+/** The durable cancellation receipt is written only after a frozen, complete
+ * child inventory and positive owned-process teardown. Transport EOF alone,
+ * missing PIDs or an idle conversation cannot create this evidence. */
+function supervisedTermination(directory: string, filename: string, record: HostProcessRecord, boot: HostBootIdentity | undefined, probeIdentity: (pid: number) => string | undefined): HostSupervisedTermination | undefined {
+  if (record.status !== "exited" || record.inventoryComplete !== true || record.exitCode !== null || record.exitSignal !== "SIGKILL" || !record.pid || !record.identity || !ownedIdentity(record, record.identity) || !Array.isArray(record.children) || !validBoot(record.boot) || !boot || !validBoot(boot) || record.boot.machineId !== boot.machineId || record.boot.platform !== boot.platform || !ownedReceipt(directory, filename, record)) return undefined;
+  if (ownedIdentity(record, probeIdentity(record.pid)) || record.children.some(child => probeIdentity(child.pid) === child.identity)) return undefined;
+  return {
+    schemaVersion: 2, kind: "supervised-termination", evidence: "complete-owned-teardown", observedAt: record.updatedAt,
+    currentBoot: boot, previousStatus: "exited", previousUpdatedAt: record.updatedAt,
+    priorRecordSha256: createHash("sha256").update(readFileSync(filename)).digest("hex"),
+    processKey: record.processKey, sessionId: record.sessionId, cwd: record.cwd, inventoryComplete: true,
+    supervisor: { pid: record.pid, identity: record.identity, path: record.supervisorPath }, children: structuredClone(record.children), exitCode: null, exitSignal: "SIGKILL",
+  };
+}
+
 function processIdentity(pid: number): string | undefined {
   try { return execFileSync("/bin/ps", ["-p", String(pid), "-o", "lstart=", "-o", "command="], { encoding: "utf8", timeout: 10_000 }).trim(); }
   catch (error) {
@@ -281,7 +302,15 @@ export function reconcileHostProcesses(directory: string, probes: HostProcessRec
   const probeIdentity = probes.processIdentity ?? processIdentity;
   return records(directory).map(({ filename, record }) => {
     const state = { processKey: record.processKey, sessionId: record.sessionId, pid: record.pid, createdAt: record.createdAt, cwd: record.cwd, recordPath: filename };
-    if (record.status === "exited") return { ...state, state: "exited" };
+    if (record.status === "exited") {
+      if (record.inventoryComplete !== true) return { ...state, state: "exited" };
+      if (!bootRead) { bootRead = true; boot = (probes.readBoot ?? readHostBootIdentity)(); }
+      try {
+        if (record.pid && ownedIdentity(record, probeIdentity(record.pid)) || (record.children ?? []).some(child => probeIdentity(child.pid) === child.identity)) return { ...state, state: "unknown" };
+        const termination = supervisedTermination(directory, filename, record, boot, probeIdentity);
+        return { ...state, state: "exited", ...(termination ? { termination } : {}) };
+      } catch { return { ...state, state: "unknown" }; }
+    }
     if (!bootRead) { bootRead = true; boot = (probes.readBoot ?? readHostBootIdentity)(); }
     let identity: string | undefined;
     try { if (record.pid) identity = probeIdentity(record.pid); } catch { return { ...state, state: "unknown" }; }

@@ -117,11 +117,12 @@ async function interruptedHostReceipt() {
   const filename = path.join(state.processDirectory, `${author.processKey}.json`);
   const running = JSON.parse(await readFile(filename, "utf8"));
   await author.stop(); await author.exit;
+  const terminated = JSON.parse(await readFile(filename, "utf8"));
   // Simulate a lost service/OS transport using the original running receipt.
   // Its actual subprocess was positively stopped above, so the test leaks none.
   running.status = "outcome-unknown";
   await writeFile(filename, JSON.stringify(running));
-  return { ...f, ...state, filename, running, proofPath: path.join(state.processDirectory, `${author.processKey}.reboot.json`) };
+  return { ...f, ...state, filename, running, terminated, proofPath: path.join(state.processDirectory, `${author.processKey}.reboot.json`) };
 }
 function laterBoot(original: HostBootIdentity): HostBootIdentity {
   const started = Date.now() + 20_000;
@@ -288,5 +289,50 @@ test("operator reboot migration rejects wrong receipt/boot/context, unsafe owner
     await writeFile(f.filename, original);
     const proofPath = path.join(f.processDirectory, `${f.running.processKey}.operator-reboot.json`);
     await assert.rejects(readFile(proofPath), { code: "ENOENT" });
+  } finally { await rm(f.directory, { recursive: true, force: true }); }
+});
+
+test("completed supervised teardown exposes exact positive termination evidence on the same boot", async () => {
+  const f = await interruptedHostReceipt();
+  try {
+    // The fixture retains the original running receipt. Restore the complete
+    // termination journal produced by its genuine supervised stop.
+    await writeFile(f.filename, JSON.stringify(f.terminated));
+    const original = await readFile(f.filename, "utf8"), digest = (await import("node:crypto")).createHash("sha256").update(original).digest("hex");
+    const state = reconcileHostProcesses(f.processDirectory)[0]!;
+    assert.equal(state.state, "exited");
+    assert.equal(state.termination?.kind, "supervised-termination");
+    if (state.termination?.kind !== "supervised-termination") throw new Error("Expected complete supervised teardown proof");
+    assert.equal(state.termination.evidence, "complete-owned-teardown"); assert.equal(state.termination.priorRecordSha256, digest);
+    assert.equal(state.termination.processKey, f.running.processKey); assert.equal(state.termination.sessionId, input.sessionId); assert.equal(state.termination.cwd, f.cwd);
+    assert.deepEqual(state.termination.supervisor, { pid: f.running.pid, identity: f.running.identity, path: f.running.supervisorPath });
+    assert.deepEqual(state.termination.children, f.terminated.children); assert.equal(state.termination.inventoryComplete, true);
+    assert.equal(state.termination.exitCode, null); assert.equal(state.termination.exitSignal, "SIGKILL");
+    assert.equal(state.termination.currentBoot.bootId, f.running.boot.bootId, "No reboot or operator attestation is needed");
+    assert.equal(await readFile(f.filename, "utf8"), original, "Recovery does not relabel or rewrite the complete teardown receipt");
+    const recycled = reconcileHostProcesses(f.processDirectory, { processIdentity: () => "unrelated replacement process" })[0]!;
+    assert.equal(recycled.termination?.kind, "supervised-termination"); assert.equal(process.kill(process.pid, 0), true);
+  } finally { await rm(f.directory, { recursive: true, force: true }); }
+});
+
+test("EOF, incomplete inventories, changed owners and matching live tools cannot create supervised termination proof", async () => {
+  const f = await interruptedHostReceipt();
+  try {
+    const complete = f.terminated;
+    for (const change of [
+      { inventoryComplete: false }, { inventoryComplete: undefined }, { exitCode: 0, exitSignal: null },
+      { children: undefined }, { identity: "unowned process" }, { boot: undefined }, { status: "outcome-unknown" },
+    ]) {
+      await writeFile(f.filename, JSON.stringify({ ...complete, ...change }));
+      assert.equal(reconcileHostProcesses(f.processDirectory)[0]?.termination, undefined, "Only complete positive supervised teardown can admit continuation");
+    }
+    await writeFile(f.filename, JSON.stringify(complete));
+    assert.equal(reconcileHostProcesses(f.processDirectory, { processIdentity: pid => pid === complete.pid ? complete.identity : undefined })[0]?.state, "unknown", "A matching live supervisor fences continuation");
+    const child = complete.children[0]; assert.ok(child);
+    assert.equal(reconcileHostProcesses(f.processDirectory, { processIdentity: pid => pid === child.pid ? child.identity : undefined })[0]?.state, "unknown", "A matching live owned child fences continuation");
+    const source = await readFile(complete.supervisorPath, "utf8");
+    await writeFile(complete.supervisorPath, "changed supervisor ownership");
+    assert.equal(reconcileHostProcesses(f.processDirectory)[0]?.termination, undefined);
+    await writeFile(complete.supervisorPath, source);
   } finally { await rm(f.directory, { recursive: true, force: true }); }
 });

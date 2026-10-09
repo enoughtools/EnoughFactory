@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test, { type TestContext } from 'node:test';
 import { createHash } from 'node:crypto';
-import type { HostOperatorRebootTermination, HostProcessState } from '@enoughfactory/agents';
+import type { HostOperatorRebootTermination, HostProcessState, HostSupervisedTermination } from '@enoughfactory/agents';
 import type { Chat, ExecutionTargetAdvertisement, Goal, InspectionAuthority, InspectionSourceIdentity, InspectionVerificationRun, Project, Session, TaskQualityRequirements } from '@enoughfactory/contracts';
 import { ArtifactStore, InspectionSnapshotManager, importInspectionSnapshot, type InspectionSnapshot, type InspectionSnapshotTransfer } from '@enoughfactory/workspaces';
 import type { DeviceApp } from './app.ts';
@@ -1280,6 +1280,62 @@ test('legacy operator attestation cannot authorize another run, chat, process, w
     f.setHostProcesses([{ ...f.process, termination: mutate(operatorRebootProof(f)) }]);
     assert.deepEqual(await f.recovered.ensure(f.input), f.run); assert.equal(f.calls.length, 1); assert.equal(f.reconciliations(), 0);
     assert.equal(f.store.events('inspection-verifier-reconciliation', f.run.id).length, 0);
+  });
+});
+
+function supervisedTerminationProof(f: Awaited<ReturnType<typeof rebootedVerifierFixture>>): HostSupervisedTermination {
+  const supervisorPath = f.process.recordPath.replace(/\.json$/, '.cjs');
+  return {
+    schemaVersion: 2, kind: 'supervised-termination', evidence: 'complete-owned-teardown', observedAt: new Date().toISOString(),
+    currentBoot: f.process.termination!.currentBoot, previousStatus: 'exited', previousUpdatedAt: new Date().toISOString(), priorRecordSha256: 'a'.repeat(64),
+    processKey: f.process.processKey, sessionId: f.run.sessionId!, cwd: f.process.cwd!, inventoryComplete: true,
+    supervisor: { pid: 1337, path: supervisorPath, identity: `Original supervisor ${supervisorPath} ${f.process.processKey}` },
+    children: [{ pid: 7331, identity: 'Original owned verifier tool' }], exitCode: null, exitSignal: 'SIGKILL',
+  };
+}
+
+test('a complete supervised provider stop resumes only the same retained verifier without claiming a reboot or success', async t => {
+  const f = await rebootedVerifierFixture(t), proof = supervisedTerminationProof(f);
+  f.setHostProcesses([{ ...f.process, pid: proof.supervisor.pid, termination: proof }]);
+  const unknownAction = { id: 'original-unknown-action', status: 'unknown', requestId: 'never-replay-original-request', source: f.run.source };
+  f.store.set('inspection-actions', unknownAction);
+  const result = await f.recovered.ensure(f.input);
+  assert.equal(result.status, 'succeeded'); assert.equal(result.id, f.run.id); assert.equal(result.sessionId, f.run.sessionId); assert.equal(result.chatId, f.run.chatId);
+  assert.equal(result.startedAt, f.run.startedAt); assert.deepEqual(result.authority, f.run.authority); assert.deepEqual(result.source, f.run.source);
+  assert.equal(f.calls.length, 2); assert.equal(f.preparations.length, 1); assert.equal(f.reconciliations(), 1);
+  assert.equal(f.calls[1]!.chatId, f.calls[0]!.chatId); assert.equal(f.store.get<Chat>('chats', f.run.chatId!)!.threadId, 'original-rebooted-provider-thread');
+  assert.deepEqual(f.store.get('inspection-actions', unknownAction.id), unknownAction);
+  assert.match(f.calls[1]!.prompt, /never repeat their old request IDs/);
+  const audit = f.store.events<{ action: string; previous: InspectionVerificationRun; processes: HostProcessState[] }>('inspection-verifier-reconciliation', result.id)[0]!.value;
+  assert.equal(audit.action, 'host-supervised-continuation'); assert.deepEqual(audit.previous, f.run); assert.equal(audit.previous.status, 'unknown');
+  assert.deepEqual(audit.processes[0]!.termination, proof);
+});
+
+test('supervised continuation refuses incomplete teardown, mismatched ownership and unresolved dependent processes', async t => {
+  const cases: Array<[string, (proof: HostSupervisedTermination) => HostSupervisedTermination]> = [
+    ['incomplete inventory', proof => ({ ...proof, inventoryComplete: false } as unknown as HostSupervisedTermination)],
+    ['EOF without owned teardown', proof => ({ ...proof, exitCode: 0, exitSignal: null } as unknown as HostSupervisedTermination)],
+    ['different process', proof => ({ ...proof, processKey: 'another-process' })],
+    ['different session', proof => ({ ...proof, sessionId: 'another-session' })],
+    ['different source directory', proof => ({ ...proof, cwd: '/another/source' })],
+    ['missing original receipt hash', proof => ({ ...proof, priorRecordSha256: '' })],
+    ['another supervisor PID', proof => ({ ...proof, supervisor: { ...proof.supervisor, pid: 9999 } })],
+    ['unowned supervisor path', proof => ({ ...proof, supervisor: { ...proof.supervisor, path: '/another/owner.cjs' } })],
+    ['unowned supervisor identity', proof => ({ ...proof, supervisor: { ...proof.supervisor, identity: 'unrelated replacement' } })],
+    ['missing owned child inventory', proof => ({ ...proof, children: undefined } as unknown as HostSupervisedTermination)],
+    ['invalid owned child identity', proof => ({ ...proof, children: [{ pid: 7331, identity: '' }] })],
+    ['teardown predates verifier', proof => ({ ...proof, observedAt: '2000-01-01T00:00:00.000Z' })],
+  ];
+  for (const [label, mutate] of cases) await t.test(label, async inner => {
+    const f = await rebootedVerifierFixture(inner), proof = mutate(supervisedTerminationProof(f));
+    f.setHostProcesses([{ ...f.process, pid: 1337, termination: proof }]);
+    assert.deepEqual(await f.recovered.ensure(f.input), f.run); assert.equal(f.calls.length, 1); assert.equal(f.reconciliations(), 0);
+    assert.equal(f.store.events('inspection-verifier-reconciliation', f.run.id).length, 0);
+  });
+  await t.test('unknown autonomous decision owner', async inner => {
+    const f = await rebootedVerifierFixture(inner), proof = supervisedTerminationProof(f);
+    f.setHostProcesses([{ ...f.process, pid: 1337, termination: proof }, { ...f.process, processKey: 'decision-owner', sessionId: `${f.run.sessionId}-decision-original`, state: 'unknown' }]);
+    assert.deepEqual(await f.recovered.ensure(f.input), f.run); assert.equal(f.calls.length, 1); assert.equal(f.reconciliations(), 0);
   });
 });
 

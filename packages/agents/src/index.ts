@@ -17,7 +17,7 @@ export { ApprovalRouter, matchPolicyRule } from "./policy.ts";
 export { CODEX_PROTOCOL_VERSION, codexApprovalResponse } from "./codex.ts";
 export type { CodexPayloadRelease } from "./provision.ts";
 export { prepareAgentToolchain, verifyPreparedAgentToolchain, type PreparedAgentToolchain, type AgentToolchainOptions } from "./toolchain-image.ts";
-export { HostProcess, cancelHostProcess, reconcileHostProcesses, readHostBootIdentity, attestLegacyHostReboot, type HostProcessState, type HostBootIdentity, type HostProcessTermination, type HostOperatorRebootTermination, type HostObservedRebootInput } from "./host-process.ts";
+export { HostProcess, cancelHostProcess, reconcileHostProcesses, readHostBootIdentity, attestLegacyHostReboot, type HostProcessState, type HostBootIdentity, type HostProcessTermination, type HostOperatorRebootTermination, type HostSupervisedTermination, type HostObservedRebootInput } from "./host-process.ts";
 export { provisionHostCodex, hostCodexAvailability, type HostCodexRuntime, type HostProvisionOptions } from "./host-provision.ts";
 export { codexToolConfiguration } from "./tool-config.ts";
 
