@@ -1,7 +1,8 @@
 import { spawn, execFileSync, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createInterface } from "node:readline";
-import { randomUUID } from "node:crypto";
-import { lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
+import { lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, writeFileSync, type Stats } from "node:fs";
+import { uptime } from "node:os";
 import path from "node:path";
 import type { AgentProcess, SpawnProcess } from "./process.ts";
 import { AgentError } from "./types.ts";
@@ -13,8 +14,38 @@ interface HostProcessRecord {
   exitCode?: number | null; exitSignal?: NodeJS.Signals | null;
   children?: Array<{ pid: number; identity: string }>;
   inventoryComplete?: boolean;
+  boot?: HostBootIdentity;
 }
-export interface HostProcessState { processKey: string; sessionId: string; pid?: number; state: "active" | "exited" | "unknown"; recordPath: string; }
+export interface HostBootIdentity {
+  schemaVersion: 1; platform: "darwin" | "linux"; machineId: string; bootId: string;
+  startedAt: string; observedAt: string; uptimeMs: number;
+}
+/** Positive process termination evidence. This never asserts a successful agent turn. */
+interface HostProcessTerminationBase {
+  schemaVersion: 2; observedAt: string; currentBoot: HostBootIdentity;
+  previousStatus: HostProcessRecord["status"]; previousUpdatedAt: string; priorRecordSha256: string;
+}
+export interface HostKernelRebootTermination extends HostProcessTerminationBase {
+  kind: "host-reboot"; evidence: "boot-identity-change"; previousBoot: HostBootIdentity;
+}
+export interface HostRebootWitness { path: string; sha256: string; content: string; }
+export interface HostOperatorRebootTermination extends HostProcessTerminationBase {
+  kind: "operator-attested-reboot"; evidence: "operator-observed-os-restart";
+  actor: string; verificationRunId: string; chatId: string; sessionId: string; cwd: string; processKey: string;
+  beforeWitness: HostRebootWitness; afterWitness: HostRebootWitness;
+}
+export type HostProcessTermination = HostKernelRebootTermination | HostOperatorRebootTermination;
+export interface HostObservedRebootInput {
+  processKey: string; sessionId: string; cwd: string; priorRecordSha256: string; currentBootId: string;
+  actor: string; verificationRunId: string; chatId: string;
+  beforeWitness: { path: string; sha256: string }; afterWitness: { path: string; sha256: string };
+}
+export interface HostProcessState {
+  processKey: string; sessionId: string; pid?: number; createdAt?: string; cwd?: string;
+  state: "active" | "exited" | "unknown"; recordPath: string; termination?: HostProcessTermination;
+}
+/** Trusted OS probes may be injected by process recovery tests; no request data belongs here. */
+export interface HostProcessRecoveryProbes { readBoot?: () => HostBootIdentity | undefined; processIdentity?: (pid: number) => string | undefined; }
 export interface HostProcessOptions {
   cwd: string; environment: NodeJS.ProcessEnv; processDirectory: string; sessionId: string;
   spawnProcess?: SpawnProcess;
@@ -36,6 +67,149 @@ child.on('close', (code, signal) => {
   setTimeout(() => { try { process.kill(-process.pid, 'SIGKILL'); } catch { process.exit(typeof code === 'number' ? code : 1); } }, 300);
 });
 `;
+
+const statuses = ["starting", "running", "cancellation-requested", "outcome-unknown", "exited"] as const;
+const uuid = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i;
+function timestamp(value: unknown): number | undefined {
+  if (typeof value !== "string" || !/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/.test(value)) return undefined;
+  const time = Date.parse(value);
+  return Number.isFinite(time) && new Date(time).toISOString() === value ? time : undefined;
+}
+function validBoot(value: unknown): value is HostBootIdentity {
+  const boot = value as HostBootIdentity | undefined;
+  return !!boot && boot.schemaVersion === 1 && ["darwin", "linux"].includes(boot.platform) && /^[a-f0-9]{64}$/.test(boot.machineId) && uuid.test(boot.bootId) && timestamp(boot.startedAt) !== undefined && timestamp(boot.observedAt) !== undefined && Number.isFinite(boot.uptimeMs) && boot.uptimeMs >= 0;
+}
+/** Read identifiers supplied by the kernel, rather than a saved service PID or wall clock alone. */
+export function readHostBootIdentity(): HostBootIdentity | undefined {
+  try {
+    let bootId: string, machineId: string, startedAt: number;
+    if (process.platform === "darwin") {
+      bootId = execFileSync("/usr/sbin/sysctl", ["-n", "kern.bootsessionuuid"], { encoding: "utf8", timeout: 10_000 }).trim().toLowerCase();
+      const bootTime = execFileSync("/usr/sbin/sysctl", ["-n", "kern.boottime"], { encoding: "utf8", timeout: 10_000 });
+      const match = /^\{ sec = (\d+), usec = (\d+) \}/.exec(bootTime);
+      if (!match || Number(match[2]) >= 1_000_000) return undefined;
+      startedAt = Number(match[1]) * 1000 + Math.floor(Number(match[2]) / 1000);
+      const hardware = execFileSync("/usr/sbin/ioreg", ["-rd1", "-c", "IOPlatformExpertDevice"], { encoding: "utf8", timeout: 10_000 });
+      const hardwareId = /"IOPlatformUUID"\s*=\s*"([a-f0-9-]+)"/i.exec(hardware)?.[1];
+      if (!hardwareId || !uuid.test(hardwareId)) return undefined;
+      machineId = createHash("sha256").update(hardwareId.toLowerCase()).digest("hex");
+    } else if (process.platform === "linux") {
+      bootId = readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim().toLowerCase();
+      const hardwareId = readFileSync("/etc/machine-id", "utf8").trim().toLowerCase();
+      if (!/^[a-f0-9]{32}$/.test(hardwareId)) return undefined;
+      machineId = createHash("sha256").update(hardwareId).digest("hex");
+      const match = /^btime (\d+)$/m.exec(readFileSync("/proc/stat", "utf8"));
+      if (!match) return undefined;
+      startedAt = Number(match[1]) * 1000;
+    } else return undefined;
+    const boot: HostBootIdentity = { schemaVersion: 1, platform: process.platform, bootId, machineId, startedAt: new Date(startedAt).toISOString(), observedAt: new Date().toISOString(), uptimeMs: uptime() * 1000 };
+    return validBoot(boot) ? boot : undefined;
+  } catch { return undefined; }
+}
+
+function privateOwnedFile(filename: string): Stats | undefined {
+  try {
+    const stat = lstatSync(filename);
+    return stat.isFile() && !stat.isSymbolicLink() && stat.uid === process.getuid?.() && (stat.mode & 0o077) === 0 ? stat : undefined;
+  } catch { return undefined; }
+}
+function privateOwnedDirectory(directory: string): boolean {
+  try { const stat = lstatSync(directory); return stat.isDirectory() && !stat.isSymbolicLink() && stat.uid === process.getuid?.() && (stat.mode & 0o077) === 0; }
+  catch { return false; }
+}
+function ownedReceipt(directory: string, filename: string, record: HostProcessRecord): boolean {
+  if (timestamp(record.createdAt) === undefined || timestamp(record.updatedAt) === undefined || timestamp(record.updatedAt)! < timestamp(record.createdAt)! || !path.isAbsolute(record.cwd)) return false;
+  if (!privateOwnedDirectory(directory) || !privateOwnedFile(filename) || !privateOwnedFile(record.supervisorPath)) return false;
+  try { return readFileSync(record.supervisorPath, "utf8") === supervisor; } catch { return false; }
+}
+function validTermination(value: unknown, record: HostProcessRecord, digest: string): value is HostProcessTermination {
+  const proof = value as HostProcessTermination | undefined;
+  if (!proof || proof.schemaVersion !== 2 || timestamp(proof.observedAt) === undefined || proof.observedAt !== proof.currentBoot?.observedAt || !validBoot(proof.currentBoot) || proof.priorRecordSha256 !== digest || proof.previousStatus !== record.status || proof.previousUpdatedAt !== record.updatedAt) return false;
+  if (proof.kind === "host-reboot") return proof.evidence === "boot-identity-change" && validBoot(proof.previousBoot) && JSON.stringify(proof.previousBoot) === JSON.stringify(record.boot) && proof.previousBoot.machineId === proof.currentBoot.machineId && proof.previousBoot.platform === proof.currentBoot.platform && proof.previousBoot.bootId !== proof.currentBoot.bootId;
+  return proof.kind === "operator-attested-reboot" && proof.evidence === "operator-observed-os-restart" && !record.boot && proof.processKey === record.processKey && proof.sessionId === record.sessionId && proof.cwd === record.cwd && operatorIdentity(proof) && validWitness(proof.beforeWitness, "before", proof) && validWitness(proof.afterWitness, "after", proof);
+}
+
+function operatorIdentity(input: Pick<HostObservedRebootInput, "actor" | "verificationRunId" | "chatId">): boolean {
+  return [input.actor, input.verificationRunId, input.chatId].every(value => typeof value === "string" && /^[a-zA-Z0-9_./:@-]{1,256}$/.test(value));
+}
+function validWitness(witness: HostRebootWitness, phase: "before" | "after", proof: HostOperatorRebootTermination): boolean {
+  if (!witness || !path.isAbsolute(witness.path) || !/^[a-f0-9]{64}$/.test(witness.sha256) || typeof witness.content !== "string" || Buffer.byteLength(witness.content) > 131072 || createHash("sha256").update(witness.content).digest("hex") !== witness.sha256) return false;
+  try {
+    const manifest = JSON.parse(witness.content) as Record<string, unknown>;
+    if (manifest.schemaVersion !== 1 || manifest.kind !== `operator-observed-reboot-${phase}` || timestamp(manifest.observedAt) === undefined || typeof manifest.observation !== "string" || manifest.observation.length < 20 || manifest.observation.length > 4096) return false;
+    for (const field of ["actor", "verificationRunId", "chatId", "sessionId", "cwd", "processKey", "priorRecordSha256"] as const) if (manifest[field] !== proof[field]) return false;
+    return phase === "before" ? manifest.executionObserved === "running" : manifest.executionObserved === "os-restarted" && manifest.currentBootId === proof.currentBoot.bootId;
+  } catch { return false; }
+}
+function ownedSessionReceipt(directory: string, record: HostProcessRecord): boolean {
+  const home = path.dirname(directory), sessionPath = path.join(home, "session.json");
+  if (path.basename(directory) !== "processes" || path.basename(home) !== createHash("sha256").update(record.sessionId).digest("hex") || !privateOwnedDirectory(home) || !privateOwnedFile(sessionPath)) return false;
+  try {
+    const session = JSON.parse(readFileSync(sessionPath, "utf8")) as { schemaVersion?: number; sessionId?: string; cwd?: string; createdAt?: string };
+    return session.schemaVersion === 1 && session.sessionId === record.sessionId && session.cwd === record.cwd && timestamp(session.createdAt) !== undefined && realpathSync(directory) === path.resolve(directory);
+  } catch { return false; }
+}
+
+/** Privileged local operator migration for pre-boot-UUID journals only. Never
+ * exposed to an author, model tool or automatic recovery. The caller explicitly
+ * attests their observed OS restart; this is not historical kernel UUID proof. */
+export function attestLegacyHostReboot(directory: string, input: HostObservedRebootInput): HostOperatorRebootTermination {
+  if (!operatorIdentity(input) || !uuid.test(input.processKey) || !uuid.test(input.currentBootId) || !/^[a-f0-9]{64}$/.test(input.priorRecordSha256) || !input.sessionId || !path.isAbsolute(input.cwd)) throw new AgentError("The operator reboot attestation identity is invalid.", "HOST_REBOOT_ATTESTATION_INVALID");
+  const selected = records(directory).find(entry => entry.record.processKey === input.processKey);
+  if (!selected) throw new AgentError("The exact original host process receipt is unavailable.", "HOST_REBOOT_ATTESTATION_INVALID");
+  const { record, filename } = selected;
+  const original = readFileSync(filename), digest = createHash("sha256").update(original).digest("hex");
+  if (record.boot || record.status === "exited" || digest !== input.priorRecordSha256 || record.sessionId !== input.sessionId || record.cwd !== input.cwd || !ownedReceipt(directory, filename, record) || !ownedSessionReceipt(directory, record)) throw new AgentError("The original legacy host process ownership changed.", "HOST_REBOOT_ATTESTATION_INVALID");
+  const boot = readHostBootIdentity();
+  if (!boot || boot.bootId !== input.currentBootId.toLowerCase()) throw new AgentError("The current host boot no longer matches the operator observation.", "HOST_REBOOT_ATTESTATION_INVALID");
+  if (record.pid && ownedIdentity(record, processIdentity(record.pid)) || (record.children ?? []).some(child => processIdentity(child.pid) === child.identity)) throw new AgentError("The original host process still has a matching live owner.", "HOST_PROCESS_ACTIVE");
+  const readWitness = (reference: HostObservedRebootInput["beforeWitness"]): HostRebootWitness => {
+    if (!reference || !path.isAbsolute(reference.path) || !/^[a-f0-9]{64}$/.test(reference.sha256)) throw new AgentError("The reboot observation witness is invalid.", "HOST_REBOOT_ATTESTATION_INVALID");
+    const stat = lstatSync(reference.path);
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.uid !== process.getuid?.() || (stat.mode & 0o022) !== 0 || stat.size > 131072) throw new AgentError("The reboot observation witness ownership changed.", "HOST_REBOOT_ATTESTATION_INVALID");
+    return { ...reference, content: readFileSync(reference.path, "utf8") };
+  };
+  const proof: HostOperatorRebootTermination = { schemaVersion: 2, kind: "operator-attested-reboot", evidence: "operator-observed-os-restart", actor: input.actor, verificationRunId: input.verificationRunId, chatId: input.chatId, sessionId: input.sessionId, cwd: input.cwd, processKey: input.processKey, observedAt: boot.observedAt, currentBoot: boot, previousStatus: record.status, previousUpdatedAt: record.updatedAt, priorRecordSha256: digest, beforeWitness: readWitness(input.beforeWitness), afterWitness: readWitness(input.afterWitness) };
+  if (!validTermination(proof, record, digest)) throw new AgentError("The reboot observations do not match this original execution.", "HOST_REBOOT_ATTESTATION_INVALID");
+  const proofPath = path.join(directory, `${record.processKey}.operator-reboot.json`);
+  try {
+    const stat = lstatSync(proofPath);
+    if (!privateOwnedFile(proofPath) || stat.size > 524288) throw new AgentError("The previous reboot attestation is not an owned receipt.", "HOST_REBOOT_ATTESTATION_INVALID");
+    const existing: unknown = JSON.parse(readFileSync(proofPath, "utf8"));
+    if (validTermination(existing, record, digest) && existing.kind === "operator-attested-reboot" && existing.currentBoot.bootId === boot.bootId && existing.actor === proof.actor && existing.verificationRunId === proof.verificationRunId && existing.chatId === proof.chatId && existing.beforeWitness.sha256 === proof.beforeWitness.sha256 && existing.afterWitness.sha256 === proof.afterWitness.sha256) return existing;
+    throw new AgentError("A different reboot attestation already exists for this process.", "HOST_REBOOT_ATTESTATION_INVALID");
+  } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+  if (createHash("sha256").update(readFileSync(filename)).digest("hex") !== digest || record.pid && ownedIdentity(record, processIdentity(record.pid)) || (record.children ?? []).some(child => processIdentity(child.pid) === child.identity) || readHostBootIdentity()?.bootId !== boot.bootId) throw new AgentError("Host ownership changed while recording the reboot observation.", "HOST_PROCESS_UNKNOWN");
+  writeFileSync(proofPath, JSON.stringify(proof), { flag: "wx", mode: 0o600 });
+  return proof;
+}
+
+function rebootTermination(directory: string, filename: string, record: HostProcessRecord, boot: HostBootIdentity | undefined, identity: string | undefined, probeIdentity: (pid: number) => string | undefined): HostProcessTermination | undefined {
+  if (!boot || !validBoot(boot) || ownedIdentity(record, identity) || !ownedReceipt(directory, filename, record)) return undefined;
+  const digest = createHash("sha256").update(readFileSync(filename)).digest("hex"), proofPath = path.join(directory, `${record.processKey}.reboot.json`);
+  try { if ((record.children ?? []).some(child => probeIdentity(child.pid) === child.identity)) return undefined; }
+  catch { return undefined; }
+  let automaticProofExists = false;
+  for (const candidate of [proofPath, path.join(directory, `${record.processKey}.operator-reboot.json`)]) {
+    try {
+      const stat = lstatSync(candidate);
+      if (candidate === proofPath) automaticProofExists = true;
+      if (!privateOwnedFile(candidate) || stat.size > 524288) continue;
+      const proof: unknown = JSON.parse(readFileSync(candidate, "utf8"));
+      if (validTermination(proof, record, digest) && proof.currentBoot.machineId === boot.machineId && proof.currentBoot.platform === boot.platform && (proof.kind !== "operator-attested-reboot" || ownedSessionReceipt(directory, record))) return proof;
+    } catch { /* Invalid or old proofs remain available for diagnosis, never authorizing a retry. */ }
+  }
+  if (automaticProofExists) return undefined;
+  // An old wall timestamp cannot replace a historical boot UUID: a clock step
+  // can also move kern.boottime past that timestamp without ending any process.
+  if (!validBoot(record.boot) || record.boot.machineId !== boot.machineId || record.boot.platform !== boot.platform || record.boot.bootId === boot.bootId) return undefined;
+  const proof: HostKernelRebootTermination = { schemaVersion: 2, kind: "host-reboot", evidence: "boot-identity-change", observedAt: boot.observedAt, currentBoot: boot, previousBoot: record.boot, previousStatus: record.status, previousUpdatedAt: record.updatedAt, priorRecordSha256: digest };
+  // Keep the original running/unknown receipt byte-for-byte for audit. The
+  // separate positive termination proof fences retries without fabricating EOF.
+  try { writeFileSync(proofPath, JSON.stringify(proof), { flag: "wx", mode: 0o600 }); }
+  catch { return undefined; }
+  return proof;
+}
 
 function processIdentity(pid: number): string | undefined {
   try { return execFileSync("/bin/ps", ["-p", String(pid), "-o", "lstart=", "-o", "command="], { encoding: "utf8", timeout: 10_000 }).trim(); }
@@ -95,24 +269,31 @@ function records(directory: string): Array<{ filename: string; record: HostProce
       const filename = path.join(directory, name), stat = lstatSync(filename);
       if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 1_048_576) throw new AgentError("Host process record ownership changed.", "HOST_STORAGE_UNSAFE");
       const record = JSON.parse(readFileSync(filename, "utf8")) as HostProcessRecord;
-      if (record.schemaVersion !== 1 || `${record.processKey}.json` !== name || record.supervisorPath !== path.join(directory, `${record.processKey}.cjs`) || !record.sessionId || !["starting", "running", "cancellation-requested", "outcome-unknown", "exited"].includes(record.status) || record.pid !== undefined && (!Number.isSafeInteger(record.pid) || record.pid < 2) || record.children !== undefined && (!Array.isArray(record.children) || record.children.length > 2048 || record.children.some(child => !child || !Number.isSafeInteger(child.pid) || child.pid < 2 || typeof child.identity !== "string" || !child.identity || child.identity.length > 65536))) throw new AgentError("Host process record is invalid.", "HOST_STORAGE_UNSAFE");
+      if (record.schemaVersion !== 1 || `${record.processKey}.json` !== name || record.supervisorPath !== path.join(directory, `${record.processKey}.cjs`) || !record.sessionId || !statuses.includes(record.status) || record.boot !== undefined && !validBoot(record.boot) || record.pid !== undefined && (!Number.isSafeInteger(record.pid) || record.pid < 2) || record.children !== undefined && (!Array.isArray(record.children) || record.children.length > 2048 || record.children.some(child => !child || !Number.isSafeInteger(child.pid) || child.pid < 2 || typeof child.identity !== "string" || !child.identity || child.identity.length > 65536))) throw new AgentError("Host process record is invalid.", "HOST_STORAGE_UNSAFE");
       return { filename, record };
     });
   } catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return []; throw error; }
 }
 
 /** Reconcile without interpreting a missing transport as successful task completion. */
-export function reconcileHostProcesses(directory: string): HostProcessState[] {
+export function reconcileHostProcesses(directory: string, probes: HostProcessRecoveryProbes = {}): HostProcessState[] {
+  let boot: HostBootIdentity | undefined, bootRead = false;
+  const probeIdentity = probes.processIdentity ?? processIdentity;
   return records(directory).map(({ filename, record }) => {
-    if (record.status === "exited") return { processKey: record.processKey, sessionId: record.sessionId, pid: record.pid, state: "exited", recordPath: filename };
+    const state = { processKey: record.processKey, sessionId: record.sessionId, pid: record.pid, createdAt: record.createdAt, cwd: record.cwd, recordPath: filename };
+    if (record.status === "exited") return { ...state, state: "exited" };
+    if (!bootRead) { bootRead = true; boot = (probes.readBoot ?? readHostBootIdentity)(); }
     let identity: string | undefined;
-    try { if (record.pid) identity = processIdentity(record.pid); } catch { /* Unreadable ownership stays unknown. */ }
-    return { processKey: record.processKey, sessionId: record.sessionId, pid: record.pid, state: ownedIdentity(record, identity) ? "active" : "unknown", recordPath: filename };
+    try { if (record.pid) identity = probeIdentity(record.pid); } catch { return { ...state, state: "unknown" }; }
+    const termination = rebootTermination(directory, filename, record, boot, identity, probeIdentity);
+    if (termination) return { ...state, state: "exited", termination };
+    return { ...state, state: ownedIdentity(record, identity) ? "active" : "unknown" };
   });
 }
 
 /** Cancel only a currently verified owned group. Recovery never signals an arbitrary saved PID. */
 export async function cancelHostProcess(directory: string, processKey: string): Promise<boolean> {
+  if (reconcileHostProcesses(directory).find(record => record.processKey === processKey)?.state === "exited") return false;
   const selected = records(directory).find(entry => entry.record.processKey === processKey);
   if (!selected || selected.record.status === "exited") return false;
   const { record, filename } = selected;
@@ -167,13 +348,15 @@ export class HostProcess implements AgentProcess {
   private isReady = false;
   private pendingWrites: unknown[] = [];
   constructor(command: string, args: string[], private options: HostProcessOptions) {
+    const boot = readHostBootIdentity();
+    if (!boot) throw new AgentError("The host boot identity cannot be verified yet.", "HOST_BOOT_UNAVAILABLE");
     mkdirSync(options.processDirectory, { recursive: true, mode: 0o700 });
     const status = lstatSync(options.processDirectory);
     if (!status.isDirectory() || status.isSymbolicLink()) throw new AgentError("Host process storage ownership changed.", "HOST_STORAGE_UNSAFE");
     this.recordPath = path.join(options.processDirectory, `${this.processKey}.json`);
     const supervisorPath = path.join(options.processDirectory, `${this.processKey}.cjs`);
     writeFileSync(supervisorPath, supervisor, { flag: "wx", mode: 0o600 });
-    this.record = { schemaVersion: 1, processKey: this.processKey, sessionId: options.sessionId, supervisorPath, cwd: options.cwd, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), status: "starting" };
+    this.record = { schemaVersion: 1, processKey: this.processKey, sessionId: options.sessionId, supervisorPath, cwd: options.cwd, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), status: "starting", boot };
     writeRecord(this.recordPath, this.record);
     this.process = (options.spawnProcess ?? spawn)(command, [supervisorPath, this.processKey, command, ...args], { cwd: options.cwd, env: options.environment, stdio: "pipe", detached: true }) as ChildProcessWithoutNullStreams;
     this.record.pid = this.process.pid;

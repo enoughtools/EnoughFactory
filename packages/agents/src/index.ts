@@ -1,7 +1,7 @@
 import type { RuntimeCapability, RuntimeKind } from "@enoughfactory/contracts";
 import { CodexTurn, codexAppServerArguments, codexManagedFeatureArguments } from "./codex.ts";
 import { ContainerProcess, containerCommand, checkContainerId, type AgentProcess, type SpawnProcess } from "./process.ts";
-import { HostProcess, cancelHostProcess, reconcileHostProcesses, type HostProcessState } from "./host-process.ts";
+import { HostProcess, cancelHostProcess, reconcileHostProcesses, readHostBootIdentity, type HostProcessState, type HostBootIdentity } from "./host-process.ts";
 import { hostCodexAvailability, provisionHostCodex, type HostCodexRuntime } from "./host-provision.ts";
 import { prepareHostSession, retireHostSessionState } from "./host-state.ts";
 import { codexToolConfiguration, validateToolEnvironment } from "./tool-config.ts";
@@ -17,7 +17,7 @@ export { ApprovalRouter, matchPolicyRule } from "./policy.ts";
 export { CODEX_PROTOCOL_VERSION, codexApprovalResponse } from "./codex.ts";
 export type { CodexPayloadRelease } from "./provision.ts";
 export { prepareAgentToolchain, verifyPreparedAgentToolchain, type PreparedAgentToolchain, type AgentToolchainOptions } from "./toolchain-image.ts";
-export { HostProcess, cancelHostProcess, reconcileHostProcesses, type HostProcessState } from "./host-process.ts";
+export { HostProcess, cancelHostProcess, reconcileHostProcesses, readHostBootIdentity, attestLegacyHostReboot, type HostProcessState, type HostBootIdentity, type HostProcessTermination, type HostOperatorRebootTermination, type HostObservedRebootInput } from "./host-process.ts";
 export { provisionHostCodex, hostCodexAvailability, type HostCodexRuntime, type HostProvisionOptions } from "./host-provision.ts";
 export { codexToolConfiguration } from "./tool-config.ts";
 
@@ -60,7 +60,9 @@ export class AgentManager {
     const directory = path.join(this.options.hostRuntimeDir, "sessions");
     try {
       const entries = await readdir(directory, { withFileTypes: true });
-      return entries.filter(entry => entry.isDirectory() && /^[a-f0-9]{64}$/.test(entry.name)).flatMap(entry => reconcileHostProcesses(path.join(directory, entry.name, "processes")));
+      let boot: HostBootIdentity | undefined, bootRead = false;
+      const readBoot = (): HostBootIdentity | undefined => { if (!bootRead) { bootRead = true; boot = readHostBootIdentity(); } return boot; };
+      return entries.filter(entry => entry.isDirectory() && /^[a-f0-9]{64}$/.test(entry.name)).flatMap(entry => reconcileHostProcesses(path.join(directory, entry.name, "processes"), { readBoot }));
     } catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return []; throw error; }
   }
   async cancelHostSession(sessionId: string): Promise<void> {
