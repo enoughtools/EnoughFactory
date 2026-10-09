@@ -268,9 +268,11 @@ export class FactoryCoordinator {
         autonomy: input.autonomy, approvalMode: input.approvalMode, runtime: input.runtime, concurrency: input.concurrency,
         maxAttempts: input.maxAttempts, maxDurationMs: input.maxDurationMs, execution,
       });
-      if (this.control(goalId).waitingFor === "budget-changed") this.wake(goalId, "Execution budget was updated.");
-      else if (input.runtime && this.control(goalId).waitingFor === "runtime-available") this.wake(goalId, "The goal runtime was updated.");
-      else if (execution && this.control(goalId).waitingFor === "execution-capability") this.wake(goalId, "Execution requirements were updated.");
+      if (goal.status !== "paused") {
+        if (this.control(goalId).waitingFor === "budget-changed") this.wake(goalId, "Execution budget was updated.");
+        else if (input.runtime && this.control(goalId).waitingFor === "runtime-available") this.wake(goalId, "The goal runtime was updated.");
+        else if (execution && this.control(goalId).waitingFor === "execution-capability") this.wake(goalId, "Execution requirements were updated.");
+      }
     });
     this.changed();
   }

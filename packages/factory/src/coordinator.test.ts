@@ -2163,3 +2163,36 @@ test("retained verification recovery holds a paused goal until saved verificatio
     assert.equal(factory.store.list<Attempt>("attempts").filter(item => item.taskId === task.id).length, 1, "The saved source still has its original author only");
   });
 });
+
+test("goal configuration preserves explicit pause across budget, runtime and execution waits while waking active waiting goals", async t => {
+  for (const condition of ["budget-changed", "runtime-available", "execution-capability"] as const) for (const paused of [true, false]) await t.test(`${condition}: ${paused ? "paused" : "waiting"}`, async () => {
+    const { factory, goal, task, attempt, detail, outcome, proofs } = await retainedVerificationFailure();
+    outcome("pass");
+    const waitReason = `Waiting for ${condition}`;
+    factory.store.set("goals", { ...factory.store.get<Goal>("goals", goal.id)!, status: "waiting" });
+    factory.store.set("factory-control", { ...factory.store.get<ControlRecord>("factory-control", goal.id)!, stage: "wait", waitingFor: condition, waitReason });
+    if (paused) factory.coordinator.pause(goal.id);
+    const configuration = condition === "budget-changed" ? { maxDurationMs: 60_000 } : condition === "runtime-available" ? { runtime: "codex" as const } : { execution: { target: "container" as const } };
+    factory.coordinator.configure(goal.id, configuration);
+    const configuredGoal = factory.store.get<Goal>("goals", goal.id)!, configuredControl = factory.store.get<ControlRecord>("factory-control", goal.id)!;
+    assert.equal(configuredGoal.status, paused ? "paused" : "running");
+    assert.equal(configuredControl.waitingFor, paused ? condition : undefined);
+    assert.equal(configuredControl.waitReason, paused ? waitReason : undefined);
+    if (condition === "budget-changed") assert.equal(configuredControl.maxDurationMs, 60_000);
+    else if (condition === "runtime-available") assert.equal(configuredGoal.runtime, "codex");
+    else assert.deepEqual(configuredGoal.execution, { target: "container" });
+    for (let tick = 0; tick < 2; tick++) { await factory.coordinator.tick(); await factory.coordinator.waitForIdle(); }
+    if (paused) {
+      assert.equal(factory.store.get<Goal>("goals", goal.id)!.status, "paused");
+      assert.equal(factory.store.get<ControlRecord>("factory-control", goal.id)!.waitingFor, condition);
+      assert.deepEqual(factory.store.get<AttemptDetail>("factory-attempt-details", attempt.id), detail);
+      assert.equal(proofs.length, 0, "Configuration cannot start an automatic check recovery for an explicitly paused goal");
+      assert.equal(factory.calls.check, 1); assert.equal(factory.calls.integrate, 0);
+      assert.equal(factory.calls.diagnosis, 0); assert.equal(factory.calls.execute, 1); assert.equal(factory.calls.capture, 1);
+    } else {
+      assert.equal(proofs.length, 1); assert.equal(factory.calls.check, 2); assert.equal(factory.calls.integrate, 1);
+      assert.equal(factory.store.get<FactoryTask>("tasks", task.id)!.status, "completed");
+      assert.equal(factory.calls.execute, 1); assert.equal(factory.calls.capture, 1);
+    }
+  });
+});
