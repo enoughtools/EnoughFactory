@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { spawn } from "node:child_process";
-import { access, chmod, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { access, chmod, mkdir, mkdtemp, open, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { provisionRuntime } from "./provision.ts";
+import { provisionRuntime, runtimeInstallScript } from "./provision.ts";
 import { quote, type SpawnProcess } from "./process.ts";
 import { RUNTIME_PINS } from "./types.ts";
 
@@ -13,7 +13,7 @@ const dockerEndpoint = { cliPath: "/owned/docker", host: "unix:///owned/docker.s
 /** Execute the actual provisioning shell in a disposable local filesystem, without Docker or downloads. */
 async function fixture(architecture = "aarch64") {
   const directory = await mkdtemp(join(tmpdir(), "enough-provision-test-"));
-  const node = join(directory, "node"), home = join(directory, "home"), temporary = join(directory, "tmp");
+  const node = join(directory, "node"), home = join(directory, "home"), temporary = join(directory, "tmp"), profiles = join(directory, "etc", "profile.d");
   await Promise.all([mkdir(join(node, "bin"), { recursive: true }), mkdir(join(home, ".npm", "_cacache"), { recursive: true }), mkdir(join(home, ".codex"), { recursive: true }), mkdir(temporary)]);
   await writeFile(join(home, ".npm", "_cacache", "existing"), "previous cache must survive");
   await writeFile(join(home, ".codex", "continuation"), "provider state must survive");
@@ -22,6 +22,7 @@ async function fixture(architecture = "aarch64") {
     await chmod(join(node, "bin", name), 0o755);
   }
   await executable("node", "exit 0");
+  await executable("npx", "exit 0");
   await executable("setsid", "exit 0");
   await executable("uname", 'printf "%s\\n" "$FIXTURE_ARCH"');
   await executable("codex", `if [ ! -f "$FIXTURE_ROOT/installed-version" ]; then exit 1; fi
@@ -50,7 +51,7 @@ case "$FIXTURE_MODE" in
   *) printf '${RUNTIME_PINS.codex}' > "$FIXTURE_ROOT/installed-version";;
 esac`);
   let mode = "success";
-  const translate = (text: string) => text.replaceAll("/opt/enoughfactory/node", node).replaceAll("/opt/enoughfactory/agents", join(directory, "agents")).replaceAll("/root", home);
+  const translate = (text: string) => text.replaceAll("/opt/enoughfactory/node", node).replaceAll("/opt/enoughfactory/agents", join(directory, "agents")).replaceAll("/root", home).replaceAll("/etc/profile.d", profiles);
   const spawnProcess = ((command: string, args: readonly string[]) => {
     assert.equal(command, dockerEndpoint.cliPath);
     assert.deepEqual(args.slice(0, 4), ["--host", dockerEndpoint.host, "--config", dockerEndpoint.configDirectory]);
@@ -58,11 +59,12 @@ esac`);
     assert.ok(index > 4, "Only the selected container may receive the command");
     const shell = args.slice(index + 1);
     assert.equal(shell[0], "sh");
-    const replacements = `s|/opt/enoughfactory/node|${node}|g;s|/opt/enoughfactory/agents|${join(directory, "agents")}|g;s|/root|${home}|g`;
+    const replacements = `s|/opt/enoughfactory/node|${node}|g;s|/opt/enoughfactory/agents|${join(directory, "agents")}|g;s|/root|${home}|g;s|/etc/profile.d|${profiles}|g`;
     const localArgs = shell[1] === "-s" ? ["-c", `sed ${quote(replacements)} | /bin/sh -s`] : shell.slice(1).map(translate);
     return spawn("/bin/sh", localArgs, { stdio: "pipe", env: { PATH: `${node}/bin:/usr/bin:/bin`, HOME: home, TMPDIR: temporary, FIXTURE_ROOT: directory, FIXTURE_MODE: mode, FIXTURE_ARCH: architecture } });
   }) as SpawnProcess;
   return {
+    directory, node, home, profiles, translate,
     options: { dockerEndpoint, spawnProcess },
     setMode(value: string) { mode = value; },
     async npmArguments() { return (await readFile(join(directory, "npm-arguments"), "utf8")).trim().split("\n"); },
@@ -81,6 +83,56 @@ esac`);
     close() { return rm(directory, { recursive: true, force: true }); },
   };
 }
+
+test("on-demand tools survive a reset login-like PATH while preserving provider and system paths", async () => {
+  const context = await fixture();
+  try {
+    const generated = context.translate(runtimeInstallScript("codex"));
+    assert.equal(generated.replaceAll(context.profiles, "<private-profile-directory>").includes("/etc/profile.d"), false, "Every container profile path is translated before local execution");
+    assert(generated.includes(context.profiles));
+    await provisionRuntime("fixture-container", "codex", {}, context.options);
+    const profile = join(context.profiles, "enoughfactory-agent-tools.sh"), vendorBin = join(context.directory, "provider-vendor", "bin");
+    await mkdir(vendorBin, { recursive: true });
+    const resetPath = `${vendorBin}:/usr/bin:/bin`;
+    const script = `PATH=${quote(resetPath)}; export PATH; . ${quote(profile)}; printf '%s\\n' "$PATH"; command -v node; command -v npm; command -v npx`;
+    const result = await new Promise<{ code: number | null; output: string; error: string }>((resolve, reject) => {
+      const child = spawn("/bin/sh", ["-c", script], { env: { PATH: resetPath, HOME: context.home }, stdio: "pipe" });
+      let output = "", error = ""; child.stdout.on("data", data => { output += data; }); child.stderr.on("data", data => { error += data; });
+      child.once("error", reject); child.once("close", code => resolve({ code, output, error }));
+    });
+    assert.equal(result.code, 0, result.error);
+    assert.deepEqual(result.output.trim().split("\n"), [
+      `${context.node}/bin:${context.home}/.local/bin:${resetPath}`,
+      join(context.node, "bin", "node"), join(context.node, "bin", "npm"), join(context.node, "bin", "npx"),
+    ]);
+    assert.equal((await stat(profile)).mode & 0o777, 0o644);
+    assert.deepEqual(await readdir(context.profiles), ["enoughfactory-agent-tools.sh"], "Atomic profile staging leaves no temporary files");
+    await context.assertPreserved();
+  } finally { await context.close(); }
+});
+
+test("already-pinned on-demand runtimes atomically repair a stale or missing profile without reinstalling tools", async () => {
+  const context = await fixture();
+  try {
+    await provisionRuntime("fixture-container", "codex", {}, context.options);
+    const originalNpm = await context.npmArguments(), profile = join(context.profiles, "enoughfactory-agent-tools.sh");
+    await writeFile(join(context.profiles, "provider-vendor.sh"), "export VENDOR_SETTING=preserved\n");
+    await writeFile(profile, "export PATH=/legacy-toolchain:$PATH\n");
+    const old = await open(profile, "r");
+    try {
+      await provisionRuntime("fixture-container", "codex", {}, context.options);
+      assert.equal(await old.readFile("utf8"), "export PATH=/legacy-toolchain:$PATH\n", "Existing readers retain the complete old inode until atomic replacement");
+    } finally { await old.close(); }
+    assert.match(await readFile(profile, "utf8"), new RegExp(context.node.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "/bin"));
+    await rm(profile);
+    await provisionRuntime("fixture-container", "codex", {}, context.options);
+    await access(profile);
+    assert.deepEqual(await context.npmArguments(), originalNpm, "Profile repair does not execute another dependency install");
+    assert.equal(await readFile(join(context.profiles, "provider-vendor.sh"), "utf8"), "export VENDOR_SETTING=preserved\n");
+    assert.deepEqual(await readdir(context.profiles), ["enoughfactory-agent-tools.sh", "provider-vendor.sh"]);
+    assert.equal((await context.assertPreserved()).length, 1);
+  } finally { await context.close(); }
+});
 
 test("failed provider transfer and successful retry clean only their own temporary caches", async () => {
   const context = await fixture();

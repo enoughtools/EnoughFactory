@@ -11,6 +11,16 @@ export interface RuntimeOptions { dockerEndpoint?: DockerRuntimeEndpoint; spawnP
 const assetsDirectory = fileURLToPath(new URL("../../../runtime/agents/", import.meta.url));
 const paths = `export PATH=/opt/enoughfactory/node/bin:/root/.local/bin:$PATH; export HOME=/root;`;
 export const AGENT_RUNTIME_PATHS = paths;
+const runtimeShellProfile = `(
+  runtime_profile_stage=''
+  trap 'if [ -n "$runtime_profile_stage" ]; then rm -f -- "$runtime_profile_stage"; fi' EXIT
+  mkdir -p /etc/profile.d
+  runtime_profile_stage=$(mktemp /etc/profile.d/.enoughfactory-agent-tools.XXXXXXXX)
+  printf '%s\\n' 'export PATH=/opt/enoughfactory/node/bin:/root/.local/bin:$PATH' > "$runtime_profile_stage"
+  chmod 644 "$runtime_profile_stage"
+  mv -f -- "$runtime_profile_stage" /etc/profile.d/enoughfactory-agent-tools.sh
+  runtime_profile_stage=''
+)`;
 export async function availability(containerId: string, options: RuntimeOptions = {}): Promise<RuntimeCapability[]> {
   const query = `${paths}
 for runtime in codex claude agy; do
@@ -36,6 +46,7 @@ if ! command -v setsid >/dev/null 2>&1; then
   apt-get update -qq; apt-get install -y -qq util-linux
 fi
 mkdir -p /opt/enoughfactory/agents
+${runtimeShellProfile}
 `;
   if (runtime === "antigravity") return `${common}
 if ! command -v python3 >/dev/null 2>&1 || ! python3 -m venv --help >/dev/null 2>&1; then
@@ -217,6 +228,10 @@ export async function provisionRuntime(containerId: string, runtime: RuntimeKind
   const desired = runtime === "codex" ? RUNTIME_PINS.codex : runtime === "claude" ? RUNTIME_PINS.claude : RUNTIME_PINS.antigravitySdk;
   if (!before.available || !hasPinnedVersion(before, desired) || runtime === "antigravity" && !before.interactiveApprovals) {
     await containerCommand(containerId, ["sh", "-s"], { ...options, input: runtimeInstallScript(runtime), timeout: 300_000 });
+  } else {
+    // A pinned provider may predate login-shell PATH provisioning. Repair only
+    // the owned container profile without downloading or reinstalling its tools.
+    await containerCommand(containerId, ["sh", "-s"], { ...options, input: `set -eu\n${runtimeShellProfile}\n`, timeout: 30_000 });
   }
   if (runtime === "antigravity") {
     const script = await readFile(resolve(options.runtimeAssetsDir ?? assetsDirectory, "antigravity_bridge.py"));

@@ -1,17 +1,20 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import test, { type TestContext } from 'node:test';
-import type { Attempt, AttemptInspection, FactoryTask, Goal, InspectionAction, InspectionAuthority, InspectionEvidence, InspectionJob, InspectionSourceIdentity, InspectionVerificationRun, TaskQualityRequirements } from '@enoughfactory/contracts';
+import type { Attempt, AttemptInspection, Chat, FactoryTask, Goal, Project, Session, InspectionAction, InspectionAuthority, InspectionEvidence, InspectionJob, InspectionSourceIdentity, InspectionVerificationRun, TaskQualityRequirements } from '@enoughfactory/contracts';
 import type { AttemptDetail, GoalCheckRecord } from '@enoughfactory/factory';
-import { ArtifactStore } from '@enoughfactory/workspaces';
+import { ArtifactStore, exportInspectionSnapshot, InspectionSnapshotManager } from '@enoughfactory/workspaces';
 import { Store } from './store.ts';
 import type { InspectionObservation } from './inspection-jobs.ts';
 import { InspectionQualityService } from './inspection-quality.ts';
 import { inspectionQualityPolicySha256, inspectionVerificationKey } from './inspection-verification-identity.ts';
 import { InspectionVerificationHistory } from './inspection-verification-history.ts';
+import type { InspectionSourceRetention } from './inspection-retention.ts';
+import type { EphemeralContainerReceipt } from './factory-container-retirement.ts';
 
 const at = '2026-10-09T00:00:00.000Z';
 const authority: InspectionAuthority = { goalId: 'goal', goalRevision: 12, taskId: 'drafts', attemptId: 'current-author', authorityGeneration: 3, policyRevision: 12 };
@@ -292,5 +295,243 @@ test('historical screenshot acknowledgment rechecks original scope after viewing
     else f.store.set('factory-attempt-details', { ...f.detail, contract: { ...contract, description: 'Only restore a marker.' } });
     assert.throws(() => f.service.acknowledgeImage({ run: f.run, chatId: f.run.chatId!, sha256: f.screenshot.artifact.sha256, server: 'factory', tool: 'factory_verification_image', eventId: 'retired-image', mimeType: 'image/png', byteLength: png.length }), /original scope or immutable manifest|original historical task/);
     assert.deepEqual(f.store.list('inspection-verification-history-image-deliveries'), []); assert.deepEqual(f.store.list('provider-image-deliveries'), []);
+  });
+});
+
+type HistoryFixture = Awaited<ReturnType<typeof fixture>>;
+const completedAt = '2026-10-09T00:01:00.000Z';
+async function authorFixture(t: TestContext) {
+  const f = await fixture(t);
+  const workspace = { id: f.originalAuthor.id, attemptId: f.originalAuthor.id, taskId: f.task.id, goalId: f.goal.id, path: path.join(f.directory, 'author'),
+    provider: 'git' as const, baseCommit: f.originalAuthor.baseCommit!, sessionId: 'original-session', deviceId: 'mac' };
+  const author = { ...f.originalAuthor, chatId: 'original-chat', sessionId: workspace.sessionId };
+  const project: Project = { id: 'original-internal-project', name: 'Original worker', path: workspace.path, deviceId: 'mac', createdAt: at,
+    runtime: 'codex', approvalMode: 'approve-all', rules: [], internal: true, sourceProjectId: f.goal.projectId };
+  const session: Session = { id: author.sessionId, projectId: project.id, deviceId: 'mac', name: 'f-original', status: 'stopped', createdAt: at, updatedAt: completedAt,
+    branch: 'factory/original', containerId: 'envmux-original', services: [] };
+  const chat: Chat = { id: author.chatId, sessionId: session.id, deviceId: 'mac', title: 'Original author', runtime: 'codex', attemptId: author.id,
+    approvalMode: 'approve-all', status: 'idle', createdAt: at, updatedAt: completedAt, threadId: 'original-provider-thread' };
+  const detail = { ...f.detail, workspace };
+  const result = { id: chat.id, attemptId: author.id, completedAt, result: { stopReason: 'completed', text: detail.result!.text, threadId: chat.threadId } };
+  f.store.set('attempts', author); f.store.set('factory-attempt-details', detail); f.store.set('projects', project);
+  f.store.set('sessions', session); f.store.set('chats', chat); f.store.set('chat-results', result);
+  return { ...f, author, detail, workspace, project, session, chat, result };
+}
+
+/** The production chat writer saves seq:0 in JSON; SQL owns the durable cursor and timestamp. */
+function originalEvents(f: HistoryFixture, values: Array<{ at: string; value: Record<string, unknown> }>) {
+  const db = new DatabaseSync(path.join(f.directory, 'factory.sqlite'));
+  try {
+    const insert = db.prepare('INSERT INTO events(topic,entity,value,at) VALUES(?,?,?,?)');
+    return values.map(({ at, value }) => {
+      const original = JSON.stringify({ id: `event-${value.id}`, chatId: 'original-chat', seq: 0, at, ...value });
+      return { seq: Number(insert.run('chat', 'original-chat', original, at).lastInsertRowid), at, original };
+    });
+  } finally { db.close(); }
+}
+async function tracePage(f: HistoryFixture, eventCursor = 0, eventLimit = 32, maximum = 16000) {
+  let original = '', offset = 0, digest: unknown;
+  for (;;) {
+    const page = payload(await f.service.call('factory_verification_evidence', { kind: 'author-trace', id: authority.attemptId, eventCursor, eventLimit, offset, maxCharacters: maximum }));
+    assert.equal(page.historical, true); assert.equal(page.acceptanceUse, 'context-only');
+    if (digest !== undefined) assert.equal(page.contentSha256, digest);
+    digest = page.contentSha256; original += String(page.original); offset = Number(page.nextOffset);
+    if (offset === page.totalCharacters) break;
+  }
+  assert.equal(createHash('sha256').update(original).digest('hex'), digest);
+  return JSON.parse(original) as { originalOwner: { chatId: string; sessionId: string }; prefix: ReturnType<Store['chatEventPrefix']>; events: Array<{ seq: number; at: string; original: string }>; nextEventCursor: number; complete: boolean; limits: string };
+}
+
+test('author trace preserves failed server, repaired edit, successful check and later browser chronology in exact original pages', async t => {
+  const f = await authorFixture(t);
+  const rows = originalEvents(f, [
+    { at: '2026-10-09T00:00:01.000Z', value: { id: 'server-failed', kind: 'tool', data: { type: 'commandExecution', status: 'completed', command: 'node server.cjs', exitCode: 127, output: 'node: not found\n' } } },
+    { at: '2026-10-09T00:00:02.000Z', value: { id: 'server-started', kind: 'tool', data: { type: 'commandExecution', status: 'started', command: 'node server.cjs', processId: 10959 } } },
+    { at: '2026-10-09T00:00:03.000Z', value: { id: 'edit', kind: 'tool', data: { type: 'fileChange', status: 'completed', changes: [{ path: 'app.js', diff: '-false\n+true\n' }] } } },
+    { at: '2026-10-09T00:00:04.000Z', value: { id: 'check', kind: 'tool', data: { type: 'commandExecution', status: 'completed', command: 'node scripts/check.cjs', exitCode: 0, output: 'PASS complete body\n' } } },
+    { at: '2026-10-09T00:00:05.000Z', value: { id: 'browser', kind: 'tool', data: { type: 'mcpToolCall', status: 'completed', server: 'factory', tool: 'factory_browser_start', result: { jobId: 'original-job' } } } },
+    { at: '2026-10-09T00:00:06.000Z', value: { id: 'server-exited', kind: 'tool', data: { type: 'commandExecution', status: 'completed', command: 'node server.cjs', processId: 10959, exitCode: 0 } } },
+    { at: '2026-10-09T00:02:00.000Z', value: { id: 'later-turn', kind: 'tool', data: { command: 'unrelated later work' } } },
+  ]);
+  const before = ['inspection-evidence', 'provider-image-deliveries', 'inspection-quality-equivalences'].map(bucket => f.store.list(bucket));
+  const first = await tracePage(f, 0, 2, 83), second = await tracePage(f, first.nextEventCursor, 2), last = await tracePage(f, second.nextEventCursor, 2);
+  assert.deepEqual([...first.events, ...second.events, ...last.events], rows.slice(0, 6));
+  assert.equal(first.complete, false); assert.equal(last.complete, true); assert.equal(last.nextEventCursor, rows[5]!.seq);
+  assert.equal(first.originalOwner.chatId, f.chat.id); assert.equal(first.originalOwner.sessionId, f.session.id);
+  assert.deepEqual(first.prefix, f.store.chatEventPrefix(f.chat.id, completedAt));
+  assert.equal(first.prefix.toolEventCount, 6); assert.equal(JSON.parse(first.events[0]!.original).seq, 0);
+  assert.equal(JSON.parse(first.events[0]!.original).data.exitCode, 127);
+  assert.ok(rows[3]!.seq < rows[4]!.seq); assert.match(last.limits, /write absence is not proven/);
+  assert.deepEqual(['inspection-evidence', 'provider-image-deliveries', 'inspection-quality-equivalences'].map(bucket => f.store.list(bucket)), before);
+  for (const args of [{ eventLimit: 0 }, { eventLimit: 33 }, { eventCursor: -1 }, { eventCursor: rows[6]!.seq }, { eventLimit: '2' }]) {
+    await assert.rejects(f.service.call('factory_verification_evidence', { kind: 'author-trace', id: f.author.id, offset: 0, maxCharacters: 16000, ...args }), /original tool-event cursor/);
+  }
+});
+
+test('author trace reaches original tool events after 10000 messages and freezes its viewed prefix', async t => {
+  const f = await authorFixture(t);
+  const rows = originalEvents(f, [
+    ...Array.from({ length: 10005 }, (_, id) => ({ at, value: { id, kind: 'message', role: 'assistant', text: `Original explanation ${id}` } })),
+    { at: '2026-10-09T00:00:59.000Z', value: { id: 'late-check', kind: 'tool', data: { command: 'node scripts/check.cjs', exitCode: 0 } } },
+  ]);
+  assert.equal(f.store.events('chat', f.chat.id).length, 10000, 'The ordinary UI window omits the late tool event');
+  const page = await tracePage(f);
+  assert.deepEqual(page.events, [rows.at(-1)!]); assert.equal(page.prefix.eventCount, rows.length); assert.equal(page.complete, true);
+  const expectedDigest = createHash('sha256');
+  for (const row of rows) expectedDigest.update(JSON.stringify([row.seq, row.at, row.original]) + '\n');
+  assert.equal(page.prefix.sha256, expectedDigest.digest('hex'));
+  originalEvents(f, [{ at: '2026-10-09T00:00:59.500Z', value: { id: 'backfilled', kind: 'tool', data: { command: 'forged earlier check' } } }]);
+  await assert.rejects(tracePage(f), /journal prefix changed/);
+});
+
+test('author trace requires the original completed provider, chat, session, internal project and workspace chain', async t => {
+  for (const mutation of ['foreign-chat', 'verifier-chat', 'foreign-session', 'verifier-session', 'foreign-project', 'workspace-path', 'workspace-attempt', 'device', 'result-text', 'result-attempt', 'result-incomplete', 'contract'] as const) await t.test(mutation, async t => {
+    const f = await authorFixture(t);
+    if (mutation === 'foreign-chat') f.store.set('chats', { ...f.chat, attemptId: 'another-author' });
+    if (mutation === 'verifier-chat') f.store.set('chats', { ...f.chat, verificationRunId: f.run.id });
+    if (mutation === 'foreign-session') f.store.set('sessions', { ...f.session, projectId: 'foreign-project' });
+    if (mutation === 'verifier-session') f.store.set('sessions', { ...f.session, verificationRunId: f.run.id });
+    if (mutation === 'foreign-project') f.store.set('projects', { ...f.project, sourceProjectId: 'another-goal-project' });
+    if (mutation === 'workspace-path') f.store.set('projects', { ...f.project, path: path.join(f.directory, 'another-worker') });
+    if (mutation === 'workspace-attempt') f.store.set('factory-attempt-details', { ...f.detail, workspace: { ...f.workspace, attemptId: 'another-author' } });
+    if (mutation === 'device') f.store.set('sessions', { ...f.session, deviceId: 'other-device' });
+    if (mutation === 'result-text') f.store.set('chat-results', { ...f.result, result: { ...f.result.result, text: 'A newer author result' } });
+    if (mutation === 'result-attempt') f.store.set('chat-results', { ...f.result, attemptId: 'another-author' });
+    if (mutation === 'result-incomplete') f.store.set('chat-results', { ...f.result, result: { ...f.result.result, stopReason: 'interrupted' } });
+    if (mutation === 'contract') f.store.set('factory-attempt-details', { ...f.detail, contract: { ...contract, description: 'Only verify one line' } });
+    if (mutation !== 'contract') {
+      const items = payload(await f.service.call('factory_verification_history', {})).items as Array<{ kind: string; unavailable?: string }>;
+      assert.ok(items.find(item => item.kind === 'author-trace')?.unavailable);
+    }
+    await assert.rejects(tracePage(f), /ownership is unavailable|original historical task/);
+    assert.deepEqual(f.store.list('inspection-verification-history-views'), []);
+  });
+});
+
+test('author trace rejects owner or journal changes during its awaited publication fence', async t => {
+  for (const mutation of ['session', 'prefix'] as const) await t.test(mutation, async t => {
+    const f = await authorFixture(t);
+    originalEvents(f, [{ at, value: { id: 'check', kind: 'tool', data: { exitCode: 0 } } }]);
+    let reads = 0;
+    f.setCurrentHook(() => {
+      if (++reads !== 2) return;
+      if (mutation === 'session') f.store.set('sessions', { ...f.session, deviceId: 'foreign-device' });
+      else originalEvents(f, [{ at, value: { id: 'late-added', kind: 'tool', data: { exitCode: 0 } } }]);
+    });
+    await assert.rejects(tracePage(f), /owner, prefix or captured source changed|journal prefix changed/);
+    assert.equal(reads, 2); assert.deepEqual(f.store.list('inspection-verification-history-views'), []);
+  });
+});
+
+async function sourceFixture(t: TestContext) {
+  const f = await fixture(t), physical = await realpath(f.directory), primary = path.join(physical, 'mail-source'), secondary = path.join(physical, 'enough-ui');
+  await mkdir(primary); await mkdir(path.join(secondary, 'empty'), { recursive: true });
+  await writeFile(path.join(primary, 'app.js'), 'const restore = true;\r\nconst body = "first\\nsecond\\nlast ";\n');
+  await writeFile(path.join(secondary, 'tokens.css'), ':root { --spacing: 12px; }\n');
+  const dataDir = path.join(physical, 'captured'); await mkdir(dataDir, { mode: 0o700 });
+  const snapshots = new InspectionSnapshotManager({ dataDir, artifacts: f.artifacts });
+  const snapshot = await snapshots.create({ roots: [{ id: 'mail', name: 'Mail', path: primary }, { id: 'ui', name: 'EnoughUI', path: secondary }], context: originalAuthority });
+  const transfer = await exportInspectionSnapshot({ snapshot, artifacts: f.artifacts, context: originalAuthority });
+  const retention: InspectionSourceRetention = { id: snapshot.id, version: 1, sourceDigest: snapshot.sourceDigest, authority: originalAuthority, transfer, retainedAt: Date.parse(snapshot.manifest.createdAt), lastUsedAt: Date.parse(snapshot.manifest.createdAt) };
+  const source: InspectionSourceIdentity = { snapshotId: snapshot.id, sha256: snapshot.sourceDigest, roots: snapshot.roots.map(root => ({ id: root.id, sha256: root.sourceDigest, commit: root.commit })) };
+  const job = { ...f.job, id: 'captured-author-preview', source };
+  f.store.set('inspection-jobs', job); f.store.set('inspection-source-retention', retention);
+  return { ...f, snapshots, snapshot, transfer, retention, source, capturedJob: job };
+}
+
+test('source history returns the original all-root transfer manifest, capture time and exact file inventory from retained CAS bytes', async t => {
+  const f = await sourceFixture(t);
+  const expected = (await f.artifacts.read(f.transfer.sourceManifest)).toString('utf8');
+  const index = payload(await f.service.call('factory_verification_history', {})).items as Array<{ kind: string; id: string; originalAuthority?: unknown; jobId?: string }>;
+  const entry = index.find(item => item.kind === 'source-manifest');
+  assert.equal(entry?.id, f.transfer.sourceManifest.id); assert.deepEqual(entry.originalAuthority, originalAuthority); assert.equal(entry.jobId, f.capturedJob.id);
+  await f.snapshots.remove(f.snapshot);
+  assert.equal(await readAll(f.service, 'source-manifest', f.transfer.sourceManifest.id, 127), expected);
+  const pack = JSON.parse(expected);
+  assert.equal(pack.snapshot.id, f.source.snapshotId); assert.equal(pack.snapshot.sourceDigest, f.source.sha256);
+  assert.equal(pack.snapshot.createdAt, f.snapshot.manifest.createdAt); assert.equal(pack.snapshot.roots.length, 2);
+  assert.deepEqual(pack.snapshot.roots, JSON.parse(JSON.stringify(f.snapshot.manifest.roots))); assert.deepEqual(pack.sourceArtifacts, f.transfer.sourceArtifacts);
+  assert.deepEqual(f.store.list('provider-image-deliveries'), []);
+});
+
+test('source history rejects foreign transfer ownership, root omission and mutable source drift', async t => {
+  for (const mutation of ['retention-authority', 'retention-digest', 'transfer-id', 'root-omission', 'job-roots', 'artifact-owner', 'corrupt-bytes'] as const) await t.test(mutation, async t => {
+    const f = await sourceFixture(t);
+    if (mutation === 'retention-authority') f.store.set('inspection-source-retention', { ...f.retention, authority: { ...originalAuthority, attemptId: 'another-author' } });
+    if (mutation === 'retention-digest') f.store.set('inspection-source-retention', { ...f.retention, sourceDigest: '9'.repeat(64) });
+    if (mutation === 'transfer-id') f.store.set('inspection-source-retention', { ...f.retention, transfer: { ...f.transfer, snapshotId: 'another-snapshot' } });
+    if (mutation === 'root-omission') f.store.set('inspection-source-retention', { ...f.retention, transfer: { ...f.transfer, sourceArtifacts: f.transfer.sourceArtifacts.slice(0, 1) } });
+    if (mutation === 'job-roots') f.store.set('inspection-jobs', { ...f.capturedJob, source: { ...f.source, roots: f.source.roots!.slice(0, 1) } });
+    if (mutation === 'artifact-owner') {
+      const first = f.transfer.sourceArtifacts[0]!;
+      f.store.set('inspection-source-retention', { ...f.retention, transfer: { ...f.transfer, sourceArtifacts: [{ ...first, manifest: { ...first.manifest, attemptId: 'another-author' } }, f.transfer.sourceArtifacts[1]!] } });
+    }
+    if (mutation === 'corrupt-bytes') await writeFile(await f.artifacts.path(f.transfer.sourceManifest), 'corrupt original inventory');
+    await assert.rejects(readAll(f.service, 'source-manifest', f.transfer.sourceManifest.id), /same-goal task scope|transfer manifest|artifact|digest|content/i);
+    assert.deepEqual(f.store.list('inspection-verification-history-views'), []);
+  });
+});
+
+test('source history revalidates original job and retention ownership after asynchronous artifact reads', async t => {
+  for (const mutation of ['job', 'retention'] as const) await t.test(mutation, async t => {
+    const f = await sourceFixture(t), originalRead = f.artifacts.read.bind(f.artifacts);
+    let reads = 0;
+    f.artifacts.read = async manifest => {
+      const bytes = await originalRead(manifest);
+      if (manifest.id === f.transfer.sourceManifest.id && ++reads === 1) {
+        if (mutation === 'job') f.store.set('inspection-jobs', { ...f.capturedJob, authority: { ...originalAuthority, attemptId: 'foreign-author' } });
+        else f.store.set('inspection-source-retention', { ...f.retention, sourceDigest: '9'.repeat(64) });
+      }
+      return bytes;
+    };
+    await assert.rejects(readAll(f.service, 'source-manifest', f.transfer.sourceManifest.id), /owner, prefix or captured source changed/);
+    assert.equal(reads, 1); assert.deepEqual(f.store.list('inspection-verification-history-views'), []);
+  });
+});
+
+async function retirementFixture(t: TestContext) {
+  const f = await authorFixture(t), containerId = '7'.repeat(64);
+  const identity = { sessionId: f.session.id, container: f.session.containerId!, name: f.session.containerId!, project: f.project.id, sessionName: f.session.name, projectPath: f.workspace.path, branch: f.session.branch!, workdir: '/work' };
+  const labels = { schema: '2', kind: 'session', instance: identity.name, project: identity.project, session: identity.sessionName, directory: identity.projectPath, branch: identity.branch, workdir: identity.workdir };
+  const receipt: EphemeralContainerReceipt = { version: 2, status: 'removed', identity, containerId, runtime: 'ephemeral', runtimeKinds: ['codex'],
+    fingerprint: { container: { id: containerId, name: `/${identity.name}`, created: at, state: { Running: false, Paused: false, Restarting: false, Dead: false, Pid: 0, Status: 'exited' }, labels }, mounts: [] },
+    archive: path.join(f.directory, 'recorded-provider-archive.tar.gz'), sha256: '8'.repeat(64), size: 100, rawSha256: '9'.repeat(64), rawSize: 1000, entries: 3, archives: [], exclusions: [],
+    ownedVolumes: ['home', 'work'].map(role => ({ name: `${identity.name}-${role}`, status: 'removed', identity: { Name: `${identity.name}-${role}`, Driver: 'local', Scope: 'local', CreatedAt: at,
+      Labels: { 'envmux.schema': '2', 'envmux.instance': identity.name, 'envmux.project': identity.project, 'envmux.session': identity.sessionName, 'envmux.directory': identity.projectPath, 'envmux.branch': identity.branch, 'envmux.volume': role }, Options: null } })) };
+  const retired = { id: f.session.id, containerId, name: identity.name, status: 'removed', receipt, updatedAt: completedAt };
+  f.store.set('session-container-retirement', retired);
+  return { ...f, receipt, retired };
+}
+
+test('author retirement exposes the original typed removed-container receipt without claiming unrecorded server or write evidence', async t => {
+  const f = await retirementFixture(t);
+  const before = f.store.list('inspection-evidence');
+  const record = JSON.parse(await readAll(f.service, 'author-retirement', f.author.id));
+  assert.equal(record.originalOwner.sessionId, f.session.id); assert.deepEqual(record.originalSession, f.session); assert.deepEqual(record.originalRetirement, f.retired);
+  assert.equal(record.originalRetirement.receipt.version, 2); assert.equal(record.originalRetirement.receipt.containerId, f.retired.containerId);
+  assert.equal(record.originalRetirement.updatedAt, completedAt); assert.match(record.limits, /not unrecorded write absence/);
+  assert.deepEqual(f.store.list('provider-image-deliveries'), []); assert.deepEqual(f.store.list('inspection-evidence'), before);
+});
+
+test('author retirement fails closed for unavailable, foreign, live or incompletely removed environments', async t => {
+  for (const mutation of ['missing', 'foreign-session', 'foreign-container', 'foreign-workspace', 'still-archived', 'running', 'foreign-labels', 'retained-volume', 'no-volume-proof'] as const) await t.test(mutation, async t => {
+    const f = await retirementFixture(t);
+    const receipt = structuredClone(f.receipt);
+    if (mutation === 'missing') f.store.delete('session-container-retirement', f.session.id);
+    else {
+      if (mutation === 'foreign-session') receipt.identity.sessionId = 'another-session';
+      if (mutation === 'foreign-container') receipt.containerId = '6'.repeat(64);
+      if (mutation === 'foreign-workspace') receipt.identity.projectPath = path.join(f.directory, 'another-worker');
+      if (mutation === 'still-archived') receipt.status = 'archived';
+      if (mutation === 'running') (receipt.fingerprint as { container: { state: { Running: boolean } } }).container.state.Running = true;
+      if (mutation === 'foreign-labels') (receipt.fingerprint as { container: { labels: { project: string } } }).container.labels.project = 'another-project';
+      if (mutation === 'retained-volume') receipt.ownedVolumes[0]!.status = 'retained';
+      if (mutation === 'no-volume-proof') receipt.ownedVolumes = [];
+      f.store.set('session-container-retirement', { ...f.retired, receipt });
+    }
+    const items = payload(await f.service.call('factory_verification_history', {})).items as Array<{ kind: string; unavailable?: string }>;
+    assert.ok(items.find(item => item.kind === 'author-retirement')?.unavailable);
+    await assert.rejects(readAll(f.service, 'author-retirement', f.author.id), /retirement receipt|retirement fingerprint/);
+    assert.deepEqual(f.store.list('inspection-verification-history-views'), []);
   });
 });

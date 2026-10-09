@@ -1,6 +1,10 @@
 import { DatabaseSync } from 'node:sqlite';
 import { mkdirSync, chmodSync } from 'node:fs';
 import path from 'node:path';
+import { createHash } from 'node:crypto';
+
+export interface ChatEventPrefix { completedAt: string; throughSeq: number; eventCount: number; toolEventCount: number; byteLength: number; sha256: string; }
+export interface OriginalChatEvent { seq: number; at: string; original: string; }
 
 const migrations = [{
   version: 1,
@@ -108,6 +112,27 @@ export class Store {
   }
   events<T>(topic: string, entity: string, cursor = 0): {seq: number; value: T}[] {
     return this.db.prepare('SELECT seq,value FROM events WHERE topic=? AND entity=? AND seq>? ORDER BY seq LIMIT 10000').all(topic, entity, cursor).map(row => ({ seq: Number(row.seq), value: JSON.parse(String(row.value)) as T }));
+  }
+  /** Stream the complete original journal prefix, without the UI event window limit. */
+  chatEventPrefix(chatId: string, completedAt: string): ChatEventPrefix {
+    if (!Number.isFinite(Date.parse(completedAt)) || new Date(completedAt).toISOString() !== completedAt) throw new Error('The original chat completion time is unavailable.');
+    const last = this.db.prepare("SELECT MAX(seq) AS seq FROM events WHERE topic='chat' AND entity=? AND at<=?").get(chatId, completedAt);
+    const throughSeq = Number(last?.seq ?? 0), digest = createHash('sha256');
+    let eventCount = 0, toolEventCount = 0, byteLength = 0;
+    for (const row of this.db.prepare("SELECT seq,at,value FROM events WHERE topic='chat' AND entity=? AND seq<=? ORDER BY seq").iterate(chatId, throughSeq)) {
+      const original = String(row.value), event = JSON.parse(original);
+      if (event.chatId !== chatId || String(row.at) > completedAt) throw new Error('The original chat journal prefix has inconsistent ownership or chronology.');
+      const framed = JSON.stringify([Number(row.seq), String(row.at), original]) + '\n';
+      digest.update(framed); byteLength += Buffer.byteLength(framed); eventCount++; if (event.kind === 'tool') toolEventCount++;
+    }
+    return { completedAt, throughSeq, eventCount, toolEventCount, byteLength, sha256: digest.digest('hex') };
+  }
+  /** Read only original tool events within a positively completed prefix. */
+  chatToolEventPage(chatId: string, afterSeq: number, throughSeq: number, limit: number): { events: OriginalChatEvent[]; nextEventCursor: number; complete: boolean } {
+    if (![afterSeq, throughSeq, limit].every(Number.isSafeInteger) || afterSeq < 0 || afterSeq > throughSeq || limit < 1 || limit > 32) throw new Error('Select an original tool-event cursor and 1–32 events.');
+    const rows = this.db.prepare("SELECT seq,at,value FROM events WHERE topic='chat' AND entity=? AND seq>? AND seq<=? AND json_extract(value,'$.kind')='tool' ORDER BY seq LIMIT ?").all(chatId, afterSeq, throughSeq, limit + 1);
+    const events = rows.slice(0, limit).map(row => ({ seq: Number(row.seq), at: String(row.at), original: String(row.value) }));
+    return { events, nextEventCursor: rows.length > limit ? events.at(-1)!.seq : throughSeq, complete: rows.length <= limit };
   }
   close(): void { this.db.close(); }
 }
