@@ -2,11 +2,13 @@ export interface ParsedBrowserObservation {
   uiTree: string;
   elements: Array<{ label: string; identifier?: string; value?: string }>;
   elementIds: string[];
+  /** Snapshot-listed editable controls; raw snapshot text is not exact form-value evidence. */
+  formFields: Array<{ index: number; identifier?: string; label: string }>;
   /** Incomplete/unsupported structure may support positive inspection, never an absence assertion. */
   truncated: boolean;
 }
 const maxBytes = 64 * 1024, maxElements = 2000;
-const empty = (): ParsedBrowserObservation => ({ uiTree: '', elements: [], elementIds: [], truncated: true });
+const empty = (): ParsedBrowserObservation => ({ uiTree: '', elements: [], elementIds: [], formFields: [], truncated: true });
 const roles = new Set(('alert alertdialog application article banner blockquote button caption cell checkbox code columnheader combobox complementary contentinfo definition deletion dialog directory document emphasis feed figure form generic grid gridcell group heading img insertion link list listbox listitem log main marquee math menu menubar menuitem menuitemcheckbox menuitemradio meter navigation none note option paragraph presentation progressbar radio radiogroup region row rowgroup rowheader scrollbar search searchbox separator slider spinbutton status strong subscript superscript switch tab table tablist tabpanel term textbox time timer toolbar tooltip tree treegrid treeitem text iframe').split(' '));
 const inputs = new Set(['textbox', 'searchbox', 'combobox', 'spinbutton', 'slider']);
 // The pinned renderer silently omits names longer than 900 characters. For these
@@ -41,7 +43,7 @@ export function parseBrowserObservation(input: string): ParsedBrowserObservation
   const original = section[1]!;
   const bytes = Buffer.from(original), truncatedBytes = bytes.length > maxBytes;
   const uiTree = (truncatedBytes ? bytes.subarray(0, maxBytes).toString('utf8') : original);
-  const output: ParsedBrowserObservation = { uiTree, elements: [], elementIds: [], truncated: truncatedBytes };
+  const output: ParsedBrowserObservation = { uiTree, elements: [], elementIds: [], formFields: [], truncated: truncatedBytes };
   const refs = new Set<string>();
   const parents = new Map<number, { role: string; element: ParsedBrowserObservation['elements'][number] }>();
   let previousIndent = -2, nodes = 0;
@@ -83,6 +85,7 @@ export function parseBrowserObservation(input: string): ParsedBrowserObservation
     if (role === 'text' && nodeValue !== undefined && parent && inputs.has(parent.role)) parent.element.value = parent.element.value === undefined ? nodeValue : `${parent.element.value}\n${nodeValue}`;
     for (const level of parents.keys()) if (level >= indent) parents.delete(level);
     parents.set(indent, { role, element });
+    if (inputs.has(role)) output.formFields.push({ index: output.elements.length, ...(identifier ? { identifier } : {}), label });
     output.elements.push(element);
   }
   if (!nodes) output.truncated = true;

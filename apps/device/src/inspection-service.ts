@@ -17,6 +17,7 @@ import { InspectionJobs } from './inspection-jobs.ts';
 import { InspectionDelegation } from './inspection-delegation.ts';
 import type { PeerManager } from '@enoughfactory/peers';
 import { parseBrowserObservation } from './inspection-browser-observation.ts';
+import { beginBrowserFormObservation, completeBrowserFormObservation } from './inspection-browser-values.ts';
 import { createContainerInspectionBridge, createHostInspectionBridge, inspectionMcpHandler, type InspectionMcpBridge } from './inspection-mcp.ts';
 import { NativeInspectionAdapter, type NativeFixtureProfile, type NativeInspectionBuild } from './inspection-native.ts';
 import { NativeBuildRunner } from './inspection-build-runner.ts';
@@ -600,12 +601,12 @@ export class InspectionService {
     if(name==='factory_assert'){
       if(session.latestObservationId!==args.observationId)throw new Error('Re-observe before asserting current UI state.');
       const observation=this.jobs.observation(String(args.observationId)),needle=String(args.labelIncludes||'');if(!needle.trim())throw new Error('An assertion needs a concrete observed label.');
-      const structured=this.app.store.get<{id:string;elements:Array<{label?:string;identifier?:string;value?:string}>;truncated:boolean}>('inspection-structured-observations',String(args.observationId));
+      const structured=this.app.store.get<{id:string;elements:Array<{label?:string;identifier?:string;value?:string}>;truncated:boolean;formValues?:{artifact:{id:string;sha256:string}}}>('inspection-structured-observations',String(args.observationId));
       if(!structured)throw new Error('This observation has no complete structured assertions. Use a native observation or a browser assertion tool.');
       if(args.absent===true&&structured.truncated)throw new Error('A truncated observation cannot prove an element is absent.');
       const passed=evaluateObservedCondition(structured.elements,{labelIncludes:needle,...(args.labelEquals!==undefined?{labelEquals:args.labelEquals as string}:{}),...(args.valueIncludes!==undefined?{valueIncludes:args.valueIncludes as string}:{}),...(args.valueEquals!==undefined?{valueEquals:args.valueEquals as string}:{}),...(args.absent===true?{absent:true}:{})});
-      const artifact=await this.artifacts.put(JSON.stringify({passed,observationId:args.observationId,condition:args,observedAt:observation?.createdAt}),{goalId:authority.goalId,taskId:authority.taskId,attemptId:authority.attemptId,name:'workflow-assertion.json',mime:'application/json'});
-      const evidence=this.jobs.publishEvidence(session.jobId,{kind:'assertion',sessionId:session.id,artifact,metadata:{passed,observationId:args.observationId,platform:backend.kind==='browser'?'web':session.capability==='macos-app-inspection'?'macos':'ios-simulator'}});this.app.store.set('factory-artifacts',artifact);return result({passed,evidenceId:evidence.id});
+      const artifact=await this.artifacts.put(JSON.stringify({passed,observationId:args.observationId,condition:args,observedAt:observation?.createdAt,...(structured.formValues?{formValuesArtifact:structured.formValues.artifact}:{})}),{goalId:authority.goalId,taskId:authority.taskId,attemptId:authority.attemptId,name:'workflow-assertion.json',mime:'application/json'});
+      const evidence=this.jobs.publishEvidence(session.jobId,{kind:'assertion',sessionId:session.id,artifact,metadata:{passed,observationId:args.observationId,...(structured.formValues?{formValuesArtifactId:structured.formValues.artifact.id,formValuesArtifactSha256:structured.formValues.artifact.sha256}:{}),platform:backend.kind==='browser'?'web':session.capability==='macos-app-inspection'?'macos':'ios-simulator'}});this.app.store.set('factory-artifacts',artifact);return result({passed,evidenceId:evidence.id});
     }
     const browserTool=String(args.tool||''),kind=name==='factory_native_restart'?'restart':name==='factory_observe'?'observe':name==='factory_native_action'?String((args.action as Record<string,unknown>)?.kind):browserTool==='browser_navigate'?'navigate':browserTool==='browser_take_screenshot'?'screenshot':['browser_snapshot','browser_console_messages','browser_network_requests'].includes(browserTool)?'observe':browserTool.includes('type')||browserTool.includes('fill')?'type':browserTool.includes('press_key')?'key':browserTool.includes('scroll')?'scroll':'click';
     const actionArgs=name==='factory_native_action'?args.action as Record<string,unknown>:args.arguments as Record<string,unknown>||{};
@@ -638,24 +639,34 @@ export class InspectionService {
       if(!['factory_browser_call','factory_observe'].includes(name))throw new Error('Use the advertised browser tools to inspect this browser session.');
       const supported=await this.browser.listTools(backend.backendSessionId);if(name!=='factory_observe'&&!supported.some(tool=>tool.name===browserTool))throw new Error('This browser tool is not advertised.');
       const browserOptions={signal:context.signal,source:{snapshotSha256:session.source.sha256,dirty:true},assertCurrent:()=>{this.jobs.authorize(token);}};
+      const observes=name==='factory_observe'||browserTool==='browser_snapshot'||browserTool==='browser_take_screenshot';
+      const formCall=(tool:string,arguments_:Record<string,unknown>)=>this.browser.call(backend.backendSessionId,tool,arguments_,browserOptions);
+      const formFrame=observes?await beginBrowserFormObservation({backendSessionId:backend.backendSessionId,sourceSha256:session.source.sha256,authority},supported.map(tool=>tool.name),formCall):undefined;
       let observed=await this.browser.call(backend.backendSessionId,name==='factory_observe'?'browser_snapshot':browserTool,actionArgs,browserOptions);
+      let snapshotResponse=observed;
       if(name==='factory_observe'||browserTool==='browser_take_screenshot'){
         const companion=await this.browser.call(backend.backendSessionId,name==='factory_observe'?'browser_take_screenshot':'browser_snapshot',name==='factory_observe'?{type:'png'}:{},browserOptions);
+        if(browserTool==='browser_take_screenshot')snapshotResponse=companion;
         observed={...observed,result:{content:[...observed.result.content,...companion.result.content],isError:observed.result.isError||companion.result.isError},artifacts:[...observed.artifacts,...companion.artifacts]};
       }
       await this.assertBrowserSource(context,session.jobId);
       for(const artifact of observed.artifacts)this.app.store.set('factory-artifacts',artifact);
       const screenshots=observed.artifacts.filter(artifact=>artifact.mime.startsWith('image/'));
-      const parsed=parseBrowserObservation(observed.result.content.filter(block=>block.type==='text').map(block=>block.text||'').join('\n'));
+      const snapshotText=snapshotResponse.result.content.filter(block=>block.type==='text').map(block=>block.text||'').join('\n');
+      const parsed=parseBrowserObservation(snapshotText);
+      const exactForms=formFrame&&!observed.result.isError?await completeBrowserFormObservation(formFrame,parsed,snapshotText,formCall):undefined;
+      await this.assertBrowserSource(context,session.jobId);
       const tree=parsed.uiTree;
       const evidence=screenshots.map(artifact=>this.jobs.publishEvidence(session.jobId,{kind:'screenshot',sessionId:session.id,actionId:begun.action.id,artifact,metadata:{platform:'web'}}));
       let observationId:string|undefined;
-      if((kind==='observe'||kind==='screenshot')&&!observed.result.isError){
-        observationId=this.jobs.recordObservation(begun.action.id,{uiTree:tree,elementIds:parsed.elementIds,screenshotEvidenceId:evidence[0]?.id}).id;
-        this.app.store.set('inspection-structured-observations',{id:observationId,elements:parsed.elements,truncated:parsed.truncated});
-      }
-      this.jobs.actionComplete(begun.action.id,{status:observed.result.isError?'failed':'succeeded',evidenceIds:evidence.map(item=>item.id)});
-      return {...observed.result,content:[text({sessionId:session.id,actionId:begun.action.id,observationId,evidenceIds:evidence.map(item=>item.id)}),...observed.result.content]};
+      if(observes&&!observed.result.isError&&exactForms?.observationCurrent!==false)observationId=this.jobs.recordObservation(begun.action.id,{uiTree:tree,elementIds:parsed.elementIds,screenshotEvidenceId:evidence[0]?.id}).id;
+      const formArtifact=exactForms&&(parsed.formFields.length||exactForms.raw.reads.length)?await this.artifacts.put(Buffer.from(JSON.stringify({...exactForms.raw,inspectionSessionId:session.id,actionId:begun.action.id,observationId,source:session.source})),{goalId:authority.goalId,taskId:authority.taskId,attemptId:authority.attemptId,name:'browser-exact-form-observation.json',mime:'application/json'}):undefined;
+      if(formArtifact)this.app.store.set('factory-artifacts',formArtifact);
+      this.jobs.authorize(token);await this.assertBrowserSource(context,session.jobId);
+      if(observationId)this.app.store.set('inspection-structured-observations',{id:observationId,elements:exactForms?.elements??parsed.elements,truncated:parsed.truncated,...(formArtifact?{formValues:{artifact:formArtifact,complete:exactForms!.raw.complete,reason:exactForms!.raw.reason}}:{})});
+      const pageInvalid=exactForms?.observationCurrent===false;
+      this.jobs.actionComplete(begun.action.id,{status:observed.result.isError||pageInvalid?'failed':'succeeded',...(pageInvalid?{reason:exactForms.raw.reason}:{}),evidenceIds:evidence.map(item=>item.id)});
+      return {...observed.result,...(pageInvalid?{isError:true}:{}),content:[text({sessionId:session.id,actionId:begun.action.id,observationId,evidenceIds:evidence.map(item=>item.id),...(exactForms?{exactFormValues:{elements:pageInvalid?[]:exactForms.elements,complete:exactForms.raw.complete,reason:exactForms.raw.reason,...(formArtifact?{artifact:formArtifact}:{})}}:{})}),...observed.result.content]};
     }catch(error){
       const uncertain=(error as {outcomeUnknown?:boolean}).outcomeUnknown===true||['action-unknown','helper-disconnected','termination-unknown','restart-unknown','process-changed','simulator-unknown'].includes((error as {code?:string}).code||'')||/timeout|timed out|transport|disconnected|unresponsive|closed/i.test((error as Error).message);
       if(uncertain)this.jobs.markActionUnknown(begun.action.id,(error as Error).message);

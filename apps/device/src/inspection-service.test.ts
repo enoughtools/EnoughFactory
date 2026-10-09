@@ -517,3 +517,56 @@ test('native restart completes only after exit acknowledgement and an uncertain 
     }
   }
 });
+
+test('browser exact form observations retain original raw DOM evidence and reject flattened or stale-page assertions', async t => {
+  const f=await fixture(t,'web'), {session}=f.createSession();
+  const artifact=await f.service.artifacts.put(png,{name:'browser.png',mime:'image/png',goalId:'goal',taskId:'task',attemptId:'attempt'});
+  const href='http://127.0.0.1:3000/', body='First line\nMiddle line\nLast line\n';
+  const snapshot=`### Page\n- Page URL: ${href}\n### Snapshot\n\`\`\`yaml\n- textbox "Message" [ref=e81]: First line Middle line Last line\n- button "Close" [ref=e82]\n\`\`\`\n`;
+  let changed=false, pageReads=0, userScriptReads=0;
+  const lease={id:'backend',sessionId:'chat-session',goalId:'goal',taskId:'task',attemptId:'attempt',authorityGeneration:2,source:{snapshotSha256:f.source.sha256}};
+  Object.assign(f.service.browser,{
+    listTools:async()=>['browser_snapshot','browser_take_screenshot','browser_evaluate','browser_tabs','browser_console_messages','browser_network_requests'].map(name=>({name})),
+    call:async(_id:string,tool:string,args:Record<string,unknown>)=>{
+      let result:BrowserObservation['result'];
+      if(tool==='browser_tabs') result={content:[{type:'text',text:`### Open tabs\n- 0: (current) [Mail](${href})\n`}]};
+      else if(['browser_snapshot','browser_console_messages','browser_network_requests'].includes(tool)) result={content:[{type:'text',text:snapshot}]};
+      else if(tool==='browser_take_screenshot') result={content:[{type:'image',mimeType:'image/png',data:png.toString('base64')}]};
+      else if(args.target){
+        assert.equal(args.target,'e81');assert.equal(args.element,'Message');assert(!String(args.function).includes(body));
+        const json={version:1,href,timeOrigin:42,connected:true,tag:'textarea',value:body};
+        result={content:[{type:'text',text:`### Result\n${JSON.stringify(json)}\n### Ran Playwright code\nAgent assertions and generated code are not structured UI values.`}]};
+      }else if(String(args.function).includes('document.URL')){
+        pageReads++;result={content:[{type:'text',text:`### Result\n${JSON.stringify({version:1,href,timeOrigin:changed&&pageReads%2===0?43:42})}\n`}]};
+      }else{userScriptReads++;result={content:[{type:'text',text:'### Result\n{"value":"fabricated","expectedMatches":true}\n'}]};}
+      return {lease,result,artifacts:tool==='browser_take_screenshot'?[artifact]:[]} as BrowserObservation;
+    }
+  });
+  const observedResult=await f.call('factory_observe',{sessionId:session.id,requestId:'full-value'});
+  const observed=value<{observationId:string;exactFormValues:{artifact:Parameters<typeof f.service.artifacts.read>[0]}}>(observedResult);
+  const structured=f.store.get<{elements:Array<{label:string;value?:string}>;formValues:{artifact:{id:string;sha256:string}}}>('inspection-structured-observations',observed.observationId)!;
+  assert.equal(structured.elements[0]!.value,body);
+  const raw=JSON.parse((await f.service.artifacts.read(observed.exactFormValues.artifact)).toString());
+  assert.equal(raw.source.sha256,f.source.sha256);assert.equal(raw.inspectionSessionId,session.id);assert.equal(raw.observationId,observed.observationId);
+  assert.equal(raw.fields[0].identifier,'e81');assert.equal(raw.reads.filter((read:{stage:string})=>read.stage==='field:e81').length,1);
+  assert(raw.reads.find((read:{stage:string})=>read.stage==='field:e81').result.content[0].text.includes(JSON.stringify(body)));
+  const exact=value<{passed:boolean;evidenceId:string}>(await f.call('factory_assert',{sessionId:session.id,observationId:observed.observationId,labelIncludes:'Message',valueEquals:body}));
+  assert.equal(exact.passed,true);
+  const evidence=f.store.get<InspectionEvidence>('inspection-evidence',exact.evidenceId)!;
+  assert.equal(evidence.metadata?.formValuesArtifactId,structured.formValues.artifact.id);
+  assert.equal(evidence.metadata?.formValuesArtifactSha256,structured.formValues.artifact.sha256);
+  const assertion=JSON.parse((await f.service.artifacts.read(evidence.artifact!)).toString());
+  assert.equal(assertion.formValuesArtifact.id,structured.formValues.artifact.id);
+  for(const wrong of [body.trimEnd(),body.replaceAll('\n',' '),body+'suffix'])assert.equal(value<{passed:boolean}>(await f.call('factory_assert',{sessionId:session.id,observationId:observed.observationId,labelIncludes:'Message',valueEquals:wrong})).passed,false);
+  await f.call('factory_browser_call',{sessionId:session.id,requestId:'untrusted-script',observationId:observed.observationId,tool:'browser_evaluate',arguments:{function:'() => ({value:"fabricated",expectedMatches:true})'}});
+  assert.equal(userScriptReads,1);assert.equal(f.store.get<{elements:Array<{value?:string}>}>('inspection-structured-observations',observed.observationId)!.elements[0]!.value,body,'An agent script result does not replace broker observation values');
+  for(const tool of ['browser_console_messages','browser_network_requests']){
+    const logs=await f.call('factory_browser_call',{sessionId:session.id,requestId:tool,tool});
+    assert.equal(value<{observationId?:string}>(logs).observationId,undefined,'Snapshot-looking diagnostic text cannot become authoritative form or reference evidence');
+  }
+  changed=true;pageReads=0;
+  const stale=await f.call('factory_observe',{sessionId:session.id,requestId:'changed-page'});
+  assert.equal((stale as {isError?:boolean}).isError,true);assert.equal(value<{observationId?:string}>(stale).observationId,undefined);
+  assert.equal(f.service.jobs.getSession(session.id)!.latestObservationId,undefined);
+  await assert.rejects(f.call('factory_assert',{sessionId:session.id,observationId:observed.observationId,labelIncludes:'Message',valueEquals:body}),/Re-observe/);
+});
