@@ -5,9 +5,15 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import test, { type TestContext } from 'node:test';
-import type { Attempt, AttemptInspection, Chat, FactoryTask, Goal, Project, Session, InspectionAction, InspectionAuthority, InspectionEvidence, InspectionJob, InspectionSourceIdentity, InspectionVerificationRun, TaskQualityRequirements } from '@enoughfactory/contracts';
+import type { Attempt, AttemptInspection, Chat, ChatEvent, FactoryTask, Goal, Project, Session, InspectionAction, InspectionAuthority, InspectionEvidence, InspectionJob, InspectionSourceIdentity, InspectionVerificationRun, TaskQualityRequirements } from '@enoughfactory/contracts';
+import type { AgentManager, TurnCallbacks, TurnInput } from '@enoughfactory/agents';
 import type { AttemptDetail, GoalCheckRecord } from '@enoughfactory/factory';
 import { ArtifactStore, exportInspectionSnapshot, InspectionSnapshotManager } from '@enoughfactory/workspaces';
+import { CodexTurn, type RpcMessage } from '../../../packages/agents/src/codex.ts';
+import { ApprovalRouter } from '../../../packages/agents/src/policy.ts';
+import type { AgentProcess } from '../../../packages/agents/src/process.ts';
+import type { DeviceApp } from './app.ts';
+import { ChatController } from './chats.ts';
 import { Store } from './store.ts';
 import type { InspectionObservation } from './inspection-jobs.ts';
 import { InspectionQualityService } from './inspection-quality.ts';
@@ -342,6 +348,72 @@ async function tracePage(f: HistoryFixture, eventCursor = 0, eventLimit = 32, ma
   assert.equal(createHash('sha256').update(original).digest('hex'), digest);
   return JSON.parse(original) as { originalOwner: { chatId: string; sessionId: string }; prefix: ReturnType<Store['chatEventPrefix']>; events: Array<{ seq: number; at: string; original: string }>; nextEventCursor: number; complete: boolean; limits: string };
 }
+
+test('Codex terminal interactions persist through the chat writer into exact historical author context', async t => {
+  const f = await authorFixture(t);
+  const ledgers = ['factory-attempt-details', 'inspection-verifier-runs', 'inspection-jobs', 'inspection-evidence', 'inspection-actions', 'inspection-quality-reports', 'provider-image-deliveries', 'inspection-quality-equivalences'];
+  const before = ledgers.map(bucket => f.store.list(bucket));
+  const chats = new ChatController({ store: f.store, extensions: [], closers: [], runtimeStopHooks: [], sessions: { beforeStop: [] }, emit: () => {}, changed: () => {} } as unknown as DeviceApp,
+    { shutdown: async () => {} } as unknown as AgentManager);
+  const input: TurnInput = { chatId: f.chat.id, sessionId: f.session.id, containerId: f.session.containerId, cwd: f.workspace.path,
+    runtime: 'codex', approvalMode: 'approve-all', rules: [], prompt: 'Inspect the mailbox and stop its owned server.', threadId: f.chat.threadId, attemptId: f.author.id };
+  const callbacks: TurnCallbacks = { onEvent: event => { chats.event(f.chat.id, event); }, onApproval: async () => assert.fail('No approval is requested by this provider trace.') };
+  const turnId = 'original-provider-turn', itemId = 'server-command', processId = '61824';
+  const command = { id: itemId, type: 'commandExecution', command: 'node server.cjs', cwd: f.workspace.path, processId };
+  const startedItem = { ...command, status: 'inProgress', aggregatedOutput: null, exitCode: null, durationMs: null };
+  const completedItem = { ...command, status: 'completed', aggregatedOutput: 'Mailbox ready at http://127.0.0.1:3000\n^C\n', exitCode: 0, durationMs: 160260 };
+  const interaction = (stdin: string) => ({ threadId: f.chat.threadId!, turnId, itemId, processId, stdin });
+  let receive!: (line: string) => void;
+  const requests: string[] = [];
+  const process: AgentProcess = {
+    lines(callback) { receive = callback; }, exit: new Promise(() => {}), errorText: () => '', end: () => {}, stop: async () => {},
+    write(value) {
+      const message = value as RpcMessage;
+      if (message.id === undefined) return;
+      requests.push(message.method!);
+      const result = message.method === 'thread/resume' ? { thread: { id: f.chat.threadId } } : message.method === 'turn/start' ? { turn: { id: turnId } } : {};
+      queueMicrotask(() => {
+        receive(JSON.stringify({ id: message.id, result }));
+        if (message.method !== 'turn/start') return;
+        for (const event of [
+          { method: 'turn/started', params: { threadId: f.chat.threadId, turn: { id: turnId } } },
+          { method: 'item/started', params: { threadId: f.chat.threadId, turnId, item: startedItem } },
+          { method: 'item/commandExecution/terminalInteraction', params: interaction('') },
+          { method: 'item/commandExecution/terminalInteraction', params: interaction('\u0003') },
+          { method: 'item/completed', params: { threadId: f.chat.threadId, turnId, item: completedItem } },
+          { method: 'item/completed', params: { threadId: f.chat.threadId, turnId, item: { id: 'final', type: 'agentMessage', phase: 'final_answer', text: f.detail.result!.text } } },
+          { method: 'turn/completed', params: { threadId: f.chat.threadId, turn: { id: turnId, status: 'completed' } } },
+        ]) receive(JSON.stringify(event));
+      });
+    },
+  };
+  const signal = new AbortController().signal;
+  const result = await new CodexTurn(input, callbacks, process, new ApprovalRouter(input, callbacks, signal), signal).run();
+  assert.deepEqual(requests, ['initialize', 'thread/resume', 'turn/start']);
+  assert.equal(result.stopReason, 'completed'); assert.equal(result.text, f.detail.result!.text);
+  const providerCompletedAt = new Date().toISOString();
+  f.store.set('chat-results', { ...f.result, result, completedAt: providerCompletedAt });
+  f.store.set('chats', { ...chats.get(f.chat.id), status: 'idle', updatedAt: providerCompletedAt });
+
+  const persisted = f.store.events<ChatEvent>('chat', f.chat.id), tools = persisted.filter(row => row.value.kind === 'tool');
+  assert.equal(tools.length, 4, 'Started command, empty poll, Ctrl-C input and original completion must all survive the normal chat writer.');
+  assert.deepEqual(tools.map(row => row.value.data), [
+    { method: 'item/started', item: startedItem },
+    { method: 'item/commandExecution/terminalInteraction', ...interaction('') },
+    { method: 'item/commandExecution/terminalInteraction', ...interaction('\u0003') },
+    { method: 'item/completed', item: completedItem },
+  ]);
+  assert.deepEqual(tools.map(row => row.value.text), [command.command, 'Terminal input', 'Terminal input', command.command]);
+  assert.ok(tools.every((row, index) => index === 0 || row.seq > tools[index - 1]!.seq));
+  assert.ok(tools.every(row => row.value.seq === 0 && row.value.chatId === f.chat.id));
+  const page = await tracePage(f, 0, 32, 83);
+  assert.equal(page.complete, true); assert.equal(page.prefix.toolEventCount, 4); assert.equal(page.prefix.eventCount, persisted.length);
+  assert.deepEqual(page.prefix, f.store.chatEventPrefix(f.chat.id, providerCompletedAt));
+  assert.deepEqual(page.events.map(row => ({ seq: row.seq, original: row.original })), tools.map(row => ({ seq: row.seq, original: JSON.stringify(row.value) })));
+  assert.equal(page.originalOwner.chatId, f.chat.id); assert.equal(page.originalOwner.sessionId, f.session.id);
+  assert.match(page.limits, /unrecorded or transient write absence is not proven/);
+  assert.deepEqual(ledgers.map(bucket => f.store.list(bucket)), before, 'Historical provider interactions do not create current source or acceptance evidence.');
+});
 
 test('author trace preserves failed server, repaired edit, successful check and later browser chronology in exact original pages', async t => {
   const f = await authorFixture(t);

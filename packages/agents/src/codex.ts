@@ -7,6 +7,8 @@ import { codexToolOverrides, retainToolImages } from "./tool-config.ts";
 type JsonRecord = Record<string, any>;
 export type RpcMessage = { id?: number | string; method?: string; params?: JsonRecord; result?: JsonRecord; error?: { code: number; message: string; data?: unknown } };
 export const CODEX_PROTOCOL_VERSION = RUNTIME_PINS.codex;
+/** Pinned app-server notification; stdin may be empty or contain literal terminal control input. */
+interface CodexTerminalInteractionNotification { threadId: string; turnId: string; itemId: string; processId: string; stdin: string; }
 
 /** Native/private tool routes must not silently sync personal account plugins. */
 export function codexManagedFeatureArguments(): string[] {
@@ -38,6 +40,7 @@ export class CodexTurn {
   private finished = false;
   private failure?: Error;
   private turnStartRequested = false;
+  private terminalInteractionsClosed = false;
   private events: Promise<void> = Promise.resolve();
   get executionMayHaveStarted(): boolean { return this.turnStartRequested; }
   constructor(private input: TurnInput, private callbacks: TurnCallbacks, private process: AgentProcess, private router: ApprovalRouter, private signal: AbortSignal) {
@@ -110,6 +113,12 @@ export class CodexTurn {
         }
       } else if (item.type !== "userMessage" && item.type !== "reasoning") await this.emit({ kind: "tool", text: item.command ?? item.type ?? "Agent activity", data: { method, item } });
     } else if (method === "item/commandExecution/outputDelta") await this.emit({ kind: "tool", text: params.delta ?? "", data: { method, itemId: params.itemId, outputDelta: true } });
+    else if (method === "item/commandExecution/terminalInteraction") {
+      if (this.terminalInteractionsClosed || !this.threadId || !this.turnId || params.threadId !== this.threadId || params.turnId !== this.turnId) return;
+      if (!["threadId", "turnId", "itemId", "processId", "stdin"].every(key => typeof params[key] === "string")) throw new AgentError("Codex emitted an invalid terminal interaction notification.", "PROTOCOL_ERROR");
+      const interaction = params as CodexTerminalInteractionNotification;
+      await this.emit({ kind: "tool", text: "Terminal input", data: { method, ...interaction } });
+    }
     else if (method === "thread/tokenUsage/updated") {
       this.usage = params.tokenUsage;
       await this.emit({ kind: "usage", data: { usage: this.usage } });
@@ -117,6 +126,7 @@ export class CodexTurn {
     else if (method === "turn/completed") {
       const turn = params.turn ?? {};
       if (this.turnId && turn.id !== this.turnId) return;
+      this.terminalInteractionsClosed = true;
       if (turn.status === "failed") { this.fail(new AgentError(turn.error?.message ?? "Codex turn failed.", "AGENT_TURN_FAILED", true)); return; }
       if (turn.status === "interrupted") { this.fail(new AgentError("Agent turn interrupted.", "INTERRUPTED")); return; }
       await this.events;

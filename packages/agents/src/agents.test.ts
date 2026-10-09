@@ -116,6 +116,87 @@ test('only a terminal Codex provider response proves a failed turn ended', async
   }
 });
 
+function terminalNotificationTurn(onEvent: (event: AgentEvent) => void | Promise<void>) {
+  let receive!: (line: string) => void, admitted!: () => void;
+  const ready = new Promise<void>(resolve => { admitted = resolve; });
+  const process = {
+    lines(callback: (line: string) => void) { receive = callback; },
+    exit: new Promise<{ code: number }>(() => {}), errorText: () => '',
+    write(message: RpcMessage) {
+      if (message.id === undefined) return;
+      const result = message.method === 'thread/start' ? { thread: { id: 'thread' } } : message.method === 'turn/start' ? { turn: { id: 'turn' } } : {};
+      queueMicrotask(() => {
+        receive(JSON.stringify({ id: message.id, result }));
+        if (message.method === 'turn/start') {
+          receive(JSON.stringify({ method: 'turn/started', params: { threadId: 'thread', turn: { id: 'turn' } } }));
+          admitted();
+        }
+      });
+    },
+  } as unknown as ContainerProcess;
+  const controller = new AbortController(), callbacks = { onEvent, onApproval: async () => true };
+  const turn = new CodexTurn(input, callbacks, process, new ApprovalRouter(input, callbacks, controller.signal), controller.signal);
+  return { ready, result: turn.run(), notify(method: string, params: Record<string, unknown>) { receive(JSON.stringify({ method, params })); } };
+}
+
+test('terminal interactions retain exact poll and Ctrl-C input with original ownership before genuine command completion', async () => {
+  const events: AgentEvent[] = [], f = terminalNotificationTurn(event => {
+    events.push(event);
+    if (event.kind === 'status') f.notify('item/commandExecution/terminalInteraction', { threadId: 'thread', turnId: 'turn', itemId: 'server', processId: '86613', stdin: 'before turn admission' });
+  });
+  f.notify('item/commandExecution/terminalInteraction', { threadId: 'thread', turnId: 'turn', itemId: 'server', processId: '86613', stdin: 'before thread admission' });
+  await f.ready;
+  const interaction = { threadId: 'thread', turnId: 'turn', itemId: 'server', processId: '86613', stdin: '' };
+  f.notify('item/started', { threadId: 'thread', turnId: 'turn', item: { id: 'server', type: 'commandExecution', command: 'node server.cjs', processId: '86613', status: 'inProgress' } });
+  f.notify('item/commandExecution/terminalInteraction', interaction);
+  f.notify('item/commandExecution/terminalInteraction', { ...interaction, threadId: 'foreign-thread', stdin: 'foreign' });
+  f.notify('item/commandExecution/terminalInteraction', { ...interaction, turnId: 'retired-turn', stdin: 'retired' });
+  f.notify('item/commandExecution/terminalInteraction', { ...interaction, stdin: '\u0003' });
+  const completed = { id: 'server', type: 'commandExecution', command: 'node server.cjs', processId: '86613', status: 'completed', exitCode: 0, aggregatedOutput: 'Server ready\nShutdown complete\n' };
+  f.notify('item/completed', { threadId: 'thread', turnId: 'turn', item: completed });
+  f.notify('turn/completed', { threadId: 'thread', turn: { id: 'turn', status: 'completed' } });
+  assert.equal((await f.result).stopReason, 'completed');
+  const original = events.filter(event => event.data?.method === 'item/commandExecution/terminalInteraction');
+  assert.deepEqual(original.map(event => event.data), [{ method: 'item/commandExecution/terminalInteraction', ...interaction }, { method: 'item/commandExecution/terminalInteraction', ...interaction, stdin: '\u0003' }]);
+  assert.ok(original.every(event => event.kind === 'tool' && event.data?.status === undefined && event.data?.exitCode === undefined && event.data?.result === undefined));
+  const completion = events.find(event => event.data?.method === 'item/completed');
+  assert.deepEqual(completion?.data?.item, completed, 'Completion is independently reported by the provider, not inferred from Ctrl-C');
+  assert.ok(events.indexOf(original[1]!) < events.indexOf(completion!));
+  f.notify('item/commandExecution/terminalInteraction', { ...interaction, stdin: 'after completion' });
+  await Promise.resolve();
+  assert.equal(events.filter(event => event.data?.method === 'item/commandExecution/terminalInteraction').length, 2);
+});
+
+test('terminal interactions arriving during completed-turn persistence drain cannot enter its original event prefix', async () => {
+  let entered!: () => void, release!: () => void;
+  const held = new Promise<void>(resolve => { entered = resolve; }), persist = new Promise<void>(resolve => { release = resolve; });
+  const events: AgentEvent[] = [], f = terminalNotificationTurn(async event => {
+    if (event.data?.method === 'item/commandExecution/terminalInteraction') { entered(); await persist; }
+    events.push(event);
+  });
+  await f.ready;
+  const interaction = { threadId: 'thread', turnId: 'turn', itemId: 'server', processId: '86613', stdin: '\u0003' };
+  f.notify('item/commandExecution/terminalInteraction', interaction); await held;
+  f.notify('turn/completed', { threadId: 'thread', turn: { id: 'turn', status: 'completed' } });
+  f.notify('item/commandExecution/terminalInteraction', { ...interaction, stdin: 'late input' });
+  release(); await f.result;
+  assert.deepEqual(events.filter(event => event.kind === 'tool').map(event => event.data), [{ method: 'item/commandExecution/terminalInteraction', ...interaction }]);
+});
+
+test('malformed terminal interactions cannot create typed input or completed execution evidence', async () => {
+  for (const params of [
+    { threadId: 'thread', turnId: 'turn', itemId: 'server', processId: '86613' },
+    { threadId: 'thread', turnId: 'turn', itemId: 'server', processId: 86613, stdin: '\u0003' },
+    { threadId: 'thread', turnId: 'turn', itemId: 'server', processId: '86613', stdin: null },
+  ]) {
+    const events: AgentEvent[] = [], f = terminalNotificationTurn(event => { events.push(event); });
+    await f.ready;
+    const rejected = assert.rejects(f.result, error => (error as { code?: string; executionEnded?: boolean }).code === 'PROTOCOL_ERROR' && (error as { executionEnded?: boolean }).executionEnded === false);
+    f.notify('item/commandExecution/terminalInteraction', params); await rejected;
+    assert.equal(events.some(event => event.kind === 'tool'), false);
+  }
+});
+
 test('a nonzero CLI transport exit cannot masquerade as confirmed provider completion', async () => {
   const spawnProcess = (() => {
     const child = new EventEmitter() as EventEmitter & { stdout: PassThrough; stderr: PassThrough; stdin: PassThrough; kill: () => boolean };
