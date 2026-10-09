@@ -257,6 +257,23 @@ export class SessionController {
     this.store.transaction(()=>{this.store.set('sessions',record);
       this.store.set<LaunchRecord>('session-launch',{id:record.id,projectPath:project.path,generation,executionTargetKind:'host-macos',executionTargetId:options.executionTargetId,workingDirectorySources:options.workingDirectorySources,referenceContext:options.referenceContext});
       options.onCreated?.(record);});
+    return this.prepareHost(record,options,generation,abort);
+  }
+  /** Retry only the positively unadmitted overlap failure, retaining its original inspection owner. */
+  async retryUnadmittedHostPreparation(sessionId:string,options:HostLaunchOptions):Promise<Session> {
+    const record=this.record(sessionId),launch=this.store.get<LaunchRecord>('session-launch',sessionId),project=this.store.get<Project>('projects',record.projectId);
+    const assertUnadmitted=()=>{
+      options.assertCurrent?.();const current=this.record(sessionId);
+      if(!project||current.projectId!==project.id||current.deviceId!==this.deviceId||current.executionTargetKind!=='host-macos'||current.status!=='failed'||current.error!=='Host authoring must not expose the primary project checkout as its working directory.'||!current.verificationRunId||options.workspace.id!==current.verificationRunId||launch?.projectPath!==project.path||launch.executionTargetKind!=='host-macos'||launch.executionTargetId!==current.executionTargetId||options.executionTargetId!==current.executionTargetId||launch.workingDirectorySources?.length||launch.referenceContext||options.workingDirectorySources?.length||options.referenceContext||this.store.get('session-host',sessionId)||this.store.list<Chat>('chats').some(chat=>chat.sessionId===sessionId)||this.starts.has(sessionId)||this.launchJobs.has(sessionId)||this.stopJobs.has(sessionId)||this.stopping.has(sessionId)||this.restoring.has(sessionId)||this.stoppedInputReleases.has(sessionId))throw new HttpError(409,'The original native preparation has no confirmed unadmitted overlap failure.','HOST_PREPARATION_UNRESOLVED');
+    };
+    assertUnadmitted();
+    try{await lstat(path.join(this.workspaceDataDir,'host-sessions',sessionId));throw new HttpError(409,'An unpublished native input directory requires recovery.','HOST_PREPARATION_UNRESOLVED');}catch(error){if((error as NodeJS.ErrnoException).code!=='ENOENT')throw error;}
+    assertUnadmitted();this.assertActiveProject(project);
+    const generation=launch!.generation+1,abort=new AbortController();
+    this.store.transaction(()=>{this.store.set('sessions',{...record,status:'starting',phase:'Preparing original private native workspace',error:undefined,updatedAt:now()});this.store.set('session-launch',{...launch!,generation});});
+    return this.prepareHost(this.record(sessionId),options,generation,abort);
+  }
+  private async prepareHost(record:Session,options:HostLaunchOptions,generation:number,abort:AbortController):Promise<Session> {
     this.generations.set(record.id,generation);this.starts.set(record.id,abort);this.changed();
     const assertCurrent=()=>{
       options.assertCurrent?.();

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { createInterface } from 'node:readline';
@@ -11,7 +11,7 @@ import type { DeviceApp } from './app.ts';
 import { ChatController, type AgentToolBridge, type AgentToolBridgeContext, type RunOptions } from './chats.ts';
 import type { NativeFixtureProfile } from './inspection-native.ts';
 import { NativeProfileSetup, PROFILE_AUDITS, validateNativeProfileProposal, type NativeProfileAudit, type NativeProfileProposal } from './inspection-profile-setup.ts';
-import { SessionController } from './sessions.ts';
+import { SessionController, type HostLaunchOptions } from './sessions.ts';
 import { Store } from './store.ts';
 
 const authority: InspectionAuthority = { goalId: 'goal', goalRevision: 3, taskId: 'task', attemptId: 'author', authorityGeneration: 2, policyRevision: 3 };
@@ -179,6 +179,143 @@ async function fixture(t: TestContext, effects: { retire?: boolean; target?: 'ho
     restart: () => { serviceApprovals.clear(); setup = new NativeProfileSetup(options); setup.recover(); return setup; },
   };
 }
+
+function realNativeSessions(t: TestContext, f: Awaited<ReturnType<typeof fixture>>, reproduceOverlap = false) {
+  const workspaceDataDir = path.join(f.directory, 'service', 'workspace-data');
+  const endpoint = { host: 'unix:///unused-real-native-profile.sock', configDirectory: path.join(f.directory, 'owned-docker'), cliPath: '/must-not-run-docker' };
+  const sessions = new SessionController(f.store, 'mac', () => {}, () => {}, {
+    endpoint, ensureReady: async () => assert.fail('Independent native source preparation must not start Docker'), bridgeHostAddress: () => undefined,
+  }, workspaceDataDir);
+  Object.assign(f.app, { sessions });
+  t.after(() => sessions.close());
+  let creates = 0, originalOptions!: HostLaunchOptions;
+  if (reproduceOverlap) {
+    const createHost = sessions.createHost.bind(sessions);
+    t.mock.method(sessions, 'createHost', async (project: Project, name: string, options: HostLaunchOptions) => {
+      creates++; originalOptions = options;
+      if (creates !== 1) return createHost(project, name, options);
+      const workspace = { ...options.workspace, projectPath: options.workspace.path };
+      await writeFile(path.join(path.dirname(workspace.path), 'workspace.json'), JSON.stringify(workspace));
+      return createHost(project, name, { ...options, workspace });
+    });
+  }
+  return { sessions, workspaceDataDir, creates: () => creates, options: () => originalOptions };
+}
+
+test('real native audit preparation keeps executable scratch separate from original source reads', { timeout: 60000, skip: process.platform !== 'darwin' }, async t => {
+  const f = await fixture(t), native = realNativeSessions(t, f);
+  const original = await readFile(path.join(f.primary, 'App.swift'));
+  f.setAfterReads(async () => {
+    const audit = f.store.list<NativeProfileAudit>(PROFILE_AUDITS)[0]!;
+    const context = await native.sessions.waitExecutionReady(audit.sessionId!, 1000);
+    const prepared = await native.sessions.hostWorkspaces.load(audit.sessionId!);
+    assert.equal(context.kind, 'host-macos'); assert.equal(context.workdir, path.join(native.workspaceDataDir, 'workspaces', audit.id, 'repository'));
+    assert.equal(prepared.cwd, context.workdir); assert.equal(prepared.workspaceId, audit.id); assert.deepEqual(prepared.roots, []);
+    assert.notEqual(context.workdir, audit.snapshot.roots[0]!.path);
+    assert.deepEqual((await readdir(context.workdir)).sort(), ['.git', 'README.md']);
+    assert.equal(f.store.get<Session>('sessions', audit.sessionId!)!.verificationRunId, audit.id);
+  });
+  const run = await f.execute(await f.propose());
+  assert.equal(run.status, 'configured', run.reason); assert(run.sessionId && run.chatId && run.verdict && run.receipt);
+  assert.equal(native.sessions.record(run.sessionId).status, 'stopped'); assert.equal(f.calls.length, 1); assert.equal(f.configured.length, 1);
+  const workspace = JSON.parse(await readFile(path.join(native.workspaceDataDir, 'workspaces', run.id, 'workspace.json'), 'utf8'));
+  assert.equal(workspace.projectPath, run.snapshot.roots[0]!.path); assert.notEqual(workspace.projectPath, workspace.path);
+  const reads = f.store.list<{ id: string; runId: string; rootId: string }>('inspection-profile-audit-reads').filter(read => read.runId === run.id);
+  assert.deepEqual([...new Set(reads.map(read => read.rootId))].sort(), ['design', 'primary']);
+  assert.deepEqual(await readFile(path.join(f.primary, 'App.swift')), original); assert.deepEqual(await readFile(path.join(run.snapshot.roots[0]!.path, 'App.swift')), original);
+});
+
+test('real native overlap failure retries the original unadmitted audit session and retains its source', { timeout: 60000, skip: process.platform !== 'darwin' }, async t => {
+  const f = await fixture(t), native = realNativeSessions(t, f, true);
+  const original = await readFile(path.join(f.primary, 'App.swift'));
+  let run = await f.execute(await f.propose());
+  assert.equal(run.status, 'waiting'); assert.match(run.reason!, /must not expose the primary project checkout/);
+  assert(run.sessionId); const originalSession = run.sessionId, originalAudit = run.id, source = structuredClone(run.source);
+  assert.equal(native.sessions.record(originalSession).status, 'failed'); assert.equal(f.store.get('session-host', originalSession), undefined);
+  assert.equal(f.calls.length, 0); assert.equal(run.chatId, undefined); assert.equal(native.creates(), 1);
+  await assert.rejects(readFile(path.join(native.workspaceDataDir, 'host-sessions', originalSession, 'workspace.json')), { code: 'ENOENT' });
+  f.restart(); run = await f.execute(f.setup.get(run.id));
+  assert.equal(run.status, 'configured', run.reason); assert.equal(run.id, originalAudit); assert.equal(run.sessionId, originalSession); assert.deepEqual(run.source, source);
+  assert.equal(native.creates(), 1, 'The original failed session must prepare again without a new deterministic-name allocation.');
+  assert.equal(f.store.list<Session>('sessions').filter(session => session.verificationRunId === run.id).length, 1);
+  assert.equal(f.store.get<{ generation: number }>('session-host', originalSession)!.generation, 2); assert.equal(native.sessions.record(originalSession).status, 'stopped');
+  assert.equal(f.calls.length, 1); assert.equal(f.configured.length, 1); assert(run.verdict && run.receipt);
+  assert.deepEqual(await readFile(path.join(f.primary, 'App.swift')), original); assert.deepEqual(await readFile(path.join(run.snapshot.roots[0]!.path, 'App.swift')), original);
+});
+
+test('real native audit recovery survives interruption after the owned workspace metadata is corrected', { timeout: 60000, skip: process.platform !== 'darwin' }, async t => {
+  const f = await fixture(t), native = realNativeSessions(t, f, true);
+  let run = await f.execute(await f.propose());
+  assert.equal(run.status, 'waiting'); assert(run.sessionId);
+  const sessionId = run.sessionId, auditId = run.id, source = structuredClone(run.source), originalSession = native.sessions.record(sessionId);
+  const workspacePath = path.join(native.workspaceDataDir, 'workspaces', run.id, 'workspace.json'), previous = JSON.parse(await readFile(workspacePath, 'utf8'));
+  const retryPreparation = native.sessions.retryUnadmittedHostPreparation.bind(native.sessions);
+  let retries = 0;
+  t.mock.method(native.sessions, 'retryUnadmittedHostPreparation', async (id: string, options: HostLaunchOptions) => {
+    retries++; assert.equal(id, sessionId);
+    if (retries === 1) throw new Error('Service interrupted after metadata correction before the original session claim');
+    return retryPreparation(id, options);
+  });
+  run = await f.execute(run);
+  assert.equal(run.status, 'waiting'); assert.match(run.reason!, /interrupted after metadata correction/);
+  const corrected = { ...previous, projectPath: run.snapshot.roots[0]!.path };
+  assert.deepEqual(JSON.parse(await readFile(workspacePath, 'utf8')), corrected, 'Only the frozen original-input path may change in the owned workspace record.');
+  assert.deepEqual(native.sessions.record(sessionId), originalSession); assert.equal(f.calls.length, 0); assert.equal(native.creates(), 1);
+  f.restart(); run = await f.execute(f.setup.get(auditId));
+  assert.equal(run.status, 'configured', run.reason); assert.equal(run.id, auditId); assert.equal(run.sessionId, sessionId); assert.deepEqual(run.source, source);
+  assert.equal(retries, 2); assert.equal(native.creates(), 1); assert.equal(f.calls.length, 1); assert.equal(f.configured.length, 1);
+  assert.deepEqual(JSON.parse(await readFile(workspacePath, 'utf8')), corrected);
+  assert.equal(f.store.list<Session>('sessions').filter(session => session.verificationRunId === auditId).length, 1);
+  assert.equal(f.store.get<{ generation: number }>('session-host', sessionId)!.generation, 2); assert(run.verdict && run.receipt);
+});
+
+test('real native preparation retry refuses admitted chats, retained inputs and unknown failures', { timeout: 60000, skip: process.platform !== 'darwin' }, async t => {
+  const f = await fixture(t), native = realNativeSessions(t, f, true), run = await f.execute(await f.propose());
+  assert.equal(run.status, 'waiting'); assert(run.sessionId);
+  const sessionId = run.sessionId, failed = native.sessions.record(sessionId), launch = f.store.get('session-launch', sessionId);
+  const inputRoot = path.join(native.workspaceDataDir, 'host-sessions', sessionId);
+  const cases: Array<{ label: string; introduce(): Promise<void> | void; remove(): Promise<void> | void }> = [
+    { label: 'an admitted idle chat', introduce: () => { f.store.set('chats', { id: 'already-admitted', sessionId, status: 'idle' }); }, remove: () => { f.store.delete('chats', 'already-admitted'); } },
+    { label: 'unpublished input files', introduce: async () => { await mkdir(inputRoot, { recursive: true }); await writeFile(path.join(inputRoot, 'retained.txt'), 'Unconfirmed native work must be preserved.\n'); }, remove: async () => { assert.equal(await readFile(path.join(inputRoot, 'retained.txt'), 'utf8'), 'Unconfirmed native work must be preserved.\n'); await rm(inputRoot, { recursive: true }); } },
+    { label: 'an unknown execution outcome', introduce: () => { f.store.set('sessions', { ...failed, status: 'unknown' }); }, remove: () => { f.store.set('sessions', failed); } },
+    { label: 'a different failed preparation', introduce: () => { f.store.set('sessions', { ...failed, error: 'The original native preparation outcome is unresolved.' }); }, remove: () => { f.store.set('sessions', failed); } },
+    { label: 'an existing published host owner', introduce: () => { f.store.set('session-host', { id: sessionId, deviceId: 'mac', generation: 1 }); }, remove: () => { f.store.delete('session-host', sessionId); } },
+  ];
+  for (const value of cases) {
+    await value.introduce(); const before = native.sessions.record(sessionId);
+    try {
+      await assert.rejects(native.sessions.retryUnadmittedHostPreparation(sessionId, native.options()), (error: unknown) => {
+        assert.equal((error as { code?: string }).code, 'HOST_PREPARATION_UNRESOLVED', value.label); return true;
+      });
+      assert.deepEqual(native.sessions.record(sessionId), before, value.label); assert.deepEqual(f.store.get('session-launch', sessionId), launch, value.label);
+      assert.deepEqual(native.sessions.serviceActivity(), { starting: 0, stopping: 0 }); assert.equal(native.creates(), 1); assert.equal(f.calls.length, 0); assert.equal(f.configured.length, 0);
+    } finally { await value.remove(); }
+  }
+});
+
+test('real native audit recovery preserves changed scratch files and authority metadata without retrying', { timeout: 60000, skip: process.platform !== 'darwin' }, async t => {
+  const f = await fixture(t), native = realNativeSessions(t, f, true);
+  let run = await f.execute(await f.propose());
+  assert.equal(run.status, 'waiting'); assert(run.sessionId);
+  const session = native.sessions.record(run.sessionId), launch = f.store.get('session-launch', run.sessionId);
+  const repository = path.join(native.workspaceDataDir, 'workspaces', run.id, 'repository'), workspacePath = path.join(path.dirname(repository), 'workspace.json');
+  const workspace = await readFile(workspacePath, 'utf8'), readmePath = path.join(repository, 'README.md'), originalReadme = await readFile(readmePath, 'utf8');
+  const cases: Array<{ label: string; introduce(): Promise<void>; remove(): Promise<void>; retained(): Promise<void> }> = [
+    { label: 'different task authority', introduce: () => writeFile(workspacePath, JSON.stringify({ ...JSON.parse(workspace), taskId: 'another-task' })), remove: () => writeFile(workspacePath, workspace), retained: async () => { assert.equal(JSON.parse(await readFile(workspacePath, 'utf8')).taskId, 'another-task'); } },
+    { label: 'changed scratch readme', introduce: () => writeFile(readmePath, 'Retained scratch edit from uncertain work.\n'), remove: () => writeFile(readmePath, originalReadme), retained: async () => { assert.equal(await readFile(readmePath, 'utf8'), 'Retained scratch edit from uncertain work.\n'); } },
+    { label: 'additional scratch work', introduce: () => writeFile(path.join(repository, 'Retained.swift'), '// Original uncertain work must survive.\n'), remove: () => rm(path.join(repository, 'Retained.swift')), retained: async () => { assert.equal(await readFile(path.join(repository, 'Retained.swift'), 'utf8'), '// Original uncertain work must survive.\n'); } },
+  ];
+  for (const value of cases) {
+    await value.introduce(); const before = await readFile(workspacePath);
+    try {
+      run = await f.execute(run);
+      assert.equal(run.status, 'waiting', value.label); assert.match(run.reason!, /original failed audit scratch identity or source changed/);
+      assert.deepEqual(await readFile(workspacePath), before, value.label); await value.retained();
+      assert.deepEqual(native.sessions.record(session.id), session); assert.deepEqual(f.store.get('session-launch', session.id), launch);
+      assert.equal(f.store.get('session-host', session.id), undefined); assert.equal(native.creates(), 1); assert.equal(f.calls.length, 0); assert.equal(f.configured.length, 0);
+    } finally { await value.remove(); }
+  }
+});
 
 test('native setup rejects absent roots, escaped build paths and reusable fixture namespaces', async t => {
   const f = await fixture(t);
