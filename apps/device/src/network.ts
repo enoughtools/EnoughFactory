@@ -205,7 +205,7 @@ export async function initializeNetwork(app: DeviceApp): Promise<{
   };
   const owner=(call:ApiCall):string|undefined=>{
     const route=call.url.pathname;
-    if((route==='/api/health'||route==='/api/inspection/readiness')&&call.url.searchParams.has('deviceId'))return call.url.searchParams.get('deviceId')||undefined;
+    if((route==='/api/health'||route==='/api/inspection/readiness'||route==='/api/inspection/mac-permissions')&&call.url.searchParams.has('deviceId'))return call.url.searchParams.get('deviceId')||undefined;
     if(route.startsWith('/api/factory/worker/'))return undefined;
     if(/^\/api\/artifacts\/[^/]+(?:\/(?:content|chunk))?$/.test(route)&&call.url.searchParams.has('deviceId'))return call.url.searchParams.get('deviceId')||undefined;
     // A preview grant belongs to the viewing service even when its session is remote.

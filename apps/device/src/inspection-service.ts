@@ -10,7 +10,7 @@ import { ArtifactStore, InspectionSnapshotManager, WorkspaceManager, exportInspe
 import { dockerInvocation } from '@enoughfactory/runtime';
 import { RUNTIME_PINS } from '@enoughfactory/agents';
 import { BROWSER_VIEWPORT_MAX_DIMENSION, BrowserInspectionManager, validateBrowserViewport, type BrowserToolResult, type BrowserViewport } from '@enoughfactory/browser-inspection';
-import { NativeInspectionBackend, type NativeAction } from '@enoughfactory/native-inspection';
+import { NativeInspectionBackend, type NativeAction, type NativeReadiness } from '@enoughfactory/native-inspection';
 import type { DeviceApp } from './app.ts';
 import type { FactoryInspectionPorts } from './factory.ts';
 import type { AgentToolBridge, AgentToolBridgeContext, ChatController } from './chats.ts';
@@ -109,6 +109,7 @@ export class InspectionService {
   private hostPreparationAbort?:AbortController;
   private hostPreparationGeneration=0;
   private hostPreparationRequest?:'automatic'|'requested';
+  private macPermissionRequest?:Promise<{readiness:NativeReadiness;executionTargets:ExecutionTargetAdvertisement[]}>;
   constructor(readonly app:DeviceApp,readonly chats:ChatController,network?:{peers:PeerManager}){
     this.artifacts=new ArtifactStore(path.join(app.dataDir,'workspace-data','artifacts'),app.device.id);
     this.jobs=new InspectionJobs(app.store,{deviceId:app.device.id,authorityCurrent:authority=>this.authorityCurrent(authority)});
@@ -186,6 +187,11 @@ export class InspectionService {
     this.chats.setToolBridge(context=>this.bridge(context));
     this.app.extensions.push(async({method,url,body,peerId})=>{
       if(method==='GET'&&url.pathname==='/api/inspection/readiness')return {executionTargets:await this.readiness({prepareHost:'requested'})};
+      if(method==='POST'&&url.pathname==='/api/inspection/mac-permissions'){
+        if(url.searchParams.has('deviceId')&&url.searchParams.get('deviceId')!==this.app.device.id)throw new HttpError(403,'Request Mac testing permissions on their owning device.');
+        if(process.platform!=='darwin'||this.app.device.platform!=='darwin')throw new HttpError(409,'Mac testing permissions require a Mac device.');
+        return this.requestMacPermissions();
+      }
       const task=url.pathname.match(/^\/api\/tasks\/([^/]+)\/inspection$/);
       if(method==='GET'&&task){const jobs=this.jobs.listJobs().filter(job=>job.authority.taskId===task[1]),remote=this.delegation?.taskInspection(task[1]);const unique=<T extends {id:string}>(items:T[])=>[...new Map(items.map(item=>[item.id,item])).values()];return {jobs:unique([...jobs,...remote?.jobs||[]]),sessions:unique([...jobs.flatMap(job=>this.jobs.sessions(job.id)),...remote?.sessions||[]]),evidence:unique([...jobs.flatMap(job=>this.jobs.evidence(job.id)),...remote?.evidence||[]]),verifiers:this.app.store.list<InspectionVerificationRun>('inspection-verifier-runs').filter(run=>run.authority.taskId===task[1])};}
       const profiles=url.pathname.match(/^\/api\/projects\/([^/]+)\/inspection-profiles$/);
@@ -266,6 +272,19 @@ export class InspectionService {
       const reason=run.reason||'Independent application verification is waiting for inspection readiness.';return {...checked,passed:false,exitCode:1,output:reason,recovery:{condition:'inspection-evidence',reason}};
     }finally{await this.snapshots.remove(snapshot);}
   };
+  private requestMacPermissions():Promise<{readiness:NativeReadiness;executionTargets:ExecutionTargetAdvertisement[]}>{
+    if(this.closing)throw new Error('Inspection service is closing.');
+    if(this.macPermissionRequest)return this.macPermissionRequest;
+    let operation:Promise<{readiness:NativeReadiness;executionTargets:ExecutionTargetAdvertisement[]}>;
+    operation=this.app.withServiceOperation(async signal=>{
+      const current=()=>{signal.throwIfAborted();if(this.closing)throw new Error('Inspection service closed before Mac permissions were checked.');};
+      current();const readiness=await this.native.requestMacPermissions();current();
+      await this.refreshing?.catch(()=>{});current();
+      const executionTargets=await this.readiness({signal});current();
+      return {readiness,executionTargets};
+    }).finally(()=>{if(this.macPermissionRequest===operation)this.macPermissionRequest=undefined;});
+    this.macPermissionRequest=operation;return operation;
+  }
   private prepareHost(mode:'automatic'|'requested'):void{
     if(this.closing||this.hostPreparation)return;
     const recorded=this.app.store.get<HostSetupRecord>(hostSetupBucket,'mac-shell');
