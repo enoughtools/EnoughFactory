@@ -67,12 +67,17 @@ function assertVerificationChatCanStartTurn(store:FactoryStore,chat:Chat,deviceI
       store.list<FactoryTask>('tasks').filter(item=>item.goalId===goal.id).every(item=>item.status==='completed'||item.status==='canceled'):
     task.status==='review'&&!detail.integration&&detail.goalRevision===goal.revision);
   const workerOwnsSession=store.list<ChatWorker>('factory-workers').some(worker=>worker.sessionId===chat.sessionId||worker.chatId===chat.id)||store.list<Attempt>('attempts').some(author=>author.sessionId===chat.sessionId||author.chatId===chat.id);
+  // Container sessions predate explicit execution target fields. Their default
+  // is the local private container target; a native or explicitly different
+  // target still requires its exact persisted identity.
+  const sessionKind=session?.executionTargetKind??'container';
+  const sessionTargetId=session?.executionTargetId??(sessionKind==='container'?'container':undefined);
   const valid=!!run&&!!authority&&!!session&&!!attempt&&!!task&&!!goal&&!!detail&&
     purposeValid&&taskCurrent&&
     !!requestedVerificationRunId&&chat.verificationRunId===requestedVerificationRunId&&run.id===requestedVerificationRunId&&
     chat.attemptId===undefined&&requestedAttemptId===authority.attemptId&&!workerOwnsSession&&
     run.chatId===chat.id&&run.sessionId===chat.sessionId&&run.ownerDeviceId===deviceId&&chat.deviceId===deviceId&&session.deviceId===deviceId&&
-    session.verificationRunId===run.id&&session.executionTargetKind===run.executionTargetKind&&session.executionTargetId===run.executionTargetId&&
+    session.verificationRunId===run.id&&sessionKind===run.executionTargetKind&&sessionTargetId===run.executionTargetId&&
     run.status==='running'&&session.status==='ready'&&!session.archivedAt&&Date.parse(run.deadlineAt)>Date.now()&&
     attempt.chatId!==chat.id&&attempt.sessionId!==chat.sessionId&&attempt.taskId===task.id&&attempt.generation===authority.authorityGeneration&&attempt.status==='succeeded'&&
     task.goalId===goal.id&&task.currentAttemptId===attempt.id&&goal.coordinatorId===deviceId&&

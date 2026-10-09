@@ -94,6 +94,35 @@ test('a paired Linux author can hand retained source to the coordinator-owned Ma
   assert.equal(f.guard(), undefined);
 });
 
+test('independent browser verification admits the original default container session shape', async t => {
+  const shapes: Array<[string, Partial<Session>]> = [
+    ['ordinary container session', { executionTargetKind: undefined, executionTargetId: undefined }],
+    ['explicit container kind', { executionTargetKind: 'container', executionTargetId: undefined }],
+    ['explicit private container target', { executionTargetKind: 'container', executionTargetId: 'container' }],
+  ];
+  for (const [name, fields] of shapes) await t.test(name, () => {
+    const f=fixture();
+    rekeyVerifier(f,{executionTargetKind:'container',executionTargetId:'container'});
+    f.store.set('sessions',{...f.session,...fields});
+    assert.equal(f.guard(),undefined,'The unchanged succeeded author candidate can reach its separate browser verifier');
+    assert.equal(f.store.get<Session>('sessions',f.session.id)?.executionTargetKind,fields.executionTargetKind,'Admission does not rewrite retained session history');
+    assert.equal(f.store.get<Attempt>('attempts',f.attempt.id)?.status,'succeeded');
+  });
+});
+
+test('default container compatibility cannot authorize a different target or a native session', async t => {
+  const shapes: Array<[string, Partial<Session>]> = [
+    ['different explicit target', {executionTargetKind:'container',executionTargetId:'other-container'}],
+    ['native kind', {executionTargetKind:'host-macos',executionTargetId:undefined}],
+    ['native target with implicit kind', {executionTargetKind:undefined,executionTargetId:'mac-host'}],
+  ];
+  for (const [name, fields] of shapes) await t.test(name,()=>{
+    const f=fixture();rekeyVerifier(f,{executionTargetKind:'container',executionTargetId:'container'});
+    f.store.set('sessions',{...f.session,...fields});assert.throws(()=>f.guard(),stale);
+  });
+  const native=fixture();native.store.set('sessions',{...native.session,executionTargetKind:undefined,executionTargetId:undefined});assert.throws(()=>native.guard(),stale,'A native verifier must retain explicit native placement');
+});
+
 test('verifier start requires the internal exact run marker and original authority attempt', () => {
   const f = fixture();
   assert.throws(() => assertFactoryChatCanStartTurn(f.store, f.chat, 'device'), stale);
