@@ -631,7 +631,10 @@ export class InspectionService {
     if(name==='factory_native_profile_propose'){
       const project=this.app.store.get<Project>('projects',context.session.projectId),projectId=project?.sourceProjectId||project?.id;if(!projectId)throw new Error('Native setup project is unavailable.');
       const source=await this.capture(context,authority);
-      return result({audit:this.profileSetup.publicView(await this.profileSetup.propose({requestId:String(args.requestId),proposal:{profile:args.profile,auditPaths:args.auditPaths},authority,source:source.source,snapshot:source.snapshot,projectId,sourceSessionId:context.session.id,sourceChatId:context.chat.id}))});
+      const propose=async(snapshot:InspectionSnapshot)=>result({audit:this.profileSetup.publicView(await this.profileSetup.propose({requestId:String(args.requestId),proposal:{profile:args.profile,auditPaths:args.auditPaths},authority,source:source.source,snapshot,projectId,sourceSessionId:context.session.id,sourceChatId:context.chat.id}))});
+      // Keep retained input alive until the audit owns it; verifier copies have their own owner.
+      if(this.app.store.get('inspection-source-retention',source.id))return this.retention.use(source.id,propose,context.signal);
+      return propose(source.snapshot);
     }
     const delegated=await this.delegation?.dispatch(context,token,name,args);if(delegated!==undefined)return delegated;
     if(name==='factory_quality_submit'){

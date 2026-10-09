@@ -1,12 +1,12 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test, { type TestContext } from 'node:test';
 import type { InspectionAuthority, InspectionEvidence, InspectionJob, InspectionSourceIdentity, InspectionVerificationRun, TaskQualityRequirements } from '@enoughfactory/contracts';
 import type { BrowserObservation } from '@enoughfactory/browser-inspection';
-import type { InspectionSnapshot } from '@enoughfactory/workspaces';
+import { InspectionSnapshotManager, type InspectionSnapshot } from '@enoughfactory/workspaces';
 import type { DeviceApp } from './app.ts';
 import type { AgentToolBridgeContext, ChatController } from './chats.ts';
 import { InspectionService } from './inspection-service.ts';
@@ -14,6 +14,7 @@ import type { InspectionQualityRecord, InspectionReferenceView } from './inspect
 import type { QualityEvidenceReport } from './factory-quality.ts';
 import { Store } from './store.ts';
 import { inspectionQualityPolicySha256, inspectionVerificationKey } from './inspection-verifier.ts';
+import type { NativeProfileAudit } from './inspection-profile-setup.ts';
 
 const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO5Wj4sAAAAASUVORK5CYII=', 'base64');
 interface ToolResult { content: Array<{ type: string; text?: string; data?: string; mimeType?: string }>; }
@@ -74,8 +75,101 @@ async function fixture(t: TestContext, platform: 'macos' | 'web' = 'macos') {
       store.set('provider-image-deliveries', { id: `delivery-${store.list('provider-image-deliveries').length}`, chatId: 'chat', eventId: `event-${index}-${store.list('provider-image-deliveries').length}`, artifactSha256: createHash('sha256').update(Buffer.from(image.data!, 'base64')).digest('hex'), authority, route: 'tool-image' });
     }
   };
-  return { directory, workdir, referencePath, store, authority, quality, source, service, seam, context, token, call, createSession, deliver, events };
+  return { directory, workdir, referencePath, store, app, authority, quality, source, service, seam, context, token, call, createSession, deliver, events };
 }
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>(ready => { resolve = ready; });
+  return { promise, resolve };
+}
+
+async function nativeProposalFixture(t: TestContext) {
+  const f = await fixture(t);
+  await mkdir(path.join(f.workdir, 'Demo.xcodeproj'));
+  await writeFile(path.join(f.workdir, 'Demo.xcodeproj', 'project.pbxproj'), '// Original fixed native build recipe.');
+  await writeFile(path.join(f.workdir, 'App.swift'), '// Original isolated fixture entry.');
+  f.store.set('goals', { ...f.store.get<Record<string, unknown>>('goals', 'goal'), id: 'goal', projectId: 'project', approvalMode: 'approve-all' });
+  f.context.session.deviceId = 'mac';
+  Object.assign(f.app, { sessions: { record: (id: string) => { assert.equal(id, f.context.session.id); return f.context.session; } } });
+  const setup = f.service.profileSetup as unknown as {
+    options: { verifySnapshot(snapshot: InspectionSnapshot, signal?: AbortSignal): Promise<void> };
+    pump(id: string): void;
+  };
+  setup.pump = () => {}; // Reviewer admission is the injected provider seam; proposal/source ownership is real.
+  const args = { requestId: 'native-profile', profile: { id: 'fixture', build: { tool: 'xcodebuild', project: 'Demo.xcodeproj', scheme: 'Demo', platform: 'macos' }, launchArguments: ['--factory-fixture', '{runId}'], fixtureExpectedDataRoot: '/tmp/enoughfactory-fixtures/{runId}' },
+    auditPaths: [{ rootId: 'primary', path: 'App.swift', purposes: ['entry', 'storage', 'credentials', 'providers', 'preferences', 'notifications'] }, { rootId: 'primary', path: 'Demo.xcodeproj/project.pbxproj', purposes: ['build'] }] };
+  return { ...f, setup, args };
+}
+
+test('native profile proposal pins all source roots across a pressure sweep until its durable audit owns them', { timeout: 30000 }, async t => {
+  const f = await nativeProposalFixture(t);
+  for (const id of ['mail-web', 'verification-inputs', 'repair-source']) {
+    const directory = path.join(f.directory, id);
+    await mkdir(directory); await writeFile(path.join(directory, 'original.txt'), `Original ${id} bytes`);
+    f.context.session.workingDirectories!.push({ id, name: id, path: directory, kind: 'git', baseCommit: 'b'.repeat(40), status: 'ready' });
+  }
+  const entered = deferred<InspectionSnapshot>(), release = deferred<void>(), verify = f.setup.options.verifySnapshot;
+  f.setup.options.verifySnapshot = async (snapshot, signal) => { entered.resolve(snapshot); await release.promise; await verify(snapshot, signal); };
+  const pending = f.call('factory_native_profile_propose', f.args);
+  const settled = Promise.allSettled([pending]);
+  const snapshot = await Promise.race([entered.promise, pending.then(() => { throw new Error('Proposal completed before source verification'); })]);
+  try {
+    assert.equal(snapshot.roots.length, 5);
+    assert.equal(f.service.profileSetup.list().length, 0, 'The proposal has not yet published its source owner');
+    const swept = await f.service.retention.sweep({ maxSnapshotBytes: 1, minIdleMs: 0, pressureIdleMs: 0 });
+    assert.ok(swept.keptSnapshotIds.includes(snapshot.id), 'Pressure must not retire source in use by a proposal');
+    assert.equal(swept.retiredSnapshotIds.includes(snapshot.id), false);
+    await f.service.snapshots.verify(snapshot);
+  } finally { release.resolve(); await settled; }
+  const { audit } = value<{ audit: NativeProfileAudit }>(await pending);
+  assert.equal(audit.status, 'queued'); assert.equal(audit.source.snapshotId, snapshot.id);
+  assert.equal(audit.source.sha256, snapshot.sourceDigest);
+  assert.deepEqual(audit.source.roots!.map(({ id, sha256 }) => ({ id, sha256 })), snapshot.roots.map(({ id, sourceDigest }) => ({ id, sha256: sourceDigest })));
+  const owned = await f.service.retention.sweep({ maxSnapshotBytes: 1, minIdleMs: 0, pressureIdleMs: 0 });
+  assert.ok(owned.keptSnapshotIds.includes(snapshot.id), 'The queued audit takes over protection after the temporary reader releases');
+  f.store.set('inspection-profile-audits', { ...f.service.profileSetup.get(audit.id), status: 'canceled' });
+  const retired = await f.service.retention.sweep({ maxSnapshotBytes: 1, minIdleMs: 0, pressureIdleMs: 0 });
+  assert.ok(retired.retiredSnapshotIds.includes(snapshot.id), 'Finished ownership releases the source; no permanent pin remains');
+  await assert.rejects(lstat(snapshot.path), { code: 'ENOENT' });
+  assert.equal(await readFile(path.join(f.workdir, 'App.swift'), 'utf8'), '// Original isolated fixture entry.');
+  for (const id of ['mail-web', 'verification-inputs', 'repair-source']) assert.equal(await readFile(path.join(f.directory, id, 'original.txt'), 'utf8'), `Original ${id} bytes`);
+});
+
+test('failed and aborted native profile proposals release their temporary retained-source readers', async t => {
+  for (const outcome of ['error', 'abort'] as const) await t.test(outcome, async t => {
+    const f = await nativeProposalFixture(t);
+    let sourceId: string | undefined;
+    if (outcome === 'error') {
+      f.setup.options.verifySnapshot = async snapshot => { sourceId = snapshot.id; throw new Error('Injected source verification failed'); };
+      await assert.rejects(f.call('factory_native_profile_propose', f.args), /Injected source verification failed/);
+    } else {
+      const controller = new AbortController(), capture = f.seam.capture.bind(f.service);
+      f.context.signal = controller.signal;
+      f.seam.capture = async (context, authority) => { const source = await capture(context, authority); sourceId = source.id; controller.abort(); return source; };
+      await assert.rejects(f.call('factory_native_profile_propose', f.args), { name: 'AbortError' });
+    }
+    assert.ok(sourceId); assert.equal(f.service.profileSetup.list().length, 0);
+    const swept = await f.service.retention.sweep({ maxSnapshotBytes: 1, minIdleMs: 0, pressureIdleMs: 0 });
+    assert.ok(swept.retiredSnapshotIds.includes(sourceId), 'An unsuccessful proposal must release the reader in finally');
+  });
+});
+
+test('native profile proposals preserve independently owned verifier snapshots without restoring author cache', async t => {
+  const f = await nativeProposalFixture(t);
+  const external = new InspectionSnapshotManager({ dataDir: path.join(f.directory, 'verifier'), artifacts: f.service.artifacts });
+  const snapshot = await external.create({ roots: [{ id: 'primary', name: 'primary', path: f.workdir }, { id: 'enough-ui', name: 'enough-ui', path: f.referencePath }] });
+  const source: InspectionSourceIdentity = { snapshotId: snapshot.id, sha256: snapshot.sourceDigest, roots: snapshot.roots.map(root => ({ id: root.id, sha256: root.sourceDigest })) };
+  f.context.chat.verificationRunId = 'original-verifier';
+  Object.assign(f.service.verifier, { verificationSource: async () => ({ id: snapshot.id, source, snapshot, run: { id: 'original-verifier' } }), verifySnapshot: (actual: InspectionSnapshot, signal?: AbortSignal) => { assert.equal(actual.path, snapshot.path); return external.verify(actual, signal); } });
+  Object.assign(f.service.retention, { use: async () => assert.fail('An independently owned verifier copy must not use author-cache restore') });
+  const { audit } = value<{ audit: NativeProfileAudit }>(await f.call('factory_native_profile_propose', f.args));
+  assert.equal(audit.status, 'queued'); assert.deepEqual(audit.source, source);
+  assert.equal(f.store.get('inspection-source-retention', snapshot.id) !== undefined, true, 'The audit retains its own imported copy as before');
+  await external.verify(snapshot);
+  const owned = f.service.profileSetup.get(audit.id);
+  assert.notEqual(owned.snapshot.path, snapshot.path); await f.service.snapshots.verify(owned.snapshot);
+});
 
 function retainedCandidateInput(f: Awaited<ReturnType<typeof fixture>>) {
   const candidate={id:'retained-author-C',commit:'c'.repeat(40),baseCommit:'b'.repeat(40)};
