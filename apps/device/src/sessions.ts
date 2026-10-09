@@ -19,7 +19,7 @@ interface PrivateSession { id: string; ready: EnvmuxReady; projectPath: string; 
 interface LaunchRecord { id:string;projectPath:string;generation:number;dockerHost?:string;executionTargetKind?:'container'|'host-macos';executionTargetId?:string;workspace?:WorkspaceBinding; workingDirectorySources?:WorkingDirectorySource[]; referenceContext?:WorkingDirectorySource; developmentToolchain?:FrozenDevelopmentToolchain; agentToolchain?:PreparedAgentToolchain; }
 type RetirementReceipt = Awaited<ReturnType<typeof retireStoppedFactoryContainer>>;
 interface ContainerRetirement { id:string;containerId:string;name:string;status:'archiving'|'removed'|'restored';receipt?:RetirementReceipt;archive?:string;updatedAt:string; }
-interface LaunchOptions { workspace?:WorkspaceBinding; workingDirectorySources?:WorkingDirectorySource[]; referenceContext?:WorkingDirectorySource; developmentToolchain?:FrozenDevelopmentToolchain; assertCurrent?:()=>void; retainedEnvironment?:RetirementReceipt; agentToolchain?:PreparedAgentToolchain; }
+interface LaunchOptions { onCreated?:(session:Session)=>void; workspace?:WorkspaceBinding; workingDirectorySources?:WorkingDirectorySource[]; referenceContext?:WorkingDirectorySource; developmentToolchain?:FrozenDevelopmentToolchain; assertCurrent?:()=>void; retainedEnvironment?:RetirementReceipt; agentToolchain?:PreparedAgentToolchain; }
 export interface SessionExecutionContext {kind:'container'|'host-macos';targetId?:string;workdir:string;containerId?:string;referencePath?:string;referenceContainerPath?:string;}
 interface HostSessionRecord {id:string;deviceId:string;generation:number;prepared:HostWorkspacePrepared;releasedAt?:string;}
 export interface HostLaunchOptions {workspace:WorkspaceRecord;workingDirectorySources?:WorkingDirectorySource[];referenceContext?:WorkingDirectorySource;executionTargetId?:string;assertCurrent?:()=>void;onCreated?:(session:Session)=>void;}
@@ -169,7 +169,7 @@ export class SessionController {
     if(this.store.list<Session>('sessions').some(session=>session.name===name&&(session.projectId===project.id||this.store.get<LaunchRecord>('session-launch',session.id)?.projectPath===project.path)&&(this.stoppedInputReleases.has(session.id)||this.restoring.has(session.id))))throw new HttpError(409,'This environment name is preserving or restoring its previous contents. Wait for that operation to finish.','ENVIRONMENT_BUSY');
     if (this.store.list<Session>('sessions').some(s=>s.projectId===project.id && s.name===name && !['stopped','failed'].includes(s.status))) throw new HttpError(409,'This session already exists.');
     const record: Session = {id:id('session'),projectId:project.id,deviceId:this.deviceId,name,status:'starting',phase:'Preparing EnoughFactory runtime',createdAt:now(),updatedAt:now(),services:[]};
-    this.store.set('sessions',record); this.changed();
+    this.store.transaction(()=>{this.store.set('sessions',record);options?.onCreated?.(record);});this.changed();
     this.launch(record,project,options);return record;
   }
   private launch(record:Session,project:Project,options?:LaunchOptions):void{
@@ -254,10 +254,10 @@ export class SessionController {
     if(this.store.list<Session>('sessions').some(session=>session.projectId===project.id&&session.name===name&&!['stopped','failed'].includes(session.status)))throw new HttpError(409,'This native workspace already exists.');
     const record:Session={id:id('session'),projectId:project.id,deviceId:this.deviceId,name,status:'starting',phase:'Preparing private native workspace',executionTargetKind:'host-macos',executionTargetId:options.executionTargetId,createdAt:now(),updatedAt:now(),services:[]};
     const generation=1,abort=new AbortController();
-    this.generations.set(record.id,generation);this.starts.set(record.id,abort);this.store.set('sessions',record);
-    this.store.set<LaunchRecord>('session-launch',{id:record.id,projectPath:project.path,generation,executionTargetKind:'host-macos',executionTargetId:options.executionTargetId,workingDirectorySources:options.workingDirectorySources,referenceContext:options.referenceContext});
-    this.changed();
-    options.onCreated?.(record);
+    this.store.transaction(()=>{this.store.set('sessions',record);
+      this.store.set<LaunchRecord>('session-launch',{id:record.id,projectPath:project.path,generation,executionTargetKind:'host-macos',executionTargetId:options.executionTargetId,workingDirectorySources:options.workingDirectorySources,referenceContext:options.referenceContext});
+      options.onCreated?.(record);});
+    this.generations.set(record.id,generation);this.starts.set(record.id,abort);this.changed();
     const assertCurrent=()=>{
       options.assertCurrent?.();
       if(abort.signal.aborted||this.generations.get(record.id)!==generation||this.stopping.has(record.id))throw new SessionGenerationChangedError();

@@ -11,6 +11,7 @@ import type { DeviceApp } from './app.ts';
 import { ChatController, type AgentToolBridge, type AgentToolBridgeContext, type RunOptions } from './chats.ts';
 import type { NativeFixtureProfile } from './inspection-native.ts';
 import { NativeProfileSetup, PROFILE_AUDITS, validateNativeProfileProposal, type NativeProfileAudit, type NativeProfileProposal } from './inspection-profile-setup.ts';
+import { SessionController } from './sessions.ts';
 import { Store } from './store.ts';
 
 const authority: InspectionAuthority = { goalId: 'goal', goalRevision: 3, taskId: 'task', attemptId: 'author', authorityGeneration: 2, policyRevision: 3 };
@@ -50,7 +51,7 @@ function sourceClient(bridge: AgentToolBridge) {
 }
 
 /** Real immutable all-root capture/artifacts and SQLite; only provider and OS allocation are seams. */
-async function fixture(t: TestContext, effects: { retire?: boolean } = {}) {
+async function fixture(t: TestContext, effects: { retire?: boolean; target?: 'host-macos' | 'container' } = {}) {
   const directory = await realpath(await mkdtemp(path.join(tmpdir(), 'ef-native-profile-setup-')));
   const dataDir = path.join(directory, 'service'), primary = path.join(directory, 'app'), design = path.join(directory, 'design');
   await mkdir(path.join(primary, 'Demo.xcodeproj'), { recursive: true }); await mkdir(design);
@@ -152,7 +153,7 @@ async function fixture(t: TestContext, effects: { retire?: boolean } = {}) {
     app, chats, artifacts, snapshots, authorityCurrent: () => current,
     verifySnapshot: (snapshot: InspectionSnapshot, signal?: AbortSignal) => snapshot.path.startsWith(path.join(dataDir, 'inspection') + path.sep) ? snapshots.verify(snapshot, signal) : authorSnapshots.verify(snapshot, signal),
     sourceCurrent: async () => identity(await capture()),
-    readiness: async (): Promise<ExecutionTargetAdvertisement[]> => available ? [{ id: 'mac-host', protocolVersion: 1, kind: 'host-macos', readiness: 'ready', runtimes: ['codex'], capabilities: [{ kind: 'mac-shell', readiness: 'ready' }] }] : [],
+    readiness: async (): Promise<ExecutionTargetAdvertisement[]> => available ? [{ id: effects.target === 'container' ? 'owned-container' : 'mac-host', protocolVersion: 1, kind: effects.target ?? 'host-macos', readiness: 'ready', runtimes: ['codex'], capabilities: [{ kind: effects.target === 'container' ? 'linux-shell' : 'mac-shell', readiness: 'ready' }] }] : [],
     configure: (projectId: string, profile: NativeFixtureProfile) => { assert(store.list<NativeProfileAudit>(PROFILE_AUDITS).some(run => run.verdict)); configured.push({ projectId, profile }); },
     ...(effects.retire ? { retireReviewer: async (run: NativeProfileAudit) => { if (retirementError) throw retirementError; if (run.sessionId) await app.sessions.stop(run.sessionId); } } : {}),
   };
@@ -169,7 +170,7 @@ async function fixture(t: TestContext, effects: { retire?: boolean } = {}) {
     return settle(run.id);
   };
   const execute = async (run: NativeProfileAudit) => { available = true; return settle(run.id); };
-  return { directory, primary, design, store, artifacts, snapshots, snapshot, source, proposal, configured, calls, stopped, propose, execute, settle, admitted,
+  return { app, directory, primary, design, store, artifacts, snapshots, snapshot, source, proposal, configured, calls, stopped, propose, execute, settle, admitted,
     get setup() { return setup; }, setReads: (mode: typeof reads) => { reads = mode; }, setCurrent: (value: boolean) => { current = value; }, setApproved: (value: boolean) => { responseApproved = value; },
     setAfterReads: (callback: typeof afterReads) => { afterReads = callback; }, setProviderError: (error?: Error) => { providerError = error; }, setProcesses: (value: typeof processes) => { processes = value; },
     setPreparationError: (error: Error) => { preparationError = error; }, setRetirementError: (error?: Error) => { retirementError = error; },
@@ -426,6 +427,79 @@ test('restart before reviewer admission resumes only the exact recorded scratch 
   run = await f.execute(f.setup.get(run.id));
   assert.equal(run.status, 'configured'); assert.equal(f.calls.length, 1);
   assert.equal(await readFile(path.join(scratch, 'repository', 'Retained.txt'), 'utf8'), 'Preserved pre-admission audit scratch.\n');
+});
+
+test('container audit creation publishes its exact session before launch and recovers it after a creation crash', { timeout: 60000 }, async t => {
+  const f = await fixture(t, { target: 'container' });
+  const endpoint = { host: 'unix:///unused-owned-profile-audit.sock', configDirectory: path.join(f.directory, 'owned-docker'), cliPath: '/must-not-run-docker' };
+  const sessions = new SessionController(f.store, 'mac', () => {}, () => {}, {
+    endpoint, ensureReady: async () => assert.fail('The creation boundary test must not start Docker'), bridgeHostAddress: () => undefined,
+  }, path.join(f.directory, 'service', 'workspace-data'));
+  t.after(() => sessions.close());
+  let published!: NativeProfileAudit, savedSession!: Session, creates = 0, launchCalls = 0;
+  const launch = sessions as unknown as { launch(session: Session): void };
+  t.mock.method(launch, 'launch', (session: Session) => {
+    launchCalls++;
+    published = f.store.list<NativeProfileAudit>(PROFILE_AUDITS)[0]!;
+    savedSession = f.store.get<Session>('sessions', session.id)!;
+    assert.equal(published.status, 'preparing'); assert.equal(published.sessionId, session.id);
+    assert.equal(savedSession.status, 'starting'); assert.equal(savedSession.verificationRunId, published.id);
+    throw new Error('Simulated service interruption after session persistence and before create returns');
+  });
+  Object.assign(f.app.sessions, { create: (...args: Parameters<SessionController['create']>) => { creates++; return sessions.create(...args); } });
+  let run = await f.execute(await f.propose());
+  assert.equal(run.status, 'waiting'); assert.match(run.reason!, /Simulated service interruption/);
+  assert.equal(run.sessionId, savedSession.id); assert.equal(run.chatId, undefined); assert.equal(creates, 1); assert.equal(launchCalls, 1);
+  assert.equal(f.calls.length, 0); assert.equal(f.configured.length, 0);
+
+  // Restore the exact journal observed before the caller's catch ran, as after a service crash.
+  f.store.set(PROFILE_AUDITS, published); f.restart();
+  assert.equal(f.setup.get(run.id).status, 'waiting'); assert.equal(f.setup.get(run.id).sessionId, savedSession.id);
+  const recoveredSessions: string[] = [];
+  t.mock.method(f.app.sessions, 'waitExecutionReady', async (sessionId: string) => {
+    recoveredSessions.push(sessionId);
+    assert.equal(sessionId, savedSession.id); assert.equal(f.store.get<Session>('sessions', sessionId)!.verificationRunId, run.id);
+    throw new Error('The original saved container is still starting');
+  });
+  run = await f.execute(f.setup.get(run.id));
+  assert.equal(run.status, 'waiting'); assert.match(run.reason!, /original saved container is still starting/);
+  assert.deepEqual(recoveredSessions, [savedSession.id]); assert.equal(run.sessionId, savedSession.id); assert.equal(run.chatId, undefined);
+  assert.equal(creates, 1, 'Recovery must not create a second environment with the deterministic audit name.'); assert.equal(launchCalls, 1);
+  assert.equal(f.store.list<Session>('sessions').filter(session => session.verificationRunId === run.id).length, 1);
+  assert.equal(f.calls.length, 0); assert.equal(f.configured.length, 0);
+});
+
+for (const target of ['container', 'host-macos'] as const) test(`${target} audit owner binding rollback publishes no session or launch after its callback throws`, { timeout: 60000, skip: target === 'host-macos' && process.platform !== 'darwin' }, async t => {
+  const f = await fixture(t, { target });
+  const endpoint = { host: 'unix:///unused-owned-profile-rollback.sock', configDirectory: path.join(f.directory, 'owned-docker'), cliPath: '/must-not-run-docker' };
+  let changed = 0, launchCalls = 0, nativePreparations = 0, callbacks = 0;
+  const sessions = new SessionController(f.store, 'mac', () => { changed++; }, () => {}, {
+    endpoint, ensureReady: async () => assert.fail('Owner rollback must not start Docker'), bridgeHostAddress: () => undefined,
+  }, path.join(f.directory, 'service', 'workspace-data'));
+  t.after(() => sessions.close());
+  t.mock.method(sessions as unknown as { launch(session: Session): void }, 'launch', () => { launchCalls++; assert.fail('Owner rollback must precede container launch'); });
+  t.mock.method(sessions.hostWorkspaces, 'prepare', async () => { nativePreparations++; assert.fail('Owner rollback must precede native preparation'); });
+  let allocatedSession!: string;
+  const failBinding = (bind: ((session: Session) => void) | undefined) => (session: Session) => {
+    bind?.(session); callbacks++; allocatedSession = session.id;
+    const audit = f.store.list<NativeProfileAudit>(PROFILE_AUDITS)[0]!;
+    assert.equal(audit.sessionId, session.id); assert.equal(f.store.get<Session>('sessions', session.id)!.verificationRunId, audit.id);
+    if (target === 'host-macos') assert.equal(f.store.get<{ executionTargetKind: string }>('session-launch', session.id)!.executionTargetKind, target);
+    throw new Error('Owner binding could not be committed');
+  };
+  Object.assign(f.app.sessions, target === 'container' ? {
+    create: (project: Project, name: string, options: Parameters<SessionController['create']>[2]) => sessions.create(project, name, { ...options, onCreated: failBinding(options?.onCreated) }),
+  } : {
+    createHost: (project: Project, name: string, options: Parameters<SessionController['createHost']>[2]) => sessions.createHost(project, name, { ...options, onCreated: failBinding(options.onCreated) }),
+  });
+  const originalSessions = f.store.list<Session>('sessions');
+  const run = await f.execute(await f.propose());
+  assert.equal(run.status, 'waiting'); assert.match(run.reason!, /Owner binding could not be committed/); assert.equal(callbacks, 1);
+  assert.equal(run.sessionId, undefined); assert.equal(run.chatId, undefined);
+  assert.equal(f.store.get('sessions', allocatedSession), undefined); assert.equal(f.store.get('session-launch', allocatedSession), undefined);
+  assert.deepEqual(f.store.list('sessions'), originalSessions); assert.equal(f.store.list('session-launch').length, 0);
+  assert.deepEqual(sessions.serviceActivity(), { starting: 0, stopping: 0 }); assert.equal(changed, 0); assert.equal(launchCalls, 0); assert.equal(nativePreparations, 0);
+  assert.equal(f.calls.length, 0); assert.equal(f.configured.length, 0);
 });
 
 test('unpublished scratch with changed ownership is retained without reviewer admission', { timeout: 60000 }, async t => {
