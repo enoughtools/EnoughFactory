@@ -192,7 +192,13 @@ export class InspectionVerifier {
       // Empty inventories and same-boot missing/recycled PIDs are not evidence.
       if (!originalProcesses.length || processes.some(process => process.state !== 'exited') || !originalProcesses.every(process => {
         const proof = process.termination;
-        return proof?.schemaVersion === 2 && proof.kind === 'host-reboot' && proof.evidence === 'boot-identity-change' && proof.previousBoot?.platform === proof.currentBoot.platform && proof.previousBoot.machineId === proof.currentBoot.machineId && proof.previousBoot.bootId !== proof.currentBoot.bootId;
+        if (proof?.schemaVersion !== 2) return false;
+        if (proof.kind === 'host-reboot') return proof.evidence === 'boot-identity-change' && proof.previousBoot?.platform === proof.currentBoot.platform && proof.previousBoot.machineId === proof.currentBoot.machineId && proof.previousBoot.bootId !== proof.currentBoot.bootId;
+        // Legacy receipts lack their old kernel UUID. Only a separate privileged
+        // operator attestation may bridge that history, scoped to this exact
+        // provider, verifier conversation and independently retained witnesses.
+        if (proof.kind !== 'operator-attested-reboot' || proof.evidence !== 'operator-observed-os-restart' || !proof.actor?.trim() || proof.actor.length > 256 || proof.verificationRunId !== original.id || proof.chatId !== original.chatId || proof.sessionId !== original.sessionId || proof.cwd !== execution.workdir || proof.processKey !== process.processKey || !sha.test(proof.priorRecordSha256)) return false;
+        return [proof.beforeWitness, proof.afterWitness].every(witness => !!witness && path.isAbsolute(witness.path) && sha.test(witness.sha256) && typeof witness.content === 'string' && witness.sha256 === createHash('sha256').update(witness.content).digest('hex')) && proof.beforeWitness.sha256 !== proof.afterWitness.sha256;
       })) return false;
       const bindings = this.options.app.store.events<ChatEvent>('chat', original.chatId!).map(event => event.value).filter(event => event.kind === 'status' && event.data?.status === 'running' && typeof event.data.threadId === 'string').map(event => event.data!.threadId as string);
       const threadIds = new Set([...(originalChat!.threadId ? [originalChat!.threadId] : []), ...bindings]);

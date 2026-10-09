@@ -4,7 +4,8 @@ import { chmod, cp, lstat, mkdir, mkdtemp, readFile, readlink, realpath, rename,
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test, { type TestContext } from 'node:test';
-import type { HostProcessState } from '@enoughfactory/agents';
+import { createHash } from 'node:crypto';
+import type { HostOperatorRebootTermination, HostProcessState } from '@enoughfactory/agents';
 import type { Chat, ExecutionTargetAdvertisement, Goal, InspectionAuthority, InspectionSourceIdentity, InspectionVerificationRun, Project, Session, TaskQualityRequirements } from '@enoughfactory/contracts';
 import { ArtifactStore, InspectionSnapshotManager, importInspectionSnapshot, type InspectionSnapshot, type InspectionSnapshotTransfer } from '@enoughfactory/workspaces';
 import type { DeviceApp } from './app.ts';
@@ -1018,7 +1019,7 @@ test('reboot continuation refuses absent ownership, same-boot uncertainty, stale
     ['missing process inventory', f => f.setHostProcesses([])],
     ['ordinary exited process without reboot proof', f => f.setHostProcesses([{ ...f.process, termination: undefined }])],
     ['obsolete timestamp-only reboot proof', f => f.setHostProcesses([{ ...f.process, termination: { ...f.process.termination!, schemaVersion: 1 } as unknown as HostProcessState['termination'] }])],
-    ['same boot identity cannot prove a reboot', f => f.setHostProcesses([{ ...f.process, termination: { ...f.process.termination!, previousBoot: f.process.termination!.currentBoot } }])],
+    ['same boot identity cannot prove a reboot', f => f.setHostProcesses([{ ...f.process, termination: { ...f.process.termination!, previousBoot: f.process.termination!.currentBoot } as HostProcessState['termination'] }])],
     ['same-boot missing provider remains unknown', f => f.setHostProcesses([{ ...f.process, state: 'unknown', termination: undefined }])],
     ['another working directory', f => f.setHostProcesses([{ ...f.process, cwd: '/other/source' }])],
     ['process predates this verifier turn', f => f.setHostProcesses([{ ...f.process, createdAt: '2000-01-01T00:00:00Z' }])],
@@ -1045,6 +1046,48 @@ test('reboot continuation rechecks authority after stop-only inspection reconcil
   const raced = f.anotherVerifier({ reconcileInspection: async () => { f.setCurrent(false); return true; } });
   assert.equal((await raced.ensure(f.input)).status, 'unknown');
   assert.equal(f.calls.length, 1); assert.equal(f.stopped.length, 0); assert.equal(f.store.events('inspection-verifier-reconciliation', f.run.id).length, 0);
+});
+
+function operatorRebootProof(f: Awaited<ReturnType<typeof rebootedVerifierFixture>>): HostOperatorRebootTermination {
+  const before = JSON.stringify({ phase: 'before', runId: f.run.id, chatId: f.run.chatId, originalRecordSha256: 'a'.repeat(64) });
+  const after = JSON.stringify({ phase: 'after', runId: f.run.id, chatId: f.run.chatId, originalRecordSha256: 'a'.repeat(64), currentBootId: 'current-boot' });
+  const witness = (content: string, name: string) => ({ content, path: path.join(f.directory, name), sha256: createHash('sha256').update(content).digest('hex') });
+  return {
+    schemaVersion: 2, kind: 'operator-attested-reboot', evidence: 'operator-observed-os-restart', actor: 'authorized-device-operator',
+    verificationRunId: f.run.id, chatId: f.run.chatId!, sessionId: f.run.sessionId!, cwd: f.process.cwd!, processKey: f.process.processKey,
+    observedAt: new Date().toISOString(), currentBoot: f.process.termination!.currentBoot, previousStatus: 'outcome-unknown', previousUpdatedAt: f.run.startedAt!, priorRecordSha256: 'a'.repeat(64),
+    beforeWitness: witness(before, 'before.json'), afterWitness: witness(after, 'after.json'),
+  };
+}
+
+test('a separately attested legacy reboot resumes only its exact original verifier conversation and retains the attestation audit', async t => {
+  const f = await rebootedVerifierFixture(t), proof = operatorRebootProof(f);
+  f.setHostProcesses([{ ...f.process, termination: proof }]);
+  const result = await f.recovered.ensure(f.input);
+  assert.equal(result.status, 'succeeded'); assert.equal(result.chatId, f.run.chatId); assert.equal(result.sessionId, f.run.sessionId); assert.deepEqual(result.source, f.run.source);
+  assert.equal(f.calls.length, 2); assert.equal(f.preparations.length, 1);
+  const audit = f.store.events<{ previous: InspectionVerificationRun; processes: HostProcessState[] }>('inspection-verifier-reconciliation', result.id)[0]!.value;
+  assert.deepEqual(audit.previous, f.run); assert.deepEqual(audit.processes[0]!.termination, proof);
+});
+
+test('legacy operator attestation cannot authorize another run, chat, process, workspace or changed witness', async t => {
+  const cases: Array<[string, (proof: HostOperatorRebootTermination) => HostOperatorRebootTermination]> = [
+    ['different verifier run', proof => ({ ...proof, verificationRunId: 'different-verifier' })],
+    ['different verifier chat', proof => ({ ...proof, chatId: 'different-chat' })],
+    ['different original session', proof => ({ ...proof, sessionId: 'different-session' })],
+    ['different provider process', proof => ({ ...proof, processKey: 'different-provider' })],
+    ['different retained workspace', proof => ({ ...proof, cwd: '/different/source' })],
+    ['missing operator identity', proof => ({ ...proof, actor: ' ' })],
+    ['changed retained before witness', proof => ({ ...proof, beforeWitness: { ...proof.beforeWitness, content: 'changed manifest' } })],
+    ['changed retained after witness', proof => ({ ...proof, afterWitness: { ...proof.afterWitness, content: 'changed manifest' } })],
+    ['same witness cannot stand for before and after', proof => ({ ...proof, afterWitness: proof.beforeWitness })],
+  ];
+  for (const [label, mutate] of cases) await t.test(label, async inner => {
+    const f = await rebootedVerifierFixture(inner);
+    f.setHostProcesses([{ ...f.process, termination: mutate(operatorRebootProof(f)) }]);
+    assert.deepEqual(await f.recovered.ensure(f.input), f.run); assert.equal(f.calls.length, 1); assert.equal(f.reconciliations(), 0);
+    assert.equal(f.store.events('inspection-verifier-reconciliation', f.run.id).length, 0);
+  });
 });
 
 test('an unconfirmed execution stop overrides a passing gate with unknown ownership', async t => {
