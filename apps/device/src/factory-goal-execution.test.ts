@@ -7,12 +7,13 @@ import path from 'node:path';
 import test, { type TestContext } from 'node:test';
 import type { Attempt, ControllerRun, ExecutionTargetAdvertisement, FactoryTask, Goal, Project, Session } from '@enoughfactory/contracts';
 import type { TurnInput, TurnResult } from '@enoughfactory/agents';
-import type { AttemptDetail, CandidateRef, ControlRecord, ExecutionResult, TaskDetail } from '@enoughfactory/factory';
+import type { AttemptDetail, CandidateRef, ControlRecord, ExecutionResult, PlanRecord, TaskDetail } from '@enoughfactory/factory';
 import { git } from '../../../packages/workspaces/src/process.ts';
 import { DeviceApp } from './app.ts';
 import { ChatController } from './chats.ts';
 import { initializeFactory, type FactoryInspectionPorts } from './factory.ts';
 import { Store } from './store.ts';
+import { HostDiskAdmission } from './host-disk-admission.ts';
 
 const nativeMac = { skip: process.platform !== 'darwin' };
 const criterion = 'Native product behavior is implemented and verified';
@@ -21,7 +22,8 @@ const plan = JSON.stringify({ summary: 'Implement the native product', criteria:
   kind: 'feature', acceptanceCriteria: [criterion], expectedOutputs: ['Saved native source'], dependsOn: [], checks: [],
 }] });
 
-async function fixture(t: TestContext, inspection: FactoryInspectionPorts = {}, preInitialize?: (app: DeviceApp, project: Project) => void | Promise<void>) {
+type FixtureResponse = (input: TurnInput) => Promise<TurnResult>;
+async function fixture(t: TestContext, inspection: FactoryInspectionPorts = {}, preInitialize?: (app: DeviceApp, project: Project, respond: (handler: FixtureResponse) => void) => void | Promise<void>) {
   const directory = await realpath(await mkdtemp(path.join(tmpdir(), 'enough-goal-execution-')));
   const state = new Store(directory);
   state.set('private', { id: 'runtime-control', suspended: true }); state.close();
@@ -60,7 +62,7 @@ async function fixture(t: TestContext, inspection: FactoryInspectionPorts = {}, 
   t.mock.method(chats.manager, 'hostProcesses', async () => []);
   t.mock.method(chats.manager, 'cancelHostSession', async () => {});
   t.mock.method(chats.manager, 'interrupt', async () => {});
-  let respond: (input: TurnInput) => Promise<TurnResult> = async () => ({ threadId: 'fixture-planner-thread', text: plan });
+  let respond: FixtureResponse = async () => ({ threadId: 'fixture-planner-thread', text: plan });
   t.mock.method(chats.manager, 'runTurn', async (input: TurnInput) => {
     turns.push(input);
     assert.equal(input.executionTarget, 'host-macos');
@@ -70,7 +72,7 @@ async function fixture(t: TestContext, inspection: FactoryInspectionPorts = {}, 
     assert.equal(await readFile(path.join(input.cwd, 'source.txt'), 'utf8'), 'actual project source\n');
     return respond(input);
   });
-  await preInitialize?.(app, project);
+  await preInitialize?.(app, project, handler => { respond = handler; });
   const factory = await initializeFactory(app, chats, undefined, inspection); factory.coordinator.stop();
   await new Promise<void>(resolve => app.server.listen(0, '127.0.0.1', resolve));
   const origin = `http://127.0.0.1:${(app.server.address() as AddressInfo).port}`;
@@ -123,6 +125,66 @@ function coldStartGoal(app: DeviceApp, project: Project): Goal {
   app.store.set<ControlRecord>('factory-control', { id: goal.id, stage: 'plan', startedAt: at, steering: [] });
   return goal;
 }
+
+test('startup inventory wakes a queued capability wait without replaying settled inspection evidence', { ...nativeMac, timeout: 60000 }, async t => {
+  t.mock.method(HostDiskAdmission.prototype, 'reserve', () => () => {});
+  t.mock.method(HostDiskAdmission.prototype, 'blocker', () => undefined);
+  let authorStarted!: () => void, finishAuthor!: (result: TurnResult) => void, releasePreparation!: () => void;
+  const started = new Promise<void>(resolve => { authorStarted = resolve; });
+  const result = new Promise<TurnResult>(resolve => { finishAuthor = resolve; });
+  const preparation = new Promise<void>(resolve => { releasePreparation = resolve; });
+  const completedAuthor = { threadId: 'fixture-native-author', text: 'Saved the native implementation.' };
+  t.after(() => { releasePreparation(); finishAuthor(completedAuthor); });
+  let goal!: Goal, task!: FactoryTask, retainedGoal!: Goal, retainedTask!: FactoryTask, retainedAuthor!: Attempt, retainedDetail!: AttemptDetail;
+  const f = await fixture(t, { qualityCheck: async () => assert.fail('Startup cannot replay an existing inspection check.') }, (app, project, respond) => {
+    const createHost = app.sessions.createHost.bind(app.sessions);
+    t.mock.method(app.sessions, 'createHost', async (...args: Parameters<typeof app.sessions.createHost>) => { await preparation; return createHost(...args); });
+    app.setDevice({ ...app.device, executionTargets: app.device.executionTargets!.map(target => target.kind === 'host-macos'
+      ? { ...target, capabilities: [...target.capabilities, { kind: 'macos-app-inspection', readiness: 'ready' }] } : target) });
+    // Match production: inspection's first readiness event precedes the factory.
+    app.emit('execution-capabilities', app.device.executionTargets);
+    goal = { ...coldStartGoal(app, project), status: 'waiting', autonomy: 'autonomous', execution: { target: 'host-macos', requiredCapabilities: ['mac-shell', 'macos-app-inspection'] }, error: 'Screen recording was unavailable.' };
+    task = { id: 'queued-native-task', goalId: goal.id, title: 'Continue native delivery', description: 'Implement the native product.', dependsOn: [], status: 'queued', execution: goal.execution, createdAt: goal.createdAt, updatedAt: goal.updatedAt };
+    retainedGoal = { ...goal, id: 'retained-inspection-goal', error: 'Waiting for the original screenshot receipt.' };
+    retainedTask = { ...task, id: 'retained-inspection-task', goalId: retainedGoal.id, status: 'review', currentAttemptId: 'retained-inspection-author' };
+    retainedAuthor = { id: retainedTask.currentAttemptId!, taskId: retainedTask.id, generation: 4, deviceId: app.device.id, status: 'succeeded', startedAt: goal.createdAt, endedAt: goal.updatedAt, executionTargetKind: 'host-macos', executionTargetId: 'retained-native-target' };
+    retainedDetail = { id: retainedAuthor.id, goalId: retainedGoal.id, goalRevision: retainedGoal.revision, cancellation: 'none', phase: 'checking', candidate: { id: 'retained-candidate', commit: 'saved-source', baseCommit: 'saved-base' }, result: { status: 'succeeded', text: 'Original author is complete.' }, verificationWait: { condition: 'inspection-evidence', reason: retainedGoal.error!, since: goal.updatedAt } };
+    app.store.transaction(() => {
+      for (const [value, queuedTask, condition] of [[goal, task, 'execution-capability'], [retainedGoal, retainedTask, 'inspection-evidence']] as const) {
+        app.store.set('goals', value); app.store.set('tasks', queuedTask);
+        app.store.set<TaskDetail>('factory-task-details', { id: queuedTask.id, key: queuedTask.id, checks: [], planRevision: value.revision, selected: true, failureSignatures: [] });
+        app.store.set<PlanRecord>('factory-plans', { id: value.id, goalId: value.id, revision: value.revision, summary: 'Retained native plan', checks: [], taskKeys: { [queuedTask.id]: queuedTask.id }, createdAt: value.createdAt });
+        app.store.set<ControlRecord>('factory-control', { id: value.id, stage: 'dispatch', startedAt: value.createdAt, steering: [], waitingFor: condition, waitReason: value.error });
+      }
+      app.store.set('attempts', retainedAuthor); app.store.set('factory-attempt-details', retainedDetail);
+    });
+    respond(async input => {
+      await writeFile(path.join(input.cwd!, 'source.txt'), 'native implementation from the resumed author\n');
+      authorStarted(); return result;
+    });
+  });
+  try {
+    assert.equal(f.app.store.get<Goal>('goals', goal.id)!.status, 'running', 'The published READY inventory clears the durable wait without another event or manual resume.');
+    assert.equal(f.app.store.get<ControlRecord>('factory-control', goal.id)!.waitingFor, undefined);
+    const attempts = f.app.store.list<Attempt>('attempts').filter(attempt => attempt.taskId === task.id);
+    assert.equal(attempts.length, 1); assert.equal(attempts[0]!.generation, 1);
+    assert.equal(attempts[0]!.executionTargetKind, 'host-macos'); assert.equal(attempts[0]!.executionTargetId, f.host.id);
+    // Before the new worker produces a real agent-slot-ready event, startup
+    // itself must leave the original inspection author completely parked.
+    assert.deepEqual(f.app.store.get('attempts', retainedAuthor.id), retainedAuthor);
+    assert.deepEqual(f.app.store.get('factory-attempt-details', retainedAuthor.id), retainedDetail);
+    assert.deepEqual(f.app.store.get('tasks', retainedTask.id), retainedTask);
+    assert.deepEqual(f.app.store.get('goals', retainedGoal.id), retainedGoal);
+    assert.equal(f.app.store.get<ControlRecord>('factory-control', retainedGoal.id)!.waitingFor, 'inspection-evidence');
+    assert.equal(f.app.store.list('factory-inspection-events').length, 0);
+    assert.equal(f.counts().containerStarts, 0);
+    releasePreparation(); await started;
+    assert.equal(f.turns.length, 1, 'Only the previously queued author starts.');
+  } finally {
+    f.factory.coordinator.pause(goal.id); releasePreparation(); finishAuthor(completedAuthor);
+    await f.factory.coordinator.waitForIdle();
+  }
+});
 
 test('cold-start orphan controller preparation releases its reservation before normal single-agent planning', { ...nativeMac, timeout: 60000 }, async t => {
   let goal!: Goal;

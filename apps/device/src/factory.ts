@@ -1326,6 +1326,9 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
   // A crash can precede ControllerRun publication after inputs claimed a goal slot.
   // Retire only that exact service-owned pre-admission context before releasing its claim.
   for(const input of app.store.list<{id:string;goalId:string;sessionId?:string;status:string}>('factory-controller-inputs'))if(['preparing','prepared'].includes(input.status)&&!app.store.get('factory-controller-runs',input.id)){const goal=app.store.get<Goal>('goals',input.goalId);await app.withServiceOperation(()=>releaseController(input.id,input.sessionId,goal?.runtime??'codex'));}
+  // Inspection publishes its initial inventory before this factory subscribes.
+  // Reconcile capability waits once; restart is not new inspection evidence.
+  coordinator.notifyCondition('execution-capability');
   await coordinator.start();
   return { coordinator, workspaces, runtime, workspacePort };
 }
