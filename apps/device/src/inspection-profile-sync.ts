@@ -8,6 +8,7 @@ import type { DeviceApp } from './app.ts';
 import type { NativeFixtureProfile } from './inspection-native.ts';
 import { validateNativeProfileProposal, type NativeProfileAudit, type NativeProfileProposal } from './inspection-profile-setup.ts';
 import { HttpError } from './util.ts';
+import { INSPECTION_SOURCE_MAX_BYTES } from './inspection-source-policy.ts';
 
 const route = '/api/inspection/native-profiles';
 const bucket = 'inspection-profile-peer-installs';
@@ -158,7 +159,7 @@ export class NativeProfileSync {
       const original = await this.fetchOriginal(install);
       for (const manifest of this.dependencies(original)) await this.importArtifact(install.peerId, manifest);
       await this.validateTransfer(original);
-      const snapshot = await importInspectionSnapshot({ dataDir: path.join(this.options.app.dataDir, 'inspection'), artifacts: this.options.artifacts, sourceArtifacts: original.audit.transfer.sourceArtifacts, sourceManifest: original.audit.transfer.sourceManifest, expectedSource: { snapshotId: original.audit.source.snapshotId, sourceDigest: original.audit.source.sha256 }, context: original.audit.authority });
+      const snapshot = await importInspectionSnapshot({ dataDir: path.join(this.options.app.dataDir, 'inspection'), artifacts: this.options.artifacts, sourceArtifacts: original.audit.transfer.sourceArtifacts, sourceManifest: original.audit.transfer.sourceManifest, expectedSource: { snapshotId: original.audit.source.snapshotId, sourceDigest: original.audit.source.sha256 }, context: original.audit.authority, limits: { maxBytes: INSPECTION_SOURCE_MAX_BYTES } });
       await this.validateEvidence(original, snapshot);
       const refreshed = await this.fetchOriginal(install);
       if (!same(original, refreshed)) throw new Error('The original independent audit changed during transfer.');

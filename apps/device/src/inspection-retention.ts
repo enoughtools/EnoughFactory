@@ -7,6 +7,7 @@ import {
 } from '@enoughfactory/workspaces';
 import type { Store } from './store.ts';
 import type { InspectionLease } from './inspection-jobs.ts';
+import { INSPECTION_SOURCE_MAX_BYTES } from './inspection-source-policy.ts';
 
 const bucket = 'inspection-source-retention';
 const terminal = new Set(['succeeded', 'failed', 'canceled']);
@@ -63,7 +64,7 @@ export class InspectionRetention {
         await this.verifyDurable(saved); await this.snapshots.verify(snapshot);
         const next = { ...saved, lastUsedAt: this.clock(), retiredAt: undefined }; this.options.store.set(bucket, next); return next;
       }
-      const transfer = await exportInspectionSnapshot({ snapshot, artifacts: this.options.artifacts, context: authority });
+      const transfer = await exportInspectionSnapshot({ snapshot, artifacts: this.options.artifacts, context: authority, limits: { maxBytes: INSPECTION_SOURCE_MAX_BYTES } });
       const now = this.clock(), record: InspectionSourceRetention = { id: snapshot.id, version: 1, sourceDigest: snapshot.sourceDigest, authority: structuredClone(authority), transfer, retainedAt: now, lastUsedAt: now };
       await this.verifyDurable(record);
       // Register every root, rather than retaining only a primary source bundle.
@@ -81,6 +82,7 @@ export class InspectionRetention {
       const snapshot = await importInspectionSnapshot({ dataDir: this.options.dataDir, artifacts: this.options.artifacts,
         sourceArtifacts: saved.transfer.sourceArtifacts, sourceManifest: saved.transfer.sourceManifest,
         expectedSource: { snapshotId: saved.id, sourceDigest: saved.sourceDigest }, context: saved.authority, signal,
+        limits: { maxBytes: INSPECTION_SOURCE_MAX_BYTES },
       });
       this.options.store.set(bucket, { ...saved, lastUsedAt: this.clock(), retiredAt: undefined });
       return snapshot;
@@ -122,6 +124,7 @@ export class InspectionRetention {
           const snapshot = await importInspectionSnapshot({ dataDir: this.options.dataDir, artifacts: this.options.artifacts,
             sourceArtifacts: current.transfer.sourceArtifacts, sourceManifest: current.transfer.sourceManifest,
             expectedSource: { snapshotId: current.id, sourceDigest: current.sourceDigest }, context: current.authority,
+            limits: { maxBytes: INSPECTION_SOURCE_MAX_BYTES },
           });
           // Check owner state again after asynchronous integrity checks.
           if (this.protected(record.id)) { result.keptSnapshotIds.push(record.id); return; }

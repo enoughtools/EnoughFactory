@@ -1,11 +1,11 @@
 import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'node:child_process';
-import { chmod, lstat, mkdir, mkdtemp, realpath, rm, symlink, writeFile } from 'node:fs/promises';
+import { chmod, cp, lstat, mkdir, mkdtemp, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { createInterface } from 'node:readline';
 import test, { type TestContext } from 'node:test';
-import type { ControllerRun, Goal, InspectionAuthority, InspectionEvidence, InspectionJob, InspectionSourceIdentity, Project, TaskQualityRequirements } from '@enoughfactory/contracts';
+import type { ControllerRun, Goal, InspectionAuthority, InspectionEvidence, InspectionJob, InspectionSourceIdentity, InspectionVerificationAcceptance, InspectionVerificationRun, Project, TaskQualityRequirements } from '@enoughfactory/contracts';
 import { WorkingDirectoryManager, WorkspaceManager } from '@enoughfactory/workspaces';
 import type { DeviceApp } from './app.ts';
 import type { AgentToolBridge, AgentToolBridgeContext, ChatController } from './chats.ts';
@@ -14,6 +14,8 @@ import { InspectionService } from './inspection-service.ts';
 import type { VerificationInput } from './inspection-verifier.ts';
 import { Store } from './store.ts';
 import { prepareControllerContext } from './controller-context.ts';
+import { inspectionAcceptanceContractSha256, inspectionQualityPolicySha256, inspectionVerificationKey } from './inspection-verification-identity.ts';
+import { inspectionSourceContentMatches } from './inspection-quality.ts';
 
 const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO5Wj4sAAAAASUVORK5CYII=', 'base64');
 const referencePng = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=', 'base64');
@@ -54,7 +56,7 @@ function client(bridge: AgentToolBridge) {
   };
 }
 
-async function fixture(t: TestContext, options: { generatedContext?: boolean; aggregate?: boolean } = {}) {
+async function fixture(t: TestContext, options: { generatedContext?: boolean; aggregate?: boolean; acceptedFinal?: boolean } = {}) {
   const directory = await realpath(await mkdtemp(path.join(tmpdir(), 'ef-inspection-controller-')));
   const workdir = path.join(directory, 'controller'), canonicalPath = path.join(directory, 'integrated'), referencePath = path.join(directory, 'enough-ui');
   await mkdir(workdir); await mkdir(canonicalPath); await mkdir(referencePath);
@@ -62,10 +64,17 @@ async function fixture(t: TestContext, options: { generatedContext?: boolean; ag
   await writeFile(path.join(canonicalPath, 'README.md'), 'The integrated mail app.');
   await writeFile(path.join(referencePath, 'Button.swift'), 'Original pinned EnoughUI component.');
   await writeFile(path.join(referencePath, 'reference.png'), referencePng);
+  let acceptedCommit: string | undefined;
+  if (options.acceptedFinal) {
+    const git = (...args: string[]) => execFileSync('git', ['-C', canonicalPath, ...args], { encoding: 'utf8' }).trim();
+    git('init', '--quiet'); git('add', '.'); git('-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '--quiet', '-m', 'Accepted application');
+    acceptedCommit = git('rev-parse', 'HEAD');
+    await cp(path.join(canonicalPath, '.git'), path.join(workdir, '.git'), { recursive: true });
+  }
   const store = new Store(path.join(directory, 'service'));
   let bridge: AgentToolBridge | undefined, provider: ReturnType<typeof client> | undefined;
   t.after(async () => { await bridge?.release?.(); await provider?.close(); store.close(); await rm(directory, { recursive: true, force: true }); });
-  const goal = { id: 'goal', projectId: 'project', revision: 7, status: 'running' } as Goal;
+  const goal = { id: 'goal', projectId: 'project', revision: 7, status: 'running', objective: 'Build the mail app.', criteria: ['Close draft restores the inbox.'] } as Goal;
   const run: ControllerRun = { id: 'evaluator', goalId: goal.id, role: 'evaluator', status: 'running', sessionId: 'review-session', chatId: 'review-chat', updatedAt: new Date().toISOString() };
   const authority: InspectionAuthority = { goalId: goal.id, goalRevision: 4, taskId: 'task', attemptId: 'attempt', authorityGeneration: 2, policyRevision: 4 };
   const quality: TaskQualityRequirements = { platforms: ['macos'], workflows: [{ id: 'close-draft', platform: 'macos' }], referenceIds: ['enough-ui'] };
@@ -75,7 +84,9 @@ async function fixture(t: TestContext, options: { generatedContext?: boolean; ag
   store.set('projects', { id: 'project', path: canonicalPath, workingDirectories: [{ id: 'enough-ui', name: 'enough-ui', path: referencePath }] });
   store.set('tasks', { id: 'task', goalId: goal.id, status: 'completed', currentAttemptId: 'attempt', quality });
   store.set('attempts', { id: 'attempt', taskId: 'task', generation: 2, status: 'succeeded' });
-  store.set('factory-attempt-details', { id: 'attempt', assignmentGoalRevision: 4, contract: { quality } });
+  const contract = { title: 'Close draft', description: 'Closing the draft restores the inbox.', acceptanceCriteria: ['Close draft restores the inbox.'], expectedOutputs: ['Verified app'], dependsOn: [], checks: [], quality, planRevision: 4 };
+  store.set('factory-attempt-details', { id: 'attempt', goalId: goal.id, goalRevision: 4, assignmentGoalRevision: 4, contract,
+    ...(acceptedCommit ? { candidate: { id: 'accepted-C', commit: acceptedCommit, baseCommit: acceptedCommit }, integration: { candidateCommit: acceptedCommit, commit: acceptedCommit } } : {}) });
   const app = { dataDir: path.join(directory, 'service'), device: { id: 'mac', capacity: 1 }, store,
     runtime: { endpoint: { host: 'unix:///no-docker-needed', cliPath: '/usr/bin/false', configDirectory: path.join(directory, 'private-docker') } },
     sessions: { record: (id: string) => { assert.equal(id, run.sessionId); return context.session; }, execution: (id: string) => { assert.equal(id, run.sessionId); return context.execution; }, owns: (id:string)=>id===run.sessionId },
@@ -83,7 +94,8 @@ async function fixture(t: TestContext, options: { generatedContext?: boolean; ag
   } as unknown as DeviceApp;
   const service = new InspectionService(app, {isRunning:()=>false} as unknown as ChatController);
   const snapshot = await service.snapshots.create({ roots: [{ id: 'primary', name: 'primary', path: workdir }, { id: 'enough-ui', name: 'enough-ui', path: referencePath }], context: { goalId: goal.id, taskId: authority.taskId, attemptId: authority.attemptId } });
-  const source: InspectionSourceIdentity = { snapshotId: snapshot.id, sha256: snapshot.sourceDigest, roots: snapshot.roots.map(root => ({ id: root.id, sha256: root.sourceDigest, ...(root.sourceCommit ? { commit: root.sourceCommit } : {}) })) };
+  const source: InspectionSourceIdentity = { snapshotId: snapshot.id, sha256: snapshot.sourceDigest, roots: snapshot.roots.map(root => ({ id: root.id, sha256: root.sourceDigest, ...(root.sourceCommit ? { commit: root.sourceCommit } : {}) })),
+    ...(acceptedCommit ? { candidateId: 'accepted-C', candidateCommit: acceptedCommit, checkedCommit: acceptedCommit } : {}) };
   const { token } = service.jobs.issueAuthority(authority, { capabilities: ['macos-app-inspection'], executionTargetIds: ['mac-host'] });
   const job = service.jobs.createJob(token, { idempotencyKey: 'author-preview', executionTargetId: 'mac-host', capability: 'macos-app-inspection', source, profile: {} });
   assert.equal(service.jobs.claimNext()!.id, job.id); service.jobs.markRunning(job.id);
@@ -114,6 +126,34 @@ async function fixture(t: TestContext, options: { generatedContext?: boolean; ag
   const report: QualityEvidenceReport = { version: 1, source, workflows: [{ id: 'close-draft', platform: 'macos', before: beforeScreenshot.id, action: close.id, after: screenshot.id, outcome: 'passed', assertion: 'Composer disappeared and inbox became visible.', assertionEvidenceId: assertion.id }], reviews: [{ platform: 'macos', observations: [beforeScreenshot.id, screenshot.id], references: [{ id: 'enough-ui', comparison: 'Inbox controls follow the pinned EnoughUI reference.' }], dimensions, defects: [] }] };
   const qualityRecord = await service.quality.submit({ authority, quality, report });
   assert.equal(qualityRecord.gate.status, 'ready-for-review');
+  if (acceptedCommit) {
+    // Persist the same real contract-bound report that the completion service
+    // reads. Native provider dispatch is outside these controller/source tests.
+    const acceptanceContract: InspectionVerificationAcceptance = { version: 1, task: contract, goal: { revision: goal.revision, objective: goal.objective, criteria: goal.criteria,
+      taskContracts: [{ taskId: authority.taskId, attemptId: authority.attemptId, authorityGeneration: authority.authorityGeneration, assignmentGoalRevision: authority.goalRevision, contract }] } };
+    const identity = { authority, source, quality, purpose: 'goal-final' as const, goalRevision: goal.revision, acceptanceContract };
+    const id = inspectionVerificationKey(identity), chatId = 'final-verifier-chat', sessionId = 'final-verifier-session';
+    const verificationRun: InspectionVerificationRun = { ...identity, id, chatId, sessionId, policySha256: inspectionQualityPolicySha256(quality), ownerDeviceId: 'mac', executionTargetKind: 'host-macos', executionTargetId: 'mac-host', status: 'running', createdAt: run.updatedAt, updatedAt: run.updatedAt, deadlineAt: new Date(Date.now() + 60000).toISOString() };
+    const verification = { runId: id, chatId, acceptanceContractSha256: inspectionAcceptanceContractSha256(acceptanceContract) };
+    store.set('inspection-verifier-runs', verificationRun);
+    store.set('chats', { id: chatId, sessionId, verificationRunId: id, deviceId: 'mac', runtime: 'codex', status: 'running' });
+    store.set('sessions', { id: sessionId, verificationRunId: id, deviceId: 'mac', executionTargetKind: 'host-macos', executionTargetId: 'mac-host', status: 'ready' });
+    for (const item of [beforeScreenshot, screenshot]) store.set('provider-image-deliveries', { id: `final-delivery-${item.id}`, chatId, eventId: `final-tool-${item.id}`, authority, artifactSha256: item.artifact.sha256, route: 'tool-image' });
+    store.set('inspection-reference-views', { id: 'final-reference', referenceId: 'enough-ui', authority, source, artifacts: [authorReference], verification, inspectedAt: run.updatedAt });
+    const finalReport = await service.quality.submit({ authority, quality, report, verification });
+    assert.equal(finalReport.gate.status, 'ready-for-review', finalReport.gate.issues.join(' '));
+    const completed = { ...verificationRun, status: 'succeeded' as const };
+    store.set('inspection-verifier-runs', completed);
+    store.set('chats', { id: chatId, sessionId, verificationRunId: id, deviceId: 'mac', runtime: 'codex', status: 'idle' });
+    store.set('sessions', { id: sessionId, verificationRunId: id, deviceId: 'mac', executionTargetKind: 'host-macos', executionTargetId: 'mac-host', status: 'stopped' });
+    t.mock.method(service.verifier, 'ensure', async (input: VerificationInput) => {
+      assert.equal(input.purpose, 'goal-final'); assert.equal(input.goalRevision, goal.revision);
+      assert.deepEqual(input.authority, authority); assert.deepEqual(input.quality, quality);
+      assert.equal(input.source.candidateId, 'accepted-C'); assert.equal(input.source.candidateCommit, acceptedCommit); assert.equal(input.source.checkedCommit, acceptedCommit);
+      assert(inspectionSourceContentMatches(input.source, source));
+      return completed;
+    });
+  }
   if (options.generatedContext) {
     const project = store.get<Project>('projects', 'project')!;
     if (options.aggregate) for (let index = 1; index < 8; index++) {
@@ -125,7 +165,9 @@ async function fixture(t: TestContext, options: { generatedContext?: boolean; ag
     const workspaces = new WorkspaceManager({ dataDir: path.join(app.dataDir, 'workspace-data'), deviceId: 'mac' });
     const directoryManager = new WorkingDirectoryManager({ dataDir: path.join(app.dataDir, 'workspace-data'), artifacts: workspaces.artifacts });
     const prepared = await prepareControllerContext({ operation: run.id, goalId: goal.id, role: 'evaluator', project, store, workspaces, directoryManager, dataDir: app.dataDir, selected: [] });
+    store.set('session-launch', { id: run.sessionId, workingDirectorySources: prepared.workingDirectorySources });
     const transferred = await directoryManager.prepare({ identity: 'actual-evaluator-session', transferred: prepared.workingDirectorySources });
+    store.set('session-host', { id: run.sessionId, deviceId: 'mac', prepared: { sessionId: run.sessionId, roots: transferred } });
     context.session.workingDirectories = transferred.map(root => ({ id: root.id, name: root.name, path: root.path, kind: root.kind, baseCommit: root.baseCommit, sourceCommit: root.sourceCommit, status: 'ready' }));
   }
   bridge = await (service as unknown as ControllerSeam).controllerBridge(context); assert(bridge);
@@ -198,7 +240,7 @@ test('controller references are scoped to configured roots and pin original byte
 });
 
 test('completion review requires its own image and reference reads and recaptures actual integrated source', { timeout: 15000 }, async t => {
-  const f = await fixture(t), actual = value<ReviewList>(await f.provider.call('factory_review_screens')).source;
+  const f = await fixture(t, { acceptedFinal: true }), actual = value<ReviewList>(await f.provider.call('factory_review_screens')).source;
   const resultText = () => JSON.stringify({ complete: true, visualReview: f.review(actual) });
   const missing = await f.service.reviewController({ goal: f.goal, run: f.run, resultText: resultText() });
   assert.equal(missing.ready, false); assert.match(missing.reason!, /screenshot|reference/);
@@ -212,7 +254,8 @@ test('completion review requires its own image and reference reads and recapture
   const changed = await f.service.reviewController({ goal: f.goal, run: completed, resultText: resultText() });
   assert.equal(changed.ready, false); assert.match(changed.reason!, /workspace differs/);
   const incomplete = await f.service.reviewController({ goal: f.goal, run: completed, resultText: JSON.stringify({ complete: false, reason: 'Work remains.' }) });
-  assert.equal(incomplete.ready, true, 'An evaluator declining completion does not wait for completion-only image requirements.');
+  assert.equal(incomplete.ready, false, 'An evidence-only incomplete decision still reconciles its exact source before final verification.');
+  assert.match(incomplete.reason!, /workspace differs/);
 });
 
 test('controller evidence and callbacks cannot cross goals or survive retired review authority', { timeout: 15000 }, async t => {
@@ -321,7 +364,7 @@ test('an actionable evaluator repair plan bypasses redundant final verification 
 });
 
 test('canonical source changes during final evidence verification refuse completion', { timeout: 15000 }, async t => {
-  const f = await fixture(t), actual = value<ReviewList>(await f.provider.call('factory_review_screens')).source;
+  const f = await fixture(t, { acceptedFinal: true }), actual = value<ReviewList>(await f.provider.call('factory_review_screens')).source;
   await f.deliver(await f.provider.call('factory_review_image', { evidenceId: f.screenshot.id }), 'final-image');
   await f.provider.call('factory_review_reference', { referenceId: 'enough-ui', rootId: 'enough-ui', relativePath: 'Button.swift' });
   await f.provider.call('factory_review_evidence', { evidenceId: f.assertion.id });
@@ -346,7 +389,7 @@ test('a private reference-folder change cannot substitute for the canonical addi
 });
 
 test('actual generated controller evidence is excluded while declared private reference changes still reject completion', { timeout: 20000 }, async t => {
-  const f = await fixture(t, { generatedContext: true });
+  const f = await fixture(t, { generatedContext: true, acceptedFinal: true });
   const generated = f.context.session.workingDirectories!.find(root => root.id === `controller-context-${f.run.id}`)!;
   assert(generated, 'Use the real generated source prepared and transferred by the controller context.');
   const list = value<ReviewList>(await f.provider.call('factory_review_screens'));

@@ -11,6 +11,7 @@ import { createContainerInspectionBridge, createHostInspectionBridge, inspection
 import type { NativeFixtureProfile } from './inspection-native.ts';
 import { goalAgentCount } from './factory-agent-capacity.ts';
 import { exec } from './util.ts';
+import { INSPECTION_SOURCE_MAX_BYTES } from './inspection-source-policy.ts';
 
 export const PROFILE_AUDITS = 'inspection-profile-audits';
 const READS = 'inspection-profile-audit-reads';
@@ -110,8 +111,8 @@ export class NativeProfileSetup {
     if(!this.options.authorityCurrent(input.authority))throw new Error('Native setup author authority was retired.');
     await (this.options.verifySnapshot?.(input.snapshot)??this.options.snapshots.verify(input.snapshot));
     if(!sourceMatches(input.source,{snapshotId:input.snapshot.id,sha256:input.snapshot.sourceDigest,roots:input.snapshot.roots.map(root=>({id:root.id,sha256:root.sourceDigest}))}))throw new Error('Native setup source is not the captured all-root source.');
-    const transfer=await exportInspectionSnapshot({snapshot:input.snapshot,artifacts:this.options.artifacts,context:input.authority});
-    const snapshot=await importInspectionSnapshot({dataDir:path.join(this.options.app.dataDir,'inspection'),artifacts:this.options.artifacts,sourceArtifacts:transfer.sourceArtifacts,sourceManifest:transfer.sourceManifest,expectedSource:{snapshotId:input.snapshot.id,sourceDigest:input.snapshot.sourceDigest},context:input.authority});
+    const transfer=await exportInspectionSnapshot({snapshot:input.snapshot,artifacts:this.options.artifacts,context:input.authority,limits:{maxBytes:INSPECTION_SOURCE_MAX_BYTES}});
+    const snapshot=await importInspectionSnapshot({dataDir:path.join(this.options.app.dataDir,'inspection'),artifacts:this.options.artifacts,sourceArtifacts:transfer.sourceArtifacts,sourceManifest:transfer.sourceManifest,expectedSource:{snapshotId:input.snapshot.id,sourceDigest:input.snapshot.sourceDigest},context:input.authority,limits:{maxBytes:INSPECTION_SOURCE_MAX_BYTES}});
     await this.options.retainSnapshot?.(snapshot,input.authority);if(!this.options.authorityCurrent(input.authority))throw new Error('Native setup author authority changed during retention.');goal=this.options.app.store.get<Goal>('goals',input.authority.goalId);if(!goal||['paused','failed','completed','canceled'].includes(goal.status))throw new Error('Native setup goal stopped during proposal retention.');
     const at=new Date().toISOString(), run:NativeProfileAudit={id:`profile-audit-${randomUUID()}`,requestKey,proposalSha256,proposal,authority:structuredClone(input.authority),source:structuredClone(input.source),ownerDeviceId:this.options.app.device.id,projectId:input.projectId,sourceSessionId:input.sourceSessionId,snapshot,transfer,status:'queued',createdAt:at,updatedAt:at};
     const sourceChat=input.sourceChatId&&this.options.app.store.get<Chat>('chats',input.sourceChatId);if(goal.approvalMode!=='approve-all'&&(!sourceChat||sourceChat.sessionId!==input.sourceSessionId||sourceChat.deviceId!==run.ownerDeviceId||sourceChat.attemptId&&sourceChat.attemptId!==run.authority.attemptId))throw new Error('Selective setup policy requires its original author conversation.');

@@ -15,6 +15,7 @@ import type { DelegatedNativeInspectionReadiness } from './inspection-delegation
 import { canonicalVerificationValue as canonical, inspectionAcceptanceContractSha256, inspectionQualityPolicySha256, inspectionVerificationKey } from './inspection-verification-identity.ts';
 import { INLINE_VERIFICATION_CONTRACT_CHARACTERS, verificationContractContent } from './inspection-verification-contract.ts';
 import { exec } from './util.ts';
+import { INSPECTION_SOURCE_MAX_BYTES } from './inspection-source-policy.ts';
 export { inspectionAcceptanceContractSha256, inspectionQualityPolicySha256, inspectionVerificationKey } from './inspection-verification-identity.ts';
 
 export const INSPECTION_VERIFIER_RUNS = 'inspection-verifier-runs';
@@ -283,7 +284,7 @@ export class InspectionVerifier {
         if (canonical(await this.artifacts.get(artifact.id)) !== canonical(artifact)) return false;
         await this.artifacts.path(artifact);
       }
-      const snapshot = await importInspectionSnapshot({ dataDir: path.join(this.options.app.dataDir, 'workspace-data', 'inspection-verification', id), artifacts: this.artifacts, sourceArtifacts: saved.transfer.sourceArtifacts, sourceManifest: saved.transfer.sourceManifest, expectedSource: { snapshotId: original.source.snapshotId, sourceDigest: original.source.sha256 }, context: original.authority, signal });
+      const snapshot = await importInspectionSnapshot({ dataDir: path.join(this.options.app.dataDir, 'workspace-data', 'inspection-verification', id), artifacts: this.artifacts, sourceArtifacts: saved.transfer.sourceArtifacts, sourceManifest: saved.transfer.sourceManifest, expectedSource: { snapshotId: original.source.snapshotId, sourceDigest: original.source.sha256 }, context: original.authority, signal, limits: { maxBytes: INSPECTION_SOURCE_MAX_BYTES } });
       if (!eligible() || !inspectionSourceContentMatches(original.source, { snapshotId: snapshot.id, sha256: snapshot.sourceDigest, roots: snapshot.roots.map(root => ({ id: root.id, sha256: root.sourceDigest })) })) return false;
       await this.assertExecutionSource(original.sessionId!, snapshot, signal);
       if (!eligible() || !await this.options.reconcileInspection(original, signal) || !eligible()) return false;
@@ -338,7 +339,7 @@ export class InspectionVerifier {
           if (canonical(await this.artifacts.get(artifact.id)) !== canonical(artifact)) return false;
           await this.artifacts.path(artifact);
         }
-        const snapshot = await importInspectionSnapshot({ dataDir: path.join(this.options.app.dataDir, 'workspace-data', 'inspection-verification', id), artifacts: this.artifacts, sourceArtifacts: saved.transfer.sourceArtifacts, sourceManifest: saved.transfer.sourceManifest, expectedSource: { snapshotId: original.source.snapshotId, sourceDigest: original.source.sha256 }, context: original.authority, signal });
+        const snapshot = await importInspectionSnapshot({ dataDir: path.join(this.options.app.dataDir, 'workspace-data', 'inspection-verification', id), artifacts: this.artifacts, sourceArtifacts: saved.transfer.sourceArtifacts, sourceManifest: saved.transfer.sourceManifest, expectedSource: { snapshotId: original.source.snapshotId, sourceDigest: original.source.sha256 }, context: original.authority, signal, limits: { maxBytes: INSPECTION_SOURCE_MAX_BYTES } });
         if (!eligible() || !inspectionSourceContentMatches(original.source, { snapshotId: snapshot.id, sha256: snapshot.sourceDigest, roots: snapshot.roots.map(root => ({ id: root.id, sha256: root.sourceDigest })) })) return false;
         this.options.app.store.transaction(() => {
           if (!eligible()) throw new Error('The stopped setup reconciliation owner changed.');
@@ -358,12 +359,12 @@ export class InspectionVerifier {
   private async retain(id: string, input: VerificationInput, signal: AbortSignal): Promise<InspectionSnapshot> {
     let saved = this.options.app.store.get<VerificationInputs>(INPUTS, id);
     if (!saved) {
-      const transfer = await exportInspectionSnapshot({ snapshot: input.snapshot, artifacts: this.artifacts, context: input.authority, signal });
+      const transfer = await exportInspectionSnapshot({ snapshot: input.snapshot, artifacts: this.artifacts, context: input.authority, signal, limits: { maxBytes: INSPECTION_SOURCE_MAX_BYTES } });
       saved = { id, project: structuredClone(input.project), transfer };
       this.options.app.store.set(INPUTS, saved);
       for (const artifact of [transfer.sourceManifest, ...transfer.sourceArtifacts.map(source => source.manifest)]) this.options.app.store.set('factory-artifacts', artifact);
     }
-    const snapshot = await importInspectionSnapshot({ dataDir: path.join(this.options.app.dataDir, 'workspace-data', 'inspection-verification', id), artifacts: this.artifacts, sourceArtifacts: saved.transfer.sourceArtifacts, sourceManifest: saved.transfer.sourceManifest, expectedSource: { snapshotId: this.get(id).source.snapshotId, sourceDigest: this.get(id).source.sha256 }, context: this.get(id).authority, signal });
+    const snapshot = await importInspectionSnapshot({ dataDir: path.join(this.options.app.dataDir, 'workspace-data', 'inspection-verification', id), artifacts: this.artifacts, sourceArtifacts: saved.transfer.sourceArtifacts, sourceManifest: saved.transfer.sourceManifest, expectedSource: { snapshotId: this.get(id).source.snapshotId, sourceDigest: this.get(id).source.sha256 }, context: this.get(id).authority, signal, limits: { maxBytes: INSPECTION_SOURCE_MAX_BYTES } });
     this.options.app.store.set(INPUTS, { ...saved, snapshot });
     return snapshot;
   }
@@ -508,6 +509,7 @@ export class InspectionVerifier {
       `Verification run: ${run.id}\nChecked source: ${JSON.stringify(run.source)}\nFrozen quality requirements: ${JSON.stringify(run.quality)}`,
       acceptance,
       'Treat every original acceptance criterion, task description and final-goal completion criterion as required. Workflow IDs only organize evidence; a passed interaction does not establish the whole criterion. For restoration or persistence of message content, use factory_assert valueEquals on the entire observed editable value, including every line. When a required read-only field such as From is exposed as its label rather than a value, select it with labelIncludes and use labelEquals on the complete observed label, including its field prefix and exact address. labelEquals and valueEquals compare actual observed strings; an identifier or a missing value cannot replace them. Verify every exact From/To/subject/body field required by the contract. valueIncludes, matching the first line, an empty standalone draft, or a successful click cannot establish whole-message restoration. Exercise the required populated Reply flow, software keyboard, first/middle/last lines, close/reopen and confirmed restart when specified; retain the exact distinctive multiline expected text and compare the full restored body after each required transition. Never send mail unless the original contract explicitly requires and authorizes it. If the observation cannot expose an entire required field string, report that acceptance evidence as blocked instead of claiming it passed.',
+      'When an original criterion requires author history, pre-edit reproduction, stop/edit/check/new-source order, unchanged files or the final author badge/chat, use factory_verification_history and read the original attempt/check/result records, assertions and base-to-candidate diffs through factory_verification_evidence. View original pre-edit/final screenshot pixels with factory_verification_image. Continue bounded reads until every relevant original record is complete. These are historical context with their original source/authority; they never establish current workflow acceptance and their IDs cannot replace this verifier own current-source screenshots/actions/assertions. Missing original bytes or unresolved chronology remains an explicit verification gap.',
       'Use factory_capabilities. For native platforms select the configured fixture profile, factory_native_build, poll its job, then factory_native_start. For web start the app from this private verification workspace and use factory_browser_start. View original screenshot image tool responses, inspect required reference/design-system files with factory_reference, execute every required workflow, re-observe and use factory_assert on resulting state. Distinguish screenshot evidence IDs from observation/action IDs.',
       'Submit a version 1 QualityEvidenceReport through factory_quality_submit using the EXACT Checked source object. Each passed workflow requires before/action/after plus assertionEvidenceId. Review hierarchy, spacing, clipping, typography, controls and states against the inspected reference; record serious defects honestly. Missing capabilities or failed interactions are blocked/failed evidence, never a success claim. Finish by stopping the owned app/browser sessions. Do not ask the user or start another author attempt.',
       context,
@@ -572,7 +574,7 @@ export class InspectionVerifier {
             if (canonical(await this.artifacts.get(artifact.id)) !== canonical(artifact)) throw new Error('The durable verifier source manifest changed.');
             await this.artifacts.path(artifact);
           }
-          const frozen = await importInspectionSnapshot({ dataDir: path.join(this.options.app.dataDir, 'workspace-data', 'inspection-verification', run.id), artifacts: this.artifacts, sourceArtifacts: inputs.transfer.sourceArtifacts, sourceManifest: inputs.transfer.sourceManifest, expectedSource: { snapshotId: run.source.snapshotId, sourceDigest: run.source.sha256 }, context: run.authority });
+          const frozen = await importInspectionSnapshot({ dataDir: path.join(this.options.app.dataDir, 'workspace-data', 'inspection-verification', run.id), artifacts: this.artifacts, sourceArtifacts: inputs.transfer.sourceArtifacts, sourceManifest: inputs.transfer.sourceManifest, expectedSource: { snapshotId: run.source.snapshotId, sourceDigest: run.source.sha256 }, context: run.authority, limits: { maxBytes: INSPECTION_SOURCE_MAX_BYTES } });
           const workspaces = new WorkspaceManager({ dataDir: path.join(this.options.app.dataDir, 'workspace-data'), deviceId: this.options.app.device.id });
           const workspaceDirectory = path.join(this.options.app.dataDir, 'workspace-data', 'workspaces', run.id);
           const cacheIdentity = `${run.id}-inputs`;
@@ -595,8 +597,8 @@ export class InspectionVerifier {
               const manager = new InspectionSnapshotManager({ dataDir: path.join(this.options.app.dataDir, 'workspace-data', 'verification-retirement', run.id), artifacts: this.artifacts });
               let preserved: InspectionSnapshot | undefined;
               try {
-                preserved = await manager.create({ roots: [{ id: frozen.roots[0]!.id, name: frozen.roots[0]!.name, path: workspace.path, kind: 'git' }], includeAll: true, context: run.authority });
-                primarySource = await exportInspectionSnapshot({ snapshot: preserved, artifacts: this.artifacts, context: run.authority });
+                preserved = await manager.create({ roots: [{ id: frozen.roots[0]!.id, name: frozen.roots[0]!.name, path: workspace.path, kind: 'git' }], includeAll: true, context: run.authority, maxBytes: INSPECTION_SOURCE_MAX_BYTES });
+                primarySource = await exportInspectionSnapshot({ snapshot: preserved, artifacts: this.artifacts, context: run.authority, limits: { maxBytes: INSPECTION_SOURCE_MAX_BYTES } });
                 for (const artifact of [primarySource.sourceManifest, ...primarySource.sourceArtifacts.map(source => source.manifest)]) this.options.app.store.set('factory-artifacts', artifact);
               } finally { if (preserved) await manager.remove(preserved); }
             }
@@ -781,8 +783,8 @@ export class InspectionVerifier {
     let actual: InspectionSnapshot | undefined;
     const manager = new InspectionSnapshotManager({ dataDir: path.join(this.options.app.dataDir, 'workspace-data', 'verification-validation') });
     try {
-      if (execution.kind === 'container') exported = await exportInspectionContainerRoots({ endpoint: this.options.app.runtime.endpoint, containerId: execution.containerId!, roots, scratchDirectory: path.join(this.options.app.dataDir, 'workspace-data', 'verification-exports', sessionId), signal });
-      actual = await manager.create({ roots: exported?.roots ?? roots, signal });
+      if (execution.kind === 'container') exported = await exportInspectionContainerRoots({ endpoint: this.options.app.runtime.endpoint, containerId: execution.containerId!, roots, scratchDirectory: path.join(this.options.app.dataDir, 'workspace-data', 'verification-exports', sessionId), signal, limits: { maxBytes: INSPECTION_SOURCE_MAX_BYTES } });
+      actual = await manager.create({ roots: exported?.roots ?? roots, signal, maxBytes: INSPECTION_SOURCE_MAX_BYTES });
       if (!inspectionSourceContentMatches({ snapshotId: expected.id, sha256: expected.sourceDigest, roots: expected.roots.map(root => ({ id: root.id, sha256: root.sourceDigest })) }, { snapshotId: actual.id, sha256: actual.sourceDigest, roots: actual.roots.map(root => ({ id: root.id, sha256: root.sourceDigest })) })) throw new Error('The private verifier execution changed the exact checked source while preparing.');
     } finally { if (actual) await manager.remove(actual); await exported?.cleanup(); }
   }

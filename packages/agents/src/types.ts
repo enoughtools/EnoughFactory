@@ -33,7 +33,7 @@ export interface TurnCallbacks {
   onApproval: (approval: Approval, signal?: AbortSignal) => Promise<boolean | { decision: "allow" | "deny" }>;
   onQuestion?: (request: { id: string; questions: unknown; chatId: string }, signal: AbortSignal) => Promise<Record<string, { answers: string[] }>>;
   /** Persist original bytes once. Only the returned reference is stored with tool events. */
-  onToolImage?: (image: { bytes: Buffer; mimeType: string; itemId?: string }, signal: AbortSignal) => Promise<AgentImageReference>;
+  onToolImage?: (image: { bytes: Buffer; mimeType: string; itemId?: string; server?: string; tool?: string }, signal: AbortSignal) => Promise<AgentImageReference>;
 }
 export interface TurnResult {
   threadId?: string;

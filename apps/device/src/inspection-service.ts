@@ -6,7 +6,7 @@ import { execFile } from 'node:child_process';
 import { isDeepStrictEqual, promisify } from 'node:util';
 import type { Attempt, ControllerRun, ExecutionCapability, ExecutionTargetAdvertisement, FactoryTask, Goal, InspectionAuthority, InspectionJob, InspectionSourceIdentity, InspectionVerificationRun, Project, TaskQualityRequirements } from '@enoughfactory/contracts';
 import { readJsonObject, type AttemptDetail } from '@enoughfactory/factory';
-import { ArtifactStore, InspectionSnapshotManager, WorkspaceManager, exportInspectionContainerRoots, exportInspectionSnapshot, type ArtifactManifest, type InspectionSnapshot } from '@enoughfactory/workspaces';
+import { ArtifactStore, InspectionSnapshotManager, WorkspaceManager, exportInspectionContainerRoots, exportInspectionSnapshot, type ArtifactManifest, type InspectionSnapshot, type WorkingDirectorySource } from '@enoughfactory/workspaces';
 import { dockerInvocation } from '@enoughfactory/runtime';
 import { BrowserInspectionManager, type BrowserToolResult } from '@enoughfactory/browser-inspection';
 import { NativeInspectionBackend, type NativeAction } from '@enoughfactory/native-inspection';
@@ -17,6 +17,7 @@ import { InspectionJobs } from './inspection-jobs.ts';
 import { InspectionDelegation } from './inspection-delegation.ts';
 import type { PeerManager } from '@enoughfactory/peers';
 import { parseBrowserObservation } from './inspection-browser-observation.ts';
+import { InspectionVerificationHistory } from './inspection-verification-history.ts';
 import { beginBrowserFormObservation, completeBrowserFormObservation } from './inspection-browser-values.ts';
 import { createContainerInspectionBridge, createHostInspectionBridge, inspectionMcpHandler, type InspectionMcpBridge } from './inspection-mcp.ts';
 import { NativeInspectionAdapter, type NativeFixtureProfile, type NativeInspectionBuild } from './inspection-native.ts';
@@ -30,6 +31,7 @@ import { NativeProfileSync } from './inspection-profile-sync.ts';
 import { HostDiskAdmission } from './host-disk-admission.ts';
 import { InspectionRetention } from './inspection-retention.ts';
 import { inspectionGoalQuality } from './inspection-goal-quality.ts';
+import { INSPECTION_SOURCE_MAX_BYTES } from './inspection-source-policy.ts';
 import { HttpError } from './util.ts';
 
 const execute=promisify(execFile);
@@ -148,8 +150,8 @@ export class InspectionService {
       const host=session.executionTargetKind==='host-macos'?this.app.store.get<{prepared:{cwd:string};releasedAt?:string}>('session-host',session.id):undefined;
       if(host?.releasedAt)throw new Error('The native reviewer input was released before its source was retained.');
       if(host)await this.app.sessions.assertHostExecutionCurrent(session.id);
-      const preserved=await this.snapshots.create({roots:[{id:'primary',name:'primary',path:host?.prepared.cwd??repository}],includeAll:true,context:run.authority});
-      try{const source=await exportInspectionSnapshot({snapshot:preserved,artifacts:this.artifacts,context:run.authority});journal={id:run.id,sessionId:session.id,chatId:run.chatId,root,proposalSha256:run.proposalSha256,source,createdAt:new Date().toISOString()};this.app.store.set(bucket,journal);}finally{await this.snapshots.remove(preserved);}
+      const preserved=await this.snapshots.create({roots:[{id:'primary',name:'primary',path:host?.prepared.cwd??repository}],includeAll:true,context:run.authority,maxBytes:INSPECTION_SOURCE_MAX_BYTES});
+      try{const source=await exportInspectionSnapshot({snapshot:preserved,artifacts:this.artifacts,context:run.authority,limits:{maxBytes:INSPECTION_SOURCE_MAX_BYTES}});journal={id:run.id,sessionId:session.id,chatId:run.chatId,root,proposalSha256:run.proposalSha256,source,createdAt:new Date().toISOString()};this.app.store.set(bucket,journal);}finally{await this.snapshots.remove(preserved);}
     }
     assertCurrent();
     if(session.executionTargetKind==='host-macos'){
@@ -239,7 +241,7 @@ export class InspectionService {
       const captured=input.candidate.workingDirectories?.find(item=>item.containerPath===root.containerPath);
       return {id:captured?.id||path.basename(root.containerPath),name:captured?.name||path.basename(root.containerPath),path:root.path};
     })];
-    const snapshot=await this.snapshots.create({roots,signal:input.signal});
+    const snapshot=await this.snapshots.create({roots,signal:input.signal,maxBytes:INSPECTION_SOURCE_MAX_BYTES});
     try{
       const detail=this.app.store.get<AttemptDetail>('factory-attempt-details',input.attempt.id),revision=detail?.assignmentGoalRevision??detail?.goalRevision??input.goal.revision;
       const authority:InspectionAuthority={goalId:input.goal.id,goalRevision:revision,taskId:input.task.id,attemptId:input.attempt.id,authorityGeneration:input.attempt.generation,policyRevision:revision};
@@ -289,11 +291,22 @@ export class InspectionService {
     if(saved){try{this.jobs.authorize(saved.token);}catch{saved=undefined;}}
     if(!saved){const grant=this.jobs.issueAuthority(authority,{capabilities:['chromium-inspection','apple-compilation','macos-app-inspection','ios-simulator-inspection'],executionTargetIds:['container','mac-host']});saved={id:key,token:grant.token,grantId:grant.grant.id,authority};this.app.store.set('inspection-private-tokens',saved);}
     const token=saved.token;this.contexts.set(authority.attemptId,context);
-    const handler=inspectionMcpHandler(tools,async(name,args)=>this.app.withServiceOperation(async()=>{this.jobs.authorize(token);if(context.signal.aborted)throw new Error('The author turn was canceled.');return this.call(context,token,name,args);}));
+    const historicalTools=verification?[
+      {name:'factory_verification_history',description:'List original same-goal evidence for the verifier anchor and accepted task contracts. Historical context never establishes current workflow acceptance.',inputSchema:objectSchema({offset:{type:'integer',minimum:0},limit:{type:'integer',minimum:1,maximum:24}})},
+      {name:'factory_verification_evidence',description:'Read original scoped inspection/attempt/check/result records, quality reports and exact base-to-candidate diff bytes in bounded ranges. Preserve original source identity; do not submit these IDs as current workflow proof.',inputSchema:objectSchema({kind:{type:'string',enum:['inspection','attempt','candidate-diff','goal-check','quality-report']},id:string,offset:{type:'integer',minimum:0},maxCharacters:{type:'integer',minimum:1,maximum:16000}},['kind','id','offset','maxCharacters'])},
+      {name:'factory_verification_image',description:'View original historical screenshot pixels for the scoped goal/task/attempt. Records a historical image view only; current acceptance still needs this verifier own current-source UI observations.',inputSchema:objectSchema({evidenceId:string},['evidenceId'])},
+    ]:[];
+    const history=new InspectionVerificationHistory({store:this.app.store,artifacts:this.artifacts,current:()=>this.verifier.verificationSource(context),qualityReports:this.quality});
+    const handler=inspectionMcpHandler([...tools,...historicalTools],async(name,args)=>this.app.withServiceOperation(async()=>{this.jobs.authorize(token);if(context.signal.aborted)throw new Error('The author turn was canceled.');return this.call(context,token,name,args);}));
     const bridge=context.execution.kind==='host-macos'?await createHostInspectionBridge(token,handler):await createContainerInspectionBridge(this.app.runtime.endpoint,context.execution.containerId!,token,handler);
     this.bridges.add(bridge);
     return {mcpServers:{factory:bridge.server},systemInstructions:'Factory inspection tools are available. Use factory_capabilities first. Capture/build your actual source, open it, view screenshot image responses, operate fresh element IDs, check resulting state and repair serious defects. Native builds and UI sessions are different durable jobs; poll queued/running jobs with factory_job_status. Finish or explicitly stop all inspection jobs before ending your turn. For a new native app with no matching profile, use factory_native_profile_propose with its fixed xcodebuild recipe, per-run fixture arguments and original source starting paths for entry/storage/credentials/providers/preferences/notifications/build. Poll factory_native_profile_status; the service independently reviews original source and issues its receipt. Changed compiled source needs a fresh profile audit. Use configured isolated native fixture profiles; do not launch personal-data instances. Compiling alone is not product acceptance. If factory_capabilities returns a quality contract, you may submit factory_quality_submit. Factory independently verifies missing evidence after authoring. Report schema: report={version:1,source:job.source,workflows:[{id:requiredWorkflowId,platform,before:screenshotEvidenceId,action:actionId,after:screenshotEvidenceId,outcome:passedOrFailedOrBlocked,assertion:concreteObservedResult,assertionEvidenceId}],reviews:[{platform,observations:[screenshotEvidenceId],references:[{id:requiredReferenceId,comparison:concreteComparison}],dimensions:{hierarchy,spacing,clipping,typography,controls,states},defects:[{id,severity:minorOrMajorOrBlocking,status:openOrRepaired,description,observation:screenshotEvidenceId}]}]}. IDs must come from actual tool receipts; all six dimensions need concrete review text. Inspect supplied reference files via factory_reference and actual screenshot images. A report with missing receipts is a durable evidence wait; serious defects require repair.',onToolImage:async(image)=>{
       const sha256=createHash('sha256').update(image.bytes).digest('hex');
+      if(verification){
+        const current=await this.verifier.verificationSource(context);if(!current)throw new Error('The independent verifier image owner changed.');
+        const historical=history.acknowledgeImage({run:current.run,chatId:context.chat.id,sha256,server:image.server,tool:image.tool,eventId:image.itemId||randomUUID(),mimeType:image.mimeType,byteLength:image.bytes.length});
+        if(historical)return {artifactId:historical.id,sha256,mimeType:image.mimeType,byteLength:image.bytes.length};
+      }
       const existing=[...this.jobs.listJobs(authority).flatMap(job=>this.jobs.evidence(job.id)),...this.delegation?.evidenceForAuthority(authority)||[]].find(evidence=>evidence.kind==='screenshot'&&evidence.artifact.sha256===sha256)?.artifact;
       const artifact=existing||await this.artifacts.put(image.bytes,{goalId:authority.goalId,taskId:authority.taskId,attemptId:authority.attemptId,name:`inspection-${sha256.slice(0,12)}.png`,mime:image.mimeType});
       this.app.store.set('factory-artifacts',artifact);
@@ -306,8 +319,22 @@ export class InspectionService {
     return inspectionGoalQuality(this.app.store,goalId);
   }
   private async controllerContext(context:AgentToolBridgeContext,goal:Goal,controllerRunId:string):Promise<AgentToolBridgeContext>{
+    const run=this.app.store.get<ControllerRun>('factory-controller-runs',controllerRunId);
+    if(!run||run.goalId!==goal.id||run.sessionId!==context.session.id||run.chatId!==context.chat.id)throw new Error('The controller source context has no matching service owner.');
     const project=this.app.store.get<Project>('projects',goal.projectId);if(!project)throw new Error('The integrated project is unavailable.');
     const declared=project.workingDirectories||[],mounted=context.session.workingDirectories||[];
+    const undeclared=mounted.filter(root=>!declared.some(source=>source.id===root.id));
+    if(undeclared.length){
+      const attachment=undeclared[0],sources=this.app.store.get<{id:string;workingDirectorySources?:WorkingDirectorySource[]}>('session-launch',context.session.id)?.workingDirectorySources||[];
+      const frozen=sources.filter(root=>root.id===`controller-context-${controllerRunId}`);
+      if(undeclared.length!==1||attachment!.id!==`controller-context-${controllerRunId}`||frozen.length!==1||frozen[0]!.kind!=='folder'||attachment!.kind!==frozen[0]!.kind||attachment!.name!==frozen[0]!.name||attachment!.baseCommit!==frozen[0]!.baseCommit||attachment!.sourceCommit!==frozen[0]!.sourceCommit||frozen[0]!.sourceArtifact.metadata?.workingDirectoryId!==attachment!.id||frozen[0]!.sourceArtifact.metadata?.commit!==frozen[0]!.baseCommit)throw new Error('The controller has an undeclared folder without a frozen service-owned evidence attachment. Recreate its source context.');
+      if(context.execution.kind==='container'){
+        if(attachment!.path!==frozen[0]!.containerPath)throw new Error('The controller evidence attachment changed its frozen mount path.');
+      }else{
+        const host=this.app.store.get<{id:string;deviceId:string;prepared:{sessionId:string;roots:Array<WorkingDirectorySource&{path:string}>}}>('session-host',context.session.id),prepared=host?.prepared.roots.filter(root=>root.id===attachment!.id)||[];
+        if(host?.deviceId!==this.app.device.id||host.prepared.sessionId!==context.session.id||prepared.length!==1||prepared[0]!.path!==attachment!.path||prepared[0]!.sourceArtifact.id!==frozen[0]!.sourceArtifact.id||prepared[0]!.sourceArtifact.sha256!==frozen[0]!.sourceArtifact.sha256)throw new Error('The controller evidence attachment changed its retained host mount path.');
+      }
+    }
     const direct=declared.map(root=>mounted.filter(item=>item.id===root.id));
     if(direct.some(matches=>matches.length>1))throw new Error('The evaluator has ambiguous declared reference-folder identities. Recreate its source context.');
     const aggregate=mounted.filter(root=>root.id===`controller-context-${controllerRunId}`);
@@ -341,7 +368,7 @@ export class InspectionService {
       }catch(error){signal?.throwIfAborted();return undefined;}
     };
     const before=await gitState();
-    const snapshot=await this.snapshots.create({roots:[{id:'primary',name:'primary',path:project.path},...(project.workingDirectories||[]).map(root=>({id:root.id,name:root.name,path:root.path}))],signal});
+    const snapshot=await this.snapshots.create({roots:[{id:'primary',name:'primary',path:project.path},...(project.workingDirectories||[]).map(root=>({id:root.id,name:root.name,path:root.path}))],signal,maxBytes:INSPECTION_SOURCE_MAX_BYTES});
     const after=await gitState(),primary=snapshot.roots.find(root=>root.id==='primary');
     const clean=primary?.kind==='git'?Boolean(before?.clean&&after?.clean&&before.commit===after.commit&&primary.sourceCommit===after.commit):undefined;
     return {id:snapshot.id,snapshot,...(clean!==undefined?{clean}:{}),...(clean?{checkedCommit:after!.commit}:{}),source:{snapshotId:snapshot.id,sha256:snapshot.sourceDigest,roots:snapshot.roots.map(root=>({id:root.id,sha256:root.sourceDigest,...(root.sourceCommit?{commit:root.sourceCommit}:{})}))}};
@@ -364,7 +391,7 @@ export class InspectionService {
       assertCurrent();
       const project=this.app.store.get<Project>('projects',goal.projectId)!,canonicalPaths=new Map([['primary',project.path],...(project.workingDirectories||[]).map(root=>[root.id,root.path] as [string,string])]);
       for(const change of changes){if(!change.root)throw new Error('The evaluator omitted a declared source root.');if(context.execution.kind==='host-macos'&&await realpath(change.root)===await realpath(canonicalPaths.get(change.rootId)!))throw new Error('Canonical source permissions cannot be changed while preparing an evaluator.');}
-      const previous=await exportInspectionSnapshot({snapshot:current.snapshot,artifacts:this.artifacts,context:{goalId:goal.id,taskId:'control-evaluator',attemptId:run.id},signal:context.signal});
+      const previous=await exportInspectionSnapshot({snapshot:current.snapshot,artifacts:this.artifacts,context:{goalId:goal.id,taskId:'control-evaluator',attemptId:run.id},signal:context.signal,limits:{maxBytes:INSPECTION_SOURCE_MAX_BYTES}});
       for(const artifact of [previous.sourceManifest,...previous.sourceArtifacts.map(root=>root.manifest)])this.app.store.set('factory-artifacts',artifact);
       auditId=randomUUID();this.app.store.set('controller-source-preparations',{id:auditId,controllerRunId:run.id,goalId:goal.id,goalRevision:goal.revision,sessionId:context.session.id,chatId:context.chat.id,status:'preparing',previous:current.source,previousTransfer:previous,canonical:canonical.source,changedModes:changes.length,createdAt:new Date().toISOString()});
       for(let offset=0;offset<changes.length;offset+=32){
@@ -509,11 +536,14 @@ export class InspectionService {
     return this.captureActual(context,authority,retain);
   }
   private async captureActual(context:AgentToolBridgeContext,authority?:InspectionAuthority,retain=false):Promise<SourceRecord>{
+    const controllers=this.app.store.list<ControllerRun>('factory-controller-runs').filter(run=>run.sessionId===context.session.id&&run.chatId===context.chat.id);
+    if(controllers.length>1)throw new Error('The execution source has ambiguous controller owners.');
+    if(controllers.length){const run=controllers[0]!,goal=this.app.store.get<Goal>('goals',run.goalId);if(!goal)throw new Error('The controller source goal is unavailable.');context=await this.controllerContext(context,goal,run.id);}
     const roots=[{id:'primary',name:'primary',path:context.execution.workdir},...(context.session.workingDirectories||[]).map(root=>({id:root.id,name:root.name,path:root.path}))];
     let exported:Awaited<ReturnType<typeof exportInspectionContainerRoots>>|undefined;
     try{
-      if(context.execution.kind==='container')exported=await exportInspectionContainerRoots({endpoint:this.app.runtime.endpoint,containerId:context.execution.containerId!,roots,scratchDirectory:path.join(this.app.dataDir,'inspection','exports'),signal:context.signal});
-      const snapshot=await this.snapshots.create({roots:exported?.roots||roots,signal:context.signal,context:authority?{goalId:authority.goalId,taskId:authority.taskId,attemptId:authority.attemptId}:undefined});
+      if(context.execution.kind==='container')exported=await exportInspectionContainerRoots({endpoint:this.app.runtime.endpoint,containerId:context.execution.containerId!,roots,scratchDirectory:path.join(this.app.dataDir,'inspection','exports'),signal:context.signal,limits:{maxBytes:INSPECTION_SOURCE_MAX_BYTES}});
+      const snapshot=await this.snapshots.create({roots:exported?.roots||roots,signal:context.signal,maxBytes:INSPECTION_SOURCE_MAX_BYTES,context:authority?{goalId:authority.goalId,taskId:authority.taskId,attemptId:authority.attemptId}:undefined});
       const source:InspectionSourceIdentity={snapshotId:snapshot.id,sha256:snapshot.sourceDigest,roots:snapshot.roots.map(root=>({id:root.id,sha256:root.sourceDigest,...(root.sourceCommit?{commit:root.sourceCommit}:{})}))};
       const record={id:snapshot.id,snapshot,source};if(retain){if(!authority)throw new Error('Retained execution source requires an author owner.');await this.retention.retain(snapshot,authority);this.app.store.set('inspection-source-snapshots',record);}return record;
     }finally{await exported?.cleanup();}
@@ -521,6 +551,10 @@ export class InspectionService {
   private async call(context:AgentToolBridgeContext,token:string,name:string,args:Record<string,unknown>):Promise<unknown>{
     const authority=this.jobs.authorize(token).authority;
     const verification=context.chat.verificationRunId?await this.verifier.verificationSource(context):undefined;
+    if(['factory_verification_history','factory_verification_evidence','factory_verification_image'].includes(name)){
+      if(!verification)throw new Error('Historical inspection reads require an independent current verifier.');
+      return new InspectionVerificationHistory({store:this.app.store,artifacts:this.artifacts,current:()=>this.verifier.verificationSource(context),qualityReports:this.quality}).call(name,args);
+    }
     if(name==='factory_native_profile_status')return result(this.profileSetup.publicView(await this.profileSetup.status(String(args.auditId),authority,Number(args.waitSeconds)||0)));
     if(name==='factory_native_profile_propose'){
       const project=this.app.store.get<Project>('projects',context.session.projectId),projectId=project?.sourceProjectId||project?.id;if(!projectId)throw new Error('Native setup project is unavailable.');

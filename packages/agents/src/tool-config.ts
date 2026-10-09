@@ -64,9 +64,15 @@ export function codexToolOverrides(servers: Record<string, AgentMcpServer> | und
 /** Codex has already consumed MCP content. History keeps references, never repeated image bodies. */
 export async function retainToolImages(event: AgentEvent, callbacks: TurnCallbacks, signal: AbortSignal): Promise<AgentEvent> {
   if (event.kind !== "tool" || !event.data) return event;
-  const item = event.data.item as { id?: string; type?: string; status?: string } | undefined;
+  const item = event.data.item as { id?: string; type?: string; status?: string; server?: unknown; tool?: unknown } | undefined;
   const itemId = item?.id;
   const completedMcpResult = event.data.method === "item/completed" && item?.type === "mcpToolCall" && item.status === "completed";
+  const originText = (value: unknown): value is string => typeof value === "string" && value.length > 0 && value.length <= 512 && value.trim() === value && !/[\u0000-\u001f\u007f]/.test(value);
+  // Origin comes from the provider's completed item, never its arguments or result.
+  const origin = completedMcpResult ? {
+    ...(originText(item.server) ? { server: item.server } : {}),
+    ...(originText(item.tool) ? { tool: item.tool } : {}),
+  } : {};
   const visit = async (value: unknown, depth: number, location: Array<string | number>): Promise<unknown> => {
     if (depth > 32) return { omitted: "Tool result nesting exceeded the history limit." };
     if (Array.isArray(value)) return Promise.all(value.map((entry, index) => visit(entry, depth + 1, [...location, index])));
@@ -86,7 +92,7 @@ export async function retainToolImages(event: AgentEvent, callbacks: TurnCallbac
       if (!providerImageResult) return { type: "image", retained: false, imageDataRemoved: true, omitted: "Image-shaped data outside a completed MCP image result." };
       if (encoded.length > 28_000_000 || !/^image\/[A-Za-z0-9.+-]+$/.test(mimeType!) || !/^[A-Za-z0-9+/\r\n]*={0,2}$/.test(encoded)) return { type: "image", retained: false, omitted: "Invalid or oversized image response." };
       const bytes = Buffer.from(encoded, "base64"), sha256 = createHash("sha256").update(bytes).digest("hex");
-      const reference = callbacks.onToolImage ? await callbacks.onToolImage({ bytes, mimeType: mimeType!, itemId }, signal) : { sha256, byteLength: bytes.length, mimeType, retained: false };
+      const reference = callbacks.onToolImage ? await callbacks.onToolImage({ bytes, mimeType: mimeType!, itemId, ...origin }, signal) : { sha256, byteLength: bytes.length, mimeType, retained: false };
       if (reference.sha256 !== sha256 || reference.byteLength !== bytes.length || reference.mimeType !== mimeType) throw new AgentError("The tool image retention reference does not match its original bytes.", "IMAGE_RETENTION_MISMATCH");
       return { type: "image", ...reference, imageDataRemoved: true };
     }

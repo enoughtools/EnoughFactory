@@ -13,6 +13,7 @@ import { NativeDelegationOwner } from './inspection-delegation-owner.ts';
 import { InspectionRemote, RemoteInspectionOutcomeUnknown, type MaterializedInspectionReply, type RemoteInspectionAssignmentInput, type RemoteInspectionHandle, type RemoteInspectionOperation } from './inspection-remote.ts';
 import { HttpError } from './util.ts';
 import { INSPECTION_VERIFIER_RUNS, inspectionQualityPolicySha256 } from './inspection-verifier.ts';
+import { INSPECTION_SOURCE_MAX_BYTES } from './inspection-source-policy.ts';
 
 const buckets = { bindings: 'inspection-delegation-private-bindings', jobs: 'inspection-delegation-author-jobs', sessions: 'inspection-delegation-author-sessions', requests: 'inspection-delegation-author-requests', projections: 'inspection-delegation-projections', cursors: 'inspection-delegation-journal-cursors', events: 'inspection-delegation-imported-events' };
 const sha = (value: unknown) => createHash('sha256').update(JSON.stringify(value)).digest('hex');
@@ -158,7 +159,7 @@ export class InspectionDelegation {
     const captured = await this.options.capture(context, authority), snapshot = 'snapshot' in captured ? captured.snapshot : captured;
     const source: InspectionSourceIdentity = 'source' in captured ? captured.source : { snapshotId: snapshot.id, sha256: snapshot.sourceDigest, roots: snapshot.roots.map(root => ({ id: root.id, sha256: root.sourceDigest, ...(root.sourceCommit ? { commit: root.sourceCommit } : {}) })) };
     if (source.snapshotId !== snapshot.id || source.sha256 !== snapshot.sourceDigest || !isDeepStrictEqual(source.roots?.map(root => ({ id: root.id, sha256: root.sha256 })), snapshot.roots.map(root => ({ id: root.id, sha256: root.sourceDigest })))) throw new Error('The protected source identity differs from its captured native snapshot.');
-    const transfer = await exportInspectionSnapshot({ snapshot, artifacts: this.options.artifacts, context: { goalId: authority.goalId, taskId: authority.taskId, attemptId: authority.attemptId }, signal: context.signal });
+    const transfer = await exportInspectionSnapshot({ snapshot, artifacts: this.options.artifacts, context: { goalId: authority.goalId, taskId: authority.taskId, attemptId: authority.attemptId }, signal: context.signal, limits: { maxBytes: INSPECTION_SOURCE_MAX_BYTES } });
     const input: RemoteInspectionAssignmentInput = { authority, coordinatorId: this.coordinator(authority), authorDeviceId: this.options.app.device.id, ownerDeviceId: selected.deviceId, executionTargetId: selected.targetId,
       capability: selected.profile.platform === 'macos' ? 'macos-app-inspection' : 'ios-simulator-inspection', source,
       profile: { projectId, profileId: selected.profile.id }, sourceArtifacts: transfer.sourceArtifacts, sourceManifest: transfer.sourceManifest };

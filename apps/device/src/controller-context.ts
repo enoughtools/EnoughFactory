@@ -204,7 +204,7 @@ export async function prepareControllerContext(input: {
 }
 
 /** Export only decision evidence, never settings, provider configuration or live workspace state. */
-function controllerRecords(store: FactoryStore, goalId: string, revision?: number) {
+export function controllerRecords(store: FactoryStore, goalId: string, revision?: number) {
   const tasks = new Map(store.list<FactoryTask>('tasks').filter(task => task.goalId === goalId).map(task => [task.id, task]));
   const records: Array<Omit<NonNullable<ContextManifest['records']>[number], 'path'> & { bytes: string }> = [];
   const add = (record: string, value: unknown, identity: Omit<NonNullable<ContextManifest['records']>[number], 'record' | 'path' | 'sha256' | 'size' | 'checks'>, checks: NonNullable<ContextManifest['records']>[number]['checks'] = []) => {

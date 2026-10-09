@@ -11,6 +11,7 @@ import type { NativeFixtureProfile, NativeInspectionAdapter, NativeInspectionBui
 import type { NativeBuildRunner } from './inspection-build-runner.ts';
 import type { RemoteInspectionAssignment, RemoteInspectionOperation, RemoteInspectionResult, VerifiedRemoteInspectionSource } from './inspection-remote.ts';
 import type { Store } from './store.ts';
+import { INSPECTION_SOURCE_MAX_BYTES } from './inspection-source-policy.ts';
 
 type OwnerStore = Pick<Store, 'get' | 'set' | 'list' | 'transaction' | 'events'>;
 export interface NativeDelegationOwnerOptions {
@@ -57,7 +58,7 @@ export class NativeDelegationOwner {
     // importInspectionSnapshot verifies the original manifest, every bundle/tree and extracted byte.
     const snapshot = await importInspectionSnapshot({ dataDir: join(this.options.app.dataDir, 'inspection'), artifacts: this.options.artifacts,
       sourceArtifacts: assignment.sourceArtifacts, sourceManifest: assignment.sourceManifest,
-      expectedSource: { snapshotId: assignment.source.snapshotId, sourceDigest: assignment.source.sha256 }, context: context(assignment.authority) });
+      expectedSource: { snapshotId: assignment.source.snapshotId, sourceDigest: assignment.source.sha256 }, context: context(assignment.authority), limits: { maxBytes: INSPECTION_SOURCE_MAX_BYTES } });
     const expected = assignment.source.roots;
     if (!expected || expected.length !== snapshot.roots.length || snapshot.roots.some((root, index) => root.id !== expected[index]?.id || root.sourceDigest !== expected[index]?.sha256 || (expected[index]?.commit !== undefined && root.sourceCommit !== expected[index]?.commit))) throw new Error('The original native snapshot roots differ from the assigned identities.');
     const previous = this.options.app.store.get<OwnerAssignment>(buckets.assignments, assignment.id);

@@ -233,10 +233,10 @@ test('real native overlap failure retries the original unadmitted audit session 
   assert(run.sessionId); const originalSession = run.sessionId, originalAudit = run.id, source = structuredClone(run.source);
   assert.equal(native.sessions.record(originalSession).status, 'failed'); assert.equal(f.store.get('session-host', originalSession), undefined);
   assert.equal(f.calls.length, 0); assert.equal(run.chatId, undefined); assert.equal(native.creates(), 1);
-  const marker = f.store.get<{ id: string; auditId: string; projectId: string; deviceId: string; generation: number; executionTargetId: string; failedAt: string; failure: string }>('session-host-unadmitted-overlap', originalSession)!;
+  const marker = f.store.get<{ id: string; auditId: string; projectId: string; deviceId: string; generation: number; executionTargetId: string; workspaceId: string; workspacePath: string; failedAt: string; failure: string }>('session-host-unadmitted-overlap', originalSession)!;
   assert(marker, 'The actual failing session producer must record its durable audit binding.');
   const { failedAt, ...identity } = marker;
-  assert.deepEqual(identity, { id: originalSession, auditId: originalAudit, projectId: `workspace-${originalAudit}`, deviceId: 'mac', generation: 1, executionTargetId: 'mac-host', failure: 'primary-workspace-overlap' });
+  assert.deepEqual(identity, { id: originalSession, auditId: originalAudit, projectId: `workspace-${originalAudit}`, deviceId: 'mac', generation: 1, executionTargetId: 'mac-host', workspaceId: originalAudit, workspacePath: path.join(native.workspaceDataDir, 'workspaces', originalAudit, 'repository'), failure: 'primary-workspace-overlap' });
   assert(Number.isFinite(Date.parse(failedAt)));
   f.store.delete('session-host-unadmitted-overlap', originalSession);
   await assert.rejects(readFile(path.join(native.workspaceDataDir, 'host-sessions', originalSession, 'workspace.json')), { code: 'ENOENT' });

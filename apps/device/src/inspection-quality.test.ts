@@ -622,3 +622,14 @@ test('controller report context bounds repeated review history and links workflo
   assert.deepEqual(JSON.parse(original.original), f.report);
   await assert.rejects(f.service.controllerReport({ goalId: 'different-goal', reportId: first.id }), /your goal/);
 });
+
+
+test('historical image acknowledgments with identical current pixels cannot satisfy contract-bound acceptance',async t=>{
+  const f=await fixture(t),owner=verifierOwner(f);
+  const view=f.store.get<InspectionReferenceView>('inspection-reference-views','reference-view')!;
+  f.store.set('inspection-reference-views',{...view,id:'current-reference-view',verification:owner.verification});
+  for(const evidence of f.evidence)f.store.set('inspection-verification-history-image-deliveries',{id:`history-${evidence.id}`,verificationRunId:owner.run.id,chatId:owner.chat.id,acceptanceContractSha256:owner.verification.acceptanceContractSha256,evidenceId:evidence.id,artifactSha256:evidence.artifact.sha256,eventId:`historical-image-${evidence.id}`,historical:true});
+  assert.equal((await owner.submit()).gate.status,'evidence-required','Viewing original historical pixels cannot establish this verifier current UI observation delivery, even when the bytes are identical');
+  assert.equal((await owner.check()).passed,false);
+  owner.deliver();assert.equal((await owner.submit()).gate.status,'ready-for-review');assert.equal((await owner.check()).passed,true,'Genuine current verifier image delivery continues to satisfy the existing gate');
+});

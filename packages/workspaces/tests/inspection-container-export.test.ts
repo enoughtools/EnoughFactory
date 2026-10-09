@@ -127,6 +127,57 @@ test("container inspection enforces byte and entry bounds and disposes partial e
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
+test("an explicit 512 MiB source policy admits larger headers while generic defaults and the declared upper bound remain enforced", async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "enough-inspection-source-policy-")));
+  const source = join(root, "source"), scratch = join(root, "scratch"), mib = 1024 * 1024;
+  const cases = [
+    { name: "generic default", maxBytes: undefined, size: 256 * mib + 1, accepted: false },
+    { name: "explicit larger source", maxBytes: 512 * mib, size: 256 * mib + 1, accepted: true },
+    { name: "exact explicit boundary", maxBytes: 512 * mib, size: 512 * mib, accepted: true },
+    { name: "above explicit boundary", maxBytes: 512 * mib, size: 512 * mib + 1, accepted: false },
+  ];
+  try {
+    await mkdir(source); await writeFile(join(source, "mail.ts"), "author source is never copied or changed by this header test\n");
+    for (const scenario of cases) {
+      const controller = new AbortController(), abort = Object.assign(new Error("Controlled source export abort after header acceptance"), { code: "ABORT_ERR" });
+      let invoked = false, headerAccepted = false, wireBytes = 0;
+      const transport: Transport = async (invocation, options, consume) => {
+        invoked = true;
+        const guest = JSON.parse(invocation.args.at(-1)!);
+        assert.equal(guest.maxBytes, scenario.maxBytes ?? 256 * mib, `${scenario.name}: the guest must enforce the same selected budget as the receiver`);
+        assert.equal(guest.maxEntries, 30_000);
+        assert.equal(guest.timeoutMs, 120_000);
+        assert.deepEqual(guest.roots, [{ id: "mail", name: "Mail", path: source }]);
+        assert.equal(options.signal, controller.signal);
+        for (const record of [
+          { type: "start", version: 1 },
+          { type: "root", index: 0, id: "mail", kind: "folder", originalPath: source, sha256: "a".repeat(64) },
+          { type: "entry", sourceType: "file", path: "large-source.bin", mode: 0o644, size: scenario.size, sha256: "b".repeat(64) },
+        ]) {
+          const line = Buffer.from(JSON.stringify(record) + "\n"); wireBytes += line.length;
+          await consume(line);
+        }
+        headerAccepted = true;
+        const outputs = await readdir(scratch);
+        assert.equal(outputs.length, 1);
+        assert.equal((await stat(join(scratch, outputs[0]!, "mail", "large-source.bin"))).size, 0, "a declared size must not allocate or copy file contents before chunks arrive");
+        controller.abort(abort);
+        throw abort;
+      };
+      await assert.rejects(exportInspectionContainerRoots({ endpoint, containerId, roots: [{ id: "mail", name: "Mail", path: source }], scratchDirectory: scratch, ...(scenario.maxBytes === undefined ? {} : { limits: { maxBytes: scenario.maxBytes } }), signal: controller.signal }, { transport }), error => {
+        if (scenario.accepted) assert.equal(error, abort, `${scenario.name}: header admission must proceed to the controlled transport abort`);
+        else assert.match((error as Error).message, /byte limit/i, `${scenario.name}: reject the header before any file data`);
+        return true;
+      });
+      assert.equal(invoked, true);
+      assert.equal(headerAccepted, scenario.accepted, scenario.name);
+      assert.ok(wireBytes < 1024, "this budget boundary test sends only metadata, never large buffers or source chunks");
+      assert.equal(await readFile(join(source, "mail.ts"), "utf8"), "author source is never copied or changed by this header test\n");
+      await assertEmptyScratch(scratch);
+    }
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
 test("an interrupted container source stream is rejected and its partial files are removed", async () => {
   const root = await realpath(await mkdtemp(join(tmpdir(), "enough-inspection-stream-")));
   const project = join(root, "source"), scratch = join(root, "scratch");
