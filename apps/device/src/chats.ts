@@ -19,6 +19,8 @@ export class ChatController {
   private running=new Map<string,Promise<TurnResult>>();
   private turnAborts=new Map<string,AbortController>();
   private toolBridge?:AgentToolBridgeFactory;
+  private serviceApprovals=new Map<string,(approval:Approval,allowed:boolean)=>void>();
+  registerServiceApproval(action:string,handler:(approval:Approval,allowed:boolean)=>void):void {if(this.serviceApprovals.has(action))throw new Error('A service approval owner is already registered.');this.serviceApprovals.set(action,handler);}
   setToolBridge(factory:AgentToolBridgeFactory):void {this.toolBridge=factory;}
   constructor(readonly app:DeviceApp,manager?:AgentManager){
     this.manager=manager??new AgentManager({dockerEndpoint:app.runtime.endpoint,copyHostAuth:true,hostRuntimeDir:path.join(app.dataDir,'agents','host'),hostWorkspaceRoots:[path.join(app.dataDir,'workspace-data')],runtimeAssetsDir:process.env.ENOUGHFACTORY_RESOURCES?path.join(process.env.ENOUGHFACTORY_RESOURCES,'agents'):path.join(app.repositoryRoot,'runtime/agents')});
@@ -152,6 +154,8 @@ export class ChatController {
   }
   decide(approvalId:string,allowed:boolean):void{
     const approval=this.app.store.get<Approval>('approvals',approvalId),pending=this.approvals.get(approvalId);
+    const service=approval&&this.serviceApprovals.get(approval.action);
+    if(service){if(approval!.status!=='pending')throw new HttpError(409,'This request is no longer pending.');service(approval!,allowed);this.app.store.set('approvals',{...approval!,status:allowed?'allowed':'denied',decidedAt:now()});this.app.changed();return;}
     if(!approval||approval.status!=='pending'||!pending||pending.signal?.aborted)throw new HttpError(409,'This request is no longer pending.');
     this.app.store.set('approvals',{...approval,status:allowed?'allowed':'denied',decidedAt:now()});this.approvals.delete(approvalId);pending.resolve(allowed);this.patch(approval.chatId,{status:'running'});
   }

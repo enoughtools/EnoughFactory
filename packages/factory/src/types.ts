@@ -162,6 +162,7 @@ export interface CreateGoalInput {
   runtime?: RuntimeKind; approvalMode?: ApprovalMode; autonomy?: AutonomyMode;
   concurrency?: number; maxAttempts?: number; maxDurationMs?: number;
   execution?: TaskExecutionRequirements;
+  acceptance?: Goal["acceptance"];
 }
 export interface ConfigureGoalInput {
   autonomy?: AutonomyMode; approvalMode?: ApprovalMode; runtime?: RuntimeKind; concurrency?: number;
@@ -173,5 +174,7 @@ export interface CoordinatorOptions {
   deviceId: string; devices: () => Device[]; project: (id: string) => Project | undefined;
   /** Fresh owning-host capacity check before allocating new controller or worker work. */
   admission?: (goal: Goal) => { reason: string; condition: string } | undefined;
+  /** Owned inspection/setup agents share this goal's author concurrency budget. */
+  additionalActiveAgents?: (goalId: string) => number;
   onChange?: () => void; now?: () => Date;
 }

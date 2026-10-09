@@ -4,7 +4,7 @@ import { mkdir, readFile, writeFile, lstat, readlink, open } from 'node:fs/promi
 import path from 'node:path';
 import type { Attempt, FactoryTask, Goal, Project, Decision, ControllerRun, ContainerRuntimeStatus, DevelopmentToolchain, DevelopmentToolchainId, TaskQualityRequirements } from '@enoughfactory/contracts';
 import {
-  FactoryCoordinator, FactoryOperationError, FactoryCapacityError, FactoryControllerError, FactoryVerificationWaitError, selectExecutionTarget, validateTaskExecution, UI_QUALITY_CHECK_COMMAND, type FactoryVerificationContext, type FactoryWorkspacePort, type FactoryRuntimePort, type WorkspaceRef,
+  FactoryCoordinator, FactoryOperationError, FactoryCapacityError, FactoryControllerError, FactoryDecisionError, FactoryVerificationWaitError, selectExecutionTarget, validateTaskExecution, validateGoalAcceptance, UI_QUALITY_CHECK_COMMAND, type FactoryVerificationContext, type FactoryWorkspacePort, type FactoryRuntimePort, type WorkspaceRef,
   type CandidateRef, type ExecutionResult, type CheckResult, type CreateGoalInput,
   type RepositoryEvidence, type EvaluationRecord, type ControlRecord, type TaskDetail, type AttemptDetail, type FactoryStore, type FrozenTaskCheckInputs,
 } from '@enoughfactory/factory';
@@ -18,6 +18,7 @@ import type { SessionController } from './sessions.ts';
 import { exec, HttpError, now } from './util.ts';
 import { inspectAttempt, inspectGoal, inspectTask, taskControlReason, taskDispatchBlocker } from './task-inspection.ts';
 import { factoryChatBinding } from './factory-chat.ts';
+import { goalAgentCount } from './factory-agent-capacity.ts';
 import { controllerError } from './factory-controller-error.ts';
 import { releaseControllerInputs } from './factory-controller-inputs.ts';
 import { releaseCoordinatorWorkerInputs, releaseGoalCheckInputs, releaseWorkerInputs } from './factory-worker-inputs.ts';
@@ -32,6 +33,7 @@ import { importFactoryEnvironmentArchives } from './factory-archive-imports.ts';
 import { hostCheckExecutor } from './host-checks.ts';
 import { factoryQualityInstructions } from './factory-quality.ts';
 import { configureTaskCheckInputs, freezeTaskCheckInputs } from './factory-check-inputs.ts';
+import { inspectionGoalQuality } from './inspection-goal-quality.ts';
 
 interface WorkerRecord {
   id: string; coordinatorId: string; goal: Goal; task: FactoryTask; attempt: Attempt; project: Project;
@@ -99,6 +101,8 @@ interface ControllerReviewContinuation {id:string;goalId:string;goalRevision:num
 
 /** The service owns execution and the supervisor; no open window is required. */
 export interface FactoryInspectionPorts {
+  holdsSession?: (sessionId:string)=>boolean;
+  activeInspectionAgents?: (goalId:string)=>number;
   prepareControllerReview?: (input:{goal:Goal;run:ControllerRun;signal?:AbortSignal})=>Promise<void>;
   reviewController?: (input:{goal:Goal;run:ControllerRun;resultText:string;signal?:AbortSignal})=>Promise<{ready:boolean;reason?:string;evidenceIds:string[]}>;
   qualityCheck?: (input:FactoryVerificationContext & {candidate:Candidate;quality:TaskQualityRequirements;path:string;workingDirectories?:Array<{path:string;containerPath:string;commit:string}>;checkedCommit:string;signal?:AbortSignal})=>Promise<CheckResult>;
@@ -195,7 +199,7 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
       const uncertain = factoryExecutionIsUncertain(error);
       const result: ExecutionResult = { status: uncertain ? 'unknown' : 'failed', text: '', error: error.message, sessionId: record.sessionId, chatId: record.chatId };
       patchWorker(id, { status: uncertain ? 'unknown' : 'failed', error: error.message, result });
-    }).finally(() => { if (jobs.get(id)?.done === running) jobs.delete(id); });
+    }).finally(() => { if (jobs.get(id)?.done === running) jobs.delete(id);app.emit('inspection-evidence',{goalId:worker(id).goal.id,purpose:'agent-slot-ready'}); });
     jobs.set(id, { phase, done: running });
   };
   async function rpc<T>(peerId: string, method: string, route: string, body?: unknown): Promise<T> {
@@ -301,6 +305,7 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
   function candidateRef(candidate: Candidate): CandidateRef { return { ...candidate }; }
   async function releaseLocalWorker(id: string): Promise<void> {
     if (jobs.has(id) || jobs.has(`capture-${id}`) || captureJobs.has(id)) throw new HttpError(409, 'Wait for the worker and its source capture to finish before releasing inputs.');
+    if(worker(id).sessionId&&inspection.holdsSession?.(worker(id).sessionId!))throw new HttpError(409,'Independent native setup still owns this saved source. Its author and input copies remain retained.');
     await releaseWorkerInputs({ attemptId: id, dataDir: app.dataDir, store: app.store, sessions: app.sessions,
       directoryManager: app.sessions.directoryManager, artifacts: workspaces.artifacts, workspaces,
       retireContainer: async (sessionId,assertCurrent) => {
@@ -704,7 +709,7 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
     },
   };
   function needsControllerReview(goal:Goal):boolean {
-    return app.store.list<FactoryTask>('tasks').some(task=>task.goalId===goal.id&&task.status!=='canceled'&&!!task.quality);
+    return !!inspectionGoalQuality(app.store,goal.id);
   }
   const controllerReleases=new Map<string,Promise<void>>();
   async function releaseController(operation:string,sessionId:string|undefined,runtime:Goal['runtime']):Promise<void> {
@@ -717,17 +722,20 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
     finally { activeControllerOperations.delete(operation);if(sessionId)terminalCleanup?.request(sessionId); }
     })();controllerReleases.set(operation,job);try{await job;}finally{if(controllerReleases.get(operation)===job)controllerReleases.delete(operation);}
   }
+  function controllerSlotReason(goal:Goal,operation?:string):string|undefined{return goalAgentCount(app.store,goal.id,operation?[`controller:${operation}`]:[])>=Math.max(1,goal.concurrency)?'The goal’s agent limit is occupied by ongoing work. Continue the same controller after a slot becomes available.':undefined;}
   async function reviewController(goal:Goal,run:ControllerRun,resultText:string,systemInstructions:string,repository:RepositoryEvidence,signal?:AbortSignal):Promise<string> {
     const assertCurrent=()=>{
       const current=app.store.get<Goal>('goals',goal.id);
       if(signal?.aborted||!current||current.revision!==goal.revision||['paused','completed','failed','canceled'].includes(current.status)||current.runtime!==goal.runtime||JSON.stringify(current.execution??null)!==JSON.stringify(goal.execution??null))throw new Error('The controller decision was revoked.');
     };
     assertCurrent();
+    const defer=(reason:string):never=>{app.store.set<ControllerReviewContinuation>('factory-controller-reviews',{id:run.id,goalId:goal.id,goalRevision:goal.revision,runtime:goal.runtime,execution:JSON.stringify(goal.execution??null),sessionId:run.sessionId!,chatId:run.chatId!,repository,resultText,systemInstructions,status:'waiting',reason,updatedAt:now()});app.store.set('factory-controller-runs',{...run,status:'waiting',result:resultText,error:reason,updatedAt:now()});throw new FactoryControllerError(reason,'inspection-evidence');};
     const check=()=>inspection.reviewController?.({goal,run:{...run,status:'running'},resultText,signal})??Promise.resolve({ready:false,reason:'Completion requires the configured visual inspection service.',evidenceIds:[]});
     let review=await check();
     assertCurrent();
     if(!review.ready){
       if(signal?.aborted)throw new Error('The controller decision was revoked.');
+      const capacity=controllerSlotReason(goal,run.id);if(capacity)defer(capacity);
       const followup=await chats.run(run.chatId!,`Completion review needs more evidence: ${review.reason??'Inspect the current product screens and references.'}\nUse the inspection tools to view the actual current integrated product and relevant references. Return the full evaluator JSON again, including visualReview with the current source and concrete comparisons. If behavior or design is deficient, return a specific follow-up plan instead of marking the goal complete.`,{autonomous:goal.autonomy==='autonomous',systemInstructions});
       resultText=followup.text;review=await check();
       assertCurrent();
@@ -740,6 +748,7 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
   async function resumeControllerReview(goal:Goal,continuation:ControllerReviewContinuation,signal?:AbortSignal):Promise<{text:string;chatId:string}> {
     const operation=continuation.id,run=app.store.get<ControllerRun>('factory-controller-runs',operation);
     if(!run||run.chatId!==continuation.chatId||run.sessionId!==continuation.sessionId||app.sessions.record(continuation.sessionId).status!=='ready')throw new FactoryControllerError('The retained completion review environment is unavailable; its source and conversation remain saved.','controller-retry-required');
+    const capacity=controllerSlotReason(goal,operation);if(capacity)throw new FactoryControllerError(capacity,'inspection-evidence');
     activeControllerOperations.add(operation);
     let waiting=false;
     const cancel=()=>{void chats.interrupt(continuation.chatId).catch(()=>{});};signal?.addEventListener('abort',cancel,{once:true});
@@ -759,6 +768,7 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
   const runtime: FactoryRuntimePort = {
     controllerRecordReferences: true,
     async complete({ goal, role, prompt, project, signal, recordRequirements }) {
+      const capacity=controllerSlotReason(goal);if(capacity)throw new FactoryControllerError(capacity,'inspection-evidence');
       if(role==='evaluator'){
         const retained=app.store.list<ControllerReviewContinuation>('factory-controller-reviews').filter(item=>item.goalId===goal.id&&item.status==='waiting');
         const currentRepository=retained.length?await workspacePort.inspect(project):undefined;
@@ -786,6 +796,7 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
       const developmentToolchain=host?'default':await resolveToolchain(project,signal);
       hostDisk.assert();
       const operation = randomUUID();
+      const capacity=controllerSlotReason(goal);if(capacity)throw new FactoryControllerError(capacity,'inspection-evidence');
       activeControllerOperations.add(operation);
       app.store.set('factory-controller-inputs', { id: operation, goalId: goal.id, role, status: 'preparing', updatedAt: now() });
       let sessionId: string | undefined;
@@ -817,10 +828,12 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
         if (signal?.aborted) throw new Error('The controller decision was revoked.');
         const chat = chats.create({ sessionId: session.id, runtime: goal.runtime, approvalMode: goal.approvalMode, title: `${goal.title} · ${role}` });
         chatId = chat.id;
-        app.store.set('factory-controller-runs', { ...record, chatId: chat.id, status: 'running', updatedAt: now() });
+        app.store.set('factory-controller-runs', { ...record, chatId: chat.id, status: 'starting', updatedAt: now() });
         if(role==='evaluator'&&needsControllerReview(goal))await inspection.prepareControllerReview?.({goal,run:{...record,chatId:chat.id,status:'running'},signal});
         providerInvoked = true;
         const systemInstructions = [`You are the EnoughFactory ${role}. ${host?'You run on the configured Mac with full same-user host access in a private Git snapshot; this is not a container sandbox.':'This container contains an isolated snapshot of the current project repository with full container permissions.'} Inspect the actual source and relevant runtime evidence to make your decision under ${goal.approvalMode} policy. Your role is to decide the next factory action; implementation belongs to assigned worker tasks. Do not modify product source as part of this decision. Return the structured JSON requested in the prompt. Goal: ${goal.objective}`, role === 'evaluator' ? 'Audit current behavior in the integrated primary repository. Historical candidate source bundles are not duplicated into this audit; full stored task/attempt contracts, checks and integration records remain available through the evidence manifest. Historical artifact references do not promise their bodies are present and cannot be claimed inspected.' : '', validationInstructions(host?'host-macos':'container'),factoryQualityInstructions(role),toolchainInstructions(app.sessions.record(session.id).developmentToolchain),executionInstructions(context.instructions,session.id)].filter(Boolean).join('\n\n');
+        const dispatchCapacity=controllerSlotReason(goal,operation);if(dispatchCapacity)throw new FactoryControllerError(dispatchCapacity,'inspection-evidence');
+        app.store.set('factory-controller-runs',{...record,chatId:chat.id,status:'running',updatedAt:now()});
         const result = await chats.run(chat.id, prompt, { autonomous: goal.autonomy === 'autonomous',systemInstructions });
         const running={...record,chatId:chat.id,status:'running' as const};
         const text=role==='evaluator'&&needsControllerReview(goal)?await reviewController(goal,running,result.text,systemInstructions,controllerRepository!,signal):result.text;
@@ -873,7 +886,7 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
     }
     patchWorker(id, { cancellationAcknowledged: true, result: { status: 'failed', text: '', error: 'Cancellation acknowledged by the owning service.', sessionId: record.sessionId, chatId: record.chatId } });
   }
-  const coordinator = new FactoryCoordinator({ store: app.store, runtime, workspaces: workspacePort,
+  const coordinator = new FactoryCoordinator({ store: app.store, runtime, workspaces: workspacePort,additionalActiveAgents:goalId=>goalAgentCount(app.store,goalId,[],false),
     deviceId: app.device.id, devices: () => app.devices, project: id => app.store.get<Project>('projects', id), admission, onChange: () => app.changed() });
   const runtimeReady = (topic: string, data: unknown) => {
     if (topic !== 'runtime' || (data as ContainerRuntimeStatus).state !== 'ready') return;
@@ -927,7 +940,11 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
       const workspaceProvider = body.workspaceProvider === undefined
         ? process.env.ENOUGHFACTORY_WORKSPACE_PROVIDER === 'artifactfs' ? 'artifactfs' : 'git'
         : body.workspaceProvider as 'git' | 'artifactfs';
-      const input = createGoalInput(body); const goal = { ...coordinator.create(input), workspaceProvider };
+      const input = createGoalInput(body);
+      let created: Goal;
+      try { created = coordinator.create(input); }
+      catch (error) { if (error instanceof FactoryDecisionError) throw new HttpError(400, error.message); throw error; }
+      const goal = { ...created, workspaceProvider };
       app.store.set('goals', goal);
       app.store.set<GoalOptions>('factory-options', { id: goal.id, workspaceProvider });
       return goal;
@@ -1254,6 +1271,7 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
     runtimeReady:()=>app.diagnostics.containerRuntime?.state==='ready',eligible:session=>session.executionTargetKind!=='host-macos'&&['stopped','failed','unknown'].includes(session.status)&&!app.sessions.archivedEnvironment(session.id),
     identity:session=>app.sessions.retirementIdentityKey(session.id),
     busy:sessionId=>app.store.list<WorkerRecord>(journal).some(record=>record.sessionId===sessionId&&(jobs.has(record.id)||jobs.has(`capture-${record.id}`)||captureJobs.has(record.id)))
+      ||!!inspection.holdsSession?.(sessionId)
       ||app.store.list<ControllerRun>('factory-controller-runs').some(run=>run.sessionId===sessionId&&(activeControllerOperations.has(run.id)||!!app.store.get<ControllerReviewContinuation>('factory-controller-reviews',run.id))),
     retire:async(sessionId,assertCurrent)=>app.withRuntimeOperation(()=>app.sessions.withRetirementLease(sessionId,()=>chats.manager.withIdleContainer(app.sessions.retirementContainerName(sessionId),()=>{
       const runtimeKinds=[...new Set(app.store.list<import('@enoughfactory/contracts').Chat>('chats').filter(chat=>chat.sessionId===sessionId).map(chat=>chat.runtime))];
@@ -1328,7 +1346,7 @@ function createGoalInput(body: Record<string, unknown>): CreateGoalInput {
   const controls = steeringInput(body);
   return { projectId: body.projectId, objective: body.objective, title: typeof body.title === 'string' ? body.title : undefined,
     criteria: controls.criteria, autonomy: controls.autonomy, approvalMode: controls.approvalMode,
-    runtime: body.runtime as Goal['runtime'] | undefined,execution:controls.execution,
+    runtime: body.runtime as Goal['runtime'] | undefined,execution:controls.execution,acceptance:acceptanceOption(body.acceptance),
     concurrency: numberOption(body.concurrency), maxAttempts: numberOption(body.maxAttempts), maxDurationMs: numberOption(body.maxDurationMs) };
 }
 function numberOption(value: unknown): number | undefined {
@@ -1337,6 +1355,9 @@ function numberOption(value: unknown): number | undefined {
 }
 function executionOption(value:unknown):Goal['execution'] {
   try{return validateTaskExecution(value);}catch(error){throw new HttpError(400,error instanceof Error?error.message:String(error));}
+}
+function acceptanceOption(value:unknown):Goal['acceptance'] {
+  try{return validateGoalAcceptance(value);}catch(error){throw new HttpError(400,error instanceof Error?error.message:String(error));}
 }
 function steeringInput(body: Record<string, unknown>) {
   if (body.autonomy !== undefined && !['manual', 'assisted', 'autonomous'].includes(String(body.autonomy))) throw new HttpError(400, 'Unknown autonomy mode.');

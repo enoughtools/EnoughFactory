@@ -123,7 +123,7 @@ function harness(devices: Device[] = [device], now?: () => Date) {
   };
   const options = { store, runtime, workspaces, deviceId: device.id, devices: () => devices, project: (id: string) => id === project.id ? project : undefined, now };
   const coordinator = new FactoryCoordinator(options);
-  const goal = () => coordinator.create({ projectId: project.id, objective: "Build the feature and publish its release", criteria, autonomy: "autonomous", approvalMode: "approve-all", concurrency: 1 });
+  const goal = (acceptance?: Goal["acceptance"]) => coordinator.create({ projectId: project.id, objective: "Build the feature and publish its release", criteria, autonomy: "autonomous", approvalMode: "approve-all", concurrency: 1, acceptance });
   return {
     store, calls, coordinator, goal, planningPrompts, executionPrompts, evaluationPrompts, diagnosisPrompts, candidateCommands, integrationCommands, goalCommands, workspaces, runtime, controllerInputs, recover: () => new FactoryCoordinator(options),
     planning(fn: typeof planning) { planning = fn; },
@@ -287,6 +287,70 @@ test("explicit UI quality survives authoring and cannot be accepted without exac
       assert.equal(attempt.status, scenario === "combined-stale" ? "unknown" : "failed", "A potentially written combined result stays uncertain rather than permitting a blind retry");
     }
   });
+});
+
+test("application plans cannot omit a required platform or its representative workflows", async t => {
+  const acceptance: Goal["acceptance"] = { kind: "application", platforms: ["web", "macos"], referenceIds: ["primary"] };
+  for (const scenario of ["omitted", "missing-platform", "empty-workflow"] as const) await t.test(scenario, async () => {
+    const factory = harness();
+    const quality = scenario === "omitted" ? undefined : { platforms: ["web" as const, ...(scenario === "empty-workflow" ? ["macos" as const] : [])], workflows: [{ id: "compose-close", platform: "web" as const }], referenceIds: [] };
+    factory.planning(async () => ({ ...plan, tasks: [{ ...plan.tasks[0]!, quality }] }));
+    const goal = factory.goal(acceptance);
+    await factory.coordinator.tick(); await factory.coordinator.waitForIdle();
+    assert.equal(factory.store.list<FactoryTask>("tasks").length, 0, "An incomplete application policy cannot become dispatched work");
+    assert.equal(factory.calls.execute, 0);
+    assert.match(factory.store.get<ControlRecord>("factory-control", goal.id)!.replanReason!, /workflow|macos/i);
+    assert.deepEqual(factory.store.get<Goal>("goals", goal.id)!.criteria, criteria);
+    assert.deepEqual(factory.store.get<Goal>("goals", goal.id)!.acceptance, acceptance);
+  });
+});
+
+test("application creation rejects missing references and retains the explicit immutable template", () => {
+  const factory = harness();
+  assert.throws(() => factory.goal({ kind: "application", platforms: ["web"], referenceIds: ["removed-folder"] }), /available reference/);
+  assert.equal(factory.store.list<Goal>("goals").length, 0);
+  const acceptance: NonNullable<Goal["acceptance"]> = { kind: "application", platforms: ["web"], referenceIds: ["primary"] };
+  const goal = factory.goal(acceptance);
+  acceptance.platforms.push("macos"); acceptance.referenceIds.push("removed-folder");
+  assert.deepEqual(factory.store.get<Goal>("goals", goal.id)!.acceptance, { kind: "application", platforms: ["web"], referenceIds: ["primary"] });
+});
+
+test("application references freeze into UI authors while backend work remains independent", async () => {
+  const worker: Device = { ...device, executionTargets: [{ id: "container", kind: "container", protocolVersion: 1, readiness: "ready", capabilities: [{ kind: "linux-shell", readiness: "ready" }, { kind: "chromium-inspection", readiness: "ready" }] }] };
+  const factory = harness([worker]); factory.workspaces.qualityChecks = true;
+  factory.planning(async () => ({ ...plan, tasks: [
+    { ...plan.tasks[0]!, quality: { platforms: ["web"], workflows: [{ id: "compose-close", platform: "web" }], referenceIds: [] } },
+    { key: "backend", title: "Persist drafts", description: "Implement durable draft storage", kind: "unit", dependsOn: [], checks: [] },
+  ] }));
+  const originalCheck = factory.workspaces.check;
+  factory.workspaces.check = async (...input) => (await originalCheck(...input)).map(check => ({ ...check, checkedCommit: input[1].commit }));
+  const acceptance: Goal["acceptance"] = { kind: "application", platforms: ["web"], referenceIds: ["primary"] };
+  const goal = factory.goal(acceptance);
+  await factory.coordinator.tick(); await factory.coordinator.waitForIdle();
+  const planned = factory.store.list<FactoryTask>("tasks");
+  assert.deepEqual(planned.find(task => task.title === "Persist drafts")!.quality, undefined);
+  assert.deepEqual(planned.find(task => task.title !== "Persist drafts")!.quality!.referenceIds, ["primary"]);
+  for (let i = 0; i < 2; i++) { await factory.coordinator.tick(); await factory.coordinator.waitForIdle(); }
+  const uiTask = factory.store.list<FactoryTask>("tasks").find(task => task.title !== "Persist drafts")!;
+  assert.equal(uiTask.status, "completed");
+  assert.deepEqual(factory.store.get<AttemptDetail>("factory-attempt-details", uiTask.currentAttemptId!)!.contract!.quality!.referenceIds, ["primary"]);
+  assert.match(factory.planningPrompts[0]!, /Required application acceptance/);
+  assert.deepEqual(factory.store.get<Goal>("goals", goal.id)!.criteria, criteria);
+});
+
+test("final application coverage cannot disappear when its only UI task is canceled", async () => {
+  const factory = harness();
+  factory.planning(async () => ({ ...plan, tasks: [{ ...plan.tasks[0]!, quality: { platforms: ["web"], workflows: [{ id: "compose-close", platform: "web" }], referenceIds: [] } }] }));
+  const goal = factory.goal({ kind: "application", platforms: ["web"], referenceIds: [] });
+  await factory.coordinator.tick(); await factory.coordinator.waitForIdle();
+  const task = factory.store.list<FactoryTask>("tasks")[0]!;
+  factory.store.set("tasks", { ...task, status: "canceled" });
+  const control = factory.store.get<ControlRecord>("factory-control", goal.id)!;
+  factory.store.set("factory-control", { ...control, stage: "evaluate" });
+  await factory.coordinator.tick(); await factory.coordinator.waitForIdle();
+  assert.equal(factory.calls.evaluator, 0, "Model completion cannot bypass missing application evidence policies");
+  assert.equal(factory.store.get<Goal>("goals", goal.id)!.status, "planning");
+  assert.match(factory.store.get<ControlRecord>("factory-control", goal.id)!.replanReason!, /representative workflow/);
 });
 
 test("an explicit native quality policy requires its inspection capability before allocation", async () => {

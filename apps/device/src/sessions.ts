@@ -306,10 +306,10 @@ export class SessionController {
     const current=await this.hostWorkspaces.load(sessionId);
     if(current.sessionId!==sessionId||JSON.stringify(current)!==JSON.stringify(host.prepared))throw new HttpError(409,'The native workspace identity changed.');
   }
-  async waitExecutionReady(sessionId:string,timeoutMs=30*60_000):Promise<SessionExecutionContext> {
+  async waitExecutionReady(sessionId:string,timeoutMs=30*60_000,signal?:AbortSignal):Promise<SessionExecutionContext> {
     const started=Date.now();
     while(Date.now()-started<timeoutMs){
-      const record=this.record(sessionId);
+      signal?.throwIfAborted();const record=this.record(sessionId);
       if(record.status==='ready'){await this.assertHostExecutionCurrent(sessionId);return this.execution(sessionId);}
       if(['failed','stopped','unknown'].includes(record.status))throw new Error(record.error||record.phase||'Execution workspace unavailable');
       await new Promise(resolve=>setTimeout(resolve,200));

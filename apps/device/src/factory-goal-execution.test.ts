@@ -4,13 +4,13 @@ import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test, { type TestContext } from 'node:test';
-import type { Attempt, ExecutionTargetAdvertisement, FactoryTask, Goal, Project, Session } from '@enoughfactory/contracts';
+import type { Attempt, ControllerRun, ExecutionTargetAdvertisement, FactoryTask, Goal, Project, Session } from '@enoughfactory/contracts';
 import type { TurnInput, TurnResult } from '@enoughfactory/agents';
 import type { AttemptDetail, ControlRecord } from '@enoughfactory/factory';
 import { git } from '../../../packages/workspaces/src/process.ts';
 import { DeviceApp } from './app.ts';
 import { ChatController } from './chats.ts';
-import { initializeFactory } from './factory.ts';
+import { initializeFactory, type FactoryInspectionPorts } from './factory.ts';
 import { Store } from './store.ts';
 
 const nativeMac = { skip: process.platform !== 'darwin' };
@@ -20,7 +20,7 @@ const plan = JSON.stringify({ summary: 'Implement the native product', criteria:
   kind: 'feature', acceptanceCriteria: [criterion], expectedOutputs: ['Saved native source'], dependsOn: [], checks: [],
 }] });
 
-async function fixture(t: TestContext) {
+async function fixture(t: TestContext, inspection: FactoryInspectionPorts = {}) {
   const directory = await realpath(await mkdtemp(path.join(tmpdir(), 'enough-goal-execution-')));
   const state = new Store(directory);
   state.set('private', { id: 'runtime-control', suspended: true }); state.close();
@@ -69,7 +69,7 @@ async function fixture(t: TestContext) {
     assert.equal(await readFile(path.join(input.cwd, 'source.txt'), 'utf8'), 'actual project source\n');
     return respond(input);
   });
-  const factory = await initializeFactory(app, chats); factory.coordinator.stop();
+  const factory = await initializeFactory(app, chats, undefined, inspection); factory.coordinator.stop();
   await new Promise<void>(resolve => app.server.listen(0, '127.0.0.1', resolve));
   const origin = `http://127.0.0.1:${(app.server.address() as AddressInfo).port}`;
   async function request(method: string, route: string, body: Record<string, unknown>) {
@@ -111,6 +111,22 @@ test('an explicitly native goal plans from zero tasks with the private container
   assert.equal(session.executionTargetId, f.host.id); assert.equal(session.executionTargetKind, 'host-macos');
   assert.equal(session.containerId, undefined); assert.equal(session.status, 'stopped');
   assert.equal(await readFile(path.join(f.primary, 'source.txt'), 'utf8'), 'actual project source\n');
+});
+
+test('goal creation persists explicit application acceptance and rejects unavailable references as client input', nativeMac, async t => {
+  const f = await fixture(t);
+  const acceptance = { kind: 'application', platforms: ['macos', 'ios-simulator'], referenceIds: ['primary'] };
+  const goal = await f.create({ target: 'auto' }, { acceptance });
+  assert.deepEqual(goal.acceptance, acceptance);
+  assert.deepEqual(f.app.store.get<Goal>('goals', goal.id)!.acceptance, acceptance);
+  for (const invalid of [{ ...acceptance, platforms: [] }, { ...acceptance, referenceIds: ['removed-design-folder'] }]) {
+    const response = await f.request('POST', '/api/goals', { projectId: f.project.id, objective: 'Build the native app', autonomy: 'manual', acceptance: invalid });
+    assert.equal(response.status, 400, await response.clone().text());
+  }
+  assert.equal(f.app.store.list<Goal>('goals').length, 1, 'Rejected templates cannot leave a partially created goal');
+  const legacy = await f.create();
+  assert.equal(legacy.acceptance, undefined, 'API callers that omit the template preserve existing behavior');
+  assert.equal(f.turns.length, 0); assert.equal(f.counts().containerStarts, 0);
 });
 
 test('explicit native preference remains native with a ready container, while auto chooses the ready container', nativeMac, async t => {
@@ -194,4 +210,63 @@ test('configure preserves omitted execution and frozen attempts while steer revo
   const preserved = await f.request('POST', `/api/goals/${goal.id}/steer`, { context: 'Keep the selected execution preference' });
   assert.equal(preserved.status, 200); assert.deepEqual(f.app.store.get<Goal>('goals', goal.id)!.execution, before);
   assert.equal(f.app.store.get<ControlRecord>('factory-control', goal.id)!.stage, 'plan');
+});
+
+test('a source audit holding the only goal agent slot delays normal planning without spending the failure budget', { ...nativeMac, timeout: 60000 }, async t => {
+  const f = await fixture(t), goal = await f.create({ target: 'host-macos' }, { concurrency: 1 });
+  const audit = { id: 'preparing-native-source-audit', authority: { goalId: goal.id, goalRevision: goal.revision, taskId: 'native-task', attemptId: 'native-author', authorityGeneration: 1, policyRevision: goal.revision }, status: 'preparing' };
+  f.app.store.set('inspection-profile-audits', audit);
+  await assert.rejects(f.complete(goal), (error: unknown) => {
+    assert.equal((error as { recovery?: string }).recovery, 'inspection-evidence'); return true;
+  });
+  assert.equal(f.turns.length, 0); assert.equal(f.app.store.list('sessions').length, 0); assert.equal(f.app.store.list('factory-controller-runs').length, 0);
+  assert.deepEqual(f.counts(), { containerStarts: 0, hostProvisions: 0 });
+
+  f.factory.coordinator.requestPlan(goal.id);
+  const requested = f.app.store.get<Goal>('goals', goal.id)!;
+  const before = f.app.store.get<ControlRecord>('factory-control', goal.id)!;
+  await f.factory.coordinator.start(); await f.factory.coordinator.waitForIdle(); f.factory.coordinator.stop();
+  const waiting = f.app.store.get<ControlRecord>('factory-control', goal.id)!;
+  assert.equal(f.app.store.get<Goal>('goals', goal.id)!.status, 'waiting'); assert.equal(f.app.store.get<Goal>('goals', goal.id)!.revision, requested.revision); assert.equal(waiting.waitingFor, 'inspection-evidence');
+  assert.equal(waiting.stage, 'plan'); assert.equal(waiting.manualAction, 'plan'); assert.deepEqual(waiting.controllerFailures, before.controllerFailures);
+  assert.equal(f.turns.length, 0); assert.equal(f.app.store.list('sessions').length, 0); assert.equal(f.app.store.list('factory-controller-runs').length, 0);
+
+  f.app.store.delete('inspection-profile-audits', audit.id);
+  f.app.emit('inspection-evidence', { goalId: goal.id, auditId: audit.id, purpose: 'source-audit-released' });
+  await f.factory.coordinator.start(); await f.factory.coordinator.waitForIdle(); f.factory.coordinator.stop();
+  const planned = f.app.store.get<Goal>('goals', goal.id)!, control = f.app.store.get<ControlRecord>('factory-control', goal.id)!;
+  assert.equal(planned.status, 'running', planned.error); assert.equal(planned.id, goal.id); assert.equal(planned.revision, requested.revision, 'The capacity wait resumes the same requested plan authority.');
+  assert.equal(control.waitingFor, undefined); assert.equal(control.controllerFailures, undefined); assert.equal(f.turns.length, 1);
+  assert.equal(f.app.store.list<FactoryTask>('tasks').filter(task => task.goalId === goal.id).length, 1);
+  assert.equal(f.app.store.list<ControllerRun>('factory-controller-runs').filter(run => run.goalId === goal.id).length, 1);
+  assert.equal(f.counts().containerStarts, 0); assert.equal(await readFile(path.join(f.primary, 'source.txt'), 'utf8'), 'actual project source\n');
+});
+
+test('a source audit capacity wait preserves the original retained evaluator conversation', { ...nativeMac, timeout: 60000 }, async t => {
+  let reviewReady = false;
+  const f = await fixture(t, { reviewController: async () => ({ ready: reviewReady, reason: 'The current native source still needs inspection evidence.', evidenceIds: [] }) });
+  const goal = await f.create({ target: 'host-macos' }, { concurrency: 1 });
+  const at = new Date().toISOString();
+  f.app.store.set<FactoryTask>('tasks', { id: 'native-ui', goalId: goal.id, title: 'Native UI', description: 'Inspect the delivered native workflow', dependsOn: [], status: 'completed', createdAt: at, updatedAt: at,
+    quality: { platforms: ['macos'], workflows: [{ id: 'native-composer', platform: 'macos' }], referenceIds: ['primary'] } });
+  const decision = JSON.stringify({ complete: true, summary: 'Recorded evaluator decision awaiting original inspection', criteria: [{ criterion, satisfied: true, evidence: ['Recorded source'] }] });
+  f.respond(async input => ({ threadId: input.threadId ?? `retained-evaluator-${input.chatId}`, text: decision }));
+  const evaluate = () => f.factory.runtime.complete({ goal: f.app.store.get<Goal>('goals', goal.id)!, project: f.project, role: 'evaluator', prompt: 'Evaluate the current integrated product.' });
+  const isInspectionWait = (error: unknown) => { assert.equal((error as { recovery?: string }).recovery, 'inspection-evidence'); return true; };
+  await assert.rejects(evaluate(), isInspectionWait);
+  const original = f.app.store.list<ControllerRun>('factory-controller-runs').find(run => run.goalId === goal.id)!;
+  assert.equal(original.status, 'waiting'); assert(original.chatId && original.sessionId); assert.equal(f.turns.length, 2);
+  const retained = f.app.store.get('factory-controller-reviews', original.id); assert(retained);
+  const audit = { id: 'final-native-source-audit', authority: { goalId: goal.id, goalRevision: goal.revision, taskId: 'native-ui', attemptId: 'native-author', authorityGeneration: 1, policyRevision: goal.revision }, status: 'preparing' };
+  f.app.store.set('inspection-profile-audits', audit);
+  await assert.rejects(evaluate(), isInspectionWait);
+  assert.equal(f.turns.length, 2); assert.equal(f.app.store.list('sessions').length, 1); assert.equal(f.app.store.list('factory-controller-runs').length, 1);
+  assert.deepEqual(f.app.store.get('factory-controller-reviews', original.id), retained); assert.equal(f.app.store.get<ControllerRun>('factory-controller-runs', original.id)!.status, 'waiting');
+
+  f.app.store.delete('inspection-profile-audits', audit.id); reviewReady = true;
+  f.app.emit('inspection-evidence', { goalId: goal.id, auditId: audit.id, purpose: 'source-audit-released' });
+  const result = await evaluate();
+  assert.deepEqual(result, { text: decision, chatId: original.chatId }); assert.equal(f.turns.length, 2, 'A finished evaluator decision cannot be rerun to bypass the occupied slot.');
+  assert.equal(f.app.store.list<ControllerRun>('factory-controller-runs').length, 1); assert.equal(f.app.store.get<ControllerRun>('factory-controller-runs', original.id)!.status, 'completed');
+  assert.equal(f.app.store.get('factory-controller-reviews', original.id), undefined); assert.equal(f.counts().containerStarts, 0);
 });

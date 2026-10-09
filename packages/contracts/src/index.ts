@@ -31,6 +31,10 @@ export type QualityPlatform = "web" | "macos" | "ios-simulator";
 export interface TaskQualityRequirements {
   platforms: QualityPlatform[]; workflows: Array<{ id: string; platform: QualityPlatform }>; referenceIds: string[];
 }
+/** User-selected application acceptance, independent of a planner's task policies. */
+export interface ApplicationAcceptance {
+  kind: "application"; platforms: QualityPlatform[]; referenceIds: string[];
+}
 export interface PolicyRule { id: string; tool?: string; commandPattern?: string; decision: "allow" | "deny" | "ask"; }
 export interface WorkingDirectory { id: string; name: string; path: string; }
 export type DevelopmentToolchainId = "default" | "swift-6.0.3";
@@ -111,6 +115,8 @@ export interface Goal {
   workspaceProvider?: "git" | "artifactfs";
   /** Explicit controller placement and default for tasks without their own execution requirements. */
   execution?: TaskExecutionRequirements;
+  /** Omission preserves existing non-application and legacy goal behavior. */
+  acceptance?: ApplicationAcceptance;
 }
 export type TaskKind = "feature" | "unit" | "architecture" | "test";
 export interface TaskResources { cpus?: number; memoryGiB?: number; }

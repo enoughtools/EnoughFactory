@@ -288,10 +288,18 @@ test('Linux author builds, inspects, edits, asserts, restarts and stops a native
   const repeated = await f.call('factory_native_action', { sessionId: started.sessionId, requestId: 'write-body', observationId: beforeObservation, action: { kind: 'type', elementId: 'body', text: 'Draft edited from Linux', mode: 'replace' } });
   assert.equal(value(repeated, 'actionId'), editActionId); assert.equal(f.actions.length, 1, 'the same request is never applied twice');
   const after = await f.call('factory_observe', { sessionId: started.sessionId, requestId: 'observe-after' }); imageDelivery(f.author.store, after, 'after-image');
-  const afterObservation = String(value(after, 'observationId')), afterEvidence = String(value(after, 'screenshotEvidenceId'));
+  let afterObservation = String(value(after, 'observationId')), afterEvidence = String(value(after, 'screenshotEvidenceId'));
   const elements = value(after, 'elements') as Array<{ id: string; value?: string }>;
   assert.equal(elements.find(item => item.id === 'body')?.value, 'Draft edited from Linux');
-  const asserted = await f.call('factory_assert', { sessionId: started.sessionId, requestId: 'assert-body', observationId: afterObservation, labelIncludes: 'Message body', valueIncludes: 'Draft edited from Linux' });
+  for (const [requestId, valueEquals] of [['reject-prefix', 'Draft edited'], ['reject-suffix', 'edited from Linux']] as const) {
+    const partial = await f.call('factory_assert', { sessionId: started.sessionId, requestId, observationId: afterObservation, labelIncludes: 'Message body', valueEquals });
+    assert.equal(value(partial, 'passed'), false, 'A delegated exact assertion cannot silently degrade into label presence or substring matching');
+    const evidence = f.author.plugin.evidenceForAuthority(authority).find(item => item.id === value(partial, 'evidenceId'))!;
+    assert.equal(evidence.metadata?.passed, false); assert.equal(evidence.metadata?.observationId, afterObservation);
+    const fresh = await f.call('factory_observe', { sessionId: started.sessionId, requestId: `observe-${requestId}` }); imageDelivery(f.author.store, fresh, `image-${requestId}`);
+    afterObservation = String(value(fresh, 'observationId')); afterEvidence = String(value(fresh, 'screenshotEvidenceId'));
+  }
+  const asserted = await f.call('factory_assert', { sessionId: started.sessionId, requestId: 'assert-body', observationId: afterObservation, labelIncludes: 'Message body', valueEquals: 'Draft edited from Linux' });
   assert.equal(value(asserted, 'passed'), true);
 
   // The acceptance service consumes the original transferred journal, rather than invented receipt objects.

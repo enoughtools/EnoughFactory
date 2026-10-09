@@ -368,6 +368,35 @@ test('queued build and launch return image observations, apply an edit to the sa
   assert.ok(f.jobs.leases(jobId).every(lease => lease.status === 'released'));
 });
 
+test('native exact assertions retain observed equality and distinguish an empty input from a missing value', async t => {
+  const f = await fixture(t), buildJobId = await f.build(), { jobId, sessionId } = await f.start(buildJobId);
+  const observed = await f.execute({ name: 'observe', arguments: { sessionId } });
+  const observationId = String(observed.value!.observationId);
+  const assertions = [
+    { labelIncludes: 'Message body', valueEquals: 'Original body' },
+    { labelIncludes: 'Message body', valueEquals: 'Original' },
+    { labelIncludes: 'Message body', valueEquals: 'body' },
+    { labelIncludes: 'Message body', valueEquals: 'Original body suffix' },
+    { labelIncludes: 'Save draft', valueEquals: '' },
+    { labelIncludes: 'Save draft', valueIncludes: '' },
+    { labelIncludes: 'Missing control', valueEquals: '', absent: true },
+  ];
+  const checked = await f.execute({ name: 'run-tests', arguments: { sessionId, observationId, assertions } });
+  assert.equal(checked.value!.passed, false);
+  assert.deepEqual((checked.value!.results as Array<{ passed: boolean }>).map(result => result.passed), [true, false, false, false, false, true, true]);
+  const evidence = f.jobs.evidence(jobId).find(item => item.id === checked.value!.evidenceId)!;
+  assert.equal(evidence.source.sha256, f.assignment.source.sha256); assert.equal(evidence.metadata?.observationId, observationId);
+  const original = JSON.parse((await f.artifacts.read(evidence.artifact)).toString()) as { results: Array<{ condition: unknown }> };
+  assert.deepEqual(original.results.map(result => result.condition), assertions);
+
+  f.values.set([...f.sessions.keys()][0]!, '');
+  const empty = await f.execute({ name: 'observe', arguments: { sessionId } });
+  await assert.rejects(f.execute({ name: 'run-tests', arguments: { sessionId, observationId: empty.value!.observationId, assertions: [{ labelIncludes: 'Message body', valueEquals: 0 }] } }), /text/i);
+  const exactEmpty = await f.execute({ name: 'run-tests', arguments: { sessionId, observationId: empty.value!.observationId, assertions: [{ labelIncludes: 'Message body', valueEquals: '' }] } });
+  assert.equal(exactEmpty.value!.passed, true);
+  await assert.rejects(f.execute({ name: 'run-tests', arguments: { sessionId, observationId, assertions: [{ labelIncludes: 'Message body', valueEquals: 'Original body' }] } }), /fresh|current/i);
+});
+
 test('lost native action replies retain unknown effects and leases; reconciliation never repeats the edit', async t => {
   const f = await fixture(t), buildJobId = await f.build(), { jobId, sessionId } = await f.start(buildJobId);
   const observed = await f.execute({ name: 'observe', arguments: { sessionId } });

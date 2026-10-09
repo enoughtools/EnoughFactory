@@ -243,6 +243,34 @@ test('native workflow observation/action/assertion produces certifiable original
   assert.equal(f.service.jobs.evidence(job.id).filter(evidence => evidence.kind === 'screenshot').length, 2);
 });
 
+test('local native exact assertions preserve the entire observed value and do not invent missing empty values', async t => {
+  const f = await fixture(t), { session } = f.createSession();
+  const screenshotPath = path.join(f.directory, 'native-exact.png'); await writeFile(screenshotPath, png);
+  Object.assign(f.service.native, {
+    observe: async () => ({ observationId: 'backend-exact', elements: [
+      { id: 'recipient', label: 'Recipient', value: 'person@example.com' },
+      { id: 'body', label: 'Message body', value: 'Complete body' },
+      { id: 'empty', label: 'Empty subject', value: '' },
+      { id: 'missing', label: 'Save draft' },
+    ], truncated: false, screenshot: { path: screenshotPath, width: 1, height: 1 } }),
+  });
+  const observed = value<{ observationId: string }>(await f.call('factory_observe', { sessionId: session.id, requestId: 'exact-observation' }));
+  const cases = [
+    ['Recipient', 'person@example.com', true], ['Recipient', 'person', false], ['Recipient', 'example.com', false],
+    ['Message body', 'Complete body', true], ['Message body', 'Complete body suffix', false],
+    ['Empty subject', '', true], ['Save draft', '', false],
+  ] as const;
+  for (const [labelIncludes, valueEquals, expected] of cases) {
+    const result = value<{ passed: boolean; evidenceId: string }>(await f.call('factory_assert', { sessionId: session.id, observationId: observed.observationId, labelIncludes, valueEquals }));
+    assert.equal(result.passed, expected, `${labelIncludes} must preserve exact observed string equality`);
+    const evidence = f.store.get<InspectionEvidence>('inspection-evidence', result.evidenceId)!;
+    assert.equal(evidence.source.sha256, f.source.sha256); assert.equal(evidence.metadata?.observationId, observed.observationId);
+    assert.equal(JSON.parse((await f.service.artifacts.read(evidence.artifact)).toString()).condition.valueEquals, valueEquals);
+  }
+  await f.call('factory_observe', { sessionId: session.id, requestId: 'new-exact-observation' });
+  await assert.rejects(f.call('factory_assert', { sessionId: session.id, observationId: observed.observationId, labelIncludes: 'Recipient', valueEquals: 'person@example.com' }), /Re-observe|current|stale/i);
+});
+
 test('browser assertions preserve unnamed text and actual input values rather than ARIA metadata', async t => {
   const f = await fixture(t, 'web'), { session } = f.createSession();
   const tree = '### Page state\n- Page URL: http://127.0.0.1:3000/\n### Page Snapshot\n```yaml\n- text: Composer\n- status [ref=e7]: Saved\n- textbox "Body" [ref=e8]: draft text\n- button "Close draft" [ref=e9]\n```\n';

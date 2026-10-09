@@ -1,6 +1,6 @@
 import type { EvaluationResponse, PlanResponse, PlannedTask } from "./types.js";
 import { FactoryDecisionError } from "./errors.js";
-import { EXECUTION_CAPABILITIES, type TaskKind, type TaskExecutionRequirements, type TaskQualityRequirements, type QualityPlatform, type ExecutionCapability } from "@enoughfactory/contracts";
+import { EXECUTION_CAPABILITIES, type ApplicationAcceptance, type TaskKind, type TaskExecutionRequirements, type TaskQualityRequirements, type QualityPlatform, type ExecutionCapability } from "@enoughfactory/contracts";
 
 /** Parse the last JSON object even when a provider wraps it in explanatory prose. */
 export function readJsonObject(text: string): Record<string, unknown> {
@@ -131,6 +131,16 @@ export function validateTaskQuality(value: unknown): TaskQualityRequirements | u
   const referenceIds = (item.referenceIds as string[]).map(id => id.trim());
   if (new Set(referenceIds).size !== referenceIds.length) throw new FactoryDecisionError("quality.referenceIds repeats a reference identity.");
   return { platforms, workflows, referenceIds };
+}
+
+/** The application template is explicit; goal titles and prose never select it. */
+export function validateGoalAcceptance(value: unknown): ApplicationAcceptance | undefined {
+  if (value === undefined) return undefined;
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new FactoryDecisionError("acceptance must be an application acceptance contract.");
+  const item = value as Record<string, unknown>;
+  if (item.kind !== "application" || Object.keys(item).some(key => !["kind", "platforms", "referenceIds"].includes(key))) throw new FactoryDecisionError("acceptance supports application kind, platforms and referenceIds only.");
+  const quality = validateTaskQuality({ platforms: item.platforms, workflows: [], referenceIds: item.referenceIds })!;
+  return { kind: "application", platforms: quality.platforms, referenceIds: quality.referenceIds };
 }
 
 export function readTasks(value: unknown): PlannedTask[] {

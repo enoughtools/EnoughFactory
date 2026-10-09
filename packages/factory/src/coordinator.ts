@@ -5,7 +5,8 @@ import type {
   EvaluationRecord, ExecutionResult, GoalCheckRecord, PlanRecord, PlannedTask, RepositoryEvidence, TaskDetail,
 } from "./types.js";
 import { UI_QUALITY_CHECK_COMMAND } from "./types.js";
-import { readCheckCommands, readEvaluation, readJsonObject, readPlan, readTasks, validateDependencies, validateTaskExecution } from "./protocol.js";
+import { readCheckCommands, readEvaluation, readJsonObject, readPlan, readTasks, validateDependencies, validateTaskExecution, validateGoalAcceptance } from "./protocol.js";
+import { applicationPlanTasks, assertApplicationWorkflowCoverage } from "./application-acceptance.js";
 import { FactoryOperationError, FactoryDecisionError, FactoryControllerError, FactoryCapacityError, FactoryVerificationWaitError } from "./errors.js";
 import { activeExecutionTasks, descendants, deviceExecutionTargets, placementConstraint, selectExecutionTarget, sortReadyTasks, taskSchedulingBlocker, taskCheckInputBlocker, taskCapabilityBlocker, verificationOnlyReservation, effectiveTaskExecution } from "./scheduler.js";
 import { ControllerEvidence, controllerPrompt } from "./controller-evidence.js";
@@ -47,6 +48,9 @@ export class FactoryCoordinator {
     if (input.maxDurationMs !== undefined && (!Number.isFinite(input.maxDurationMs) || input.maxDurationMs <= 0)) throw new Error("Time budget must be positive.");
     const at = this.now(), autonomy = input.autonomy ?? "autonomous";
     const execution = validateTaskExecution(input.execution);
+    const acceptance = validateGoalAcceptance(input.acceptance);
+    const referenceIds = new Set(["primary", ...(project.workingDirectories ?? []).map(root => root.id)]);
+    if (acceptance?.referenceIds.some(id => !referenceIds.has(id))) throw new FactoryDecisionError("Application design references must identify the project or one of its attached working folders. Choose an available reference before starting.");
     const goal: Goal = {
       id: randomUUID(), projectId: input.projectId, coordinatorId: this.options.deviceId,
       title: input.title?.trim() || input.objective.trim().split("\n")[0]!.slice(0, 96),
@@ -58,6 +62,7 @@ export class FactoryCoordinator {
       concurrency: Math.max(1, Math.min(32, Math.floor(input.concurrency ?? 8))),
       ...(input.maxAttempts === undefined ? {} : { maxAttempts: input.maxAttempts }),
       ...(execution === undefined ? {} : { execution }),
+      ...(acceptance === undefined ? {} : { acceptance }),
     };
     this.options.store.transaction(() => {
       this.options.store.set(TABLE.goals, goal);
@@ -439,6 +444,7 @@ export class FactoryCoordinator {
           "You are the EnoughFactory planner. Build the entire objective, preserving all explicit requirements. Make routine implementation decisions yourself.",
           "Return one JSON object: {summary,criteria:string[],checks:string[],tasks:[{key,title,description,kind:'feature'|'unit'|'architecture'|'test',acceptanceCriteria:string[],expectedOutputs:string[],dependsOn:string[],checks:string[],requiredCheckEnvironment?:string[],execution?:{target?:'auto'|'container'|'host-macos',requiredCapabilities?:string[],delegatedCapabilities?:string[]},quality?:{platforms:('web'|'macos'|'ios-simulator')[],workflows:[{id,platform}],referenceIds:string[]},estimatedMinutes?:number,writePaths?:string[],resources?:{cpus?:number,memoryGiB?:number},deviceId?:string}]}. Stable task keys must be unique, dependencies acyclic, checks focused and executable on the configured target.",
           "For material UI implementation or final UI delivery, declare explicit quality platforms, representative workflow identities and supplied referenceIds. Keep unrelated architecture/backend-only work independent; legacy absence does not acquire a global UI gate. Use execution.requiredCapabilities for requirements local to the author, and execution.delegatedCapabilities for browser or native tools another device can supply. Supported capabilities are linux-shell, mac-shell, chromium-inspection, apple-compilation, macos-app-inspection and ios-simulator-inspection. A Mac device running Linux containers is not a Mac-shell executor. Omitted task execution inherits the goal's explicit execution default; otherwise it preserves container execution. An explicit task execution replaces that default. Auto may select a configured Mac host for local Mac requirements. Plan only against the advertised inventory, and keep missing genuine capabilities explicit rather than substitute passing portable tests for native/visual verification.",
+          ...(goal.acceptance ? ["This goal explicitly delivers an application. Its acceptance template is mandatory independently of your task policies. Supply quality policies on material UI implementation and final delivery tasks, with at least one representative user journey for every required platform across the surviving plan. Name workflows for meaningful behavior such as compose-send-reopen-draft, not merely launch or take-screenshot. Each configured task platform needs a workflow; required design references are inherited automatically. Keep backend and architecture tasks independent when they have no material UI outcome. The final integrated application receives its own real workflow and visual review; a passing build cannot satisfy this template."] : []),
           "If a task requires independently supplied verification inputs, declare their names in requiredCheckEnvironment. Supported names are ENOUGH_EVIDENCE_ROOT, ENOUGH_NATIVE_UI_RECEIPT_DESCRIPTOR, ENOUGH_NATIVE_INDEX_SHA256 and ENOUGH_ACCEPTANCE_INDEX_SHA256. The coordinator will wait before dispatch until its authenticated check-input configuration contains every named value. Plan descriptions and checks cannot provision these values. Existing task-local external waits survive a stable-key replan; changing a plan is not evidence that their prerequisites arrived.",
           "Choose task kinds by outcome: feature delivers observable product behavior; unit implements a bounded component or change; architecture resolves a structural decision and preserves its rationale and handoff; test supplies focused verification for an identified uncertainty. Give each task concrete acceptance criteria and expected deliverables. Do not invent extra architecture/test tasks or mandatory reviews when the work does not need them.",
           "Every ordinary checks entry is a shell command, never an instruction or explanation. A structured validation profile explicitly advertised by the runtime is also a valid check; preserve its exact prefix and JSON rather than wrapping it in a shell command. For example use 'sh scripts/check-foundation.sh', not 'Run scripts/check-foundation.sh to validate the foundation'. Task checks verify only outputs available when that task and its actual prerequisites finish. An architecture or interface task should verify its deliverables without requiring the future application, packages or tests to exist. Plan-level checks are final whole-goal checks, run once on the integrated result after all tasks finish; do not copy them into every task or require expensive full-product verification at every layer. Empty task checks are acceptable when concrete deliverable evidence is the appropriate verification.",
@@ -502,7 +508,9 @@ export class FactoryCoordinator {
       this.changed(); return;
     }
     const running = this.activeWork().filter(task => task.goalId === goal.id && !verificationOnlyReservation(task)).length;
-    let capacity = Math.max(0, goal.concurrency - running);
+    const additional = this.options.additionalActiveAgents?.(goal.id) ?? 0;
+    const inspectionAgents = Number.isFinite(additional) ? Math.max(0, Math.ceil(additional)) : goal.concurrency;
+    let capacity = Math.max(0, goal.concurrency - running - inspectionAgents);
     let eligible = 0, placed = 0;
     const verificationWaits: string[] = [], capabilityWaits: string[] = [];
     const stableKeys = new Map(tasks.map(task => [task.id, this.taskDetail(task.id).key]));
@@ -843,6 +851,11 @@ export class FactoryCoordinator {
 
   private async evaluate(goal: Goal): Promise<void> {
     if (this.tasks(goal.id).some(task => !["completed", "canceled"].includes(task.status))) return;
+    try { assertApplicationWorkflowCoverage(goal, this.acceptedQuality(this.tasks(goal.id).filter(task => task.status !== "canceled"))); }
+    catch (error) {
+      if (!(error instanceof FactoryDecisionError)) throw error;
+      await this.replan(goal.id, error.message); return;
+    }
     const operation = this.beginOperation(goal, "evaluator"), project = this.project(goal);
     try {
       const repository = await this.options.workspaces.inspect(project);
@@ -883,6 +896,7 @@ export class FactoryCoordinator {
         "Inspect/run only meaningful checks needed for uncertain criteria. Return JSON {complete:boolean,summary:string,criteria:[{criterion:string,satisfied:boolean,evidence:string[]}],additionalTasks?:[{key,title,description,kind:'feature'|'unit'|'architecture'|'test',acceptanceCriteria:string[],expectedOutputs:string[],dependsOn:string[],checks:string[],requiredCheckEnvironment?:string[],execution?:{target?:'auto'|'container'|'host-macos',requiredCapabilities?:string[],delegatedCapabilities?:string[]},quality?:{platforms:('web'|'macos'|'ios-simulator')[],workflows:[{id,platform}],referenceIds:string[]}}],waitReason?:string,wakeCondition?:string}. Use task kinds for concrete delivery outcomes, not mandatory role ceremonies. Tasks needing independently supplied verification inputs must declare the supported requiredCheckEnvironment names; a prose prerequisite does not gate dispatch. Select author requirements and delegated tools from the execution inventory; absence of native or visual support cannot be replaced by portable test success.",
         "Use each criterion's exact original text. Every satisfied criterion requires concrete current-state evidence such as files, runtime outcomes, exact commit check records or published URLs. If something remains, add actionable tasks. Never weaken the objective to declare completion. No mandatory human gate applies to autonomous plus approve-all.",
         "Also inspect the accepted tasks' acceptance criteria and expected deliverables. Integration records prove accepted source, not that every requested behavior or deliverable exists. Add concrete follow-up work for any unmet contract that matters to the original objective.",
+        ...(goal.acceptance ? ["The application acceptance template also requires current integrated-source workflow and visual evidence on every configured platform, compared with its required design references. Inspect actual images and representative journeys. Additional material UI tasks need explicit quality policies with meaningful workflows; backend-only repairs can remain independent. Passing representative journeys does not prove every product feature: audit all original completion criteria separately."] : []),
         "The current integrated primary repository and attached current project folders are the sources for the final product audit. Historical candidate IDs and CAS references identify retained source; their bodies are optional evidence and are not automatically transferred for evaluation. Use the mounted manifest to determine actual available files. Never claim to have inspected a historical candidate body merely from its identity or integration record.",
         "Configured whole-goal checks have already run against the exact integrated snapshot. Do not repeat them merely to restate the evidence. A failed configured check prevents completion: use its concrete command/output to propose focused repair tasks. Checks on a future repaired snapshot will run once after that work integrates. Every additional task check must be an executable shell command scoped to outputs available at that task's completion, never prose or an unrelated whole-product gate.",
         `Whole-goal check evidence: ${JSON.stringify(evidence.goalChecks(goalChecks))}`,
@@ -943,6 +957,7 @@ export class FactoryCoordinator {
   private applyTasks(goalId: string, tasks: PlannedTask[], summary: string, checks: string[], preserveTaskIds = new Set<string>(), replanInstructions?: string): void {
     const goal = this.goal(goalId), at = this.now(), all = this.tasks(goalId);
     const existing = all.filter(task => task.status === "completed" || preserveTaskIds.has(task.id));
+    tasks = applicationPlanTasks(goal, tasks, this.acceptedQuality(existing));
     const previousPlan = this.planRecord(goalId), previousPlanChecks = previousPlan?.checkScope === "goal" ? [] : previousPlan?.checks ?? [];
     for (const task of existing) {
       const detail = this.taskDetail(task.id);
@@ -974,6 +989,14 @@ export class FactoryCoordinator {
         repairInstructions: supersededRepair ? undefined : previousDetail?.repairInstructions, priorRepairInstructions, replanInstructions, selected: goal.autonomy === "autonomous", failureSignatures: previousDetail?.failureSignatures ?? [] });
     }
     this.options.store.set<PlanRecord>(TABLE.plans, { id: goalId, goalId, revision: goal.revision, summary, checks, checkScope: "goal", taskKeys, createdAt: at });
+  }
+
+  private acceptedQuality(tasks: FactoryTask[]) {
+    return tasks.flatMap(task => {
+      const detail = task.currentAttemptId ? this.options.store.get<AttemptDetail>(TABLE.attemptDetails, task.currentAttemptId) : undefined;
+      const quality = detail?.contract ? detail.contract.quality : task.quality;
+      return quality ? [quality] : [];
+    });
   }
 
   private async replan(goalId: string, reason: string, failedTaskId?: string, instructions?: string): Promise<void> {
@@ -1209,7 +1232,7 @@ export class FactoryCoordinator {
         reason: target.reason?.slice(0, 256), capabilities: target.capabilities.slice(0, 6).map(capability => ({ kind: capability.kind, readiness: capability.readiness, version: capability.version?.slice(0, 128), reason: capability.reason?.slice(0, 256) })),
       })),
     })), omittedDevices: Math.max(0, devices.length - 32) };
-    return `Original objective:\n${goal.objective}\n\nRequired completion criteria:\n${goal.criteria.map(value => `- ${value}`).join("\n")}\n\nAutonomy: ${goal.autonomy}; approvals: ${goal.approvalMode}.\n\nGoal execution default:\n${JSON.stringify(goal.execution ?? { target: "container" })}\n\nExecution inventory:\n${JSON.stringify(executionInventory)}\n\nSteering context:\n${control.steering.join("\n")}\n\nReplanning reason:\n${reason?.omittedCharacters ? JSON.stringify(reason) : control.replanReason ?? "Initial plan"}${control.replanInstructions ? `\n\nCurrent diagnosis handoff:\n${control.replanInstructions}` : ""}`;
+    return `Original objective:\n${goal.objective}\n\nRequired completion criteria:\n${goal.criteria.map(value => `- ${value}`).join("\n")}\n\nAutonomy: ${goal.autonomy}; approvals: ${goal.approvalMode}.\n\nGoal execution default:\n${JSON.stringify(goal.execution ?? { target: "container" })}${goal.acceptance ? `\n\nRequired application acceptance:\n${JSON.stringify(goal.acceptance)}` : ""}\n\nExecution inventory:\n${JSON.stringify(executionInventory)}\n\nSteering context:\n${control.steering.join("\n")}\n\nReplanning reason:\n${reason?.omittedCharacters ? JSON.stringify(reason) : control.replanReason ?? "Initial plan"}${control.replanInstructions ? `\n\nCurrent diagnosis handoff:\n${control.replanInstructions}` : ""}`;
   }
   private executionPrompt(goal: Goal, task: FactoryTask): string {
     const detail = this.executionTaskDetail(task);

@@ -5,6 +5,7 @@ import type { InspectionActionKind, InspectionAuthority, InspectionJob, Inspecti
 import type { NativeAction, NativeObservation } from '@enoughfactory/native-inspection';
 import { importInspectionSnapshot, InspectionSnapshotManager, type ArtifactManifest, type ArtifactStore, type InspectionSnapshot } from '@enoughfactory/workspaces';
 import { InspectionJobs } from './inspection-jobs.ts';
+import { evaluateObservedCondition } from './inspection-condition.ts';
 import type { InspectionJournalEvent, InspectionJournalPage, InspectionJournalRecord } from './inspection-delegation-journal.ts';
 import type { NativeFixtureProfile, NativeInspectionAdapter, NativeInspectionBuild } from './inspection-native.ts';
 import type { NativeBuildRunner } from './inspection-build-runner.ts';
@@ -367,9 +368,7 @@ export class NativeDelegationOwner {
       if (!check || typeof check !== 'object' || Array.isArray(check)) throw new Error('Invalid workflow assertion.');
       const input = check as Record<string, unknown>, needle = string(input.labelIncludes, 'assertion label');
       if (input.absent === true && observation.observation.truncated) throw new Error('A truncated native observation cannot prove absence.');
-      if (input.valueIncludes !== undefined && typeof input.valueIncludes !== 'string') throw new Error('Assertion values must be text.');
-      const matches = observation.observation.elements.filter(element => (element.label || element.identifier || '').includes(needle));
-      return { condition: input, passed: input.absent === true ? matches.length === 0 : matches.some(element => input.valueIncludes === undefined || (element.value || '').includes(input.valueIncludes as string)) };
+      return { condition: input, passed: evaluateObservedCondition(observation.observation.elements, { ...input, labelIncludes: needle }) };
     });
     const begun = this.options.jobs.beginAction(owner.token, session.id, { idempotencyKey: `delegated:${request.requestId}`, kind: 'run-tests', arguments: { observationId, assertions: checks } });
     this.options.app.store.set(buckets.requests, { ...request, actionId: begun.action.id });

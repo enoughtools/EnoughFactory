@@ -1,13 +1,13 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, writeFile } from 'node:fs/promises';
+import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { deflateRawSync } from 'node:zlib';
 import test from 'node:test';
-import { ArtifactStore, InspectionSnapshotManager, NativeTeardownError, type AppleCheckResult, type CheckExecutor } from '@enoughfactory/workspaces';
+import { ArtifactStore, InspectionSnapshotManager, NativeTeardownError, exportInspectionSnapshot, type AppleCheckResult, type CheckExecutor } from '@enoughfactory/workspaces';
 import { NativeInspectionError, type NativeAction, type NativeInspectionBackend, type NativePlatform, type NativeProduct } from '@enoughfactory/native-inspection';
-import { NativeInspectionAdapter, validateNativeAppZip } from './inspection-native.ts';
+import { NativeInspectionAdapter, validateNativeAppZip, type NativeFixtureProfile } from './inspection-native.ts';
 
 interface ZipEntry {
   name: string;
@@ -195,6 +195,39 @@ async function buildFixture(t: { after: (fn: () => Promise<void>) => void }, che
     adapter: new NativeInspectionAdapter({ dataDir, artifacts, backend, checkExecutor }) };
 }
 
+/** Genuine source/CAS provenance with injected independent judgment; no native process is started. */
+async function automaticAuditFixture(t: { after: (fn: () => Promise<void>) => void }, checkExecutor: CheckExecutor) {
+  const f = await buildFixture(t, checkExecutor), tokens = join(f.directory, 'tokens'), empty = join(f.directory, 'empty-root');
+  await mkdir(tokens); await mkdir(empty);
+  await writeFile(join(tokens, 'Tokens.swift'), 'let fixtureSpacing = 12\n', { mode: 0o640 });
+  await chmod(join(tokens, 'Tokens.swift'), 0o640);
+  const roots = [...f.roots, { id: 'enough-ui', name: 'enough-ui', path: tokens }, { id: 'empty', name: 'empty', path: empty }];
+  const snapshot = await f.snapshots.create({ roots, context: authority });
+  const transfer = await exportInspectionSnapshot({ snapshot, artifacts: f.artifacts, context: authority });
+  const source = { snapshotId: snapshot.id, sha256: snapshot.sourceDigest, roots: snapshot.roots.map(root => ({ id: root.id, sha256: root.sourceDigest })) };
+  const read = await f.artifacts.put(await readFile(join(snapshot.roots[0]!.path, 'source.txt')), {
+    ...authority, name: 'audit-read-source.txt', mime: 'application/octet-stream',
+  });
+  const runId = 'profile-audit-native-consumer', chatId = 'independent-native-source-auditor';
+  const verdict = await f.artifacts.put(JSON.stringify({ version: 1, kind: 'independent-native-fixture-judgment', runId, chatId, source,
+    proposalSha256: 'a'.repeat(64), judgment: 'source-review-not-runtime-proof',
+    verdict: { approved: true, findings: ['entry', 'storage', 'credentials', 'providers', 'preferences', 'notifications', 'build'].map(purpose => ({ purpose,
+      reasoning: 'Injected source-auditor judgment for this receipt consumer fixture; runtime isolation is tested separately.', files: [{ rootId: 'primary', path: 'source.txt' }] })), blockedReasons: [] }, readIds: ['original-audit-read'],
+  }), { ...authority, name: 'original-independent-judgment.json', mime: 'application/json' });
+  const fixture: Omit<NativeFixtureProfile, 'receipt' | 'fixtureEvidenceSha256'> = {
+    id: 'automatic-ios-fixture', build: { ...profile.build, platform: 'ios-simulator' }, launchArguments: ['--production-fixture', '{runId}'],
+  };
+  const audit = { version: 2, kind: 'native-fixture-source-audit', profileId: fixture.id, ...fixture,
+    sourceSha256: snapshot.sourceDigest, roots: snapshot.manifest.roots.map(root => ({ name: root.name, sourceDigest: root.sourceDigest, entries: [] })),
+    sourceManifest: transfer.sourceManifest, independentReview: { runId, chatId, verdict, reads: [read], judgment: 'source-review-not-runtime-proof' },
+  };
+  const bindAudit = async (body: unknown = audit, selected = fixture): Promise<NativeFixtureProfile> => {
+    const receipt = await f.artifacts.put(JSON.stringify(body), { ...authority, name: `automatic-source-audit-${selected.id}.json`, mime: 'application/json' });
+    return { ...selected, receipt, fixtureEvidenceSha256: receipt.sha256 };
+  };
+  return { ...f, tokens, empty, roots, snapshot, transfer, audit, profile: await bindAudit(), bindAudit };
+}
+
 function attestedChecker(artifacts: () => ArtifactStore, entries = appEntries()): CheckExecutor {
   return async context => {
     const product = await artifacts().put(zip(entries), {
@@ -259,6 +292,67 @@ test('an original fixture audit cannot authorize a fresh valid snapshot with cha
   await assert.rejects(f.adapter.build(snapshot, f.profile, { authority }),
     (error: unknown) => error instanceof NativeInspectionError && error.code === 'fixture-source-changed');
   assert.equal(called, 0, 'a valid frozen snapshot does not make its stale fixture audit valid');
+});
+
+test('an automatic whole-source receipt accepts compact all-root identities including an empty declared root', async t => {
+  let called = 0;
+  const f = await automaticAuditFixture(t, async context => {
+    called++;
+    assert.equal(context.workingDirectories?.length, 2);
+    return { command: context.command, exitCode: 65, stdout: 'Reached the genuine checker boundary', stderr: 'Intentional compiler failure; this fixture never invokes an SDK.',
+      startedAt: '2026-10-08T12:00:00.000Z', endedAt: '2026-10-08T12:00:01.000Z' };
+  });
+  assert.ok(f.audit.roots.every(root => root.entries.length === 0));
+  assert.equal(f.snapshot.manifest.roots.find(root => root.id === 'empty')!.entries.length, 0);
+  const result = await f.adapter.build(f.snapshot, f.profile, { authority });
+  assert.equal(called, 1, 'A valid automatic audit authorizes compilation, independently of its result');
+  assert.equal(result.status, 'failed'); assert.equal(result.report.commands[0]?.exitCode, 65);
+  assert.deepEqual(result.fixtureReceiptArtifact, f.profile.receipt); assert.equal(result.fixtureProfileId, f.profile.id);
+  assert.equal(result.product, undefined, 'Source judgment does not claim a successful build or runtime isolation');
+  const pack = JSON.parse((await f.artifacts.read(f.audit.sourceManifest)).toString());
+  assert.equal(pack.snapshot.sourceDigest, f.snapshot.sourceDigest); assert.equal(pack.snapshot.roots.length, 3);
+  await f.snapshots.verify(f.snapshot);
+});
+
+test('automatic whole-source receipts reject secondary-root mode changes and added files before compilation', async t => {
+  for (const mutation of ['mode', 'new file'] as const) await t.test(mutation, async inner => {
+    let called = 0;
+    const f = await automaticAuditFixture(inner, async () => { called++; throw new Error('Changed automatic audit source must not compile'); });
+    if (mutation === 'mode') await chmod(join(f.tokens, 'Tokens.swift'), 0o600);
+    else await writeFile(join(f.tokens, 'ProductionFallback.swift'), 'let unexpectedProductionFallback = true\n');
+    const changed = await f.snapshots.create({ roots: f.roots, context: authority });
+    await f.snapshots.verify(changed);
+    assert.notEqual(changed.sourceDigest, f.snapshot.sourceDigest);
+    assert.equal(changed.manifest.roots[0]!.sourceDigest, f.snapshot.manifest.roots[0]!.sourceDigest, 'The primary source is unchanged');
+    await assert.rejects(f.adapter.build(changed, f.profile, { authority }),
+      (error: unknown) => error instanceof NativeInspectionError && error.code === 'fixture-source-changed');
+    assert.equal(called, 0);
+  });
+});
+
+test('automatic receipts reject a substituted original source manifest even when the replacement is authentic', async t => {
+  let called = 0;
+  const f = await automaticAuditFixture(t, async () => { called++; throw new Error('Substituted original source must not compile'); });
+  await writeFile(join(f.tokens, 'Tokens.swift'), 'let differentSource = true\n');
+  const changed = await f.snapshots.create({ roots: f.roots, context: authority });
+  const replacement = await exportInspectionSnapshot({ snapshot: changed, artifacts: f.artifacts, context: authority });
+  assert.notEqual(replacement.sourceDigest, f.transfer.sourceDigest);
+  const substituted = await f.bindAudit({ ...f.audit, sourceManifest: replacement.sourceManifest });
+  await assert.rejects(f.adapter.build(f.snapshot, substituted, { authority }),
+    (error: unknown) => error instanceof NativeInspectionError && error.code === 'fixture-source-changed');
+  assert.equal(called, 0, 'An authentic unrelated manifest cannot replace the exact audited source');
+});
+
+test('automatic Mac receipt namespaces reject dot segments before touching the fixed fixture base or compiling', async t => {
+  let called = 0;
+  const f = await automaticAuditFixture(t, async () => { called++; throw new Error('Unsafe automatic Mac namespace must not compile'); });
+  for (const fixtureExpectedDataRoot of ['/tmp/enoughfactory-fixtures/{runId}/./mail', '/private/tmp/enoughfactory-fixtures/{runId}/../mail']) {
+    const selected = { id: 'automatic-mac-fixture', build: profile.build, launchArguments: profile.launchArguments, fixtureExpectedDataRoot };
+    const bound = await f.bindAudit({ ...f.audit, profileId: selected.id, ...selected }, selected);
+    await assert.rejects(f.adapter.build(f.snapshot, bound, { authority }),
+      (error: unknown) => error instanceof NativeInspectionError && error.code === 'fixture-required');
+    assert.equal(called, 0);
+  }
 });
 
 test('unchanged audited fixture source permits unrelated UI edits in a new frozen snapshot', { skip: process.platform !== 'darwin' }, async t => {

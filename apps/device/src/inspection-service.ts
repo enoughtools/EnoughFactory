@@ -6,7 +6,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import type { Attempt, ControllerRun, ExecutionCapability, ExecutionTargetAdvertisement, FactoryTask, Goal, InspectionAuthority, InspectionJob, InspectionSourceIdentity, InspectionVerificationRun, Project, TaskQualityRequirements } from '@enoughfactory/contracts';
 import { readJsonObject, type AttemptDetail } from '@enoughfactory/factory';
-import { ArtifactStore, InspectionSnapshotManager, exportInspectionContainerRoots, exportInspectionSnapshot, type ArtifactManifest, type InspectionSnapshot } from '@enoughfactory/workspaces';
+import { ArtifactStore, InspectionSnapshotManager, WorkspaceManager, exportInspectionContainerRoots, exportInspectionSnapshot, type ArtifactManifest, type InspectionSnapshot } from '@enoughfactory/workspaces';
 import { dockerInvocation } from '@enoughfactory/runtime';
 import { BrowserInspectionManager, type BrowserToolResult } from '@enoughfactory/browser-inspection';
 import { NativeInspectionBackend, type NativeAction } from '@enoughfactory/native-inspection';
@@ -22,6 +22,10 @@ import { NativeInspectionAdapter, type NativeFixtureProfile, type NativeInspecti
 import { NativeBuildRunner } from './inspection-build-runner.ts';
 import { InspectionQualityService, inspectionSourceContentMatches } from './inspection-quality.ts';
 import { InspectionVerifier } from './inspection-verifier.ts';
+import { evaluateObservedCondition } from './inspection-condition.ts';
+import { NativeProfileSetup } from './inspection-profile-setup.ts';
+import { NativeProfileSync } from './inspection-profile-sync.ts';
+import { HostDiskAdmission } from './host-disk-admission.ts';
 import { InspectionRetention } from './inspection-retention.ts';
 import { inspectionGoalQuality } from './inspection-goal-quality.ts';
 import { HttpError } from './util.ts';
@@ -33,6 +37,8 @@ const objectSchema=(properties:Record<string,unknown>,required:string[]=[])=>({t
 const string={type:'string'};
 const tools=[
   {name:'factory_capabilities',description:'Get actual execution and inspection readiness and configured native profiles.',inputSchema:objectSchema({})},
+  {name:'factory_native_profile_propose',description:'Set up testing for a new native app. Propose a fixed build and isolated fixture; Factory independently audits actual immutable source before issuing its profile receipt. No manual receipt or host SDK is needed for the source review. Poll factory_native_profile_status. Any source edit requires a fresh audit.',inputSchema:objectSchema({requestId:string,profile:{type:'object'},auditPaths:{type:'array',items:objectSchema({rootId:string,path:string,purposes:{type:'array',items:{type:'string',enum:['entry','storage','credentials','providers','preferences','notifications','build']}}},['rootId','path','purposes'])}},['requestId','profile','auditPaths'])},
+  {name:'factory_native_profile_status',description:'Read your independent native setup audit and concrete findings. Waiting preserves your source and author; unknown ownership is reconciled before the same review continues.',inputSchema:objectSchema({auditId:string,waitSeconds:{type:'integer',minimum:0,maximum:30}},['auditId'])},
   {name:'factory_native_build',description:'Capture your dirty/untracked source and build an exact private native product using a configured profile. Returns a durable job; poll it before launching.',inputSchema:objectSchema({profileId:string,requestId:string},['profileId','requestId'])},
   {name:'factory_job_status',description:'Read your durable build/session job. Waiting does not create another author attempt.',inputSchema:objectSchema({jobId:string,waitSeconds:{type:'integer',minimum:0,maximum:30}},['jobId'])},
   {name:'factory_native_start',description:'Launch your verified build with the configured isolated fixture. A shared Mac or Simulator lease queues fairly.',inputSchema:objectSchema({buildJobId:string,requestId:string},['buildJobId','requestId'])},
@@ -41,7 +47,7 @@ const tools=[
   {name:'factory_native_restart',description:'Restart the exact owned app in the same fixture and simulator, preserving its data. Requires a fresh observation and confirmed previous process exit.',inputSchema:objectSchema({sessionId:string,requestId:string,observationId:string},['sessionId','requestId','observationId'])},
   {name:'factory_browser_start',description:'Prepare an isolated Chromium browser sharing your author container localhost. Includes its supported tools.',inputSchema:objectSchema({requestId:string},['requestId'])},
   {name:'factory_browser_call',description:'Operate your own browser using its advertised Playwright tools. Inspect screenshot images and resulting state; fresh observation required for input.',inputSchema:objectSchema({sessionId:string,requestId:string,observationId:string,tool:string,arguments:{type:'object'}},['sessionId','requestId','tool','arguments'])},
-  {name:'factory_assert',description:'Check a condition against the last actual UI observation. Records the observed result; does not accept a model-written pass claim.',inputSchema:objectSchema({sessionId:string,observationId:string,labelIncludes:string,valueIncludes:string,absent:{type:'boolean'}},['sessionId','observationId','labelIncludes'])},
+  {name:'factory_assert',description:'Check a condition against the last actual UI observation. Records the observed result; does not accept a model-written pass claim.',inputSchema:objectSchema({sessionId:string,observationId:string,labelIncludes:string,valueIncludes:string,valueEquals:string,absent:{type:'boolean'}},['sessionId','observationId','labelIncludes'])},
   {name:'factory_stop',description:'Stop your owned native/browser session and release its lease after backend acknowledgement.',inputSchema:objectSchema({sessionId:string},['sessionId'])},
   {name:'factory_reference',description:'Inspect a supplied reference source or image in a declared workspace root. Returns original content and records its inspected identity.',inputSchema:objectSchema({referenceId:string,rootId:string,relativePath:string,sourceSnapshotId:string},['referenceId','rootId','relativePath','sourceSnapshotId'])},
   {name:'factory_quality_submit',description:'Submit workflow assertions and visual review against your configured quality contract. Verified screenshots and image delivery are checked independently.',inputSchema:objectSchema({report:{type:'object'}},['report'])},
@@ -73,6 +79,8 @@ export class InspectionService {
   readonly verifier:InspectionVerifier;
   readonly retention:InspectionRetention;
   readonly builds:NativeBuildRunner;
+  readonly profileSetup:NativeProfileSetup;
+  readonly profileSync?:NativeProfileSync;
   private readonly active=new Map<string,Promise<void>>();
   private readonly bridges=new Set<InspectionMcpBridge>();
   private readonly contexts=new Map<string,AgentToolBridgeContext>();
@@ -85,8 +93,8 @@ export class InspectionService {
     this.jobs=new InspectionJobs(app.store,{deviceId:app.device.id,authorityCurrent:authority=>this.authorityCurrent(authority)});
     this.snapshots=new InspectionSnapshotManager({dataDir:path.join(app.dataDir,'inspection'),artifacts:this.artifacts});
     this.quality=new InspectionQualityService({store:app.store,artifacts:this.artifacts,authorityCurrent:authority=>this.authorityCurrent(authority)});
-    this.verifier=new InspectionVerifier({app,chats,quality:this.quality,authorityCurrent:authority=>this.authorityCurrent(authority),readiness:()=>this.readiness(),reconcileInspection:(run,signal)=>this.reconcileVerifierInspection(run,signal)});
-    this.retention=new InspectionRetention({dataDir:path.join(app.dataDir,'inspection'),artifacts:this.artifacts,store:app.store,jobs:this.jobs,activeJobIds:()=>new Set(this.active.keys())});
+    this.verifier=new InspectionVerifier({app,chats,quality:this.quality,authorityCurrent:authority=>this.authorityCurrent(authority),readiness:()=>this.readiness(),delegatedReadiness:projectId=>this.delegation?.capabilities(projectId)??Promise.resolve([]),allowNativeProfileSetup:true,pendingNativeSetup:(authority,source)=>this.profileSetup?.pending(authority,source),reconcileInspection:(run,signal)=>this.reconcileVerifierInspection(run,signal)});
+    this.retention=new InspectionRetention({dataDir:path.join(app.dataDir,'inspection'),artifacts:this.artifacts,store:app.store,jobs:this.jobs,activeJobIds:()=>new Set(this.active.keys()),protectedSnapshotIds:()=>new Set(this.profileSetup?.list().filter(run=>['queued','preparing','running','waiting','unknown'].includes(run.status)).map(run=>run.source.snapshotId))});
     this.browser=new BrowserInspectionManager({endpoint:app.runtime.endpoint,dataDir:path.join(app.dataDir,'inspection','browser'),artifacts:this.artifacts,onRecord:()=>app.changed()});
     const backend=new NativeInspectionBackend({directory:path.join(app.dataDir,'inspection','native-sessions')});
     this.native=new NativeInspectionAdapter({dataDir:path.join(app.dataDir,'inspection'),artifacts:this.artifacts,backend,verifySnapshot:async(snapshot,signal)=>{
@@ -97,6 +105,51 @@ export class InspectionService {
       if(snapshot.path.startsWith(path.join(app.dataDir,'inspection','inspection-snapshots')+path.sep))await this.snapshots.verify(snapshot,signal);else await this.verifier.verifySnapshot(snapshot,signal);
     }});
     if(network)this.delegation=new InspectionDelegation({app,peers:network.peers,jobs:this.jobs,native:this.native,builds:this.builds,artifacts:this.artifacts,profiles:id=>this.profiles(id),localAuthorityCurrent:authority=>this.localAuthorityCurrent(authority),capture:(context,authority)=>this.capture(context,authority)});
+    this.profileSetup=new NativeProfileSetup({app,chats,artifacts:this.artifacts,snapshots:this.snapshots,authorityCurrent:authority=>this.authorityCurrent(authority),verifySnapshot:async(snapshot,signal)=>{if(snapshot.path.startsWith(path.join(app.dataDir,'inspection','inspection-snapshots')+path.sep))await this.snapshots.verify(snapshot,signal);else await this.verifier.verifySnapshot(snapshot,signal);},readiness:()=>this.readiness(),sourceCurrent:async(sessionId,authority,signal)=>{
+      const session=app.sessions.record(sessionId),execution=app.sessions.execution(sessionId),context={session,execution,signal,chat:{id:'source-audit-current',sessionId,runtime:'codex'} as AgentToolBridgeContext['chat']};
+      const current=await this.captureActual(context,authority,false);try{return current.source;}finally{await this.snapshots.remove(current.snapshot);}
+    },retainSnapshot:async(snapshot,authority)=>{await this.retention.retain(snapshot,authority);},configure:(projectId,profile)=>this.configureProfile(projectId,profile),retireReviewer:run=>this.retireProfileReviewer(run)});
+    if(network)this.profileSync=new NativeProfileSync({app,peers:network.peers,artifacts:this.artifacts,auditOriginal:async id=>{const original=this.profileSetup.original(id),configured=this.profiles(original.audit.projectId).find(profile=>profile.id===original.audit.proposal.profile.id);if(configured?.receipt?.sha256!==original.audit.receipt?.sha256)throw new Error('A newer independently audited profile superseded this source receipt.');return original;},authorityCurrent:authority=>this.authorityCurrent(authority),auditApproved:run=>this.profileSetup.approved(run),configure:(projectId,profile)=>this.configureProfile(projectId,profile)});
+  }
+  private configureProfile(projectId:string,profile:NativeFixtureProfile):void{const profiles=this.profiles(projectId).filter(current=>current.id!==profile.id);if(profiles.length>=16)throw new Error('The project already has sixteen native fixture profiles.');this.app.store.set('inspection-project-profiles',{id:projectId,profiles:[...profiles,profile]});this.app.emit('inspection-evidence',{projectId,profileId:profile.id,purpose:'native-profile-ready'});this.app.changed();}
+  private async syncNativeProfiles():Promise<void>{if(!this.profileSync)return;await this.profileSync.reconcilePending();for(const run of this.profileSetup.list().filter(run=>run.status==='configured'&&this.authorityCurrent(run.authority))){const profile=this.profiles(run.projectId).find(profile=>profile.id===run.proposal.profile.id&&profile.receipt?.sha256===run.receipt?.sha256);if(!profile)continue;for(const device of this.app.devices.filter(device=>device.id!==this.app.device.id&&device.online&&device.executionTargets?.some(target=>target.kind==='host-macos'))){try{await this.profileSync.sync(run,profile,device.id);}catch(error){this.app.emit('inspection-setup',{auditId:run.id,deviceId:device.id,error:(error as Error).message});}}}}
+  private async retireProfileReviewer(run:import('./inspection-profile-setup.ts').NativeProfileAudit):Promise<void>{
+    if(!run.sessionId)return;
+    const session=this.app.sessions.record(run.sessionId),project=this.app.store.get<Project>('projects',session.projectId);
+    if(!project||project.id!==`workspace-${run.id}`||session.verificationRunId!==run.id||!this.app.sessions.owns(session.id))throw new Error('Source reviewer cleanup lost its exact session owner.');
+    const root=path.join(this.app.dataDir,'workspace-data','workspaces',run.id),repository=path.join(root,'repository'),bucket='inspection-profile-audit-retirement';
+    type Retirement={id:string;sessionId:string;chatId?:string;root:string;proposalSha256:string;source:import('@enoughfactory/workspaces').InspectionSnapshotTransfer;createdAt:string;disposeStartedAt?:string;retiredAt?:string};
+    let journal=this.app.store.get<Retirement>(bucket,run.id);
+    const assertCurrent=()=>{const current=this.profileSetup.get(run.id);if(!['configured','rejected','canceled'].includes(current.status)||current.chatId!==run.chatId||current.sessionId!==session.id||run.chatId&&this.chats.isRunning(run.chatId))throw new Error('Source reviewer cleanup no longer has a confirmed ended owner.');};assertCurrent();
+    if(project.path!==repository||journal&&(journal.sessionId!==session.id||journal.chatId!==run.chatId||journal.root!==root||journal.proposalSha256!==run.proposalSha256))throw new Error('Source reviewer retirement identity changed.');
+    if(journal?.retiredAt)return;
+    let rootMissing=false;try{if(await realpath(root)!==root)throw new Error('Source reviewer workspace escaped its owned directory.');}catch(error){if((error as NodeJS.ErrnoException).code!=='ENOENT')throw error;rootMissing=true;}
+    if(rootMissing){
+      const released=session.executionTargetKind==='host-macos'?!!this.app.store.get<{releasedAt?:string}>('session-host',session.id)?.releasedAt:!!this.app.sessions.archivedEnvironment(session.id);
+      if(!journal?.disposeStartedAt||session.status!=='stopped'||!released)throw new Error('Source reviewer scratch disappeared without a confirmed durable retirement.');
+      for(const artifact of [journal.source.sourceManifest,...journal.source.sourceArtifacts.map(item=>item.manifest)])await this.artifacts.path(artifact);
+      this.app.store.set(bucket,{...journal,retiredAt:new Date().toISOString()});return;
+    }
+    const owner=JSON.parse(await readFile(path.join(root,'audit-owner.json'),'utf8'));
+    if(owner.runId!==run.id||owner.deviceId!==run.ownerDeviceId||owner.proposalSha256!==run.proposalSha256||JSON.stringify(owner.source)!==JSON.stringify(run.source))throw new Error('Source reviewer cleanup owner changed.');
+    if(session.status!=='stopped')await this.app.sessions.stop(session.id);
+    if(!journal){
+      const host=session.executionTargetKind==='host-macos'?this.app.store.get<{prepared:{cwd:string};releasedAt?:string}>('session-host',session.id):undefined;
+      if(host?.releasedAt)throw new Error('The native reviewer input was released before its source was retained.');
+      if(host)await this.app.sessions.assertHostExecutionCurrent(session.id);
+      const preserved=await this.snapshots.create({roots:[{id:'primary',name:'primary',path:host?.prepared.cwd??repository}],includeAll:true,context:run.authority});
+      try{const source=await exportInspectionSnapshot({snapshot:preserved,artifacts:this.artifacts,context:run.authority});journal={id:run.id,sessionId:session.id,chatId:run.chatId,root,proposalSha256:run.proposalSha256,source,createdAt:new Date().toISOString()};this.app.store.set(bucket,journal);}finally{await this.snapshots.remove(preserved);}
+    }
+    assertCurrent();
+    if(session.executionTargetKind==='host-macos'){
+      await this.app.sessions.withStoppedInputs(session.id,async()=>{const processes=(await this.chats.manager.hostProcesses()).filter(process=>process.sessionId===session.id||process.sessionId.startsWith(`${session.id}-decision-`));if(processes.some(process=>process.state!=='exited'))throw new Error('The source reviewer provider still has unresolved ownership.');for(const providerSession of new Set([session.id,...processes.map(process=>process.sessionId)]))await this.chats.manager.retireHostSession(providerSession,this.app.store.get<{prepared:{cwd:string}}>('session-host',session.id)?.prepared.cwd??repository);await this.app.sessions.disposeHostWorkspace(session.id);});
+    }else if(!this.app.sessions.archivedEnvironment(session.id)){
+      const disk=new HostDiskAdmission(()=>[this.app.dataDir],()=>this.app.device.name);
+      await this.app.withRuntimeOperation(()=>this.app.sessions.withRetirementLease(session.id,()=>this.chats.manager.withIdleContainer(this.app.sessions.retirementContainerName(session.id),()=>this.app.sessions.retireEphemeralEnvironment(session.id,this.app.dataDir,{assertCurrent,assertSpace:()=>disk.assert(),runtimeKinds:['codex']}))));
+    }
+    assertCurrent();journal={...journal!,disposeStartedAt:journal?.disposeStartedAt??new Date().toISOString()};this.app.store.set(bucket,journal);
+    await new WorkspaceManager({dataDir:path.join(this.app.dataDir,'workspace-data'),deviceId:this.app.device.id}).dispose(run.id);
+    this.app.store.set(bucket,{...journal,retiredAt:new Date().toISOString()});
   }
   authorityCurrent(authority:InspectionAuthority):boolean{return this.localAuthorityCurrent(authority)||Boolean(this.delegation?.acceptedAuthorityCurrent(authority));}
   localAuthorityCurrent(authority:InspectionAuthority):boolean{
@@ -108,7 +161,7 @@ export class InspectionService {
     return Boolean(worker&&worker.goal.id===authority.goalId&&worker.goal.revision===authority.goalRevision&&worker.task.id===authority.taskId&&worker.attempt.generation===authority.authorityGeneration&&['preparing','prepared','running'].includes(worker.status));
   }
   async initialize():Promise<void>{
-    this.jobs.recoverAfterRestart();this.delegation?.initialize();this.verifier.recover();
+    this.jobs.recoverAfterRestart();this.delegation?.initialize();this.verifier.recover();this.profileSetup.recover();this.profileSync?.initialize();
     this.chats.setToolBridge(context=>this.bridge(context));
     this.app.extensions.push(async({method,url,body,peerId})=>{
       if(method==='GET'&&url.pathname==='/api/inspection/readiness')return {executionTargets:await this.readiness()};
@@ -116,6 +169,7 @@ export class InspectionService {
       if(method==='GET'&&task){const jobs=this.jobs.listJobs().filter(job=>job.authority.taskId===task[1]),remote=this.delegation?.taskInspection(task[1]);const unique=<T extends {id:string}>(items:T[])=>[...new Map(items.map(item=>[item.id,item])).values()];return {jobs:unique([...jobs,...remote?.jobs||[]]),sessions:unique([...jobs.flatMap(job=>this.jobs.sessions(job.id)),...remote?.sessions||[]]),evidence:unique([...jobs.flatMap(job=>this.jobs.evidence(job.id)),...remote?.evidence||[]]),verifiers:this.app.store.list<InspectionVerificationRun>('inspection-verifier-runs').filter(run=>run.authority.taskId===task[1])};}
       const profiles=url.pathname.match(/^\/api\/projects\/([^/]+)\/inspection-profiles$/);
       if(profiles&&method==='GET')return this.profiles(profiles[1]);
+      const profileAudits=url.pathname.match(/^\/api\/projects\/([^/]+)\/inspection-profile-audits$/);if(profileAudits&&method==='GET')return this.profileSetup.list(profileAudits[1]).map(run=>this.profileSetup.publicView(run));
       if(profiles&&method==='PUT'){
         if(peerId)throw new HttpError(403,'Configure native fixture profiles on the owning device.');
         if(!this.app.store.get<Project>('projects',profiles[1]))throw new HttpError(404,'Project not found.');
@@ -125,13 +179,13 @@ export class InspectionService {
       }
       return undefined;
     });
-    this.app.serviceActivityHooks.push(()=>{const verifiers=this.app.store.list<InspectionVerificationRun>('inspection-verifier-runs').filter(run=>['preparing','running','unknown'].includes(run.status)||run.status==='waiting'&&Boolean(run.sessionId));const held=this.jobs.listJobs().filter(job=>['preparing','running','waiting','unknown','cancellation-requested'].includes(job.status));return held.length||verifiers.length?[`${held.length} inspection job(s) and ${verifiers.length} verifier(s) have active or unresolved ownership.`]:[];});
+    this.app.serviceActivityHooks.push(()=>{const verifiers=this.app.store.list<InspectionVerificationRun>('inspection-verifier-runs').filter(run=>['preparing','running','unknown'].includes(run.status)||run.status==='waiting'&&Boolean(run.sessionId));const held=this.jobs.listJobs().filter(job=>['preparing','running','waiting','unknown','cancellation-requested'].includes(job.status)),audits=this.profileSetup.list().filter(run=>['queued','preparing','running','unknown'].includes(run.status));return held.length||verifiers.length||audits.length?[`${held.length} inspection job(s), ${verifiers.length} verifier(s) and ${audits.length} source audit(s) have active or unresolved ownership.`]:[];});
     this.app.closers.push(()=>this.close());
     void this.app.withServiceOperation(async()=>{await this.recoverOwnedSessions();await this.recoverOwnedBuilds();}).catch(error=>this.app.emit('inspection-error',{error:(error as Error).message}));
     this.timer=setInterval(()=>{
       if(this.closing||this.maintaining)return;
       this.maintaining=this.app.withServiceOperation(async()=>{
-        const outcomes=await Promise.allSettled([this.readiness(),this.recoverOwnedBuilds(),this.retireIdleBrowsers(),this.retention.sweep(),this.retireColdProducts(),this.verifier.sweepCompleted(run=>this.canRetireVerifier(run))]);
+        this.profileSetup.maintain();const outcomes=await Promise.allSettled([this.readiness(),this.recoverOwnedBuilds(),this.retireIdleBrowsers(),this.retention.sweep(),this.retireColdProducts(),this.verifier.sweepCompleted(run=>this.canRetireVerifier(run)),this.syncNativeProfiles()]);
         for(const outcome of outcomes)if(outcome.status==='rejected')this.app.emit('inspection-error',{error:(outcome.reason as Error).message});
       }).catch(error=>this.app.emit('inspection-error',{error:(error as Error).message})).finally(()=>{this.maintaining=undefined;});
     },30000);this.timer.unref();
@@ -149,8 +203,10 @@ export class InspectionService {
       const detail=this.app.store.get<AttemptDetail>('factory-attempt-details',input.attempt.id),revision=detail?.assignmentGoalRevision??detail?.goalRevision??input.goal.revision;
       const authority:InspectionAuthority={goalId:input.goal.id,goalRevision:revision,taskId:input.task.id,attemptId:input.attempt.id,authorityGeneration:input.attempt.generation,policyRevision:revision};
       const source:InspectionSourceIdentity={snapshotId:snapshot.id,sha256:snapshot.sourceDigest,candidateId:input.candidate.id,candidateCommit:input.candidate.commit,checkedCommit:input.checkedCommit,roots:snapshot.roots.map(root=>({id:root.id,sha256:root.sourceDigest,...(root.sourceCommit?{commit:root.sourceCommit}:{})}))};
+      this.profileSetup.bindCandidate(authority,input.candidate,source);
       const checked=await this.quality.check({authority,quality:input.quality,source,candidateCommit:input.candidate.commit,checkedCommit:input.checkedCommit});
       if(checked.passed||!checked.recovery)return checked;
+      const setup=this.profileSetup.pending(authority,source);if(setup&&setup.status!=='rejected'){this.profileSetup.maintain();return{...checked,output:`Native testing setup is ${setup.status}: ${setup.reason} The successful author and exact candidate remain retained.`,recovery:checked.recovery};}
       const project=this.app.store.get<Project>('projects',input.goal.projectId);if(!project)throw new Error('The verification project is unavailable.');
       const run=await this.verifier.ensure({authority,quality:input.quality,source,snapshot,project,signal:input.signal});
       if(run.status==='succeeded')return this.quality.check({authority,quality:input.quality,source,candidateCommit:input.candidate.commit,checkedCommit:input.checkedCommit});
@@ -183,6 +239,7 @@ export class InspectionService {
   }
   private async bridge(context:AgentToolBridgeContext):Promise<AgentToolBridge|undefined>{
     if(context.chat.runtime!=='codex')return;
+    if(context.chat.verificationRunId?.startsWith('profile-audit-'))return this.profileSetup.bridge(context);
     const verification=await this.verifier.verificationSource(context),authority=verification?.run.authority||this.authority(context);if(!authority)return this.controllerBridge(context);
     const key=`${authority.attemptId}-${authority.authorityGeneration}-${authority.goalRevision}`;
     let saved=this.app.store.get<GrantToken>('inspection-private-tokens',key);
@@ -192,7 +249,7 @@ export class InspectionService {
     const handler=inspectionMcpHandler(tools,async(name,args)=>this.app.withServiceOperation(async()=>{this.jobs.authorize(token);if(context.signal.aborted)throw new Error('The author turn was canceled.');return this.call(context,token,name,args);}));
     const bridge=context.execution.kind==='host-macos'?await createHostInspectionBridge(token,handler):await createContainerInspectionBridge(this.app.runtime.endpoint,context.execution.containerId!,token,handler);
     this.bridges.add(bridge);
-    return {mcpServers:{factory:bridge.server},systemInstructions:'Factory inspection tools are available. Use factory_capabilities first. Capture/build your actual source, open it, view screenshot image responses, operate fresh element IDs, check resulting state and repair serious defects. Native builds and UI sessions are different durable jobs; poll queued/running jobs with factory_job_status. Finish or explicitly stop all inspection jobs before ending your turn. Use configured isolated native fixture profiles; do not launch personal-data instances. Compiling alone is not product acceptance. If factory_capabilities returns a quality contract, you may submit factory_quality_submit. Factory independently verifies missing evidence after authoring. Report schema: report={version:1,source:job.source,workflows:[{id:requiredWorkflowId,platform,before:screenshotEvidenceId,action:actionId,after:screenshotEvidenceId,outcome:passedOrFailedOrBlocked,assertion:concreteObservedResult,assertionEvidenceId}],reviews:[{platform,observations:[screenshotEvidenceId],references:[{id:requiredReferenceId,comparison:concreteComparison}],dimensions:{hierarchy,spacing,clipping,typography,controls,states},defects:[{id,severity:minorOrMajorOrBlocking,status:openOrRepaired,description,observation:screenshotEvidenceId}]}]}. IDs must come from actual tool receipts; all six dimensions need concrete review text. Inspect supplied reference files via factory_reference and actual screenshot images. A report with missing receipts is a durable evidence wait; serious defects require repair.',onToolImage:async(image)=>{
+    return {mcpServers:{factory:bridge.server},systemInstructions:'Factory inspection tools are available. Use factory_capabilities first. Capture/build your actual source, open it, view screenshot image responses, operate fresh element IDs, check resulting state and repair serious defects. Native builds and UI sessions are different durable jobs; poll queued/running jobs with factory_job_status. Finish or explicitly stop all inspection jobs before ending your turn. For a new native app with no matching profile, use factory_native_profile_propose with its fixed xcodebuild recipe, per-run fixture arguments and original source starting paths for entry/storage/credentials/providers/preferences/notifications/build. Poll factory_native_profile_status; the service independently reviews original source and issues its receipt. Changed compiled source needs a fresh profile audit. Use configured isolated native fixture profiles; do not launch personal-data instances. Compiling alone is not product acceptance. If factory_capabilities returns a quality contract, you may submit factory_quality_submit. Factory independently verifies missing evidence after authoring. Report schema: report={version:1,source:job.source,workflows:[{id:requiredWorkflowId,platform,before:screenshotEvidenceId,action:actionId,after:screenshotEvidenceId,outcome:passedOrFailedOrBlocked,assertion:concreteObservedResult,assertionEvidenceId}],reviews:[{platform,observations:[screenshotEvidenceId],references:[{id:requiredReferenceId,comparison:concreteComparison}],dimensions:{hierarchy,spacing,clipping,typography,controls,states},defects:[{id,severity:minorOrMajorOrBlocking,status:openOrRepaired,description,observation:screenshotEvidenceId}]}]}. IDs must come from actual tool receipts; all six dimensions need concrete review text. Inspect supplied reference files via factory_reference and actual screenshot images. A report with missing receipts is a durable evidence wait; serious defects require repair.',onToolImage:async(image)=>{
       const sha256=createHash('sha256').update(image.bytes).digest('hex');
       const existing=[...this.jobs.listJobs(authority).flatMap(job=>this.jobs.evidence(job.id)),...this.delegation?.evidenceForAuthority(authority)||[]].find(evidence=>evidence.kind==='screenshot'&&evidence.artifact.sha256===sha256)?.artifact;
       const artifact=existing||await this.artifacts.put(image.bytes,{goalId:authority.goalId,taskId:authority.taskId,attemptId:authority.attemptId,name:`inspection-${sha256.slice(0,12)}.png`,mime:image.mimeType});
@@ -395,7 +452,7 @@ export class InspectionService {
     }));
     const token=randomBytes(32).toString('base64url');
     const bridge=context.execution.kind==='host-macos'?await createHostInspectionBridge(token,handler):await createContainerInspectionBridge(this.app.runtime.endpoint,context.execution.containerId!,token,handler);this.bridges.add(bridge);
-    return {mcpServers:{factory_review:bridge.server},systemInstructions:'Use factory_review_screens, factory_review_image, factory_review_evidence and factory_review_reference before judging app completion. Inspect original pixels and measured workflow assertions. The list provides current integrated source and quality requirements. If quality is present, your completion decision must include visualReview:{source:theCurrentSource,reviews:[{platform,observations:[actualScreenshotEvidenceId],references:[{id,comparison:concreteReferenceComparison}],dimensions:{hierarchy,spacing,clipping,typography,controls,states},defects:[{id,severity,status,description,observation}]}]}. View every screenshot you cite and inspect each required reference file yourself. Include all six dimensions as concrete critique text. Keep older source identities explicit; screenshot presence and accepted task counts alone do not establish current acceptance.',onToolImage:async image=>{
+    return {mcpServers:{factory_review:bridge.server},systemInstructions:'Use factory_review_screens, factory_review_image, factory_review_evidence and factory_review_reference before judging app completion. Inspect original pixels and measured workflow assertions. The list provides current integrated source and quality requirements. If quality is present, your completion decision must include visualReview:{source:theCurrentSource,reviews:[{platform,observations:[actualScreenshotEvidenceId],references:[{id,comparison:concreteReferenceComparison}],dimensions:{hierarchy,spacing,clipping,typography,controls,states},defects:[{id,severity:minorOrMajorOrBlocking,status:openOrRepaired,description,observation}]}]}. View every screenshot you cite and inspect each required reference file yourself. Include all six dimensions as concrete critique text. Keep older source identities explicit; screenshot presence and accepted task counts alone do not establish current acceptance.',onToolImage:async image=>{
       current();const sha256=createHash('sha256').update(image.bytes).digest('hex');
       const screenshot=this.jobs.listJobs().filter(job=>job.authority.goalId===goal.id).flatMap(job=>this.jobs.evidence(job.id)).find(item=>item.kind==='screenshot'&&item.artifact.sha256===sha256);
       const reference=this.app.store.list<{id:string;controllerRunId:string;artifacts:ArtifactManifest[]}>('controller-reference-views').filter(view=>view.controllerRunId===run.id).flatMap(view=>view.artifacts).find(artifact=>artifact.sha256===sha256);
@@ -427,6 +484,12 @@ export class InspectionService {
   private async call(context:AgentToolBridgeContext,token:string,name:string,args:Record<string,unknown>):Promise<unknown>{
     const authority=this.jobs.authorize(token).authority;
     const verification=context.chat.verificationRunId?await this.verifier.verificationSource(context):undefined;
+    if(name==='factory_native_profile_status')return result(this.profileSetup.publicView(await this.profileSetup.status(String(args.auditId),authority,Number(args.waitSeconds)||0)));
+    if(name==='factory_native_profile_propose'){
+      const project=this.app.store.get<Project>('projects',context.session.projectId),projectId=project?.sourceProjectId||project?.id;if(!projectId)throw new Error('Native setup project is unavailable.');
+      const source=await this.capture(context,authority);
+      return result({audit:this.profileSetup.publicView(await this.profileSetup.propose({requestId:String(args.requestId),proposal:{profile:args.profile,auditPaths:args.auditPaths},authority,source:source.source,snapshot:source.snapshot,projectId,sourceSessionId:context.session.id,sourceChatId:context.chat.id}))});
+    }
     const delegated=await this.delegation?.dispatch(context,token,name,args);if(delegated!==undefined)return delegated;
     if(name==='factory_quality_submit'){
       const detail=this.app.store.get<AttemptDetail>('factory-attempt-details',authority.attemptId),quality=verification?.run.quality||detail?.contract?.quality||this.app.store.get<FactoryTask>('tasks',authority.taskId)?.quality;
@@ -468,7 +531,7 @@ export class InspectionService {
       if(prior){if(prior.requestHash!==requestHash)throw new Error('Inspection request id was reused for different arguments.');return result({job:this.ownJob(token,prior.jobId),replayed:false});}
       const isBuild=name==='factory_native_build';
       const project=this.app.store.get<Project>('projects',context.session.projectId),profile=isBuild?this.profiles(project?.sourceProjectId||project?.id||'').find(profile=>profile.id===args.profileId):undefined;
-      if(isBuild&&!profile)throw new Error('Configure a verified native build/fixture profile on the project first.');
+      if(isBuild&&!profile)throw new Error(`Set up this native app with factory_native_profile_propose, then poll factory_native_profile_status. Its independent source audit issues the configured profile. Existing setup audits: ${JSON.stringify(this.profileSetup.list(project?.sourceProjectId||project?.id||'').map(run=>({id:run.id,profileId:run.proposal.profile.id,status:run.status,reason:run.reason})))}`);
       if(!isBuild&&context.execution.kind!=='container')throw new Error('Browser inspection currently requires a container author. Native authors use the Mac/iPhone inspection tools.');
       const source=await this.capture(context,authority);
       const job=this.jobs.createJob(token,{idempotencyKey:String(args.requestId),executionTargetId:isBuild?'mac-host':'container',capability:isBuild?'apple-compilation':'chromium-inspection',source:source.source,profile:isBuild?{profileId:profile!.id}:{}});
@@ -495,8 +558,7 @@ export class InspectionService {
       const structured=this.app.store.get<{id:string;elements:Array<{label?:string;identifier?:string;value?:string}>;truncated:boolean}>('inspection-structured-observations',String(args.observationId));
       if(!structured)throw new Error('This observation has no complete structured assertions. Use a native observation or a browser assertion tool.');
       if(args.absent===true&&structured.truncated)throw new Error('A truncated observation cannot prove an element is absent.');
-      const matches=structured.elements.filter(element=>(element.label||element.identifier||'').includes(needle));
-      const passed=args.absent===true?matches.length===0:matches.some(element=>typeof args.valueIncludes!=='string'||(element.value||'').includes(args.valueIncludes));
+      const passed=evaluateObservedCondition(structured.elements,{labelIncludes:needle,...(args.valueIncludes!==undefined?{valueIncludes:args.valueIncludes as string}:{}),...(args.valueEquals!==undefined?{valueEquals:args.valueEquals as string}:{}),...(args.absent===true?{absent:true}:{})});
       const artifact=await this.artifacts.put(JSON.stringify({passed,observationId:args.observationId,condition:args,observedAt:observation?.createdAt}),{goalId:authority.goalId,taskId:authority.taskId,attemptId:authority.attemptId,name:'workflow-assertion.json',mime:'application/json'});
       const evidence=this.jobs.publishEvidence(session.jobId,{kind:'assertion',sessionId:session.id,artifact,metadata:{passed,observationId:args.observationId,platform:backend.kind==='browser'?'web':session.capability==='macos-app-inspection'?'macos':'ios-simulator'}});this.app.store.set('factory-artifacts',artifact);return result({passed,evidenceId:evidence.id});
     }
@@ -674,7 +736,7 @@ export class InspectionService {
   async close():Promise<void>{
     this.closing=true;if(this.timer)clearInterval(this.timer);for(const bridge of this.bridges)await bridge.close();this.bridges.clear();
     for(const job of this.jobs.listJobs().filter(job=>job.ownerDeviceId===this.app.device.id&&['preparing','running','waiting','cancellation-requested'].includes(job.status)))this.jobs.markUnknown(job.id,'Device service closed; reconcile owned effects before replacement.');
-    await this.verifier.close();await this.delegation?.close();await this.builds.close();await this.native.closeTransport();
+    await this.profileSetup.close();await this.verifier.close();await this.delegation?.close();await this.builds.close();await this.native.closeTransport();
   }
 }
 

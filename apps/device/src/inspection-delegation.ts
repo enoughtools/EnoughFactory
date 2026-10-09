@@ -100,7 +100,7 @@ export class InspectionDelegation {
     else if (name === 'factory_observe') operation = { name: 'observe', arguments: { sessionId: id } };
     else if (name === 'factory_native_restart') operation = { name: 'restart', arguments: { sessionId: id, observationId: args.observationId } };
     else if (name === 'factory_stop') operation = { name: 'stop', arguments: { sessionId: id } };
-    else if (name === 'factory_assert') operation = { name: 'run-tests', arguments: { sessionId: id, observationId: args.observationId, assertions: [{ labelIncludes: args.labelIncludes, ...(typeof args.valueIncludes === 'string' ? { valueIncludes: args.valueIncludes } : {}), ...(args.absent === true ? { absent: true } : {}) }] } };
+    else if (name === 'factory_assert') operation = { name: 'run-tests', arguments: { sessionId: id, observationId: args.observationId, assertions: [{ labelIncludes: args.labelIncludes, ...(typeof args.valueIncludes === 'string' ? { valueIncludes: args.valueIncludes } : {}), ...(args.valueEquals !== undefined ? { valueEquals: args.valueEquals } : {}), ...(args.absent === true ? { absent: true } : {}) }] } };
     else if (name === 'factory_native_action') {
       const action = args.action as Record<string, unknown>;
       if (!action || !['click', 'type', 'key', 'scroll'].includes(String(action.kind))) throw new HttpError(400, 'Choose a supported native action.');

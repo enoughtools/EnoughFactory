@@ -42,7 +42,7 @@ function plan(tasks: PlannedTask[], checks = ["original-project-check"]): PlanRe
   return { summary: "Deliver independent work and its required dependencies", criteria: ["Requested behavior works"], checks, tasks };
 }
 
-function harness(initialPlan: PlanResponse, options: { capacity?: number; cpus?: number; coordinatorId?: string } = {}) {
+function harness(initialPlan: PlanResponse, options: { capacity?: number; cpus?: number; coordinatorId?: string; additionalActiveAgents?: (goalId: string) => number } = {}) {
   const store = new MemoryStore();
   const device: Device = {
     id: "worker", name: "Factory worker", platform: "linux", arch: "x64", online: true, local: true,
@@ -93,7 +93,7 @@ function harness(initialPlan: PlanResponse, options: { capacity?: number; cpus?:
     },
     async inspect() { return { head: "integrated-head", branch: "main", status: "" }; },
   };
-  const coordinator = new FactoryCoordinator({ store, runtime, workspaces, deviceId: options.coordinatorId ?? device.id, devices: () => [device], project: id => id === project.id ? project : undefined });
+  const coordinator = new FactoryCoordinator({ store, runtime, workspaces, deviceId: options.coordinatorId ?? device.id, devices: () => [device], project: id => id === project.id ? project : undefined, additionalActiveAgents: options.additionalActiveAgents });
   const goal = coordinator.create({ projectId: project.id, objective: "Deliver the requested behavior", criteria: ["Requested behavior works"] });
   const task = (key: string) => store.list<FactoryTask>("tasks").find(task => keyFor(task.id) === key)!;
   const detail = (key: string) => store.get<TaskDetail>("factory-task-details", task(key).id)!;
@@ -115,6 +115,29 @@ function harness(initialPlan: PlanResponse, options: { capacity?: number; cpus?:
     },
   };
 }
+
+test("a native setup audit holds the goal's only agent slot until its claim ends", async () => {
+  let audits = 0, observedGoal: string | undefined;
+  const factory = harness(plan([planned("first"), planned("second")]), { additionalActiveAgents: goalId => { observedGoal = goalId; return audits; } });
+  factory.coordinator.configure(factory.goal.id, { concurrency: 1 });
+  try {
+    await factory.startPlan();
+    await factory.coordinator.tick();
+    await settle(() => factory.calls.executions.length === 1, "first author entered");
+    assert.deepEqual(factory.calls.executions, ["first"]);
+    audits = 1;
+    factory.finish("first");
+    await settle(() => factory.task("first").status === "completed", "first author integrated while its queued audit claimed the slot");
+    await factory.coordinator.tick();
+    assert.equal(observedGoal, factory.goal.id);
+    assert.deepEqual(factory.calls.executions, ["first"], "A ready second task cannot overlap the active audit under Maximum agents 1");
+    assert.equal(factory.task("second").currentAttemptId, undefined, "Waiting for the audit does not spend an author attempt");
+    audits = 0;
+    await factory.coordinator.tick();
+    await settle(() => factory.calls.executions.length === 2, "second author entered after audit completion");
+    assert.deepEqual(factory.calls.executions, ["first", "second"]);
+  } finally { await factory.close(); }
+});
 
 test("localized replanning preserves unrelated running authority, immutable checks and queued work", async () => {
   const factory = harness(plan([

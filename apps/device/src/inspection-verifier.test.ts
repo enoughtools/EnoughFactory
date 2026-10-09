@@ -251,12 +251,12 @@ const linuxReviewer: ExecutionTargetAdvertisement = { id: 'private-linux', kind:
 const pairedMac: DelegatedNativeInspectionReadiness = { deviceId: 'paired-mac', name: 'Paired Mac', executionTargets: ready, profiles: [{ id: 'isolated-mac-app', platform: 'macos' }] };
 
 /** Real retained source and verifier lifecycle; no provider/OS/peer effects are started. */
-async function pairedVerifierFixture(t: TestContext, quality: TaskQualityRequirements = { platforms: ['macos'], workflows: [{ id: 'close-draft', platform: 'macos' }], referenceIds: ['enough-ui'] }) {
+async function pairedVerifierFixture(t: TestContext, quality: TaskQualityRequirements = { platforms: ['macos'], workflows: [{ id: 'close-draft', platform: 'macos' }], referenceIds: ['enough-ui'] }, overrides: Partial<InspectionVerifierOptions> = {}) {
   const f = await fixture(t);
   let localTargets: ExecutionTargetAdvertisement[] = [linuxReviewer];
   let pairedTargets: DelegatedNativeInspectionReadiness[] = [structuredClone(pairedMac)];
   const projectQueries: string[] = [];
-  const verifier = f.anotherVerifier({ readiness: async () => localTargets, delegatedReadiness: async projectId => { projectQueries.push(projectId); return pairedTargets; } });
+  const verifier = f.anotherVerifier({ readiness: async () => localTargets, delegatedReadiness: async projectId => { projectQueries.push(projectId); return pairedTargets; }, ...overrides });
   return { ...f, verifier, input: { ...f.input, quality }, projectQueries,
     local: (targets: ExecutionTargetAdvertisement[]) => { localTargets = targets; }, paired: (targets: DelegatedNativeInspectionReadiness[]) => { pairedTargets = targets; } };
 }
@@ -299,6 +299,49 @@ test('paired native verifier admission retains source and waits for an actual co
     assert.equal(resumed.id, waiting.id); assert.equal(resumed.executionTargetKind, 'container');
     assert.equal(resumed.status, 'failed'); assert.equal(f.calls.length, 1);
     assert.deepEqual(resumed.source, waiting.source); assert.deepEqual(resumed.authority, waiting.authority);
+  });
+});
+
+test('first native profile setup admits a source-only Linux verifier only through an explicit service option', async t => {
+  for (const enabled of [false, true]) await t.test(`setup ${enabled ? 'enabled' : 'disabled'}`, async inner => {
+    const f = await pairedVerifierFixture(inner, quality, { allowNativeProfileSetup: enabled });
+    f.paired([{ ...pairedMac, profiles: [] }]);
+    const run = await f.verifier.ensure(f.input);
+    assert.deepEqual(run.source, f.source); assert.deepEqual(run.authority, authority);
+    await f.artifacts.path(retained(f, run).transfer.sourceManifest);
+    if (!enabled) {
+      assert.equal(run.status, 'waiting'); assert.match(run.reason!, /isolated testing profile/);
+      assert.equal(f.calls.length, 0); assert.equal(f.preparations.length, 0); assert.equal(run.chatId, undefined);
+    } else {
+      assert.equal(run.executionTargetKind, 'container'); assert.equal(run.executionTargetId, linuxReviewer.id);
+      assert.equal(run.status, 'failed', 'Source-only setup admission cannot manufacture runtime or quality evidence');
+      assert.equal(f.calls.length, 1); assert.equal(f.preparations.length, 1); assert.equal(f.checks(), 1);
+      assert.equal(f.calls[0]!.options.verificationRunId, run.id); assert.equal(f.calls[0]!.options.attemptId, authority.attemptId);
+      assert.equal(f.store.get<Chat>('chats', run.chatId!)!.attemptId, undefined, 'The ended author is not replaced or resumed');
+    }
+  });
+});
+
+test('source-only native profile setup still requires real paired platform tools and a ready Codex reviewer', async t => {
+  const owner = { ...pairedMac, profiles: [] };
+  const targetsWithout = (capability: string) => ready.map(target => ({ ...target, capabilities: target.capabilities.filter(item => item.kind !== capability) }));
+  const cases: Array<{ name: string; owners: DelegatedNativeInspectionReadiness[]; local?: ExecutionTargetAdvertisement[]; quality?: TaskQualityRequirements }> = [
+    { name: 'no online authenticated owner', owners: [] },
+    { name: 'Apple compilation unavailable', owners: [{ ...owner, executionTargets: targetsWithout('apple-compilation') }] },
+    { name: 'Mac interaction unavailable', owners: [{ ...owner, executionTargets: targetsWithout('macos-app-inspection') }] },
+    { name: 'build and interaction split between owners', owners: [{ ...owner, executionTargets: targetsWithout('apple-compilation') }, { ...owner, deviceId: 'other-mac', executionTargets: targetsWithout('macos-app-inspection') }] },
+    { name: 'local reviewer has no Codex runtime', owners: [owner], local: [{ ...linuxReviewer, runtimes: ['claude'] }] },
+    { name: 'local reviewer has no Linux shell', owners: [owner], local: [{ ...linuxReviewer, capabilities: [] }] },
+    { name: 'mixed web workflow has no browser', owners: [owner], quality: { ...quality, platforms: ['macos', 'web'], workflows: [...quality.workflows, { id: 'open-web', platform: 'web' }] } },
+    { name: 'requested Simulator capability unavailable', owners: [{ ...owner, executionTargets: targetsWithout('ios-simulator-inspection') }], quality: { ...quality, platforms: ['macos', 'ios-simulator'], workflows: [...quality.workflows, { id: 'close-ios', platform: 'ios-simulator' }] } },
+  ];
+  for (const { name, owners, local, quality: selectedQuality } of cases) await t.test(name, async inner => {
+    const f = await pairedVerifierFixture(inner, selectedQuality ?? quality, { allowNativeProfileSetup: true });
+    f.paired(owners); if (local) f.local(local);
+    const waiting = await f.verifier.ensure(f.input);
+    assert.equal(waiting.status, 'waiting'); assert.equal(f.calls.length, 0); assert.equal(f.preparations.length, 0);
+    assert.deepEqual(waiting.source, f.source); assert.deepEqual(waiting.authority, authority);
+    await f.artifacts.path(retained(f, waiting).transfer.sourceManifest);
   });
 });
 
@@ -970,6 +1013,74 @@ test('a model success claim cannot pass verification without original inspection
   assert.equal(f.checks(), 1);
   assert.equal((await f.verifier.ensure(f.input)).status, 'failed');
   assert.equal(f.calls.length, 1);
+});
+
+test('service-owned pending native setup yields the provider slot and continues the same verifier for exact C', async t => {
+  for (const status of ['pending', 'unknown'] as const) await t.test(status, async inner => {
+    const f = await fixture(inner), originalSource = structuredClone(f.source);
+    let setup: ReturnType<NonNullable<InspectionVerifierOptions['pendingNativeSetup']>> = { status, reason: 'The original independent fixture audit has not finished.' };
+    const observedThreads: Array<string | undefined> = [];
+    const originalRun = f.options.chats.run;
+    f.options.chats.run = async (chatId, prompt, options) => {
+      const chat = f.store.get<Chat>('chats', chatId)!;
+      observedThreads.push(chat.threadId);
+      const result = await originalRun.call(f.options.chats, chatId, prompt, options);
+      f.store.set('chats', { ...f.store.get<Chat>('chats', chatId)!, threadId: chat.threadId ?? 'original-native-review-thread' });
+      return result;
+    };
+    const verifier = f.anotherVerifier({ pendingNativeSetup: (selectedAuthority, selectedSource) => {
+      assert.deepEqual(selectedAuthority, authority);
+      assert.deepEqual(selectedSource, originalSource, 'Setup belongs to the exact candidate and all captured roots');
+      assert.ok(f.calls.length > 0);
+      assert.equal(f.options.chats.isRunning(f.calls.at(-1)!.chatId), false, 'Only an ended provider turn may yield for setup');
+      return setup;
+    } });
+    const waiting = await verifier.ensure(f.input), inputs = retained(f, waiting);
+    assert.equal(waiting.status, 'waiting'); assert.match(waiting.reason!, new RegExp(`setup is ${status}`));
+    assert.equal(waiting.completedAt, undefined); assert.equal(f.calls.length, 1); assert.equal(f.checks(), 1);
+    assert.equal(f.options.chats.isRunning(waiting.chatId!), false, 'The ended verifier does not occupy an agent slot while the audit runs');
+    assert.equal(f.store.get<Session>('sessions', waiting.sessionId!)!.status, 'ready');
+    assert.equal(f.store.get<Chat>('chats', waiting.chatId!)!.threadId, 'original-native-review-thread');
+    assert.equal(f.store.get<Chat>('chats', waiting.chatId!)!.attemptId, undefined, 'No author conversation is dispatched');
+    assert.equal(f.preparations.length, 1); assert.deepEqual(f.stopped, []);
+    assert.deepEqual(waiting.source, originalSource); assert.deepEqual(waiting.authority, authority);
+    assert.equal(inputs.snapshot!.sourceDigest, originalSource.sha256);
+
+    setup = undefined; f.setPassed(true);
+    const resumed = await verifier.ensure(f.input);
+    assert.equal(resumed.status, 'succeeded'); assert.equal(resumed.id, waiting.id);
+    assert.equal(resumed.chatId, waiting.chatId); assert.equal(resumed.sessionId, waiting.sessionId);
+    assert.equal(resumed.startedAt, waiting.startedAt); assert.deepEqual(resumed.source, originalSource);
+    assert.deepEqual(resumed.authority, authority); assert.equal(f.preparations.length, 1);
+    assert.equal(f.calls.length, 2); assert.deepEqual(f.calls.map(call => call.chatId), [waiting.chatId, waiting.chatId]);
+    assert.deepEqual(observedThreads, [undefined, 'original-native-review-thread']);
+    assert.deepEqual(retained(f, resumed).transfer, inputs.transfer, 'Continuation retains the original source manifests');
+    assert.deepEqual(f.stopped, [waiting.sessionId]); assert.equal(f.options.chats.isRunning(resumed.chatId!), false);
+    assert.deepEqual(f.source, originalSource); await f.snapshotManager.verify(f.snapshot);
+    assert.equal(await readFile(path.join(f.main, 'Main.swift'), 'utf8'), 'let heading = "Exact dirty source"\r\n');
+  });
+});
+
+test('a rejected native audit or missing setup recovery keeps verification failed instead of hiding repair work', async t => {
+  await t.test('rejected original audit', async inner => {
+    const f = await fixture(inner);
+    const verifier = f.anotherVerifier({ pendingNativeSetup: () => ({ status: 'rejected', reason: 'Fixture startup still constructs the production provider.' }) });
+    const failed = await verifier.ensure(f.input);
+    assert.equal(failed.status, 'failed'); assert.ok(failed.completedAt);
+    assert.match(failed.reason!, /receipts are missing/); assert.deepEqual(f.stopped, [failed.sessionId]);
+    assert.deepEqual(failed.source, f.source); assert.equal(f.calls.length, 1);
+    assert.equal((await verifier.ensure(f.input)).status, 'failed'); assert.equal(f.calls.length, 1);
+  });
+  await t.test('quality failure has no setup recovery', async inner => {
+    const f = await fixture(inner); let setupQueries = 0;
+    const verifier = f.anotherVerifier({
+      pendingNativeSetup: () => { setupQueries++; return { status: 'pending', reason: 'Unrelated fixture audit is still running.' }; },
+      quality: { ...f.options.quality, check: async input => ({ command: 'enoughfactory:ui-quality', candidateCommit: input.candidateCommit, checkedCommit: input.checkedCommit, passed: false, exitCode: 1, output: 'The tested workflow failed its original assertion.' }) },
+    });
+    const failed = await verifier.ensure(f.input);
+    assert.equal(failed.status, 'failed'); assert.ok(failed.completedAt); assert.equal(setupQueries, 0);
+    assert.match(failed.reason!, /original assertion/); assert.deepEqual(f.stopped, [failed.sessionId]); assert.equal(f.calls.length, 1);
+  });
 });
 
 test('waiting for capability setup retains exact source but dispatches no author or verifier turn', async t => {

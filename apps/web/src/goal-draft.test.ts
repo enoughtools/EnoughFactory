@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { clearGoalDraft, goalObjective, parseGoalProposal, readGoalDraft, saveGoalDraft, type GoalDraft } from './goal-draft.ts';
+import { clearGoalDraft, goalAcceptance, goalAcceptanceError, goalObjective, parseGoalProposal, readGoalDraft, saveGoalDraft, type GoalDraft } from './goal-draft.ts';
 
 test('invalid agent proposals preserve the draft; applied specifications and criteria survive storage and goal creation', () => {
   const storage = new Map<string, string>();
@@ -65,4 +65,57 @@ test('invalid agent proposals preserve the draft; applied specifications and cri
     if (previous) Object.defineProperty(globalThis, 'localStorage', previous);
     else Reflect.deleteProperty(globalThis, 'localStorage');
   }
+});
+
+test('application choices survive draft storage and assistant proposals without becoming agent-editable', () => {
+  const storage = new Map<string, string>();
+  const previous = Object.getOwnPropertyDescriptor(globalThis, 'localStorage');
+  const key = 'enoughfactory.goal-draft.device.application';
+  Object.defineProperty(globalThis, 'localStorage', { configurable: true, value: {
+    getItem: (name: string) => storage.get(name) ?? null,
+    setItem: (name: string, value: string) => { storage.set(name, value); },
+    removeItem: (name: string) => { storage.delete(name); },
+  } });
+  try {
+    const draft: GoalDraft = { title: 'Mail', objective: 'Build the mail app', specification: '', criteria: 'Drafts can be reopened', workType: 'application', applicationPlatforms: ['web', 'macos'], designReferenceIds: ['primary', 'design-folder-id'] };
+    assert.equal(saveGoalDraft(key, draft), true);
+    assert.deepEqual(readGoalDraft(key), draft);
+    const proposal = parseGoalProposal(JSON.stringify({ title: 'Mail drafts', objective: 'Build a mail app with recoverable drafts', criteria: ['Drafts persist after closing the window'] }));
+    assert.ok(proposal);
+    const revised = { ...readGoalDraft(key), ...proposal };
+    const expected = { kind: 'application', platforms: ['web', 'macos'], referenceIds: ['primary', 'design-folder-id'] };
+    assert.deepEqual(goalAcceptance(revised), expected);
+    assert.equal(goalAcceptanceError(revised, ['primary', 'design-folder-id']), null);
+    assert.equal(saveGoalDraft(key, revised), true);
+    assert.deepEqual(goalAcceptance(readGoalDraft(key)), expected);
+
+    for (const choices of [
+      { workType: 'other' }, { applicationPlatforms: ['web'] }, { designReferenceIds: [] },
+      { acceptance: { kind: 'application', platforms: ['web'], referenceIds: [] } },
+    ]) {
+      assert.equal(parseGoalProposal(JSON.stringify({ objective: 'A proposal cannot change acceptance', ...choices })), null);
+    }
+
+    const other: GoalDraft = { ...revised, workType: 'other' };
+    assert.equal(saveGoalDraft(key, other), true);
+    const restored = readGoalDraft(key);
+    assert.deepEqual(restored, other);
+    assert.equal(goalAcceptance(restored), undefined, 'Other work must omit application acceptance from its goal payload');
+    assert.deepEqual(goalAcceptance({ ...restored, workType: 'application' }), expected, 'Switching work type retains the user’s application choices');
+  } finally {
+    if (previous) Object.defineProperty(globalThis, 'localStorage', previous);
+    else Reflect.deleteProperty(globalThis, 'localStorage');
+  }
+});
+
+test('legacy drafts use explicit application defaults and stale reference selections block creation', () => {
+  const legacy: GoalDraft = { title: '', objective: 'Update the server', specification: '', criteria: '' };
+  assert.deepEqual(goalAcceptance(legacy), { kind: 'application', platforms: ['web'], referenceIds: ['primary'] }, 'Defaults do not depend on the objective text');
+  assert.equal(goalAcceptanceError(legacy, ['primary', 'arbitrary-sibling-folder']), null);
+  assert.match(goalAcceptanceError({ ...legacy, applicationPlatforms: [] }, ['primary']) ?? '', /Choose at least one platform/);
+  const missingReference = { ...legacy, designReferenceIds: ['primary', 'removed-folder-id'] };
+  assert.match(goalAcceptanceError(missingReference, ['primary', 'replacement-folder-id']) ?? '', /Remove it below or reattach it/);
+  assert.equal(goalAcceptanceError(missingReference, ['primary', 'removed-folder-id']), null, 'Stable folder identity remains valid independently of its display name');
+  assert.equal(goalAcceptanceError({ ...missingReference, workType: 'other', applicationPlatforms: [] }, ['primary']), null);
+  assert.deepEqual(goalAcceptance({ ...legacy, designReferenceIds: [] })?.referenceIds, [], 'An explicit empty reference selection stays empty');
 });

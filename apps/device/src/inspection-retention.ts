@@ -28,6 +28,8 @@ export interface InspectionRetentionOptions {
   store: Pick<Store, 'get' | 'set' | 'list'>;
   jobs: JobReader;
   activeJobIds?: () => ReadonlySet<string>;
+  /** Independent source setup also owns immutable input without a native job. */
+  protectedSnapshotIds?: () => ReadonlySet<string>;
   clock?: () => number;
 }
 export interface InspectionSourceSweep {
@@ -133,6 +135,7 @@ export class InspectionRetention {
   }
 
   private protected(snapshotId: string): boolean {
+    if (this.options.protectedSnapshotIds?.().has(snapshotId)) return true;
     if (this.readers.has(snapshotId)) return true;
     const active = this.options.activeJobIds?.() ?? new Set<string>();
     for (const job of this.options.jobs.listJobs().filter(value => value.source.snapshotId === snapshotId)) {

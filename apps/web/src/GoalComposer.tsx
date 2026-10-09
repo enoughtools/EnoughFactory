@@ -3,7 +3,7 @@ import type { ApprovalMode, AutonomyMode, FactoryState, RuntimeKind, Session, Ta
 import { FileText, MessageSquare, Plus, Send, Target, Upload } from 'lucide-react';
 import type { DeviceClient } from './api';
 import { ChatPane } from './ChatPane';
-import { clearGoalDraft, goalObjective, parseGoalProposal, readGoalDraft, saveGoalDraft, type GoalDraft } from './goal-draft';
+import { applicationPlatforms, clearGoalDraft, goalAcceptance, goalAcceptanceError, goalObjective, parseGoalProposal, readGoalDraft, saveGoalDraft, type GoalDraft } from './goal-draft';
 import { policies } from './SettingsPage';
 import { GoalExecutionPreference } from './GoalExecutionPreference';
 import { Button, Field, Input, Status, Spinner } from './ui';
@@ -17,7 +17,7 @@ interface Props {
 }
 
 function assistantPrompt(draft: GoalDraft) {
-  return `Help me define the initial goal and specification for this project. This is a specification conversation before factory execution. Inspect source as useful, ask me focused questions when information is missing, and discuss scope, constraints, user behavior and observable completion criteria. Do not implement the product, change source or start execution. When you have a useful draft, include one JSON code block with {"title":"short goal name","objective":"desired outcome","specification":"complete Markdown specification","criteria":["observable completion criterion"]}. Keep this draft current as we discuss it. EnoughFactory lets me explicitly apply it and edit it before creating the goal.\n\nCurrent draft:\n${JSON.stringify({ title: draft.title, objective: draft.objective, specification: draft.specification, criteria: draft.criteria.split('\n').filter(value => value.trim()) }, null, 2)}`;
+  return `Help me define the initial goal and specification for this project. This is a specification conversation before factory execution. Inspect source as useful, ask me focused questions when information is missing, and discuss scope, constraints, user behavior and observable completion criteria. Do not implement the product, change source or start execution. When you have a useful draft, include one JSON code block with {"title":"short goal name","objective":"desired outcome","specification":"complete Markdown specification","criteria":["observable completion criterion"]}. Keep this draft current as we discuss it. EnoughFactory lets me explicitly apply it and edit it before creating the goal. The user chooses the work type, application platforms and design references separately; preserve those choices and do not include them in your proposal.\n\nUser-selected acceptance:\n${JSON.stringify(goalAcceptance(draft) ?? { kind: 'other' }, null, 2)}\n\nCurrent draft:\n${JSON.stringify({ title: draft.title, objective: draft.objective, specification: draft.specification, criteria: draft.criteria.split('\n').filter(value => value.trim()) }, null, 2)}`;
 }
 
 export function GoalComposer(props: Props) {
@@ -49,7 +49,11 @@ function ProjectDraft({ state, client, run, projectId, busy, onSubmit, creationE
   const artifactFsAvailable = state.devices.some(device => device.online && device.workspaceProviders?.includes('artifactfs')) || (project.deviceId === state.device.id && state.diagnostics.containerRuntime?.artifactFsSupported === true);
   const workspaceAvailable = workspaceProvider === 'git' || artifactFsAvailable;
   const ownerOnline = state.devices.find(device => device.id === project.deviceId)?.online !== false;
-  const readyToCreate = !!projectId && !!(draft.objective.trim() || draft.specification.trim()) && workspaceAvailable && Number.isInteger(concurrency) && concurrency >= 1 && concurrency <= 32;
+  const acceptance = goalAcceptance(draft);
+  const references = [{ id: 'primary', name: `${project.name} (primary repository)` }, ...(project.workingDirectories ?? [])];
+  const unavailableReferences = acceptance?.referenceIds.filter(id => !references.some(reference => reference.id === id)) ?? [];
+  const acceptanceError = goalAcceptanceError(draft, references.map(reference => reference.id));
+  const readyToCreate = !!projectId && !!(draft.objective.trim() || draft.specification.trim()) && workspaceAvailable && !acceptanceError && Number.isInteger(concurrency) && concurrency >= 1 && concurrency <= 32;
   useEffect(() => { setSaved(saveGoalDraft(draftKey, draft)); }, [draftKey, draft]);
   const update = (fields: Partial<GoalDraft>) => { setDraft(value => ({ ...value, ...fields })); setDraftNotice(null); };
   const assistantRun: Run = async action => {
@@ -79,10 +83,17 @@ function ProjectDraft({ state, client, run, projectId, busy, onSubmit, creationE
     catch { setAssistantError('The specification file could not be read.'); }
   }
   return <div className="goal-draft-layout">
-    <form className="goal-draft-editor modal-form" onSubmit={event => { event.preventDefault(); if (!readyToCreate) return; void onSubmit({ projectId, title: draft.title.trim(), objective: goalObjective(draft), criteria: draft.criteria.split('\n').map(value => value.trim()).filter(Boolean), autonomy, approvalMode, runtime, concurrency, workspaceProvider, execution }).then(created => { if (created) clearGoalDraft(draftKey, draft); }); }}>
+    <form className="goal-draft-editor modal-form" onSubmit={event => { event.preventDefault(); if (!readyToCreate) return; void onSubmit({ projectId, title: draft.title.trim(), objective: goalObjective(draft), criteria: draft.criteria.split('\n').map(value => value.trim()).filter(Boolean), autonomy, approvalMode, runtime, concurrency, workspaceProvider, execution, ...(acceptance ? { acceptance } : {}) }).then(created => { if (created) clearGoalDraft(draftKey, draft); }); }}>
       <div className="goal-draft-fields">
         <Field label="Goal name" hint="Optional. Defaults to the first line of your outcome."><Input value={draft.title} onChange={event => update({ title: event.target.value })} placeholder="Goal name" /></Field>
         <Field label="Outcome"><textarea autoFocus rows={2} value={draft.objective} onChange={event => update({ objective: event.target.value })} placeholder="What should exist when this goal is complete?" /></Field>
+        <Field label="Work type"><select value={draft.workType ?? 'application'} onChange={event => update({ workType: event.target.value as GoalDraft['workType'] })}><option value="application">Application</option><option value="other">Other work</option></select></Field>
+        {acceptance && <section className="goal-acceptance" aria-label="Application acceptance">
+          <fieldset><legend>Platforms</legend><div className="goal-acceptance-options">{applicationPlatforms.map(platform => <label className="goal-acceptance-choice" key={platform.value}><input type="checkbox" checked={acceptance.platforms.includes(platform.value)} onChange={event => update({ applicationPlatforms: event.target.checked ? [...acceptance.platforms, platform.value] : acceptance.platforms.filter(value => value !== platform.value) })} /><span>{platform.label}</span></label>)}</div></fieldset>
+          <fieldset><legend>Design references</legend><div className="goal-acceptance-references">{references.map(reference => <label className="goal-acceptance-choice" key={reference.id}><input type="checkbox" checked={acceptance.referenceIds.includes(reference.id)} onChange={event => update({ designReferenceIds: event.target.checked ? [...acceptance.referenceIds, reference.id] : acceptance.referenceIds.filter(id => id !== reference.id) })} /><span>{reference.name}</span></label>)}{unavailableReferences.map((id, index) => <div className="goal-acceptance-unavailable" key={id}><span>Unavailable reference {unavailableReferences.length > 1 ? index + 1 : ''}</span><Button type="button" size="sm" variant="ghost" aria-label={`Remove unavailable reference ${index + 1}`} onClick={() => update({ designReferenceIds: acceptance.referenceIds.filter(referenceId => referenceId !== id) })}>Remove</Button></div>)}</div></fieldset>
+          <p className="field-hint">The factory will run representative workflows and visually inspect the app against your selected references. Add specific behaviors to the completion criteria.</p>
+          {acceptanceError && <div className="error-banner" role="alert">{acceptanceError}</div>}
+        </section>}
         <Field label="Maximum agents" hint="The factory plans and assigns parallel tasks within this limit and your devices’ capacity."><Input required type="number" min={1} max={32} value={concurrency} onChange={event => setConcurrency(Number(event.target.value))} /></Field>
         <div className="specification-heading"><span><FileText size={14} />Specification</span><label className="spec-import"><Upload size={13} />Import .md<input type="file" accept=".md,.markdown,.txt,text/plain,text/markdown" onChange={event => { void importSpec(event.target.files?.[0]); event.target.value = ''; }} /></label></div>
         <textarea className="specification-editor" aria-label="Specification" value={draft.specification} onChange={event => update({ specification: event.target.value })} placeholder={'## Users and behavior\n\n## Scope\n\n## Constraints\n\n## Deliverables'} spellCheck={false} />

@@ -58,6 +58,16 @@ Start with the observed draft-close defect on both macOS and the owned iPhone Si
 
 These journeys prove the new development loop and fix concrete problems. They do not replace the user's original feature, offline, live-service, native-build or distribution criteria. Keep fixture success separate from authenticated service and signing results; a missing credential is a concrete prerequisite, not a reason to claim the whole application complete.
 
+## First native profile setup
+
+A new app can set up testing through the normal Factory tools. `factory_native_profile_propose` freezes the complete current source and all declared roots, a fixed Xcode build recipe, exact fixture launch arguments with a unique `{runId}`, and source-file starting points for entry, storage, credentials, providers, preferences, notifications and build behavior. On Mac the fixture root must be `/tmp/enoughfactory-fixtures/{runId}` (or its canonical `/private/tmp` spelling). iOS uses a fresh owned Simulator and its app sandbox; a host temporary path is not an iOS storage guarantee.
+
+The service queues a separate pinned Codex source reviewer. It provides the full immutable file inventory and original byte reads, so author-selected paths cannot hide production constructors or dependencies. The reviewer follows the reachable initialization graph and build phases. Requested fixture mode must route before production constructors and reject incomplete fixture invocations; ordinary user launch without fixture mode may still use production behavior. This is recorded source judgment, not a formal runtime isolation proof or UI acceptance. Exact read artifacts, judgment and the original all-root source manifest accompany the service-issued receipt. Any source or mode change requires another audit; automatic profiles have no editable exceptions.
+
+Enough owns policy and continuation. Approve all runs setup automatically; rules/manual use the durable native fixture setup action in Approvals. The reviewer counts toward the goal's configured agent limit. At a limit of one, the author leaves source unchanged and ends its turn, Factory retains the exact candidate, runs the queued audit, then continues verification of that same candidate and chat. Restart, pause and unknown provider outcomes keep the original owners and reconcile termination before replay. Completed audit workspaces and containers retire after source, chat and useful artifacts are durable.
+
+A Linux coordinator can run this source-only review and transfer its original audit, reads, receipt and frozen source over an authenticated pairing to the Mac owner. Build, launch, runtime data isolation, actual screenshot delivery, workflow assertions and visual review remain separately gated on that Mac. First-profile setup does not claim native success when Apple tools, desktop access or genuine quality evidence are unavailable.
+
 ## Compact report shape
 
 ```json

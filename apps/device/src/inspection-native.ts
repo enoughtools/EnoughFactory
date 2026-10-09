@@ -64,14 +64,17 @@ export interface NativeInspectionAdapterOptions {
 }
 
 interface FixtureSourceReceipt {
-  version: 1;
+  version: 1 | 2;
   kind: 'native-fixture-source-audit';
   profileId: string;
   launchArguments: string[];
   build: AppleCheckProfile;
   bundleIdentifier?: string;
   fixtureExpectedDataRoot?: string;
-  roots: Array<{ name: string; entries: Array<{ path: string; sha256: string }>;
+  sourceSha256?: string;
+  sourceManifest?: ArtifactManifest;
+  independentReview?: { runId: string; chatId: string; verdict: ArtifactManifest; reads: ArtifactManifest[]; judgment: 'source-review-not-runtime-proof' };
+  roots: Array<{ name: string; sourceDigest?: string; entries: Array<{ path: string; sha256: string }>;
     protectedSourceDirectories?: string[]; allowedPaths?: string[] }>;
 }
 interface NativePreparation extends Omit<NativeInspectionBuild, 'preparationArtifact'> {
@@ -445,16 +448,26 @@ export class NativeInspectionAdapter {
     await this.authenticate(artifact);
     if (artifact.size > 1024 * 1024 || artifact.mime !== 'application/json' || artifact.sha256 !== profile.fixtureEvidenceSha256) throw new NativeInspectionError('fixture-required', 'Invalid original fixture audit receipt.');
     const receipt = JSON.parse((await this.options.artifacts.read(artifact)).toString()) as FixtureSourceReceipt;
-    if (receipt.version !== 1 || receipt.kind !== 'native-fixture-source-audit' || receipt.profileId !== profile.id
+    if (![1, 2].includes(receipt.version) || receipt.kind !== 'native-fixture-source-audit' || receipt.profileId !== profile.id
       || !same(receipt.launchArguments, profile.launchArguments) || !same(receipt.build, profile.build)
       || receipt.bundleIdentifier !== profile.bundleIdentifier || receipt.fixtureExpectedDataRoot !== profile.fixtureExpectedDataRoot
       || !Array.isArray(receipt.roots) || receipt.roots.length !== manifest.roots.length) {
       throw new NativeInspectionError('fixture-required', 'Fixture audit does not authorize this exact profile and source roots.');
     }
+    if (receipt.version === 2) {
+      if (receipt.sourceSha256 !== manifest.sourceDigest || !receipt.independentReview || receipt.independentReview.judgment !== 'source-review-not-runtime-proof'
+        || !receipt.independentReview.runId.startsWith('profile-audit-') || !receipt.independentReview.chatId || !receipt.independentReview.reads.length) throw new NativeInspectionError('fixture-source-changed', 'The independently audited whole source changed; propose this profile again for a fresh audit.');
+      if(!receipt.sourceManifest||receipt.sourceManifest.mime!=='application/json'||receipt.sourceManifest.size>32*1024*1024)throw new NativeInspectionError('fixture-required','The independent fixture receipt has no bounded original source manifest.');
+      for (const original of [receipt.sourceManifest, receipt.independentReview.verdict, ...receipt.independentReview.reads]) await this.authenticate(original);
+      const pack=JSON.parse((await this.options.artifacts.read(receipt.sourceManifest)).toString()) as {version:number;purpose:string;snapshot:InspectionSnapshotManifest};
+      if(pack.version!==1||pack.purpose!=='inspection-snapshot-transfer'||!pack.snapshot||pack.snapshot.sourceDigest!==manifest.sourceDigest||!same(pack.snapshot.roots.map(root=>({id:root.id,name:root.name,sourceDigest:root.sourceDigest,entries:root.entries})),manifest.roots.map(root=>({id:root.id,name:root.name,sourceDigest:root.sourceDigest,entries:root.entries})))||receipt.sourceManifest.metadata?.sourceDigest!==manifest.sourceDigest||receipt.sourceManifest.metadata?.purpose!==pack.purpose)throw new NativeInspectionError('fixture-source-changed','The retained original source manifest differs from the independent audited source.');
+      if (receipt.roots.some(audit => audit.sourceDigest !== manifest.roots.find(root => root.name === audit.name)?.sourceDigest || audit.allowedPaths?.length || audit.protectedSourceDirectories?.length)) throw new NativeInspectionError('fixture-source-changed', 'The complete audited source roots changed; editable exceptions are not supported for automatic profiles.');
+      if(profile.build.tool==='xcodebuild'&&profile.build.platform==='macos')await verifyAutomaticMacFixtureBase(profile.fixtureExpectedDataRoot);
+    }
     const roots = new Set<string>(); let matchedEntries = 0;
     for (const audit of receipt.roots) {
       const root = manifest.roots.find(root => root.name === audit.name);
-      if (!root || roots.has(audit.name) || !Array.isArray(audit.entries) || !audit.entries.length || audit.entries.length > 30_000) throw new NativeInspectionError('fixture-required', 'Invalid fixture audit source root.');
+      if (!root || roots.has(audit.name) || !Array.isArray(audit.entries) || receipt.version === 1 && !audit.entries.length || audit.entries.length > 30_000) throw new NativeInspectionError('fixture-required', 'Invalid fixture audit source root.');
       roots.add(audit.name);
       const entries = new Map(root.entries.map(entry => [entry.path, entry])), audited = new Set<string>();
       for (const entry of audit.entries) {
@@ -555,6 +568,13 @@ export class NativeInspectionAdapter {
     }
     return { appPath, bundleIdentifier: info.CFBundleIdentifier as string, inventorySha256: sha256(JSON.stringify(inventory)) };
   }
+}
+
+/** Check on the executing Mac at build/product/start/restart, not only on a remote auditor. */
+async function verifyAutomaticMacFixtureBase(expected:string|undefined):Promise<void>{
+  if(!expected||!/^\/(?:private\/)?tmp\/enoughfactory-fixtures\/\{runId\}(?:\/[A-Za-z0-9._-]+)*$/.test(expected)||expected.split('/').some(part=>part==='.'||part==='..'))throw new NativeInspectionError('fixture-required','Automatic Mac fixtures require an owned unique run namespace.');
+  const base=join(await realpath('/tmp'),'enoughfactory-fixtures');try{await mkdir(base,{mode:0o700});}catch(error){if((error as NodeJS.ErrnoException).code!=='EEXIST')throw error;}
+  const state=await lstat(base);if(!state.isDirectory()||state.isSymbolicLink()||state.uid!==process.getuid?.()||(state.mode&0o077)!==0||await realpath(base)!==base)throw new NativeInspectionError('fixture-required','The executing Mac fixture base is not a privately owned real directory.');
 }
 
 async function privateDirectory(path: string): Promise<void> {

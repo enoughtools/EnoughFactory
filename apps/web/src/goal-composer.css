@@ -5,6 +5,15 @@
 .goal-draft-editor { min-height: 0; gap: 0; }
 .goal-draft-fields { min-height: 0; overflow: auto; padding-right: 6px; display: flex; flex-direction: column; gap: 14px; }
 .goal-draft-fields .form-field textarea { min-height: 64px; }
+.goal-acceptance { display: flex; flex-direction: column; gap: 12px; border: 1px solid var(--factory-line); padding: 12px; }
+.goal-acceptance fieldset { margin: 0; padding: 0; border: 0; min-width: 0; }
+.goal-acceptance legend { margin-bottom: 8px; padding: 0; font-size: 11px; font-weight: 500; }
+.goal-acceptance-options { display: flex; flex-wrap: wrap; gap: 10px 16px; }
+.goal-acceptance-references { display: flex; flex-direction: column; gap: 8px; }
+.goal-acceptance-choice { display: flex; align-items: flex-start; gap: 7px; font-size: 11px; line-height: 1.5; cursor: pointer; }
+.goal-acceptance input[type="checkbox"] { display: inline; flex-shrink: 0; width: 14px; min-height: 14px; height: 14px; padding: 0; margin: 1px 0 0; accent-color: var(--factory-accent); }
+.goal-acceptance-unavailable { display: flex; align-items: center; justify-content: space-between; gap: 12px; color: var(--factory-secondary); font-size: 11px; }
+.goal-acceptance .error-banner { margin: 0; }
 .specification-heading { display: flex; align-items: center; justify-content: space-between; font-size: 11px; font-weight: 500; }
 .specification-heading > span, .spec-import { display: flex; align-items: center; gap: 6px; }
 .spec-import { cursor: pointer; color: var(--factory-secondary); padding: 3px; }

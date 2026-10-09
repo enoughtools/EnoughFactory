@@ -3,6 +3,7 @@ import type { AttemptDetail, FactoryStore } from '@enoughfactory/factory';
 import { HttpError } from './util.ts';
 import { inspectionQualityPolicySha256, inspectionVerificationKey } from './inspection-verifier.ts';
 import { inspectionGoalQuality } from './inspection-goal-quality.ts';
+import { assertNativeProfileAuditChat } from './inspection-profile-setup.ts';
 
 interface ChatWorker {
   id: string; coordinatorId: string; chatId?: string; sessionId?: string;
@@ -12,6 +13,7 @@ interface ChatWorker {
 /** A new provider turn cannot modify an ended candidate or bypass its task by opening another chat. */
 export function assertFactoryChatCanStartTurn(store: FactoryStore, chat: Chat, deviceId: string, requestedAttemptId?: string,requestedVerificationRunId?:string): ReturnType<typeof factoryChatBinding> {
   if(chat.verificationRunId||requestedVerificationRunId){
+    if((chat.verificationRunId??requestedVerificationRunId)?.startsWith('profile-audit-')){assertNativeProfileAuditChat(store,chat,deviceId,requestedAttemptId,requestedVerificationRunId);return undefined;}
     assertVerificationChatCanStartTurn(store,chat,deviceId,requestedAttemptId,requestedVerificationRunId);
     return undefined;
   }

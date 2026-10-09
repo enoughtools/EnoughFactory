@@ -6,6 +6,7 @@ import { ArtifactStore, InspectionSnapshotManager, WorkspaceManager, exportInspe
 import { dockerInvocation } from '@enoughfactory/runtime';
 import type { DeviceApp } from './app.ts';
 import type { AgentToolBridgeContext, ChatController } from './chats.ts';
+import { goalAgentCount } from './factory-agent-capacity.ts';
 import { factoryQualityInstructions } from './factory-quality.ts';
 import { inspectionSourceContentMatches, type InspectionQualityService } from './inspection-quality.ts';
 import type { DelegatedNativeInspectionReadiness } from './inspection-delegation.ts';
@@ -62,6 +63,10 @@ export interface InspectionVerifierOptions {
   readiness: () => Promise<ExecutionTargetAdvertisement[]>;
   /** Project-specific profiles discovered through online authenticated paired native owners. */
   delegatedReadiness?: (projectId: string) => Promise<DelegatedNativeInspectionReadiness[]>;
+  /** Only an original service-owned audit may defer an ended verifier turn. */
+  /** Source-only setup may prepare the first profile; native actions and final evidence stay gated. */
+  allowNativeProfileSetup?: boolean;
+  pendingNativeSetup?: (authority:InspectionAuthority,source:InspectionSourceIdentity)=>{status:'pending'|'unknown'|'rejected';reason:string}|undefined;
   /** Default twenty minutes. A completed verifier is never silently dispatched again. */
   timeoutMs?: number;
   /** Alternate owner must prepare and verify exact private execution copies before return. */
@@ -172,7 +177,7 @@ export class InspectionVerifier {
     return run.status === 'unknown' && run.executionTargetKind === 'host-macos' && !!run.sessionId && !!run.chatId && !!run.startedAt && run.completedAt === undefined;
   }
 
-  /** A positively identified reboot ends old processes, not their verification result. */
+  /** Positive process teardown ends old execution, not its verification result. */
   private async reconcileInterruptedHostVerifier(id: string, input: VerificationInput, signal: AbortSignal): Promise<boolean> {
     const original = this.get(id), originalChat = this.options.app.store.get<Chat>('chats', original.chatId!);
     const eligible = () => {
@@ -197,6 +202,12 @@ export class InspectionVerifier {
         const proof = process.termination;
         if (proof?.schemaVersion !== 2) return false;
         if (proof.kind === 'host-reboot') return proof.evidence === 'boot-identity-change' && proof.previousBoot?.platform === proof.currentBoot.platform && proof.previousBoot.machineId === proof.currentBoot.machineId && proof.previousBoot.bootId !== proof.currentBoot.bootId;
+        if (proof.kind === 'supervised-termination') return proof.evidence === 'complete-owned-teardown' && proof.previousStatus === 'exited' && proof.inventoryComplete === true && proof.exitCode === null && proof.exitSignal === 'SIGKILL'
+          && proof.processKey === process.processKey && proof.sessionId === original.sessionId && proof.cwd === execution.workdir && sha.test(proof.priorRecordSha256)
+          && proof.supervisor?.pid === process.pid && Number.isSafeInteger(proof.supervisor.pid) && proof.supervisor.pid >= 2 && typeof proof.supervisor.identity === 'string'
+          && proof.supervisor.path === process.recordPath.replace(/\.json$/, '.cjs') && proof.supervisor.identity.includes(proof.supervisor.path) && proof.supervisor.identity.includes(process.processKey)
+          && Array.isArray(proof.children) && proof.children.length <= 2048 && proof.children.every(child => Number.isSafeInteger(child.pid) && child.pid >= 2 && typeof child.identity === 'string' && !!child.identity)
+          && Number.isFinite(Date.parse(proof.observedAt)) && Date.parse(proof.observedAt) >= Date.parse(process.createdAt!);
         // Legacy receipts lack their old kernel UUID. Only a separate privileged
         // operator attestation may bridge that history, scoped to this exact
         // provider, verifier conversation and independently retained witnesses.
@@ -223,12 +234,13 @@ export class InspectionVerifier {
       await this.options.app.sessions.stop(original.sessionId!);
       if (!eligible() || this.options.app.sessions.record(original.sessionId!).status !== 'stopped') return false;
       await this.assertExecutionSource(original.sessionId!, snapshot, signal);
+      const supervised = originalProcesses.some(process => process.termination?.kind === 'supervised-termination');
       this.options.app.store.transaction(() => {
-        if (!eligible()) throw new Error('The reboot continuation owner changed.');
-        this.options.app.store.append('inspection-verifier-reconciliation', id, { action: 'host-reboot-continuation', previous: original, chat: originalChat, processes: originalProcesses, threadId, source: original.source, at: this.now() });
+        if (!eligible()) throw new Error('The host continuation owner changed.');
+        this.options.app.store.append('inspection-verifier-reconciliation', id, { action: supervised ? 'host-supervised-continuation' : 'host-reboot-continuation', previous: original, chat: originalChat, processes: originalProcesses, threadId, source: original.source, at: this.now() });
         this.options.app.store.set(INPUTS, { ...saved, snapshot });
         this.options.app.store.set('chats', { ...originalChat!, threadId });
-        this.patch(id, { status: 'waiting', reason: 'The original host provider ended during a confirmed reboot. Continuing its retained independent verification conversation with fresh inspection sessions.', completedAt: undefined });
+        this.patch(id, { status: 'waiting', reason: supervised ? 'The original host provider and its owned tools confirmed termination. Continuing its retained independent verification conversation with fresh inspection sessions.' : 'The original host provider ended during a confirmed reboot. Continuing its retained independent verification conversation with fresh inspection sessions.', completedAt: undefined });
       });
       return true;
     } catch {
@@ -318,7 +330,7 @@ export class InspectionVerifier {
     const delegated = missingLocally.length ? await this.options.delegatedReadiness?.(project.sourceProjectId || project.id) ?? [] : [];
     for (const platform of missingLocally) {
       const capability = platform === 'macos' ? 'macos-app-inspection' : 'ios-simulator-inspection';
-      if (delegated.some(owner => owner.profiles.some(profile => profile.platform === platform) && owner.executionTargets?.some(target => nativeReady(target, capability)))) continue;
+      if (delegated.some(owner => (this.options.allowNativeProfileSetup || owner.profiles.some(profile => profile.platform === platform)) && owner.executionTargets?.some(target => nativeReady(target, capability)))) continue;
       reasons.push(targets.flatMap(target => target.capabilities).find(item => item.kind === capability)?.reason || `Native ${platform === 'macos' ? 'Mac' : 'iPhone Simulator'} verification needs a ready local or paired Mac with Apple builds, app testing and this project's isolated testing profile.`);
     }
     return reasons.length ? { reason: reasons.join(' ') } : { target };
@@ -331,16 +343,18 @@ export class InspectionVerifier {
     let snapshot: InspectionSnapshot | undefined;
     try {
       this.assertCurrent(this.get(id), abort.signal);
+      // Source retention needs no provider slot; own C before any capacity/readiness wait.
+      snapshot = await this.retain(id, input, abort.signal);
+      this.assertCurrent(this.get(id), abort.signal);
       const claimed = this.options.app.store.transaction(() => {
         const current = this.get(id);
         if (!['queued', 'waiting'].includes(current.status)) return false;
+        const goal=this.options.app.store.get<Goal>('goals',current.authority.goalId);
+        if(goalAgentCount(this.options.app.store,current.authority.goalId,[`verifier:${id}`])>=Math.max(1,goal?.concurrency??1)){this.patch(id,{status:'waiting',reason:'The goal’s agent limit is occupied; continue verification of this same saved source after a slot becomes available.'});return false;}
         this.patch(id, { status: 'preparing', reason: undefined });
         return true;
       });
       if (!claimed) return this.get(id);
-      // Retain before returning a readiness wait: the caller may retire its check copy.
-      snapshot = await this.retain(id, input, abort.signal);
-      this.assertCurrent(this.get(id), abort.signal);
       const selected = await abortable(this.selectedTarget(this.get(id), input.project), abort.signal);
       this.assertCurrent(this.get(id), abort.signal);
       if (!selected.target) return this.patch(id, { status: 'waiting', reason: selected.reason });
@@ -394,6 +408,8 @@ export class InspectionVerifier {
       await this.snapshotManager(id).verify(snapshot, abort.signal);
       const checked = await this.options.quality.check({ authority: run.authority, quality: run.quality, source: run.source, candidateCommit: run.source.candidateCommit!, checkedCommit: run.source.checkedCommit });
       assertCurrent();
+      const setup=!checked.passed&&checked.recovery?this.options.pendingNativeSetup?.(run.authority,run.source):undefined;
+      if(setup&&setup.status!=='rejected')return this.patch(id,{status:'waiting',reason:`Native fixture setup is ${setup.status}: ${setup.reason} Continue this same verifier conversation after setup.`,completedAt:undefined});
       return this.patch(id, { status: checked.passed ? 'succeeded' : 'failed', reason: checked.passed ? undefined : checked.output, completedAt: this.now() });
     } catch (error) {
       const failure = error as Error & { agentStarted?: boolean; executionEnded?: boolean; code?: string };

@@ -1,5 +1,5 @@
-import type { FactoryTask, TaskQualityRequirements } from '@enoughfactory/contracts';
-import type { AttemptDetail } from '@enoughfactory/factory';
+import type { FactoryTask, Goal, TaskQualityRequirements } from '@enoughfactory/contracts';
+import { goalQualityRequirements, type AttemptDetail } from '@enoughfactory/factory';
 import type { Store } from './store.ts';
 
 /** Keep every live requirement, using the policy that actually authorized its author. */
@@ -9,11 +9,5 @@ export function inspectionGoalQuality(store: Pick<Store, 'get' | 'list'>, goalId
     const quality = detail?.contract ? detail.contract.quality : task.quality;
     return quality ? [quality] : [];
   });
-  if (!requirements.length) return;
-  return {
-    platforms: [...new Set(requirements.flatMap(item => item.platforms))].sort(),
-    workflows: [...new Map(requirements.flatMap(item => item.workflows).map(item => [`${item.platform}:${item.id}`, { id: item.id, platform: item.platform }])).values()]
-      .sort((left, right) => `${left.platform}:${left.id}`.localeCompare(`${right.platform}:${right.id}`)),
-    referenceIds: [...new Set(requirements.flatMap(item => item.referenceIds))].sort(),
-  };
+  return goalQualityRequirements(store.get<Goal>('goals', goalId) ?? {}, requirements);
 }
