@@ -136,10 +136,12 @@ export class InspectionVerificationHistory {
       if (entry.kind === 'source-manifest') {
         const pack = JSON.parse(bytes.toString('utf8')), retention = entry.retention!, source = entry.job!.source;
         if (pack.version !== 1 || pack.purpose !== 'inspection-snapshot-transfer' || pack.snapshot?.id !== source.snapshotId || pack.snapshot.sourceDigest !== source.sha256 || !Number.isFinite(Date.parse(pack.snapshot.createdAt)) || manifest.metadata?.purpose !== pack.purpose || manifest.metadata?.snapshotId !== source.snapshotId || manifest.metadata?.sourceDigest !== source.sha256 || manifest.metadata?.previewOnly !== true || !isDeepStrictEqual(pack.sourceArtifacts, retention.transfer.sourceArtifacts) || !Array.isArray(pack.snapshot.roots) || pack.snapshot.roots.length !== pack.sourceArtifacts.length
-          || !isDeepStrictEqual(pack.snapshot.roots.map((root: { id: string; sourceDigest: string; commit: string }) => ({ id: root.id, sha256: root.sourceDigest, commit: root.commit })), source.roots)) throw new Error('The original source transfer manifest does not match its captured source.');
-        for (const rootArtifact of retention.transfer.sourceArtifacts) {
+          || !isDeepStrictEqual(pack.snapshot.roots.map((root: { id: string; sourceDigest: string; sourceCommit?: string }) => ({ id: root.id, sha256: root.sourceDigest, ...(root.sourceCommit ? { commit: root.sourceCommit } : {}) })), source.roots)) throw new Error('The original source transfer manifest does not match its captured source.');
+        for (const [index, rootArtifact] of retention.transfer.sourceArtifacts.entries()) {
+          const root = pack.snapshot.roots[index];
           const saved = await this.options.artifacts.get(rootArtifact.manifest.id);
-          if (!isDeepStrictEqual(saved, rootArtifact.manifest) || saved.goalId !== run.authority.goalId || saved.taskId !== entry.taskId || saved.attemptId !== entry.attemptId || saved.metadata?.snapshotId !== source.snapshotId || saved.metadata.rootId !== rootArtifact.rootId) throw new Error('The original captured root manifest or owner changed.');
+          if (!isDeepStrictEqual(saved, rootArtifact.manifest) || saved.goalId !== run.authority.goalId || saved.taskId !== entry.taskId || saved.attemptId !== entry.attemptId || rootArtifact.rootId !== root.id
+            || saved.metadata?.purpose !== 'inspection-source-bundle' || saved.metadata.previewOnly !== true || saved.metadata.snapshotId !== source.snapshotId || saved.metadata.rootId !== root.id || saved.metadata.sourceDigest !== root.sourceDigest || saved.metadata.commit !== root.commit || saved.metadata.ref !== 'HEAD') throw new Error('The original captured root manifest or owner changed.');
           await this.options.artifacts.path(saved);
         }
         content = bytes.toString('utf8');

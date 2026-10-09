@@ -15,6 +15,7 @@ import { inspectionQualityPolicySha256, inspectionVerificationKey } from './insp
 import { InspectionVerificationHistory } from './inspection-verification-history.ts';
 import type { InspectionSourceRetention } from './inspection-retention.ts';
 import type { EphemeralContainerReceipt } from './factory-container-retirement.ts';
+import { exec } from './util.ts';
 
 const at = '2026-10-09T00:00:00.000Z';
 const authority: InspectionAuthority = { goalId: 'goal', goalRevision: 12, taskId: 'drafts', attemptId: 'current-author', authorityGeneration: 3, policyRevision: 12 };
@@ -426,17 +427,23 @@ test('author trace rejects owner or journal changes during its awaited publicati
 async function sourceFixture(t: TestContext) {
   const f = await fixture(t), physical = await realpath(f.directory), primary = path.join(physical, 'mail-source'), secondary = path.join(physical, 'enough-ui');
   await mkdir(primary); await mkdir(path.join(secondary, 'empty'), { recursive: true });
+  await writeFile(path.join(primary, 'app.js'), 'const restore = false;\n');
+  const git = (args: string[]) => exec('git', ['-c', 'core.hooksPath=/dev/null', '-c', 'commit.gpgsign=false', '-c', 'init.templateDir=', ...args], { cwd: primary });
+  await git(['init', '--quiet']); await git(['add', 'app.js']);
+  await git(['-c', 'user.name=Source fixture', '-c', 'user.email=source@example.invalid', 'commit', '--quiet', '-m', 'Original author source']);
+  const sourceHead = (await git(['rev-parse', 'HEAD'])).stdout.trim();
   await writeFile(path.join(primary, 'app.js'), 'const restore = true;\r\nconst body = "first\\nsecond\\nlast ";\n');
+  await writeFile(path.join(primary, 'draft.txt'), 'Uncommitted complete draft\nfirst\nsecond\nlast \n');
   await writeFile(path.join(secondary, 'tokens.css'), ':root { --spacing: 12px; }\n');
   const dataDir = path.join(physical, 'captured'); await mkdir(dataDir, { mode: 0o700 });
   const snapshots = new InspectionSnapshotManager({ dataDir, artifacts: f.artifacts });
   const snapshot = await snapshots.create({ roots: [{ id: 'mail', name: 'Mail', path: primary }, { id: 'ui', name: 'EnoughUI', path: secondary }], context: originalAuthority });
   const transfer = await exportInspectionSnapshot({ snapshot, artifacts: f.artifacts, context: originalAuthority });
   const retention: InspectionSourceRetention = { id: snapshot.id, version: 1, sourceDigest: snapshot.sourceDigest, authority: originalAuthority, transfer, retainedAt: Date.parse(snapshot.manifest.createdAt), lastUsedAt: Date.parse(snapshot.manifest.createdAt) };
-  const source: InspectionSourceIdentity = { snapshotId: snapshot.id, sha256: snapshot.sourceDigest, roots: snapshot.roots.map(root => ({ id: root.id, sha256: root.sourceDigest, commit: root.commit })) };
+  const source: InspectionSourceIdentity = { snapshotId: snapshot.id, sha256: snapshot.sourceDigest, roots: snapshot.roots.map(root => ({ id: root.id, sha256: root.sourceDigest, ...(root.sourceCommit ? { commit: root.sourceCommit } : {}) })) };
   const job = { ...f.job, id: 'captured-author-preview', source };
   f.store.set('inspection-jobs', job); f.store.set('inspection-source-retention', retention);
-  return { ...f, snapshots, snapshot, transfer, retention, source, capturedJob: job };
+  return { ...f, snapshots, snapshot, transfer, retention, source, sourceHead, capturedJob: job };
 }
 
 test('source history returns the original all-root transfer manifest, capture time and exact file inventory from retained CAS bytes', async t => {
@@ -448,6 +455,11 @@ test('source history returns the original all-root transfer manifest, capture ti
   await f.snapshots.remove(f.snapshot);
   assert.equal(await readAll(f.service, 'source-manifest', f.transfer.sourceManifest.id, 127), expected);
   const pack = JSON.parse(expected);
+  assert.equal(f.source.roots![0]!.commit, f.sourceHead);
+  assert.equal(pack.snapshot.roots[0].sourceCommit, f.sourceHead);
+  assert.notEqual(pack.snapshot.roots[0].commit, f.sourceHead, 'Dirty source is retained in a separate synthetic preview commit');
+  assert.equal(pack.snapshot.roots[1].kind, 'folder');
+  assert.equal(Object.hasOwn(f.source.roots![1]!, 'commit'), false, 'Folder source has no original Git commit');
   assert.equal(pack.snapshot.id, f.source.snapshotId); assert.equal(pack.snapshot.sourceDigest, f.source.sha256);
   assert.equal(pack.snapshot.createdAt, f.snapshot.manifest.createdAt); assert.equal(pack.snapshot.roots.length, 2);
   assert.deepEqual(pack.snapshot.roots, JSON.parse(JSON.stringify(f.snapshot.manifest.roots))); assert.deepEqual(pack.sourceArtifacts, f.transfer.sourceArtifacts);
@@ -468,6 +480,42 @@ test('source history rejects foreign transfer ownership, root omission and mutab
     }
     if (mutation === 'corrupt-bytes') await writeFile(await f.artifacts.path(f.transfer.sourceManifest), 'corrupt original inventory');
     await assert.rejects(readAll(f.service, 'source-manifest', f.transfer.sourceManifest.id), /same-goal task scope|transfer manifest|artifact|digest|content/i);
+    assert.deepEqual(f.store.list('inspection-verification-history-views'), []);
+  });
+});
+
+test('source history rejects changed original Git identity, invented folder commits and mismatched root coverage', async t => {
+  for (const mutation of ['preview-as-original', 'folder-commit', 'root-digest', 'root-order'] as const) await t.test(mutation, async t => {
+    const f = await sourceFixture(t), source = structuredClone(f.source);
+    if (mutation === 'preview-as-original') source.roots![0]!.commit = f.snapshot.roots[0]!.commit;
+    if (mutation === 'folder-commit') source.roots![1]!.commit = f.snapshot.roots[1]!.commit;
+    if (mutation === 'root-digest') source.roots![0]!.sha256 = '9'.repeat(64);
+    if (mutation === 'root-order') source.roots!.reverse();
+    f.store.set('inspection-jobs', { ...f.capturedJob, source });
+    await assert.rejects(readAll(f.service, 'source-manifest', f.transfer.sourceManifest.id), /source transfer manifest/);
+    assert.deepEqual(f.store.list('inspection-verification-history-views'), []);
+  });
+});
+
+test('source history separately binds each retained bundle to its synthetic preview and ordered root provenance', async t => {
+  for (const mutation of ['original-as-preview', 'bundle-digest', 'bundle-root', 'bundle-purpose', 'bundle-ref', 'bundle-preview', 'root-order'] as const) await t.test(mutation, async t => {
+    const f = await sourceFixture(t), pack = JSON.parse((await f.artifacts.read(f.transfer.sourceManifest)).toString('utf8'));
+    const sourceArtifacts = structuredClone(f.transfer.sourceArtifacts);
+    if (mutation === 'root-order') sourceArtifacts.reverse();
+    else {
+      const first = sourceArtifacts[0]!, metadata = { ...first.manifest.metadata };
+      if (mutation === 'original-as-preview') metadata.commit = f.sourceHead;
+      if (mutation === 'bundle-digest') metadata.sourceDigest = '9'.repeat(64);
+      if (mutation === 'bundle-root') metadata.rootId = 'other-root';
+      if (mutation === 'bundle-purpose') metadata.purpose = 'unrelated-bundle';
+      if (mutation === 'bundle-ref') metadata.ref = 'other-ref';
+      if (mutation === 'bundle-preview') metadata.previewOnly = false;
+      first.manifest = await f.artifacts.put(await f.artifacts.read(first.manifest), { ...originalAuthority, name: 'changed-provenance.bundle', mime: first.manifest.mime, metadata });
+    }
+    pack.sourceArtifacts = sourceArtifacts;
+    const sourceManifest = await f.artifacts.put(JSON.stringify(pack), { ...originalAuthority, name: 'changed-provenance.json', mime: 'application/json', metadata: f.transfer.sourceManifest.metadata });
+    f.store.set('inspection-source-retention', { ...f.retention, transfer: { ...f.transfer, sourceArtifacts, sourceManifest } });
+    await assert.rejects(readAll(f.service, 'source-manifest', sourceManifest.id), /captured root manifest or owner/);
     assert.deepEqual(f.store.list('inspection-verification-history-views'), []);
   });
 });

@@ -8,6 +8,7 @@ import type { Attempt, ControllerRun, ExecutionCapability, ExecutionTargetAdvert
 import { readJsonObject, type AttemptDetail } from '@enoughfactory/factory';
 import { ArtifactStore, InspectionSnapshotManager, WorkspaceManager, exportInspectionContainerRoots, exportInspectionSnapshot, type ArtifactManifest, type InspectionSnapshot, type WorkingDirectorySource } from '@enoughfactory/workspaces';
 import { dockerInvocation } from '@enoughfactory/runtime';
+import { RUNTIME_PINS } from '@enoughfactory/agents';
 import { BrowserInspectionManager, type BrowserToolResult } from '@enoughfactory/browser-inspection';
 import { NativeInspectionBackend, type NativeAction } from '@enoughfactory/native-inspection';
 import type { DeviceApp } from './app.ts';
@@ -69,6 +70,9 @@ interface BackendRecord {id:string;kind:'native'|'browser';backendSessionId:stri
 interface BuildRecord {id:string;buildId:string;preparationArtifact?:ArtifactManifest;source?:InspectionSourceIdentity;finishedAt?:string;retiredAt?:string;}
 interface Submission {id:string;kind:'build'|'native'|'browser';chatSessionId:string;containerId?:string;profile?:NativeFixtureProfile;buildId?:string;snapshot?:InspectionSnapshot;}
 interface GrantToken {id:string;token:string;grantId:string;authority:InspectionAuthority;}
+interface HostSetupRecord {id:'mac-shell';status:'preparing'|'failed'|'ready';attempts:number;attemptedAt:string;updatedAt:string;retryAfter:number;error?:string;runtimeKey?:string;}
+const hostSetupBucket='inspection-host-setup',hostSetupRetryMs=60000,hostSetupAutomaticAttempts=3;
+const hostSetupRuntimeKey=`darwin-${process.arch}-node-${RUNTIME_PINS.node}-codex-${RUNTIME_PINS.codex}`;
 // Service-owned preparation only. File descriptors keep chmod from following a
 // replaced symlink; every selected entry still has to match canonical bytes.
 const controllerModesScript=`const fs=require('node:fs/promises'),C=require('node:fs').constants,p=require('node:path'),crypto=require('node:crypto');
@@ -101,6 +105,10 @@ export class InspectionService {
   private closing=false;
   private maintaining?:Promise<void>;
   private timer?:ReturnType<typeof setInterval>;
+  private hostPreparation?:Promise<void>;
+  private hostPreparationAbort?:AbortController;
+  private hostPreparationGeneration=0;
+  private hostPreparationRequest?:'automatic'|'requested';
   constructor(readonly app:DeviceApp,readonly chats:ChatController,network?:{peers:PeerManager}){
     this.artifacts=new ArtifactStore(path.join(app.dataDir,'workspace-data','artifacts'),app.device.id);
     this.jobs=new InspectionJobs(app.store,{deviceId:app.device.id,authorityCurrent:authority=>this.authorityCurrent(authority)});
@@ -177,7 +185,7 @@ export class InspectionService {
     this.jobs.recoverAfterRestart();this.delegation?.initialize();this.verifier.recover();this.profileSetup.recover();this.profileSync?.initialize();
     this.chats.setToolBridge(context=>this.bridge(context));
     this.app.extensions.push(async({method,url,body,peerId})=>{
-      if(method==='GET'&&url.pathname==='/api/inspection/readiness')return {executionTargets:await this.readiness()};
+      if(method==='GET'&&url.pathname==='/api/inspection/readiness')return {executionTargets:await this.readiness({prepareHost:'requested'})};
       const task=url.pathname.match(/^\/api\/tasks\/([^/]+)\/inspection$/);
       if(method==='GET'&&task){const jobs=this.jobs.listJobs().filter(job=>job.authority.taskId===task[1]),remote=this.delegation?.taskInspection(task[1]);const unique=<T extends {id:string}>(items:T[])=>[...new Map(items.map(item=>[item.id,item])).values()];return {jobs:unique([...jobs,...remote?.jobs||[]]),sessions:unique([...jobs.flatMap(job=>this.jobs.sessions(job.id)),...remote?.sessions||[]]),evidence:unique([...jobs.flatMap(job=>this.jobs.evidence(job.id)),...remote?.evidence||[]]),verifiers:this.app.store.list<InspectionVerificationRun>('inspection-verifier-runs').filter(run=>run.authority.taskId===task[1])};}
       const profiles=url.pathname.match(/^\/api\/projects\/([^/]+)\/inspection-profiles$/);
@@ -198,12 +206,11 @@ export class InspectionService {
     this.timer=setInterval(()=>{
       if(this.closing||this.maintaining)return;
       this.maintaining=this.app.withServiceOperation(async()=>{
-        this.profileSetup.maintain();const outcomes=await Promise.allSettled([this.readiness(),this.recoverOwnedBuilds(),this.retireIdleBrowsers(),this.retention.sweep(),this.retireColdProducts(),this.verifier.sweepCompleted(run=>this.canRetireVerifier(run)),this.syncNativeProfiles()]);
+        this.profileSetup.maintain();const outcomes=await Promise.allSettled([this.readiness({prepareHost:'automatic'}),this.recoverOwnedBuilds(),this.retireIdleBrowsers(),this.retention.sweep(),this.retireColdProducts(),this.verifier.sweepCompleted(run=>this.canRetireVerifier(run)),this.syncNativeProfiles()]);
         for(const outcome of outcomes)if(outcome.status==='rejected')this.app.emit('inspection-error',{error:(outcome.reason as Error).message});
       }).catch(error=>this.app.emit('inspection-error',{error:(error as Error).message})).finally(()=>{this.maintaining=undefined;});
     },30000);this.timer.unref();
-    if(process.platform==='darwin')void this.app.withServiceOperation(signal=>this.chats.manager.provisionHost(signal)).then(()=>this.readiness(),error=>{this.app.emit('inspection-setup',{capability:'mac-shell',error:(error as Error).message});});
-    await this.readiness();
+    await this.readiness({prepareHost:'automatic'});
   }
   profiles(projectId:string):NativeFixtureProfile[]{return this.app.store.get<{id:string;profiles:NativeFixtureProfile[]}>('inspection-project-profiles',projectId)?.profiles||[];}
   /** Public recheck preflight reads ownership only; it never stops or resumes work. */
@@ -259,16 +266,62 @@ export class InspectionService {
       const reason=run.reason||'Independent application verification is waiting for inspection readiness.';return {...checked,passed:false,exitCode:1,output:reason,recovery:{condition:'inspection-evidence',reason}};
     }finally{await this.snapshots.remove(snapshot);}
   };
-  async readiness():Promise<ExecutionTargetAdvertisement[]>{
+  private prepareHost(mode:'automatic'|'requested'):void{
+    if(this.closing||this.hostPreparation)return;
+    const recorded=this.app.store.get<HostSetupRecord>(hostSetupBucket,'mac-shell');
+    const previous=recorded?.runtimeKey&&recorded.runtimeKey!==hostSetupRuntimeKey?undefined:recorded;
+    if(previous&&previous.retryAfter>Date.now()||mode==='automatic'&&(previous?.attempts??0)>=hostSetupAutomaticAttempts)return;
+    const generation=++this.hostPreparationGeneration,controller=new AbortController();this.hostPreparationAbort=controller;
+    let lifecycleSignal:AbortSignal|undefined,operation:Promise<void>;
+    operation=this.app.withServiceOperation(async serviceSignal=>{
+      lifecycleSignal=serviceSignal;
+      const signal=AbortSignal.any([serviceSignal,controller.signal,AbortSignal.timeout(600000)]);
+      const current=()=>{signal.throwIfAborted();if(this.closing||generation!==this.hostPreparationGeneration)throw new Error('Mac agent setup was revoked.');};
+      current();const attemptedAt=new Date().toISOString(),attempts=(previous?.attempts??0)+1;
+      const record:HostSetupRecord={id:'mac-shell',status:'preparing',attempts,attemptedAt,updatedAt:attemptedAt,retryAfter:Date.now()+hostSetupRetryMs,runtimeKey:hostSetupRuntimeKey};
+      this.app.store.set(hostSetupBucket,record);
+      try{
+        await this.chats.manager.provisionHost(signal);current();
+        const provider=(await this.chats.manager.hostAvailability(signal)).find(provider=>provider.kind==='codex');current();
+        if(!provider?.available)throw new Error(provider?.details||'The pinned Mac agent tools are still unavailable after preparation.');
+        this.app.store.set(hostSetupBucket,{...record,status:'ready',attempts:0,retryAfter:0,updatedAt:new Date().toISOString()});
+      }catch(error){
+        if(this.closing||generation!==this.hostPreparationGeneration||serviceSignal.aborted||controller.signal.aborted)return;
+        const failure={...record,status:'failed' as const,error:error instanceof Error?error.message:String(error),retryAfter:Date.now()+hostSetupRetryMs,updatedAt:new Date().toISOString()};
+        this.app.store.set(hostSetupBucket,failure);this.app.emit('inspection-setup',{capability:'mac-shell',...failure});
+      }
+    }).catch(error=>{if(!this.closing&&!controller.signal.aborted&&!lifecycleSignal?.aborted)this.app.emit('inspection-setup',{capability:'mac-shell',error:(error as Error).message});}).finally(async()=>{
+      if(this.hostPreparation!==operation)return;this.hostPreparation=undefined;this.hostPreparationAbort=undefined;
+      if(this.closing||generation!==this.hostPreparationGeneration||controller.signal.aborted||lifecycleSignal?.aborted)return;
+      await this.refreshing?.catch(()=>{});
+      if(this.closing||generation!==this.hostPreparationGeneration||controller.signal.aborted||lifecycleSignal?.aborted)return;
+      await this.readiness({signal:lifecycleSignal}).catch(error=>{if(!this.closing&&!controller.signal.aborted&&!lifecycleSignal?.aborted)this.app.emit('inspection-error',{error:(error as Error).message});});
+    });
+    this.hostPreparation=operation;
+  }
+  async readiness(input:{prepareHost?:'automatic'|'requested';signal?:AbortSignal}={}):Promise<ExecutionTargetAdvertisement[]>{
+    if(this.closing)throw new Error('Inspection service is closing.');
+    input.signal?.throwIfAborted();
+    if(input.prepareHost==='requested'||input.prepareHost&&!this.hostPreparationRequest)this.hostPreparationRequest=input.prepareHost;
     if(this.refreshing)return this.refreshing;
     return this.refreshing=(async()=>{
       const containerReady=(this.app.device.capacity??0)>0;
       const capabilities:ExecutionTargetAdvertisement[]=[{id:'container',kind:'container',protocolVersion:1,readiness:containerReady?'ready':'setup-required',capacity:this.app.device.capacity,workspaceProviders:this.app.device.workspaceProviders||['git'],runtimes:['codex'],resources:this.app.device.workerResources,capabilities:[{kind:'linux-shell',readiness:containerReady?'ready':'setup-required',reason:containerReady?undefined:'Start the private runtime to run container work.',setupAction:containerReady?undefined:'Start the runtime from Devices.'},{kind:'chromium-inspection',readiness:containerReady?'ready':'setup-required',version:'playwright-mcp-0.0.82',reason:containerReady?'Prepared on demand in the private runtime.':'Start the private runtime to prepare browser testing.'}]}];
       if(process.platform==='darwin'){
         const [providers,mac,ios,apple]=await Promise.all([this.chats.manager.hostAvailability(),this.native.readiness('macos'),this.native.readiness('ios-simulator'),execute('/usr/bin/xcrun',['--find','xcodebuild'],{timeout:10000}).then(()=>true,()=>false)]);
+        if(this.closing)throw new Error('Inspection service closed before readiness was checked.');input.signal?.throwIfAborted();
         const provider=providers.find(provider=>provider.kind==='codex')!;
-        capabilities.push({id:'mac-host',kind:'host-macos',protocolVersion:1,readiness:provider.available?'ready':'preparing',capacity:Math.max(1,Math.min(4,cpus().length-1)),resources:{cpus:cpus().length,memoryGiB:totalmem()/1024**3},workspaceProviders:['git'],runtimes:['codex'],capabilities:[{kind:'mac-shell',readiness:provider.available?'ready':'preparing',version:provider.version,reason:provider.available?undefined:'Preparing the pinned Mac authoring tools.'},{kind:'apple-compilation',readiness:apple?'ready':'setup-required',setupAction:apple?undefined:'Install Xcode and its command line tools.'},{kind:'macos-app-inspection',readiness:mac.status,reason:mac.reasons.join(' ')||undefined,setupAction:mac.status==='ready'?undefined:'Set up the native testing helper, Accessibility and screen capture permissions.'},{kind:'ios-simulator-inspection',readiness:ios.status,reason:ios.reasons.join(' ')||undefined,setupAction:ios.status==='ready'?undefined:'Install the iPhone testing runner and an iOS Simulator runtime.'}]});
+        const preparationRequest=this.hostPreparationRequest;this.hostPreparationRequest=undefined;
+        if(!provider.available&&preparationRequest)this.prepareHost(preparationRequest);
+        let setup=this.app.store.get<HostSetupRecord>(hostSetupBucket,'mac-shell');
+        if(provider.available&&setup&&!this.hostPreparation&&(setup.status!=='ready'||setup.attempts!==0||setup.runtimeKey!==hostSetupRuntimeKey)){setup={...setup,status:'ready',attempts:0,retryAfter:0,error:undefined,runtimeKey:hostSetupRuntimeKey,updatedAt:new Date().toISOString()};this.app.store.set(hostSetupBucket,setup);}
+        const hostReadiness=provider.available?'ready':this.hostPreparation?'preparing':'setup-required';
+        const reason=provider.available?undefined:this.hostPreparation?'Preparing the pinned Mac authoring tools.':[setup?.error,provider.details,setup?.status==='preparing'?'Previous Mac agent preparation was interrupted.':undefined].filter(Boolean).join(' ')||'The pinned Mac authoring tools are not prepared.';
+        const setupAction=hostReadiness==='setup-required'?`Check readiness to retry Mac agent setup${setup&&setup.retryAfter>Date.now()?` after ${new Date(setup.retryAfter).toISOString()}`:''}.`:undefined;
+        capabilities.push({id:'mac-host',kind:'host-macos',protocolVersion:1,readiness:hostReadiness,reason,setupAction,capacity:Math.max(1,Math.min(4,cpus().length-1)),resources:{cpus:cpus().length,memoryGiB:totalmem()/1024**3},workspaceProviders:['git'],runtimes:['codex'],capabilities:[{kind:'mac-shell',readiness:hostReadiness,version:provider.version,reason,setupAction},{kind:'apple-compilation',readiness:apple?'ready':'setup-required',setupAction:apple?undefined:'Install Xcode and its command line tools.'},{kind:'macos-app-inspection',readiness:mac.status,reason:mac.reasons.join(' ')||undefined,setupAction:mac.status==='ready'?undefined:'Set up the native testing helper, Accessibility and screen capture permissions.'},{kind:'ios-simulator-inspection',readiness:ios.status,reason:ios.reasons.join(' ')||undefined,setupAction:ios.status==='ready'?undefined:'Install the iPhone testing runner and an iOS Simulator runtime.'}]});
       }
+      if(this.closing)throw new Error('Inspection service closed before readiness was checked.');
+      input.signal?.throwIfAborted();
       if(JSON.stringify(this.app.device.executionTargets)!==JSON.stringify(capabilities)){this.app.device={...this.app.device,executionTargets:capabilities};this.app.devices=[this.app.device,...this.app.devices.filter(device=>device.id!==this.app.device.id)];this.app.emit('execution-capabilities',capabilities);this.app.changed();}
       return capabilities;
     })().finally(()=>{this.refreshing=undefined;});
@@ -824,7 +877,7 @@ export class InspectionService {
     const retired=await this.browser.retireIdle();for(const lease of retired){const backend=this.app.store.list<BackendRecord>('inspection-backends').find(record=>record.kind==='browser'&&record.backendSessionId===lease.id);if(!backend)continue;const session=this.jobs.getSession(backend.id);if(!session)continue;this.jobs.confirmSessionStopped(session.id,'The idle browser was retired; start an explicit new inspection to continue.');this.jobs.reconcileJob(session.jobId,{status:'failed',reason:'The idle browser was retired after confirmed removal.',releaseConfirmed:true});}if(retired.length){this.app.changed();this.pump();}
   }
   async close():Promise<void>{
-    this.closing=true;if(this.timer)clearInterval(this.timer);for(const bridge of this.bridges)await bridge.close();this.bridges.clear();
+    this.closing=true;this.hostPreparationGeneration++;this.hostPreparationAbort?.abort();if(this.timer)clearInterval(this.timer);for(const bridge of this.bridges)await bridge.close();this.bridges.clear();
     for(const job of this.jobs.listJobs().filter(job=>job.ownerDeviceId===this.app.device.id&&['preparing','running','waiting','cancellation-requested'].includes(job.status)))this.jobs.markUnknown(job.id,'Device service closed; reconcile owned effects before replacement.');
     await this.profileSetup.close();await this.verifier.close();await this.delegation?.close();await this.builds.close();await this.native.closeTransport();
   }

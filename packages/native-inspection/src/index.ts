@@ -23,6 +23,7 @@ export class NativeSessionNotAllocatedError extends NativeInspectionError {
 
 const execute = promisify(execFile);
 interface Running { session: NativeSession; broker?: IOSCommandBroker; runner?: ChildProcess; observationId?: string; busy?: boolean; unknown?: boolean; restartPending?: boolean; }
+interface IOSSimulatorSelection { runtimeIdentifier: string; deviceTypeIdentifier: string; }
 function productIdentity(product: NativeProduct): string {
   const canonical = (value: any): any => Array.isArray(value) ? value.map(canonical) : value && typeof value === 'object' ? Object.fromEntries(Object.keys(value).sort().map(key => [key, canonical(value[key])])) : value;
   return sha256(JSON.stringify(canonical(product)));
@@ -47,8 +48,7 @@ export class NativeInspectionBackend {
     if (process.platform !== 'darwin') return { status: 'unsupported', reasons: ['Native Apple inspection requires a Mac.'] };
     try {
       if (platform === 'macos') return await this.helper().call({ kind: 'readiness' });
-      await execute('/usr/bin/xcrun', ['simctl', 'list', 'runtimes', '--json'], { timeout: 15_000 });
-      await stat(this.iosXctestrun());
+      await this.iosPreflight();
       return { status: 'ready', reasons: [] };
     } catch (error) { return { status: 'setup-required', reasons: [`Native inspection setup is incomplete: ${error instanceof Error ? error.message : String(error)}`] }; }
   }
@@ -57,6 +57,46 @@ export class NativeInspectionBackend {
     const path = this.options.iosXctestrunPath ?? resolveNativeAssets().iosXctestrunPath;
     if (!path) throw new NativeInspectionError('setup-required', 'Install the iOS UI runner built for this Xcode version.');
     return path;
+  }
+  private async iosInventory(kind: 'runtimes' | 'devicetypes'): Promise<unknown> {
+    try {
+      const { stdout } = await execute('/usr/bin/xcrun', ['simctl', 'list', kind, '--json'], { timeout: 15_000 });
+      return JSON.parse(stdout);
+    } catch { throw new NativeInspectionError('setup-required', `Xcode Simulator ${kind} inventory is unavailable or malformed. Repair the Simulator installation in Xcode.`); }
+  }
+  private async iosPreflight(): Promise<IOSSimulatorSelection> {
+    const runtimeInventory = await this.iosInventory('runtimes') as any;
+    const runtimes = runtimeInventory?.runtimes;
+    if (!Array.isArray(runtimes) || runtimes.some(x => !x || typeof x.identifier !== 'string' || !x.identifier || typeof x.isAvailable !== 'boolean' || typeof x.version !== 'string' || !/^\d+(?:\.\d+)*$/.test(x.version))) {
+      throw new NativeInspectionError('setup-required', 'Xcode Simulator runtime inventory is incomplete. Repair the Simulator installation in Xcode.');
+    }
+    const available = runtimes.filter(x => x.isAvailable && x.identifier.startsWith('com.apple.CoreSimulator.SimRuntime.iOS-') && (!this.options.iosSimulatorRuntime || x.identifier === this.options.iosSimulatorRuntime))
+      .sort((a, b) => b.version.localeCompare(a.version, undefined, { numeric: true }));
+    if (!available.length) throw new NativeInspectionError('setup-required', this.options.iosSimulatorRuntime
+      ? `Install or enable the configured iOS Simulator runtime (${this.options.iosSimulatorRuntime}) in Xcode.`
+      : 'Install an available iOS Simulator runtime in Xcode.');
+    const typeInventory = await this.iosInventory('devicetypes') as any;
+    const types = typeInventory?.devicetypes;
+    if (!Array.isArray(types) || types.some(x => !x || typeof x.identifier !== 'string' || !x.identifier || typeof x.name !== 'string' || !x.name)) {
+      throw new NativeInspectionError('setup-required', 'Xcode Simulator device type inventory is incomplete. Repair the Simulator installation in Xcode.');
+    }
+    const phones = types.filter(x => x.name.startsWith('iPhone') && x.identifier.startsWith('com.apple.CoreSimulator.SimDeviceType.iPhone-') && (!this.options.iosSimulatorDeviceType || x.identifier === this.options.iosSimulatorDeviceType));
+    if (!phones.length) throw new NativeInspectionError('setup-required', this.options.iosSimulatorDeviceType
+      ? `Install the configured iPhone Simulator device type (${this.options.iosSimulatorDeviceType}) in Xcode, or select an installed iPhone.`
+      : 'No iPhone Simulator device type is installed. Install one in Xcode.');
+    for (const runtime of available) {
+      if (!Array.isArray(runtime.supportedDeviceTypes) || runtime.supportedDeviceTypes.some((x: any) => !x || typeof x.identifier !== 'string' || !x.identifier)) {
+        throw new NativeInspectionError('setup-required', 'Xcode did not report compatible device types for the iOS Simulator runtime. Repair the Simulator installation in Xcode.');
+      }
+      const phone = phones.find(x => runtime.supportedDeviceTypes.some((supported: any) => supported.identifier === x.identifier));
+      if (phone) {
+        try {
+          if (!(await stat(this.iosXctestrun())).isFile()) throw new Error('Missing UI runner file.');
+        } catch { throw new NativeInspectionError('setup-required', 'Install the iOS UI runner built for this Xcode version.'); }
+        return { runtimeIdentifier: runtime.identifier, deviceTypeIdentifier: phone.identifier };
+      }
+    }
+    throw new NativeInspectionError('setup-required', 'No installed iPhone device type is compatible with the selected iOS Simulator runtime. Install a compatible iPhone and iOS runtime in Xcode, or change the configured selection.');
   }
   private async save(running: Running, status: string): Promise<void> {
     await atomicJSON(join(running.session.directory, 'session.json'), { version: 1, status, ...running.session, restartPending: Boolean(running.restartPending), updatedAt: new Date().toISOString() });
@@ -77,10 +117,14 @@ export class NativeInspectionBackend {
         throw new NativeInspectionError('session-exists', 'The coordinator session identity already has retained state; reconcile it instead of relaunching.');
       } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
     }
+    let iosSimulator: IOSSimulatorSelection | undefined;
     try {
       await verifyNativeProduct(product);
-      const ready = await this.readiness(product.platform);
-      if (ready.status !== 'ready') throw new NativeInspectionError(ready.status, ready.reasons.join(' '));
+      if (product.platform === 'ios-simulator' && process.platform === 'darwin') iosSimulator = await this.iosPreflight();
+      else {
+        const ready = await this.readiness(product.platform);
+        if (ready.status !== 'ready') throw new NativeInspectionError(ready.status, ready.reasons.join(' '));
+      }
     } catch (error) {
       if (requestedId) {
         try {
@@ -107,7 +151,7 @@ export class NativeInspectionBackend {
         session.pid = result.pid;
         if (Number.isFinite(result.processStartedAt)) session.processStartedAt = result.processStartedAt;
         await this.macLaunchReceipt(session);
-      } else await this.startIOS(running);
+      } else await this.startIOS(running, iosSimulator!);
       await verifyNativeProduct(product); // A launch never silently blesses changed original bytes.
       running.unknown = false; await this.save(running, 'running'); return structuredClone(session);
     } catch (error) {
@@ -116,22 +160,17 @@ export class NativeInspectionBackend {
       throw error;
     }
   }
-  private async startIOS(running: Running): Promise<void> {
+  private async startIOS(running: Running, selection: IOSSimulatorSelection): Promise<void> {
     const session = running.session; const product = session.product;
-    const runtimes = JSON.parse((await execute('/usr/bin/xcrun', ['simctl', 'list', 'runtimes', '--json'])).stdout).runtimes as any[];
-    const runtime = runtimes.filter(x => x.isAvailable && (this.options.iosSimulatorRuntime ? x.identifier === this.options.iosSimulatorRuntime : x.identifier.includes('.iOS-'))).sort((a, b) => String(b.version).localeCompare(String(a.version), undefined, { numeric: true }))[0];
-    if (!runtime) throw new NativeInspectionError('setup-required', 'Install a compatible iOS Simulator runtime in Xcode.');
-    const types = JSON.parse((await execute('/usr/bin/xcrun', ['simctl', 'list', 'devicetypes', '--json'])).stdout).devicetypes as any[];
-    const deviceType = this.options.iosSimulatorDeviceType ?? types.find(x => x.name.startsWith('iPhone'))?.identifier;
-    if (!deviceType) throw new NativeInspectionError('setup-required', 'No iPhone Simulator device type is installed.');
+    const runtime = selection.runtimeIdentifier; const deviceType = selection.deviceTypeIdentifier;
     const name = `EnoughFactory ${session.id.slice(0, 12)}`;
-    const simulatorId = (await execute('/usr/bin/xcrun', ['simctl', 'create', name, deviceType, runtime.identifier])).stdout.trim();
+    const simulatorId = (await execute('/usr/bin/xcrun', ['simctl', 'create', name, deviceType, runtime])).stdout.trim();
     if (!/^[A-Fa-f0-9-]{36}$/.test(simulatorId)) throw new NativeInspectionError('simulator-unknown', 'Simulator creation did not return an owned identity.');
     session.simulatorId = simulatorId; await this.save(running, 'preparing');
     const created = await this.simulator(simulatorId);
     if (!created || created.name !== name || created.deviceTypeIdentifier !== deviceType) throw new NativeInspectionError('ownership-unknown', 'The created Simulator identity could not be verified.');
     const dataPath = await realpath(created.dataPath);
-    const owner = JSON.stringify({ version: 1, sessionId: session.id, ownerAttemptId: session.ownerAttemptId, simulatorId, name, runtime: runtime.identifier, deviceType, dataPath, productInventorySha256: product.inventorySha256 });
+    const owner = JSON.stringify({ version: 1, sessionId: session.id, ownerAttemptId: session.ownerAttemptId, simulatorId, name, runtime, deviceType, dataPath, productInventorySha256: product.inventorySha256 });
     await writeFile(join(dataPath, '.enoughfactory-native-owner.json'), owner, { mode: 0o600, flag: 'wx' });
     await writeFile(join(session.directory, 'simulator-owner.json'), owner, { mode: 0o600, flag: 'wx' });
     await execute('/usr/bin/xcrun', ['simctl', 'boot', simulatorId], { timeout: 30_000 });
@@ -145,7 +184,7 @@ export class NativeInspectionBackend {
       if (entry.type === 'file' && sha256(await readFile(join(installedRoot, entry.path))) !== entry.sha256) throw new NativeInspectionError('product-changed', 'Installed Simulator app bytes differ from the original product.');
     }
     const data = (await execute('/usr/bin/xcrun', ['simctl', 'get_app_container', simulatorId, product.bundleIdentifier, 'data'])).stdout.trim();
-    await writeFile(join(session.directory, 'installed-product.json'), JSON.stringify({ originalInventorySha256: product.inventorySha256, installedApp: installedRoot, dataRoot: data, simulatorId, runtime: runtime.identifier, verifiedOriginalFiles: original.filter(x => x.type === 'file').length }, null, 2), { mode: 0o600 });
+    await writeFile(join(session.directory, 'installed-product.json'), JSON.stringify({ originalInventorySha256: product.inventorySha256, installedApp: installedRoot, dataRoot: data, simulatorId, runtime, verifiedOriginalFiles: original.filter(x => x.type === 'file').length }, null, 2), { mode: 0o600 });
     const broker = new IOSCommandBroker(session.id, this.options.commandTimeoutMs); await broker.listen(); running.broker = broker;
     const configuration = join(session.directory, 'runner-configuration.json');
     await writeFile(configuration, JSON.stringify({ sourceXctestrunPath: this.iosXctestrun(), outputDirectory: session.directory, brokerUrl: broker.url, token: broker.token, sessionId: session.id, bundleIdentifier: product.bundleIdentifier, launchArguments: product.launchArguments, maxDurationSeconds: 1800 }), { mode: 0o600 });
