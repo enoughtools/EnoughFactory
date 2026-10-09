@@ -159,13 +159,17 @@ export class FactoryCoordinator {
           this.wake(current.id, "Retry the controller after its preparation backoff.");
           current = this.goal(goal.id); control = this.control(goal.id);
         }
+        // A localized controller can also keep the goal running while disk waits.
+        if (control.waitingFor === "host-disk-space" && this.options.admission && !this.options.admission(current)) {
+          this.wake(current.id, "Host disk space is available; continuing work.");
+          current = this.goal(goal.id); control = this.control(goal.id);
+        }
         if (current.status === "waiting") {
           if (control.waitingFor === "budget-changed") {
             const reason = this.limitReason(current);
             if (reason) { this.wait(current.id, reason, "budget-changed"); continue; }
             this.wake(current.id, "No configured execution limit is currently reached; continuing work.");
-          } else if (control.waitingFor === "host-disk-space" && this.options.admission && !this.options.admission(current)) this.wake(current.id, "Host disk space is available; continuing work.");
-          else if (control.waitingFor === "device-online" && this.hasAvailableDevice(current)) this.wake(current.id, "A worker device is available.");
+          } else if (control.waitingFor === "device-online" && this.hasAvailableDevice(current)) this.wake(current.id, "A worker device is available.");
           else if (control.wakeAt && Date.parse(control.wakeAt) <= Date.parse(this.now())) this.wake(current.id, "The configured wait has elapsed.");
           else continue;
           current = this.goal(goal.id); control = this.control(goal.id);

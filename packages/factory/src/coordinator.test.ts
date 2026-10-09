@@ -8,7 +8,7 @@ import { FactoryControllerError, FactoryVerificationWaitError } from "./errors.j
 import { readPlan } from "./protocol.js";
 import { CONTROLLER_PROMPT_LIMIT, controllerTaskContract, controllerAttemptContract } from "./controller-evidence.js";
 import type {
-  AttemptDetail, CandidateRef, CheckResult, ControlRecord, EvaluationRecord, EvaluationResponse, ExecutionResult, FactoryRuntimePort,
+  AttemptDetail, CandidateRef, CheckResult, ControlRecord, CoordinatorOptions, EvaluationRecord, EvaluationResponse, ExecutionResult, FactoryRuntimePort,
   FactoryStore, FactoryWorkspacePort, PlanRecord, PlanResponse, TaskDetail, TaskCheckInputsConfiguration,
 } from "./types.js";
 import { UI_QUALITY_CHECK_COMMAND } from "./types.js";
@@ -57,7 +57,7 @@ const completeEvaluation: EvaluationResponse = {
   criteria: criteria.map((criterion, index) => ({ criterion, satisfied: true, evidence: [`artifact:proof-${index}`] })),
 };
 
-function harness(devices: Device[] = [device], now?: () => Date) {
+function harness(devices: Device[] = [device], now?: () => Date, admission?: CoordinatorOptions["admission"]) {
   const store = new MemoryStore();
   const calls = { planner: 0, evaluator: 0, diagnosis: 0, execute: 0, reconcile: 0, cancel: 0, prepare: 0, capture: 0, check: 0, goalCheck: 0, integrate: 0, integrationFences: 0, reconcileIntegration: 0 };
   const executionPrompts: string[] = [];
@@ -121,7 +121,7 @@ function harness(devices: Device[] = [device], now?: () => Date) {
     },
     async release() {},
   };
-  const options = { store, runtime, workspaces, deviceId: device.id, devices: () => devices, project: (id: string) => id === project.id ? project : undefined, now };
+  const options = { store, runtime, workspaces, deviceId: device.id, devices: () => devices, project: (id: string) => id === project.id ? project : undefined, now, admission };
   const coordinator = new FactoryCoordinator(options);
   const goal = (acceptance?: Goal["acceptance"]) => coordinator.create({ projectId: project.id, objective: "Build the feature and publish its release", criteria, autonomy: "autonomous", approvalMode: "approve-all", concurrency: 1, acceptance });
   return {
@@ -1661,6 +1661,59 @@ test("localized planning retries preserve their scope while independent work com
   assert.equal(after.controllerFailures, undefined, "a successful structured plan resets the consecutive failure budget");
   assert.equal(after.waitingFor, undefined);
   assert.equal(after.wakeAt, undefined);
+});
+
+test("localized disk waits resume their controller from fresh admission while preserving independent work", async t => {
+  for (const blockedBeforeRecovery of [false, true]) await t.test(blockedBeforeRecovery ? "capacity remains blocked before recovery" : "capacity recovered before the next tick", async () => {
+    let diskAvailable = true;
+    const factory = harness([device], undefined, () => diskAvailable ? undefined : { condition: "host-disk-space", reason: "More host disk space is required." });
+    factory.planning(async () => ({ ...plan, tasks: [
+      { ...plan.tasks[0]!, key: "repair", title: "Repair native delivery", writePaths: ["apps/mail"] },
+      { ...plan.tasks[0]!, key: "independent", title: "Independent work", writePaths: ["docs"] },
+    ] }));
+    const goal = factory.goal();
+    await factory.coordinator.tick(); await factory.coordinator.waitForIdle();
+    const tasks = factory.store.list<FactoryTask>("tasks");
+    const failed: FactoryTask = { ...tasks.find(task => task.title === "Repair native delivery")!, status: "failed", currentAttemptId: "original-failed-author" };
+    const independent: FactoryTask = { ...tasks.find(task => task.title === "Independent work")!, status: "running", currentAttemptId: "independent-author", deviceId: device.id };
+    const at = goal.createdAt;
+    const failedAuthor: Attempt = { id: failed.currentAttemptId!, taskId: failed.id, generation: 5, deviceId: device.id, status: "failed", startedAt: at, endedAt: at };
+    const independentAuthor: Attempt = { id: independent.currentAttemptId!, taskId: independent.id, generation: 2, deviceId: device.id, status: "running", startedAt: at, error: undefined };
+    const failures: NonNullable<ControlRecord["controllerFailures"]> = { revision: goal.revision, kind: "diagnosis", count: 1 };
+    factory.store.transaction(() => {
+      factory.store.set("tasks", failed); factory.store.set("tasks", independent);
+      factory.store.set("attempts", failedAuthor); factory.store.set("attempts", independentAuthor);
+      factory.store.set<AttemptDetail>("factory-attempt-details", { id: failedAuthor.id, goalId: goal.id, goalRevision: goal.revision, phase: "checking", cancellation: "none", candidate: { id: "retained-source", commit: "original-candidate", baseCommit: "original-base" }, result: { status: "failed", text: "The original check failed." } });
+      factory.store.set<AttemptDetail>("factory-attempt-details", { id: independentAuthor.id, goalId: goal.id, goalRevision: goal.revision, phase: "executing", cancellation: "none" });
+      factory.store.set<ControlRecord>("factory-control", { ...factory.store.get<ControlRecord>("factory-control", goal.id)!, stage: "diagnose", diagnosisTaskId: failed.id, waitingFor: "host-disk-space", waitReason: "More host disk space is required.", controllerFailures: failures });
+    });
+    factory.reconciling(async () => ({ status: "running" }));
+    const originalDetails = factory.store.list<AttemptDetail>("factory-attempt-details");
+    const decision = deferred<{ action: string; reason: string; instructions: string; wakeCondition: string }>();
+    factory.diagnosing(() => decision.promise);
+    if (blockedBeforeRecovery) {
+      diskAvailable = false;
+      await factory.coordinator.tick(); await factory.coordinator.waitForIdle();
+      assert.equal(factory.calls.diagnosis, 0); assert.equal(factory.calls.execute, 0);
+      assert.equal(factory.store.get<ControlRecord>("factory-control", goal.id)!.waitingFor, "host-disk-space");
+    } else assert.equal(factory.store.get<Goal>("goals", goal.id)!.status, "running", "Localized repair does not require the whole goal to be waiting.");
+    diskAvailable = true;
+    try {
+      await factory.coordinator.tick();
+      assert.equal(factory.calls.diagnosis, 1, "Fresh disk admission automatically continues the original diagnosis without a wake event or manual resume.");
+      const control = factory.store.get<ControlRecord>("factory-control", goal.id)!;
+      assert.equal(control.waitingFor, undefined); assert.equal(control.waitReason, undefined);
+      assert.equal(control.stage, "diagnose"); assert.equal(control.diagnosisTaskId, failed.id);
+      assert.deepEqual(control.controllerFailures, failures, "Admission does not reset the controller failure budget.");
+      assert.deepEqual(factory.store.list<Attempt>("attempts"), [failedAuthor, independentAuthor]);
+      assert.deepEqual(factory.store.list<AttemptDetail>("factory-attempt-details"), originalDetails);
+      assert.deepEqual(factory.store.get<FactoryTask>("tasks", independent.id), independent);
+      assert.equal(factory.calls.execute, 0); assert.equal(factory.calls.cancel, 0); assert.equal(factory.calls.capture, 0);
+    } finally {
+      decision.resolve({ action: "wait", reason: "A separate fixture prerequisite remains.", instructions: "", wakeCondition: "external-condition" });
+      await factory.coordinator.waitForIdle();
+    }
+  });
 });
 
 test("unknown controller outcomes and external waits never acquire an automatic deadline", async () => {
