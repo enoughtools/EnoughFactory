@@ -233,7 +233,14 @@ test('real native overlap failure retries the original unadmitted audit session 
   assert(run.sessionId); const originalSession = run.sessionId, originalAudit = run.id, source = structuredClone(run.source);
   assert.equal(native.sessions.record(originalSession).status, 'failed'); assert.equal(f.store.get('session-host', originalSession), undefined);
   assert.equal(f.calls.length, 0); assert.equal(run.chatId, undefined); assert.equal(native.creates(), 1);
+  const marker = f.store.get<{ id: string; auditId: string; projectId: string; deviceId: string; generation: number; executionTargetId: string; failedAt: string; failure: string }>('session-host-unadmitted-overlap', originalSession)!;
+  assert(marker, 'The actual failing session producer must record its durable audit binding.');
+  const { failedAt, ...identity } = marker;
+  assert.deepEqual(identity, { id: originalSession, auditId: originalAudit, projectId: `workspace-${originalAudit}`, deviceId: 'mac', generation: 1, executionTargetId: 'mac-host', failure: 'primary-workspace-overlap' });
+  assert(Number.isFinite(Date.parse(failedAt)));
+  f.store.delete('session-host-unadmitted-overlap', originalSession);
   await assert.rejects(readFile(path.join(native.workspaceDataDir, 'host-sessions', originalSession, 'workspace.json')), { code: 'ENOENT' });
+  await native.sessions.recover(); assert.equal(native.sessions.record(originalSession).status, 'failed', 'Cold recovery also authenticates the original legacy audit without a new producer marker.');
   f.restart(); run = await f.execute(f.setup.get(run.id));
   assert.equal(run.status, 'configured', run.reason); assert.equal(run.id, originalAudit); assert.equal(run.sessionId, originalSession); assert.deepEqual(run.source, source);
   assert.equal(native.creates(), 1, 'The original failed session must prepare again without a new deterministic-name allocation.');
@@ -261,6 +268,10 @@ test('real native audit recovery survives interruption after the owned workspace
   const corrected = { ...previous, projectPath: run.snapshot.roots[0]!.path };
   assert.deepEqual(JSON.parse(await readFile(workspacePath, 'utf8')), corrected, 'Only the frozen original-input path may change in the owned workspace record.');
   assert.deepEqual(native.sessions.record(sessionId), originalSession); assert.equal(f.calls.length, 0); assert.equal(native.creates(), 1);
+  assert(f.store.get('session-host-unadmitted-overlap', sessionId), 'The reproduced failure emitted its typed producer provenance.');
+  f.store.delete('session-host-unadmitted-overlap', sessionId);
+  f.store.set('sessions', { ...originalSession, status: 'unknown', phase: 'The native workspace owner was not recorded; preserved files require recovery.' });
+  await native.sessions.recover(); assert.equal(native.sessions.record(sessionId).status, 'failed', 'The original legacy missing-owner reload reconciles without a new producer marker.');
   f.restart(); run = await f.execute(f.setup.get(auditId));
   assert.equal(run.status, 'configured', run.reason); assert.equal(run.id, auditId); assert.equal(run.sessionId, sessionId); assert.deepEqual(run.source, source);
   assert.equal(retries, 2); assert.equal(native.creates(), 1); assert.equal(f.calls.length, 1); assert.equal(f.configured.length, 1);
@@ -289,6 +300,38 @@ test('real native preparation retry refuses admitted chats, retained inputs and 
       });
       assert.deepEqual(native.sessions.record(sessionId), before, value.label); assert.deepEqual(f.store.get('session-launch', sessionId), launch, value.label);
       assert.deepEqual(native.sessions.serviceActivity(), { starting: 0, stopping: 0 }); assert.equal(native.creates(), 1); assert.equal(f.calls.length, 0); assert.equal(f.configured.length, 0);
+    } finally { await value.remove(); }
+  }
+});
+
+test('real native cold recovery keeps lookalike unknown failures and incomplete ownership unresolved', { timeout: 60000, skip: process.platform !== 'darwin' }, async t => {
+  const f = await fixture(t), native = realNativeSessions(t, f, true), run = await f.execute(await f.propose());
+  assert.equal(run.status, 'waiting'); assert(run.sessionId);
+  const sessionId = run.sessionId, failed = native.sessions.record(sessionId), launch = f.store.get('session-launch', sessionId);
+  const unknown = { ...failed, status: 'unknown' as const, phase: 'The native workspace owner was not recorded; preserved files require recovery.' };
+  const ownerPath = path.join(native.workspaceDataDir, 'workspaces', run.id, 'audit-owner.json'), owner = await readFile(ownerPath, 'utf8');
+  const marker = f.store.get<{ id: string; auditId: string; failedAt: string }>('session-host-unadmitted-overlap', sessionId)!; assert(marker);
+  const inputRoot = path.join(native.workspaceDataDir, 'host-sessions', sessionId);
+  const cases: Array<{ label: string; introduce(): Promise<void> | void; remove(): Promise<void> | void }> = [
+    { label: 'a different unknown failure phase', introduce: () => { f.store.set('sessions', { ...unknown, phase: 'Native work ended with an uncertain outcome.' }); }, remove: () => {} },
+    { label: 'an absent original audit record', introduce: () => { f.store.delete(PROFILE_AUDITS, run.id); }, remove: () => { f.store.set(PROFILE_AUDITS, run); } },
+    { label: 'an absent source ownership file', introduce: () => rm(ownerPath), remove: () => writeFile(ownerPath, owner) },
+    { label: 'changed original source ownership', introduce: () => writeFile(ownerPath, JSON.stringify({ ...JSON.parse(owner), source: { ...JSON.parse(owner).source, sha256: 'f'.repeat(64) } })), remove: () => writeFile(ownerPath, owner) },
+    { label: 'a producer marker for another audit', introduce: () => { f.store.set('session-host-unadmitted-overlap', { ...marker, auditId: 'profile-audit-another' }); }, remove: () => { f.store.set('session-host-unadmitted-overlap', marker); } },
+    { label: 'a producer marker with an invalid failure time', introduce: () => { f.store.set('session-host-unadmitted-overlap', { ...marker, failedAt: 'unconfirmed' }); }, remove: () => { f.store.set('session-host-unadmitted-overlap', marker); } },
+    { label: 'an already admitted idle chat', introduce: () => { f.store.set('chats', { id: 'cold-admitted', sessionId, status: 'idle' }); }, remove: () => { f.store.delete('chats', 'cold-admitted'); } },
+    { label: 'partial retained host inputs', introduce: async () => { await mkdir(inputRoot, { recursive: true }); await writeFile(path.join(inputRoot, 'retained.txt'), 'Unconfirmed native inputs must survive cold recovery.\n'); }, remove: async () => { assert.equal(await readFile(path.join(inputRoot, 'retained.txt'), 'utf8'), 'Unconfirmed native inputs must survive cold recovery.\n'); await rm(inputRoot, { recursive: true }); } },
+  ];
+  for (const value of cases) {
+    f.store.set('sessions', unknown); await value.introduce();
+    try {
+      await native.sessions.recover(); assert.equal(native.sessions.record(sessionId).status, 'unknown', value.label);
+      await native.sessions.recover(); assert.equal(native.sessions.record(sessionId).status, 'unknown', `${value.label} after a second cold recovery`);
+      await assert.rejects(native.sessions.retryUnadmittedHostPreparation(sessionId, { ...native.options(), assertCurrent: undefined }), (error: unknown) => {
+        assert.equal((error as { code?: string }).code, 'HOST_PREPARATION_UNRESOLVED', value.label); return true;
+      });
+      assert.deepEqual(f.store.get('session-launch', sessionId), launch); assert.equal(f.store.get('session-host', sessionId), undefined);
+      assert.equal(native.creates(), 1); assert.equal(f.calls.length, 0); assert.equal(f.configured.length, 0);
     } finally { await value.remove(); }
   }
 });

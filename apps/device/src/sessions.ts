@@ -5,7 +5,7 @@ import { ArtifactStore, WorkingDirectoryManager, type WorkingDirectorySource, ty
 import { Store } from './store.ts';
 import { exec, HttpError, id, now } from './util.ts';
 import path from 'node:path';
-import { lstat, mkdir, rm } from 'node:fs/promises';
+import { lstat, mkdir, readFile, realpath, rm } from 'node:fs/promises';
 import { createHash, randomUUID } from 'node:crypto';
 import { managedRepositoryReader, readRepositoryChanges } from './repository-changes.ts';
 import { prepareDevelopmentToolchain, validateFrozenDevelopmentToolchain, type FrozenDevelopmentToolchain } from './development-toolchain.ts';
@@ -135,7 +135,16 @@ export class SessionController {
       try{const prepared=await this.hostWorkspaces.load(saved.id);if(JSON.stringify(prepared)!==JSON.stringify(saved.prepared))throw new Error('Native workspace binding changed after its retained owner record.');this.store.set('session-host',{...saved,prepared});if(record.status==='starting')this.patch(saved.id,{status:'unknown',phase:'The device service restarted during native workspace preparation.'});}
       catch(error){this.patch(saved.id,{status:'unknown',phase:'Native workspace requires recovery.',error:(error as Error).message});}
     }
-    for(const record of this.store.list<Session>('sessions'))if(record.executionTargetKind==='host-macos'&&!record.archivedAt&&record.status!=='stopped'&&!this.store.get<HostSessionRecord>('session-host',record.id))this.patch(record.id,{status:'unknown',phase:'The native workspace owner was not recorded; preserved files require recovery.'});
+    for(const record of this.store.list<Session>('sessions'))if(record.executionTargetKind==='host-macos'&&!record.archivedAt&&record.status!=='stopped'&&!this.store.get<HostSessionRecord>('session-host',record.id)){
+      if(await this.unadmittedAuditOverlap(record)){
+        if(record.status==='unknown')this.patch(record.id,{status:'failed',phase:'Native workspace preparation failed'});
+        continue;
+      }
+      // Preserve an uncertain audit's original diagnostic; do not manufacture
+      // the exact legacy pre-admission phase on a subsequent cold recovery.
+      if(record.status==='unknown'&&record.verificationRunId?.startsWith('profile-audit-'))continue;
+      this.patch(record.id,{status:'unknown',phase:'The native workspace owner was not recorded; preserved files require recovery.'});
+    }
     for (const saved of this.store.list<PrivateSession>('session-private')) {
       const record = this.store.get<Session>('sessions', saved.id);
       if (!record || record.archivedAt || record.status === 'stopped'||this.archivedEnvironment(saved.id)||this.stoppedInputReleases.has(saved.id)||this.restoring.has(saved.id)) continue;
@@ -144,6 +153,21 @@ export class SessionController {
       catch(error) { if(!(error instanceof SessionGenerationChangedError))this.patch(saved.id, {status:'unknown', phase:'The owned environment is not connected.',error:(error as Error).message}); }
     }
     for (const record of this.store.list<Session>('sessions')) if (!record.archivedAt && record.status === 'starting' && !this.live.has(record.id)) this.patch(record.id,{status:'unknown',phase:'Device service restarted during startup.'});
+  }
+  private async unadmittedAuditOverlap(record:Session):Promise<boolean> {
+    if(record.error!=='Host authoring must not expose the primary project checkout as its working directory.'||!(record.status==='failed'||record.status==='unknown'&&record.phase==='The native workspace owner was not recorded; preserved files require recovery.')||!record.verificationRunId?.startsWith('profile-audit-')||record.deviceId!==this.deviceId||record.executionTargetId!=='mac-host'||this.store.list<Chat>('chats').some(chat=>chat.sessionId===record.id))return false;
+    const audit=this.store.get<{id:string;status:string;sessionId?:string;chatId?:string;startedAt?:string;providerUnresolved?:boolean;sourceChanged?:boolean;executionTargetKind?:string;ownerDeviceId:string;projectId:string;source:unknown;proposalSha256:string}>('inspection-profile-audits',record.verificationRunId),launch=this.store.get<LaunchRecord>('session-launch',record.id),project=this.store.get<Project>('projects',record.projectId);
+    if(!audit||audit.id!==record.verificationRunId||!['queued','preparing','waiting'].includes(audit.status)||audit.sessionId!==record.id||audit.ownerDeviceId!==this.deviceId||audit.executionTargetKind!=='host-macos'||audit.chatId||audit.startedAt||audit.providerUnresolved||audit.sourceChanged||project?.id!==`workspace-${audit.id}`||!project.internal||project.sourceProjectId!==audit.projectId||launch?.executionTargetKind!=='host-macos'||launch.executionTargetId!==record.executionTargetId||launch.projectPath!==project.path||launch.generation!==1||launch.workingDirectorySources?.length||launch.referenceContext)return false;
+    const failure=this.store.get<{auditId:string;projectId:string;deviceId:string;generation:number;executionTargetId:string;workspaceId:string;workspacePath:string;failedAt:string;failure:string}>('session-host-unadmitted-overlap',record.id);
+    if(failure&&(failure.auditId!==audit.id||failure.projectId!==record.projectId||failure.deviceId!==record.deviceId||failure.generation!==launch.generation||failure.executionTargetId!==record.executionTargetId||failure.workspaceId!==audit.id||failure.workspacePath!==project.path||failure.failure!=='primary-workspace-overlap'||!Number.isFinite(Date.parse(failure.failedAt))))return false;
+    const root=path.join(this.workspaceDataDir,'workspaces',audit.id);
+    if(project.path!==path.join(root,'repository'))return false;
+    try{
+      try{await lstat(path.join(this.workspaceDataDir,'host-sessions',record.id));return false;}catch(error){if((error as NodeJS.ErrnoException).code!=='ENOENT')return false;}
+      if(await realpath(root)!==root)return false;
+      const owner=JSON.parse(await readFile(path.join(root,'audit-owner.json'),'utf8'));
+      return owner.runId===audit.id&&owner.deviceId===audit.ownerDeviceId&&owner.proposalSha256===audit.proposalSha256&&JSON.stringify(owner.source)===JSON.stringify(audit.source);
+    }catch{return false;}
   }
   private async attach(saved:PrivateSession):Promise<EnvmuxSession>{
     if(saved.ready.dockerHost!==this.runtime.endpoint.host)throw new HttpError(409,'This environment belongs to a previous container engine. Create a new EnoughFactory environment.');
@@ -291,6 +315,8 @@ export class SessionController {
         assertCurrent();
         this.patch(record.id,{status:'ready',phase:'Private native workspace ready',branch:options.workspace.branch,workingDirectories});
       } catch(error) {
+        const failed=this.record(record.id);
+        if((error as Error).message==='Host authoring must not expose the primary project checkout as its working directory.'&&failed.verificationRunId?.startsWith('profile-audit-')&&!this.store.get('session-host',record.id)&&!this.store.list<Chat>('chats').some(chat=>chat.sessionId===record.id))this.store.set('session-host-unadmitted-overlap',{id:record.id,auditId:failed.verificationRunId,projectId:failed.projectId,deviceId:failed.deviceId,generation,executionTargetId:failed.executionTargetId,workspaceId:options.workspace.id,workspacePath:options.workspace.path,failedAt:now(),failure:'primary-workspace-overlap'});
         this.patch(record.id,{
           status:abort.signal.aborted?(this.stopping.has(record.id)?'stopping':'stopped'):'failed',
           phase:abort.signal.aborted?'Native preparation canceled; files retained':'Native workspace preparation failed',
