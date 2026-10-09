@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
-import type { Attempt, FactoryTask, Goal, InspectionAction, InspectionAuthority, InspectionEvidence, InspectionJob, InspectionSession, InspectionSourceIdentity, Project } from '@enoughfactory/contracts';
+import type { Attempt, Chat, ExecutionTargetAdvertisement, FactoryTask, Goal, InspectionAction, InspectionAuthority, InspectionEvidence, InspectionJob, InspectionSession, InspectionSourceIdentity, InspectionVerificationRun, Project, Session } from '@enoughfactory/contracts';
 import { exportInspectionSnapshot, type ArtifactStore, type InspectionSnapshot } from '@enoughfactory/workspaces';
 import type { PeerManager } from '@enoughfactory/peers';
 import type { DeviceApp } from './app.ts';
@@ -12,6 +12,7 @@ import type { NativeBuildRunner } from './inspection-build-runner.ts';
 import { NativeDelegationOwner } from './inspection-delegation-owner.ts';
 import { InspectionRemote, RemoteInspectionOutcomeUnknown, type MaterializedInspectionReply, type RemoteInspectionAssignmentInput, type RemoteInspectionHandle, type RemoteInspectionOperation } from './inspection-remote.ts';
 import { HttpError } from './util.ts';
+import { INSPECTION_VERIFIER_RUNS, inspectionQualityPolicySha256 } from './inspection-verifier.ts';
 
 const buckets = { bindings: 'inspection-delegation-private-bindings', jobs: 'inspection-delegation-author-jobs', sessions: 'inspection-delegation-author-sessions', requests: 'inspection-delegation-author-requests', projections: 'inspection-delegation-projections', cursors: 'inspection-delegation-journal-cursors', events: 'inspection-delegation-imported-events' };
 const sha = (value: unknown) => createHash('sha256').update(JSON.stringify(value)).digest('hex');
@@ -31,6 +32,13 @@ export interface InspectionDelegationOptions {
   platform?: NodeJS.Platform;
 }
 interface RemoteProfile { id: string; platform: 'macos' | 'ios-simulator'; }
+/** Discovered only through online, authenticated paired owners and their project profiles. */
+export interface DelegatedNativeInspectionReadiness {
+  deviceId: string;
+  name: string;
+  executionTargets?: ExecutionTargetAdvertisement[];
+  profiles: RemoteProfile[];
+}
 
 /** Connects the live service tool route to authenticated paired native owners. */
 export class InspectionDelegation {
@@ -45,7 +53,7 @@ export class InspectionDelegation {
     this.owner = new NativeDelegationOwner({ app: options.app, jobs: options.jobs, native: options.native, builds: options.builds, artifacts: options.artifacts, profiles: options.profiles, refreshAuthority: id => remote.refreshAuthority(id) });
     remote = this.remote = new InspectionRemote({ store: options.app.store, deviceId: options.app.device.id, artifacts: options.artifacts, peers: options.peers,
       isPairedDevice: id => this.paired(id), authorityCurrent: options.localAuthorityCurrent,
-      authorOwnsAuthority: (authority, author) => this.authorOwnsAuthority(authority, author),
+      authorOwnsAuthority: (authority, author, source) => this.authorOwnsAuthority(authority, author, source),
       verifySourceIdentity: (...args) => this.owner.verifySourceIdentity(...args), execute: (...args) => this.owner.execute(...args), reconcile: (...args) => this.owner.reconcile(...args), authorityRetired: (assignment, reason) => this.owner.retireAssignment(assignment.id, reason) });
   }
   initialize(): void {
@@ -64,8 +72,8 @@ export class InspectionDelegation {
   }
   acceptedAuthorityCurrent(authority: InspectionAuthority): boolean { return this.remote.acceptedAuthorityCurrent(authority); }
 
-  async capabilities(projectId: string): Promise<unknown[]> {
-    const targets: unknown[] = [];
+  async capabilities(projectId: string): Promise<DelegatedNativeInspectionReadiness[]> {
+    const targets: DelegatedNativeInspectionReadiness[] = [];
     for (const device of this.nativeOwners()) {
       let profiles: RemoteProfile[] = [];
       try { profiles = await this.remoteProfiles(device.id, projectId); } catch { /* Preserve the probed device state; profile discovery can return after reconnect. */ }
@@ -282,10 +290,25 @@ export class InspectionDelegation {
     const worker = this.options.app.store.get<{ id: string; coordinatorId: string }>('factory-workers', authority.attemptId); if (worker) return worker.coordinatorId;
     throw new HttpError(409, 'The author has no current coordinator assignment.');
   }
-  private authorOwnsAuthority(authority: InspectionAuthority, author: string): boolean {
+  private authorOwnsAuthority(authority: InspectionAuthority, author: string, source: InspectionSourceIdentity): boolean {
     if (!this.options.localAuthorityCurrent(authority)) return false;
     const attempt = this.options.app.store.get<Attempt>('attempts', authority.attemptId), task = this.options.app.store.get<FactoryTask>('tasks', authority.taskId), goal = this.options.app.store.get<Goal>('goals', authority.goalId);
-    return Boolean(attempt && task && goal && task.currentAttemptId === attempt.id && attempt.deviceId === author && goal.coordinatorId === this.options.app.device.id);
+    if (!attempt || !task || !goal || task.currentAttemptId !== attempt.id || goal.coordinatorId !== this.options.app.device.id) return false;
+    if (attempt.deviceId === author) return true;
+    if (author !== this.options.app.device.id) return false;
+    // Independent review executes at the coordinator, which can differ from the
+    // original author device. Its live service-owned source/chat/session is the
+    // authority; a sender label or a historical verifier record is insufficient.
+    return this.options.app.store.list<InspectionVerificationRun>(INSPECTION_VERIFIER_RUNS).some(run => {
+      if (run.status !== 'running' || run.ownerDeviceId !== author || !sameAuthority(run.authority, authority) || !isDeepStrictEqual(run.source, source)
+        || run.policySha256 !== inspectionQualityPolicySha256(run.quality) || run.purpose === 'goal-final' && run.goalRevision !== goal.revision || !run.sessionId || !run.chatId) return false;
+      const session = this.options.app.store.get<Session>('sessions', run.sessionId), chat = this.options.app.store.get<Chat>('chats', run.chatId);
+      try {
+        return Boolean(session && chat && this.options.app.sessions.owns(session.id) && session.deviceId === author && session.status === 'ready'
+          && session.verificationRunId === run.id && (session.executionTargetKind ?? 'container') === run.executionTargetKind && session.executionTargetId === run.executionTargetId
+          && chat.deviceId === author && chat.sessionId === session.id && chat.verificationRunId === run.id && chat.runtime === 'codex' && chat.status === 'running');
+      } catch { return false; }
+    });
   }
   private nativeOwners() { return this.options.app.devices.filter(device => device.id !== this.options.app.device.id && device.online && this.paired(device.id) && device.executionTargets?.some(target => target.kind === 'host-macos' && target.protocolVersion === 1)); }
   private paired(id: string): boolean { return this.options.app.devices.some(device => device.id === id && device.platform !== 'browser' && (id !== this.options.app.device.id || device.local)); }

@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test, { type TestContext } from 'node:test';
 import { promisify } from 'node:util';
-import type { InspectionAuthority, InspectionSourceIdentity, TaskQualityRequirements } from '@enoughfactory/contracts';
+import type { Chat, InspectionAuthority, InspectionSourceIdentity, InspectionVerificationRun, Session, TaskQualityRequirements } from '@enoughfactory/contracts';
 import type { NativeAction, NativeProduct, NativeSession } from '@enoughfactory/native-inspection';
 import { ArtifactStore, InspectionSnapshotManager, type ArtifactManifest, type InspectionSnapshot } from '@enoughfactory/workspaces';
 import type { DeviceApp, Extension } from './app.ts';
@@ -21,6 +21,7 @@ import type { NativeFixtureProfile, NativeInspectionAdapter, NativeInspectionBui
 import { InspectionQualityService, type InspectionImageDelivery, type InspectionReferenceView } from './inspection-quality.ts';
 import { Store } from './store.ts';
 import { HttpError } from './util.ts';
+import { INSPECTION_VERIFIER_RUNS, inspectionQualityPolicySha256 } from './inspection-verifier.ts';
 
 const run = promisify(execFile);
 const sha = (value: string | Buffer) => createHash('sha256').update(value).digest('hex');
@@ -52,6 +53,7 @@ async function fixture(t: TestContext) {
   let trackJournals = false, activeJournals = 0, maxConcurrentJournals = 0;
   let nextJournalTamper: ((page: InspectionJournalPage) => void) | undefined;
   let protectedCaptureOverrides: Partial<InspectionSourceIdentity> | undefined;
+  let retainedVerifierSource: { snapshot: InspectionSnapshot; source: InspectionSourceIdentity } | undefined;
   let launches = 0, restarts = 0, stops = 0, captures = 0, serviceOperations = 0, runtimeOperations = 0;
   const source = join(directory, 'source'), design = join(directory, 'enough-ui');
   await mkdir(join(source, 'Mail.xcodeproj'), { recursive: true }); await mkdir(design, { recursive: true });
@@ -76,6 +78,7 @@ async function fixture(t: TestContext) {
     const app = {
       dataDir, store, device: { id: deviceId }, devices: catalog.map(device => ({ ...device, local: device.id === deviceId })), extensions, serviceActivityHooks,
       changed() {}, emit() {},
+      sessions: { owns: (id: string) => store.get<Session>('sessions', id)?.deviceId === deviceId },
       async withServiceOperation<T>(operation: (signal: AbortSignal) => Promise<T>) { serviceOperations++; return operation(new AbortController().signal); },
       async withRuntimeOperation() { runtimeOperations++; throw new Error('Native work must not require a container runtime.'); },
     } as unknown as DeviceApp;
@@ -152,6 +155,7 @@ async function fixture(t: TestContext) {
       profiles: id => deviceId === 'mac-owner' && configured && id === 'mail-project' ? [profile] : [], localAuthorityCurrent: localCurrent,
       async capture() {
         captures++;
+        if (deviceId === 'coordinator' && retainedVerifierSource) return retainedVerifierSource;
         const snapshot = await new InspectionSnapshotManager({ dataDir: join(dataDir, 'inspection'), artifacts }).create({ roots: [{ id: 'primary', name: 'Mail', path: source }, { id: 'enough-ui', name: 'EnoughUI', path: design }], context: authority });
         if (!protectedCaptureOverrides) return snapshot;
         return { snapshot, source: { snapshotId: snapshot.id, sha256: snapshot.sourceDigest, roots: snapshot.roots.map(root => ({ id: root.id, sha256: root.sourceDigest, ...(root.sourceCommit ? { commit: root.sourceCommit } : {}) })), candidateId: 'protected-candidate', candidateCommit: 'c'.repeat(40), checkedCommit: 'd'.repeat(40), ...protectedCaptureOverrides } };
@@ -224,14 +228,42 @@ async function fixture(t: TestContext) {
     trackJournalConcurrency() { trackJournals = true; activeJournals = 0; maxConcurrentJournals = 0; }, get maxConcurrentJournals() { return maxConcurrentJournals; },
     tamperNextJournal(tamper: (page: InspectionJournalPage) => void) { nextJournalTamper = tamper; },
     protectCapture(overrides: Partial<InspectionSourceIdentity> = {}) { protectedCaptureOverrides = overrides; },
+    verificationSource(snapshot: InspectionSnapshot, source: InspectionSourceIdentity) { retainedVerifierSource = { snapshot, source }; },
     get captures() { return captures; }, get launches() { return launches; }, get restarts() { return restarts; }, get stops() { return stops; }, get serviceOperations() { return serviceOperations; }, get runtimeOperations() { return runtimeOperations; } };
 }
 
-function imageDelivery(store: Store, reply: ToolReply, eventId: string) {
+/** A separate coordinator verifier owns a frozen source; its author remains on linux-author. */
+async function coordinatorVerifierFixture(t: TestContext) {
+  const f = await fixture(t), state = f.coordinator;
+  const snapshot = await new InspectionSnapshotManager({ dataDir: join(state.app.dataDir, 'verification'), artifacts: state.artifacts }).create({ roots: [{ id: 'primary', name: 'Mail', path: f.source }, { id: 'enough-ui', name: 'EnoughUI', path: f.design }], context: authority });
+  const source: InspectionSourceIdentity = { snapshotId: snapshot.id, sha256: snapshot.sourceDigest, candidateId: 'checked-candidate', candidateCommit: snapshot.roots[0]!.commit, checkedCommit: snapshot.roots[0]!.commit, roots: snapshot.roots.map(root => ({ id: root.id, sha256: root.sourceDigest, ...(root.sourceCommit ? { commit: root.sourceCommit } : {}) })) };
+  f.verificationSource(snapshot, source);
+  const quality: TaskQualityRequirements = { platforms: ['macos'], workflows: [{ id: 'edit-draft', platform: 'macos' }], referenceIds: ['enough-ui'] };
+  const at = new Date().toISOString();
+  const verifier: InspectionVerificationRun = { id: 'coordinator-verifier', authority, source, quality, policySha256: inspectionQualityPolicySha256(quality), ownerDeviceId: 'coordinator', executionTargetKind: 'container', executionTargetId: 'coordinator:container', status: 'running', sessionId: 'verifier-session', chatId: 'verifier-chat', startedAt: at, createdAt: at, updatedAt: at, deadlineAt: new Date(Date.now() + 60_000).toISOString() };
+  const session: Session = { id: verifier.sessionId!, projectId: 'mail-project', deviceId: 'coordinator', name: 'independent-verification', status: 'ready', executionTargetKind: 'container', executionTargetId: verifier.executionTargetId, verificationRunId: verifier.id, services: [], createdAt: at, updatedAt: at };
+  const chat: Chat = { id: verifier.chatId!, sessionId: session.id, deviceId: 'coordinator', runtime: 'codex', approvalMode: 'approve-all', status: 'running', title: 'Independent verification', verificationRunId: verifier.id, createdAt: at, updatedAt: at };
+  state.store.set(INSPECTION_VERIFIER_RUNS, verifier); state.store.set('sessions', session); state.store.set('chats', chat);
+  const token = state.jobs.issueAuthority(authority, { capabilities: ['apple-compilation', 'macos-app-inspection'], executionTargetIds: ['coordinator:container'] }).token;
+  const context = { session, chat, attemptId: authority.attemptId, verificationRunId: verifier.id, signal: new AbortController().signal } as AgentToolBridgeContext;
+  const call = async (name: string, args: Record<string, unknown>) => { const reply = await state.plugin.dispatch(context, token, name, args); assert.ok(reply); return reply as ToolReply; };
+  const poll = async (jobId: string, predicate: (job: NonNullable<ReturnType<InspectionJobs['getJob']>>) => boolean) => {
+    const deadline = Date.now() + 10_000;
+    while (true) {
+      await call('factory_job_status', { jobId }); const job = state.plugin.taskInspection(authority.taskId).jobs.find(job => job.id === jobId);
+      if (job && predicate(job)) return job;
+      assert.ok(Date.now() < deadline); await new Promise(resolve => setTimeout(resolve, 10));
+    }
+  };
+  return { ...f, state, verifier, verifierSession: session, verifierChat: chat, source, snapshot, quality, call, poll,
+    get launches() { return f.launches; }, get stops() { return f.stops; } };
+}
+
+function imageDelivery(store: Store, reply: ToolReply, eventId: string, chatId = 'author-chat') {
   const image = reply.content.find(item => item.type === 'image'); assert.ok(image && image.type === 'image');
   const bytes = Buffer.from(image.data, 'base64'); assert.deepEqual(bytes, png); assert.equal(image.mimeType, 'image/png');
   // Mirrors the provider delivery callback only after the original image content has been returned.
-  store.set<InspectionImageDelivery>('provider-image-deliveries', { id: eventId, chatId: 'author-chat', eventId, artifactSha256: sha(bytes), authority, route: 'tool-image' });
+  store.set<InspectionImageDelivery>('provider-image-deliveries', { id: eventId, chatId, eventId, artifactSha256: sha(bytes), authority, route: 'tool-image' });
 }
 
 test('Linux author builds, inspects, edits, asserts, restarts and stops a native app through paired Mac routes', async t => {
@@ -290,6 +322,59 @@ test('Linux author builds, inspects, edits, asserts, restarts and stops a native
   assert.equal(f.stops, 1); assert.equal(f.sessions.size, 0); assert.ok(f.owner.jobs.leases(started.jobId).every(item => item.status === 'released'));
   assert.ok(f.serviceOperations > 0); assert.equal(f.runtimeOperations, 0, 'native service admission works independently of Docker');
   assert.equal(JSON.stringify(f.control).includes(png.toString('base64')), false, 'actual pixels use the bulk artifact lane');
+});
+
+test('an independent coordinator verifier receives original paired native images and assertion evidence without impersonating its ended author', async t => {
+  const f = await coordinatorVerifierFixture(t);
+  const built = await f.call('factory_native_build', { requestId: 'verifier-build', profileId: profile.id }), buildJobId = String(value(built, 'jobId'));
+  await f.poll(buildJobId, job => job.status === 'succeeded');
+  const started = await f.call('factory_native_start', { requestId: 'verifier-start', buildJobId }), jobId = String(value(started, 'jobId'));
+  const job = await f.poll(jobId, job => Boolean(job.sessionId && f.owner.jobs.getSession(job.sessionId)?.status === 'ready'));
+  assert.ok(job.sessionId); assert.deepEqual(job.source, f.source);
+  assert.deepEqual(f.compiled[0]!.roots.map(root => root.sourceDigest), f.snapshot.roots.map(root => root.sourceDigest));
+  const before = await f.call('factory_observe', { sessionId: job.sessionId, requestId: 'verifier-before' }); imageDelivery(f.state.store, before, 'verifier-before-image', f.verifierChat.id);
+  const changed = await f.call('factory_native_action', { sessionId: job.sessionId, requestId: 'verifier-write', observationId: value(before, 'observationId'), action: { kind: 'type', elementId: 'body', text: 'Independent verified body', mode: 'replace' } });
+  const after = await f.call('factory_observe', { sessionId: job.sessionId, requestId: 'verifier-after' }); imageDelivery(f.state.store, after, 'verifier-after-image', f.verifierChat.id);
+  const assertion = await f.call('factory_assert', { sessionId: job.sessionId, observationId: value(after, 'observationId'), labelIncludes: 'Message body', valueIncludes: 'Independent verified body' });
+  assert.equal(value(assertion, 'passed'), true);
+  const references = await f.state.artifacts.put(await readFile(join(f.snapshot.roots[1]!.path, 'Tokens.swift')), { ...authority, name: 'Tokens.swift', mime: 'text/plain' });
+  f.state.store.set<InspectionReferenceView>('inspection-reference-views', { id: 'verifier-reference', referenceId: 'enough-ui', authority, source: f.source, artifacts: [references], inspectedAt: new Date().toISOString() });
+  const beforeId = String(value(before, 'screenshotEvidenceId')), afterId = String(value(after, 'screenshotEvidenceId'));
+  const report: QualityEvidenceReport = { version: 1, source: f.source,
+    workflows: [{ id: 'edit-draft', platform: 'macos', before: beforeId, action: String(value(changed, 'actionId')), after: afterId, outcome: 'passed', assertion: 'The paired broker observed the independent verifier text.', assertionEvidenceId: String(value(assertion, 'evidenceId')) }],
+    reviews: [{ platform: 'macos', observations: [beforeId, afterId], references: [{ id: 'enough-ui', comparison: 'The original supplied fixture token is 12.' }], dimensions: { hierarchy: 'OS adapter fixture pipeline coverage.', spacing: 'OS adapter fixture pipeline coverage.', clipping: 'OS adapter fixture pipeline coverage.', typography: 'OS adapter fixture pipeline coverage.', controls: 'OS adapter fixture pipeline coverage.', states: 'OS adapter fixture pipeline coverage.' }, defects: [] }] };
+  const qualityService = new InspectionQualityService({ store: f.state.store, artifacts: f.state.artifacts, authorityCurrent: () => true });
+  const submitted = await qualityService.submit({ authority, quality: f.quality, report });
+  assert.deepEqual(submitted.gate.issues, []); assert.equal(submitted.gate.status, 'ready-for-review');
+  await f.call('factory_stop', { sessionId: job.sessionId, requestId: 'verifier-stop' });
+  await f.poll(jobId, job => job.status === 'succeeded');
+  assert.equal(f.launches, 1); assert.equal(f.stops, 1);
+  assert.equal(f.coordinator.store.get<{ id: string; deviceId: string }>('attempts', authority.attemptId)!.deviceId, 'linux-author');
+  assert.equal(f.author.plugin.taskInspection(authority.taskId).jobs.length, 0, 'Original author history and tool ownership remain separate');
+  assert.equal(f.transfers.some(item => item.sender === 'mac-owner' && item.recipient === 'coordinator' && item.manifest.mime === 'image/png'), true);
+});
+
+test('coordinator native delegation rejects stale, foreign, mismatched-source and unbound verifier owners before compilation', async t => {
+  const cases: Array<[string, (f: Awaited<ReturnType<typeof coordinatorVerifierFixture>>) => void]> = [
+    ['retired verifier', f => f.state.store.set(INSPECTION_VERIFIER_RUNS, { ...f.verifier, status: 'succeeded' })],
+    ['wrong source', f => f.state.store.set(INSPECTION_VERIFIER_RUNS, { ...f.verifier, source: { ...f.source, sha256: 'e'.repeat(64) } })],
+    ['wrong candidate', f => f.state.store.set(INSPECTION_VERIFIER_RUNS, { ...f.verifier, source: { ...f.source, candidateCommit: 'e'.repeat(40) } })],
+    ['wrong generation', f => f.state.store.set(INSPECTION_VERIFIER_RUNS, { ...f.verifier, authority: { ...authority, authorityGeneration: 7 } })],
+    ['changed quality policy', f => f.state.store.set(INSPECTION_VERIFIER_RUNS, { ...f.verifier, policySha256: 'e'.repeat(64) })],
+    ['foreign owner device', f => f.state.store.set(INSPECTION_VERIFIER_RUNS, { ...f.verifier, ownerDeviceId: 'linux-author' })],
+    ['wrong running chat', f => f.state.store.set('chats', { ...f.verifierChat, verificationRunId: 'other-run' })],
+    ['idle chat', f => f.state.store.set('chats', { ...f.verifierChat, status: 'idle' })],
+    ['wrong session', f => f.state.store.set('sessions', { ...f.verifierSession, verificationRunId: 'other-run' })],
+    ['unowned session', f => f.state.store.set('sessions', { ...f.verifierSession, deviceId: 'linux-author' })],
+    ['unknown session', f => f.state.store.set('sessions', { ...f.verifierSession, status: 'unknown' })],
+    ['changed final revision', f => { f.state.store.set(INSPECTION_VERIFIER_RUNS, { ...f.verifier, purpose: 'goal-final', goalRevision: 6 }); f.state.store.set('goals', { id: authority.goalId, coordinatorId: 'coordinator', revision: 7 }); }],
+    ['coordinator authority retired', f => f.retireCoordinator()],
+  ];
+  for (const [name, change] of cases) await t.test(name, async inner => {
+    const f = await coordinatorVerifierFixture(inner); change(f);
+    await assert.rejects(f.call('factory_native_build', { requestId: 'rejected-verifier-build', profileId: profile.id }), /authoriz|current|retired|authority/);
+    assert.equal(f.compiled.length, 0); assert.equal(f.launches, 0);
+  });
 });
 
 test('a lost paired response is recovered by its original operation without repeating native input', async t => {

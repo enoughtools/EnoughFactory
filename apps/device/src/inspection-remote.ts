@@ -40,7 +40,7 @@ export interface InspectionRemoteOptions {
   isPairedDevice: (id: string) => boolean;
   authorityCurrent: (authority: InspectionAuthority) => boolean;
   /** Coordinator checks the actual task/worker assignment, not merely that the peer is paired. */
-  authorOwnsAuthority: (authority: InspectionAuthority, authorDeviceId: string) => boolean;
+  authorOwnsAuthority: (authority: InspectionAuthority, authorDeviceId: string, source: InspectionSourceIdentity) => boolean;
   /** Reconstruct and verify the snapshot manifest and every extracted root inventory before any backend effect. */
   verifySourceIdentity: (assignment: RemoteInspectionAssignment, sources: VerifiedRemoteInspectionSource[]) => Promise<void>;
   /** Inputs contain owner-local content-addressed objects only. The backend must journal requestId before effects. */
@@ -68,7 +68,7 @@ export class InspectionRemote {
 
   issueAssignment(input: RemoteInspectionAssignmentInput, idempotencyKey = sha(canonical(input))): RemoteInspectionAssignment {
     this.validateInput(input);
-    if (input.coordinatorId !== this.options.deviceId || !this.options.authorityCurrent(input.authority) || !this.options.authorOwnsAuthority(input.authority, input.authorDeviceId)) throw new HttpError(403, 'The coordinator does not authorize this author attempt.', 'INSPECTION_AUTHORITY_STALE');
+    if (input.coordinatorId !== this.options.deviceId || !this.options.authorityCurrent(input.authority) || !this.options.authorOwnsAuthority(input.authority, input.authorDeviceId, input.source)) throw new HttpError(403, 'The coordinator does not authorize this author attempt.', 'INSPECTION_AUTHORITY_STALE');
     this.requireDevice(input.authorDeviceId); this.requireDevice(input.ownerDeviceId);
     this.validId(idempotencyKey);
     return this.options.store.transaction(() => {
@@ -138,7 +138,7 @@ export class InspectionRemote {
       const assignment = this.options.store.get<RemoteInspectionAssignment>(buckets.assignments, String(body.assignmentId));
       if (!assignment || assignment.ownerDeviceId !== peerId || sha(canonical(this.assignmentInput(assignment))) !== body.inputDigest || assignment.authorDeviceId !== body.authorDeviceId) throw new HttpError(403, 'The paired coordinator assignment does not match this owner.');
       this.validateAssignment(assignment, true);
-      if (!this.options.authorityCurrent(assignment.authority) || !this.options.authorOwnsAuthority(assignment.authority, assignment.authorDeviceId)) throw new HttpError(409, 'The delegated author attempt is no longer current.', 'INSPECTION_AUTHORITY_STALE');
+      if (!this.options.authorityCurrent(assignment.authority) || !this.options.authorOwnsAuthority(assignment.authority, assignment.authorDeviceId, assignment.source)) throw new HttpError(409, 'The delegated author attempt is no longer current.', 'INSPECTION_AUTHORITY_STALE');
       const renewed = this.reauthorizeIssued(assignment);
       return { valid: true, digest: renewed.digest, expiresAt: renewed.expiresAt, assignment: renewed };
     }
@@ -235,7 +235,7 @@ export class InspectionRemote {
     this.validateAssignment(assignment, true); this.requireDevice(assignment.authorDeviceId); this.requireDevice(assignment.coordinatorId);
     if (assignment.coordinatorId === this.options.deviceId) {
       const issued = this.options.store.get<RemoteInspectionAssignment>(buckets.assignments, assignment.id);
-      if (!issued || canonical(this.assignmentInput(issued)) !== canonical(this.assignmentInput(assignment)) || !this.options.authorityCurrent(assignment.authority) || !this.options.authorOwnsAuthority(assignment.authority, assignment.authorDeviceId)) throw new HttpError(409, 'The current coordinator assignment does not authorize this inspection.', 'INSPECTION_AUTHORITY_STALE');
+      if (!issued || canonical(this.assignmentInput(issued)) !== canonical(this.assignmentInput(assignment)) || !this.options.authorityCurrent(assignment.authority) || !this.options.authorOwnsAuthority(assignment.authority, assignment.authorDeviceId, assignment.source)) throw new HttpError(409, 'The current coordinator assignment does not authorize this inspection.', 'INSPECTION_AUTHORITY_STALE');
       assignment = this.reauthorizeIssued(issued);
     } else {
       const reply = await this.call<{ valid: boolean; digest: string; assignment: RemoteInspectionAssignment }>(assignment.coordinatorId, { op: 'validate', assignmentId: assignment.id, inputDigest: sha(canonical(this.assignmentInput(assignment))), authorDeviceId: assignment.authorDeviceId }, assignment.id);

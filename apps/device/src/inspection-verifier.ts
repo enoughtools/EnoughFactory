@@ -8,6 +8,7 @@ import type { DeviceApp } from './app.ts';
 import type { AgentToolBridgeContext, ChatController } from './chats.ts';
 import { factoryQualityInstructions } from './factory-quality.ts';
 import { inspectionSourceContentMatches, type InspectionQualityService } from './inspection-quality.ts';
+import type { DelegatedNativeInspectionReadiness } from './inspection-delegation.ts';
 import { exec } from './util.ts';
 
 export const INSPECTION_VERIFIER_RUNS = 'inspection-verifier-runs';
@@ -59,6 +60,8 @@ export interface InspectionVerifierOptions {
   quality: Pick<InspectionQualityService, 'check' | 'context'>;
   authorityCurrent: (authority: InspectionAuthority) => boolean;
   readiness: () => Promise<ExecutionTargetAdvertisement[]>;
+  /** Project-specific profiles discovered through online authenticated paired native owners. */
+  delegatedReadiness?: (projectId: string) => Promise<DelegatedNativeInspectionReadiness[]>;
   /** Default twenty minutes. A completed verifier is never silently dispatched again. */
   timeoutMs?: number;
   /** Alternate owner must prepare and verify exact private execution copies before return. */
@@ -295,16 +298,28 @@ export class InspectionVerifier {
     return snapshot;
   }
 
-  private async selectedTarget(run: InspectionVerificationRun): Promise<{ target?: ExecutionTargetAdvertisement; reason?: string }> {
+  private async selectedTarget(run: InspectionVerificationRun, project: Project): Promise<{ target?: ExecutionTargetAdvertisement; reason?: string }> {
     const targets = await this.options.readiness();
-    const required: ExecutionCapability[] = run.executionTargetKind === 'container' ? ['linux-shell', 'chromium-inspection'] : ['mac-shell'];
-    const target = targets.find(target => target.kind === run.executionTargetKind && (!target.runtimes || target.runtimes.includes('codex')) && required.every(kind => target.capabilities.some(capability => capability.kind === kind && capability.readiness === 'ready')) && target.readiness === 'ready');
+    const web = run.quality.platforms.includes('web');
+    // A new native-only verifier can author its review on Linux and use the same
+    // paired Mac tools as a container author. Retained execution owners never move.
+    const kinds = run.sessionId ? [run.executionTargetKind] : web ? ['container'] : ['host-macos', 'container'];
+    const target = kinds.flatMap(kind => targets.filter(target => {
+      const required: ExecutionCapability[] = kind === 'container' ? ['linux-shell', ...(web ? ['chromium-inspection' as const] : [])] : ['mac-shell'];
+      return target.kind === kind && target.protocolVersion === 1 && (!target.runtimes || target.runtimes.includes('codex')) && required.every(kind => target.capabilities.some(capability => capability.kind === kind && capability.readiness === 'ready')) && target.readiness === 'ready'
+        && (!run.sessionId || target.id === run.executionTargetId);
+    }))[0];
     const reasons: string[] = [];
-    if (!target) reasons.push(`The ${run.executionTargetKind === 'container' ? 'private browser/container' : 'Mac Codex'} verification target is not ready.`);
-    for (const platform of run.quality.platforms) {
-      if (platform === 'web') continue;
+    if (!target) reasons.push(`The ${web ? 'private browser/container' : run.sessionId ? run.executionTargetKind === 'container' ? 'retained container Codex' : 'retained Mac Codex' : 'Mac or private container Codex'} verification target is not ready.`);
+    const nativePlatforms = run.quality.platforms.filter((platform): platform is 'macos' | 'ios-simulator' => platform !== 'web');
+    const nativeReady = (target: ExecutionTargetAdvertisement, capability: ExecutionCapability) => target.kind === 'host-macos' && target.protocolVersion === 1 && target.readiness === 'ready'
+      && ['apple-compilation', capability].every(kind => target.capabilities.some(item => item.kind === kind && item.readiness === 'ready'));
+    const missingLocally = nativePlatforms.filter(platform => !targets.some(target => nativeReady(target, platform === 'macos' ? 'macos-app-inspection' : 'ios-simulator-inspection')));
+    const delegated = missingLocally.length ? await this.options.delegatedReadiness?.(project.sourceProjectId || project.id) ?? [] : [];
+    for (const platform of missingLocally) {
       const capability = platform === 'macos' ? 'macos-app-inspection' : 'ios-simulator-inspection';
-      for (const kind of ['apple-compilation', capability] as const) if (!targets.some(target => target.capabilities.some(item => item.kind === kind && item.readiness === 'ready'))) reasons.push(targets.flatMap(target => target.capabilities).find(item => item.kind === kind)?.reason || `The ${kind} capability is not ready.`);
+      if (delegated.some(owner => owner.profiles.some(profile => profile.platform === platform) && owner.executionTargets?.some(target => nativeReady(target, capability)))) continue;
+      reasons.push(targets.flatMap(target => target.capabilities).find(item => item.kind === capability)?.reason || `Native ${platform === 'macos' ? 'Mac' : 'iPhone Simulator'} verification needs a ready local or paired Mac with Apple builds, app testing and this project's isolated testing profile.`);
     }
     return reasons.length ? { reason: reasons.join(' ') } : { target };
   }
@@ -326,10 +341,10 @@ export class InspectionVerifier {
       // Retain before returning a readiness wait: the caller may retire its check copy.
       snapshot = await this.retain(id, input, abort.signal);
       this.assertCurrent(this.get(id), abort.signal);
-      const selected = await abortable(this.selectedTarget(this.get(id)), abort.signal);
+      const selected = await abortable(this.selectedTarget(this.get(id), input.project), abort.signal);
       this.assertCurrent(this.get(id), abort.signal);
       if (!selected.target) return this.patch(id, { status: 'waiting', reason: selected.reason });
-      const run = this.patch(id, { status: 'preparing', executionTargetId: selected.target.id, deadlineAt: new Date(Date.now() + this.timeoutMs).toISOString(), reason: undefined });
+      const run = this.patch(id, { status: 'preparing', executionTargetKind: selected.target.kind, executionTargetId: selected.target.id, deadlineAt: new Date(Date.now() + this.timeoutMs).toISOString(), reason: undefined });
       timer = setTimeout(() => abort.abort(new Error('Inspection verifier exceeded its bounded deadline.')), this.timeoutMs);
       const assertCurrent = () => this.assertCurrent(this.get(id), abort.signal);
       const onSession = (session: Session) => {

@@ -13,6 +13,7 @@ import type { AgentToolBridgeContext, ChatController, RunOptions } from './chats
 import { InspectionVerifier, INSPECTION_VERIFIER_RUNS, inspectionQualityPolicySha256, inspectionVerificationKey, type InspectionVerifierOptions, type VerificationInput, type VerificationPreparation } from './inspection-verifier.ts';
 import { SessionController } from './sessions.ts';
 import { Store } from './store.ts';
+import type { DelegatedNativeInspectionReadiness } from './inspection-delegation.ts';
 
 const authority: InspectionAuthority = { goalId: 'goal', goalRevision: 12, taskId: 'task', attemptId: 'author-attempt', authorityGeneration: 3, policyRevision: 12 };
 const quality: TaskQualityRequirements = { platforms: ['macos'], workflows: [{ id: 'close-draft', platform: 'macos' }], referenceIds: ['enough-ui'] };
@@ -245,6 +246,87 @@ async function legacyContainerFixture(t: TestContext, seed: 'waiting' | 'unknown
   assert.equal(run.status, seed === 'waiting' ? 'waiting' : 'unknown'); assert.equal(f.calls.length, 0);
   return { ...f, verifier, input, run, containerSessions: fakeSessions, restarted, sourceChecks: () => sourceChecks };
 }
+
+const linuxReviewer: ExecutionTargetAdvertisement = { id: 'private-linux', kind: 'container', protocolVersion: 1, readiness: 'ready', runtimes: ['codex'], capabilities: [{ kind: 'linux-shell', readiness: 'ready' }] };
+const pairedMac: DelegatedNativeInspectionReadiness = { deviceId: 'paired-mac', name: 'Paired Mac', executionTargets: ready, profiles: [{ id: 'isolated-mac-app', platform: 'macos' }] };
+
+/** Real retained source and verifier lifecycle; no provider/OS/peer effects are started. */
+async function pairedVerifierFixture(t: TestContext, quality: TaskQualityRequirements = { platforms: ['macos'], workflows: [{ id: 'close-draft', platform: 'macos' }], referenceIds: ['enough-ui'] }) {
+  const f = await fixture(t);
+  let localTargets: ExecutionTargetAdvertisement[] = [linuxReviewer];
+  let pairedTargets: DelegatedNativeInspectionReadiness[] = [structuredClone(pairedMac)];
+  const projectQueries: string[] = [];
+  const verifier = f.anotherVerifier({ readiness: async () => localTargets, delegatedReadiness: async projectId => { projectQueries.push(projectId); return pairedTargets; } });
+  return { ...f, verifier, input: { ...f.input, quality }, projectQueries,
+    local: (targets: ExecutionTargetAdvertisement[]) => { localTargets = targets; }, paired: (targets: DelegatedNativeInspectionReadiness[]) => { pairedTargets = targets; } };
+}
+
+test('a native-only verifier can inspect retained source from Linux through a project-scoped paired native capability contract', async t => {
+  const f = await pairedVerifierFixture(t);
+  const run = await f.verifier.ensure(f.input);
+  assert.equal(run.executionTargetKind, 'container'); assert.equal(run.executionTargetId, linuxReviewer.id);
+  assert.equal(run.status, 'failed', 'Peer readiness and a provider success claim do not replace original workflow/image receipts');
+  assert.equal(f.calls.length, 1); assert.equal(f.preparations.length, 1);
+  assert.deepEqual(f.projectQueries, [f.input.project.id]);
+  assert.deepEqual(run.authority, authority); assert.deepEqual(run.source, f.source);
+  assert.deepEqual(f.preparations[0]!.snapshot.roots.map(root => root.id), f.snapshot.roots.map(root => root.id));
+  assert.match(f.calls[0]!.prompt, /factory_native_build/); assert.match(f.calls[0]!.prompt, /assertionEvidenceId/);
+});
+
+test('paired native verifier admission retains source and waits for an actual compatible profile and same-owner tools', async t => {
+  const cases: Array<[string, (owner: DelegatedNativeInspectionReadiness) => DelegatedNativeInspectionReadiness[]]> = [
+    ['offline or no authenticated peer', () => []],
+    ['profile discovery unavailable', owner => [{ ...owner, profiles: [] }]],
+    ['profile for the wrong platform', owner => [{ ...owner, profiles: [{ id: 'ios-only', platform: 'ios-simulator' }] }]],
+    ['Mac locked', owner => [{ ...owner, executionTargets: ready.map(target => ({ ...target, capabilities: target.capabilities.map(item => item.kind === 'macos-app-inspection' ? { ...item, readiness: 'setup-required' as const, reason: 'Unlock the paired Mac.' } : item) })) }]],
+    ['old native protocol', owner => [{ ...owner, executionTargets: ready.map(target => ({ ...target, protocolVersion: 0 as 1 })) }]],
+    ['native target offline', owner => [{ ...owner, executionTargets: ready.map(target => ({ ...target, readiness: 'offline' as const })) }]],
+    ['build and interaction split between owners', owner => [
+      { ...owner, executionTargets: ready.map(target => ({ ...target, capabilities: target.capabilities.filter(item => item.kind !== 'apple-compilation') })) },
+      { ...owner, deviceId: 'other-mac', executionTargets: ready.map(target => ({ ...target, capabilities: target.capabilities.filter(item => item.kind !== 'macos-app-inspection') })) },
+    ]],
+  ];
+  for (const [name, unavailable] of cases) await t.test(name, async inner => {
+    const f = await pairedVerifierFixture(inner); f.paired(unavailable(structuredClone(pairedMac)));
+    const waiting = await f.verifier.ensure(f.input);
+    assert.equal(waiting.status, 'waiting'); assert.equal(f.calls.length, 0); assert.equal(f.preparations.length, 0);
+    assert.deepEqual(waiting.source, f.source); assert.deepEqual(waiting.authority, authority);
+    const saved = retained(f, waiting);
+    await f.artifacts.path(saved.transfer.sourceManifest);
+    for (const root of saved.transfer.sourceArtifacts) await f.artifacts.path(root.manifest);
+    f.paired([structuredClone(pairedMac)]);
+    const resumed = await f.verifier.ensure(f.input);
+    assert.equal(resumed.id, waiting.id); assert.equal(resumed.executionTargetKind, 'container');
+    assert.equal(resumed.status, 'failed'); assert.equal(f.calls.length, 1);
+    assert.deepEqual(resumed.source, waiting.source); assert.deepEqual(resumed.authority, waiting.authority);
+  });
+});
+
+test('mixed web and native verification requires local browser tools plus paired profiles for every native platform', async t => {
+  const mixed: TaskQualityRequirements = { platforms: ['web', 'macos', 'ios-simulator'], workflows: [{ id: 'open-web', platform: 'web' }, { id: 'close-mac', platform: 'macos' }, { id: 'close-ios', platform: 'ios-simulator' }], referenceIds: ['enough-ui'] };
+  const f = await pairedVerifierFixture(t, mixed);
+  f.paired([{ ...pairedMac, profiles: [...pairedMac.profiles, { id: 'isolated-ios-app', platform: 'ios-simulator' }] }]);
+  const noBrowser = await f.verifier.ensure(f.input);
+  assert.equal(noBrowser.status, 'waiting'); assert.equal(f.calls.length, 0);
+  f.local([{ ...linuxReviewer, capabilities: [...linuxReviewer.capabilities, { kind: 'chromium-inspection', readiness: 'ready' }] }]);
+  f.paired([pairedMac]);
+  const noIOSProfile = await f.verifier.ensure(f.input);
+  assert.equal(noIOSProfile.status, 'waiting'); assert.equal(f.calls.length, 0);
+  f.paired([{ ...pairedMac, profiles: [...pairedMac.profiles, { id: 'isolated-ios-app', platform: 'ios-simulator' }] }]);
+  const admitted = await f.verifier.ensure(f.input);
+  assert.equal(admitted.executionTargetKind, 'container'); assert.equal(admitted.status, 'failed'); assert.equal(f.calls.length, 1);
+});
+
+test('paired tools never move a retained native verifier into a replacement container', async t => {
+  const f = await pairedVerifierFixture(t); f.local(ready);
+  f.setPreparationHook(async () => { throw Object.assign(new Error('Source preparation temporarily unavailable'), { agentStarted: false, executionEnded: true }); });
+  const original = await f.verifier.ensure(f.input);
+  assert.equal(original.status, 'waiting'); assert.equal(original.executionTargetKind, 'host-macos'); assert.ok(original.sessionId);
+  f.setPreparationHook(undefined); f.local([linuxReviewer]);
+  const waiting = await f.verifier.ensure(f.input);
+  assert.equal(waiting.status, 'waiting'); assert.equal(waiting.executionTargetKind, 'host-macos'); assert.equal(waiting.sessionId, original.sessionId);
+  assert.equal(f.preparations.length, 1); assert.equal(f.calls.length, 0);
+});
 
 async function unusedContainerChatFixture(t: TestContext) {
   const f = await legacyContainerFixture(t, 'unknown');
