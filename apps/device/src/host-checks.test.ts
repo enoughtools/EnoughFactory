@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict';
+import { execFile } from 'node:child_process';
 import { mkdtemp, mkdir, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { promisify } from 'node:util';
 import test from 'node:test';
 import { WorkspaceManager, WorkingDirectoryManager, type CheckContext, type CheckExecutor, type FrozenCheckInputs, type WorkingDirectoryCapture } from '@enoughfactory/workspaces';
 import { git, run } from '../../../packages/workspaces/src/process.ts';
@@ -11,8 +13,11 @@ import { hostCheckExecutor } from './host-checks.ts';
 const quote = (value: string) => `'${value.replaceAll("'", `'"'"'`)}'`;
 const nodeCommand = (source: string) => `${quote(process.execPath)} -e ${quote(source)}`;
 const wait = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+const execute = promisify(execFile);
+type InventoryProbe = NonNullable<Parameters<typeof hostCheckExecutor>[0]['processInventoryProbe']>;
+const actualInventory: InventoryProbe = async options => (await execute('/bin/ps', ['-U', String(process.getuid!()), '-o', 'pid=,ppid=,stat=,lstart=,command='], { timeout: options.timeoutMs, maxBuffer: options.maxBuffer, env: { PATH: '/usr/bin:/bin', LANG: 'en_US.UTF-8', LC_ALL: 'en_US.UTF-8' } })).stdout;
 
-async function fixture(t: { after: (fn: () => Promise<void>) => void }, input: { evidence?: boolean; executor?: CheckExecutor } = {}) {
+async function fixture(t: { after: (fn: () => Promise<void>) => void }, input: { evidence?: boolean; executor?: CheckExecutor; processInventoryProbe?: InventoryProbe } = {}) {
   const root = await mkdtemp(path.join(tmpdir(), 'enough-host-checks-')), project = path.join(root, 'project'), dataDir = path.join(root, 'data');
   await mkdir(project);
   assert.equal((await run('git', ['init', '-b', 'main', project])).exitCode, 0);
@@ -20,7 +25,7 @@ async function fixture(t: { after: (fn: () => Promise<void>) => void }, input: {
   await git(project, 'config', 'user.email', 'factory@example.test');
   await writeFile(path.join(project, 'source.txt'), 'original\n');
   await git(project, 'add', '.'); await git(project, 'commit', '-m', 'Original source');
-  const executor = input.executor ?? hostCheckExecutor({ checksRoot: path.join(dataDir, 'checks'), integrationRoot: path.join(dataDir, 'integration'), platform: 'darwin' });
+  const executor = input.executor ?? hostCheckExecutor({ checksRoot: path.join(dataDir, 'checks'), integrationRoot: path.join(dataDir, 'integration'), platform: 'darwin', processInventoryProbe: input.processInventoryProbe });
   const manager = new WorkspaceManager({ dataDir, deviceId: 'test-mac', checkExecutor: executor });
   const directories = new WorkingDirectoryManager({ dataDir, artifacts: manager.artifacts });
   const captures: WorkingDirectoryCapture[] = [];
@@ -104,6 +109,55 @@ test('private host environment omits personal credentials and maps exact frozen 
   assert.equal(data.evidence, path.join(context.workingDirectories![0]!.path, 'native evidence'));
   assert.equal(data.descriptor, path.join(data.evidence, "ui 'receipt' $(literal).json"));
   assert.equal(data.digest, 'a'.repeat(64)); assert.equal(JSON.parse(data.contents).verified, true);
+});
+
+test('a transient process inventory timeout recovers before confirming host check teardown and retains sanitized diagnostics', async t => {
+  let probes = 0;
+  const f = await fixture(t, { processInventoryProbe: async options => {
+    assert.equal(options.timeoutMs, 3000); assert.equal(options.maxBuffer, 8 * 1024 * 1024);
+    if (++probes === 1) throw Object.assign(new Error('Command failed with private prompt text'), { code: 'ETIMEDOUT', signal: 'SIGTERM', killed: true, stdout: 'private process arguments', stderr: 'private error text' });
+    return actualInventory(options);
+  } });
+  const context = await f.context('sleep 0.35; printf checked');
+  const result = await f.executor(context);
+  assert.equal(result.exitCode, 0, result.stderr); assert.equal(result.stdout, 'checked');
+  assert.equal(result.cleanupErrors, undefined, JSON.stringify(result.cleanupErrors));
+  assert.ok(probes >= 2, 'a fresh process inventory follows the transient timeout');
+  const [journal] = await readdir(`${context.path}-host-checks`), directory = path.join(`${context.path}-host-checks`, journal!);
+  const diagnosticText = await readFile(path.join(directory, 'process-probe-errors.json'), 'utf8');
+  const diagnostic = JSON.parse(diagnosticText);
+  assert.equal(diagnostic.failures.length, 1); assert.equal(diagnostic.omitted, 0);
+  assert.equal(diagnostic.failures[0].code, 'ETIMEDOUT'); assert.equal(diagnostic.failures[0].signal, 'SIGTERM'); assert.equal(diagnostic.failures[0].killed, true);
+  assert.equal(diagnostic.failures[0].stdoutBytes, Buffer.byteLength('private process arguments')); assert.equal(diagnostic.failures[0].stderrBytes, Buffer.byteLength('private error text'));
+  assert.doesNotMatch(diagnosticText, /private (?:prompt|process|error)/, 'process tables and error text must not be retained');
+  const completed = JSON.parse(await readFile(path.join(directory, 'completed.json'), 'utf8'));
+  assert.equal(completed.terminationConfirmed, true);
+  assert.deepEqual(completed.result.processProbeFailures, diagnostic.failures);
+  await f.executor.release!(context.path);
+});
+
+test('exhausted process inventory retries keep a successful command unconfirmed and fence snapshot release', async t => {
+  let probes = 0;
+  const f = await fixture(t, { processInventoryProbe: async () => {
+    probes++;
+    throw Object.assign(new Error('private process table must not escape'), { code: 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER', signal: 'SIGTERM', killed: true, stdout: 'private process arguments', stderr: 'private error text' });
+  } });
+  const context = await f.context('printf checked');
+  const result = await f.executor(context);
+  assert.equal(result.exitCode, 0); assert.equal(result.stdout, 'checked');
+  assert.ok(probes >= 2);
+  assert.ok(result.cleanupErrors?.some(error => /unavailable after 2 probes/.test(error)), JSON.stringify(result.cleanupErrors));
+  assert.ok(result.cleanupErrors?.some(error => /ERR_CHILD_PROCESS_STDIO_MAXBUFFER/.test(error)), 'the actual sanitized error category survives');
+  assert.doesNotMatch(JSON.stringify(result.cleanupErrors), /private process|private error/);
+  const [journal] = await readdir(`${context.path}-host-checks`), directory = path.join(`${context.path}-host-checks`, journal!);
+  const completed = JSON.parse(await readFile(path.join(directory, 'completed.json'), 'utf8'));
+  assert.equal(completed.terminationConfirmed, false);
+  assert.deepEqual(completed.result.processProbeFailures.slice(0, 2).map((failure: { attempt: number }) => failure.attempt), [1, 2]);
+  await assert.rejects(f.executor.release!(context.path), /unavailable after 2 probes/);
+  assert.equal(await readFile(path.join(context.path, 'source.txt'), 'utf8'), 'authored\n');
+  const recovered = hostCheckExecutor({ checksRoot: path.join(f.dataDir, 'checks'), platform: 'darwin' });
+  await assert.rejects(recovered.release!(context.path), /execution outcome is uncertain/);
+  await assert.rejects(recovered(context), /earlier host check outcome is uncertain/);
 });
 
 test('host route rejects non-host candidates, outside paths, symlink roots and mismatched captured evidence', async t => {

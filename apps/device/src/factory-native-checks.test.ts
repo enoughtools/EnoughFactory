@@ -137,6 +137,26 @@ test('native candidate ordinary checks run with Docker unavailable and retain fu
   f.assertNoDocker();
 });
 
+test('successful commands with uncertain cleanup expose the actual failure without claiming source changed', async t => {
+  const f = await harness(t), cleanup = 'Host check process inventory is unavailable after 2 probes: killed=true';
+  const report: CheckReport = {
+    id: 'uncertain-check', candidateId: f.candidate.id, commit: f.candidate.commit, status: 'failed',
+    commands: [{ command: 'run-native-tests', exitCode: 0, stdout: '106 tests passed', stderr: '', startedAt: f.goal.createdAt, endedAt: f.goal.updatedAt }],
+    cleanupErrors: [cleanup], createdAt: f.goal.updatedAt, logArtifact: f.candidate.bundleArtifact,
+  };
+  t.mock.method(f.factory.workspaces, 'verify', async () => report);
+  const checks = await f.factory.workspacePort.check(f.project, f.candidate, ['run-native-tests'], f.verification);
+  assert.equal(checks[0]!.passed, true);
+  assert.equal(checks[1]!.passed, false, 'Passing tests do not establish safe cleanup or source integrity.');
+  assert.match(checks[1]!.output, /could not confirm verification cleanup/);
+  assert.match(checks[1]!.output, /workspace and process journals were retained/);
+  assert(checks[1]!.output.includes(cleanup));
+  assert.doesNotMatch(checks[1]!.output, /Checks changed|were canceled/);
+  assert.equal(checks[1]!.candidateCommit, f.candidate.commit);
+  assert.equal(await git(f.project.path, 'rev-parse', 'HEAD'), f.base);
+  f.assertNoDocker();
+});
+
 test('service quality hook receives frozen contract and actual private C/M snapshots with exact secondary roots', async t => {
   const f = await harness(t);
   f.respond(async input => {

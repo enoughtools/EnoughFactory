@@ -1378,7 +1378,12 @@ function checkResults(report: CheckReport, candidateCommit: string): CheckResult
     return {command:command.command,passed:command.exitCode===0&&!command.timedOut,output:`${command.stdout}${command.stderr}`,exitCode:command.exitCode,candidateCommit,checkedCommit:report.commit,developmentToolchain:command.developmentToolchain,executionTargetKind:command.executionTargetKind,hostPermissions:command.hostPermissions,...((command as Partial<AppleCheckResult>).appleValidation?{appleValidation:(command as AppleCheckResult).appleValidation}:{}),...(command.timedOut||report.status==='canceled'?{recovery:{condition:'check-interrupted' as const,reason:'The original verification was interrupted; saved work can be rechecked only after its owning effects and source are confirmed settled.'}}:{})};
   });
   if (['failed', 'canceled'].includes(report.status) && results.every(result => result.passed)) {
-    results.push({ command: 'Repository integrity after checks', passed: false, output: 'Checks changed the tracked candidate or were canceled.', exitCode: 1, candidateCommit, checkedCommit: report.commit });
+    const output = report.cleanupErrors?.length
+      ? `Factory could not confirm verification cleanup. The check workspace and process journals were retained.\n${report.cleanupErrors.join('\n')}`
+      : report.status === 'canceled'
+        ? 'Verification was canceled before source integrity could be confirmed.'
+        : 'Checks changed the tracked candidate or its captured reference inputs.';
+    results.push({ command: 'Repository integrity after checks', passed: false, output, exitCode: 1, candidateCommit, checkedCommit: report.commit });
   }
   return results;
 }

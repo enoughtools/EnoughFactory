@@ -12,6 +12,16 @@ const commit = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/;
 const basePath = [...new Set(['/usr/bin', '/bin', '/usr/sbin', '/sbin', path.dirname(process.execPath)])].join(':');
 const privateEnvironment = { PATH: basePath, LANG: 'en_US.UTF-8', LC_ALL: 'en_US.UTF-8', GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', GIT_TERMINAL_PROMPT: '0', GIT_NO_REPLACE_OBJECTS: '1', GIT_OPTIONAL_LOCKS: '0' };
 const graceMs = 250;
+const inventoryProbeTimeoutMs = 3_000;
+const inventoryProbeMaxBuffer = 8 * 1024 * 1024;
+const inventoryProbeAttempts = 2;
+
+type InventoryProbe = (options: { timeoutMs: number; maxBuffer: number }) => Promise<string>;
+interface InventoryProbeFailure {
+  probe: 'descendant-inventory'; at: string; attempt: number; timeoutMs: number; maxBuffer: number;
+  code: string | number | null; signal: string | null; killed: boolean | null;
+  stdoutBytes: number | null; stderrBytes: number | null;
+}
 
 interface Outcome { exitCode: number; timedOut: boolean; canceled: boolean; error?: string; }
 interface ActiveRun { child: ChildProcess; stop: () => void; completed: Promise<CommandResult>; }
@@ -51,7 +61,7 @@ child.once('close', (code, signal) => {
  * and a clean environment avoid exposing the user's checkout or credentials by
  * inheritance. Only frozen host-macos candidates can enter this execution route.
  */
-export function hostCheckExecutor(options: { checksRoot: string; integrationRoot?: string; platform?: NodeJS.Platform }): CheckExecutor {
+export function hostCheckExecutor(options: { checksRoot: string; integrationRoot?: string; platform?: NodeJS.Platform; processInventoryProbe?: InventoryProbe }): CheckExecutor {
   const roots = [options.checksRoot, ...(options.integrationRoot ? [options.integrationRoot] : [])].map(root => path.resolve(root));
   if (new Set(roots).size !== roots.length || roots.some(root => path.dirname(root) === root)) throw new Error('Host checks require distinct private snapshot roots.');
   const active = new Map<string, Set<ActiveRun>>();
@@ -135,11 +145,19 @@ export function hostCheckExecutor(options: { checksRoot: string; integrationRoot
     let exited = false, closed = false, timedOut = false, canceled = false;
     child.once('close', () => { closed = true; });
     const cleanupErrors: string[] = [];
+    const probeFailures: InventoryProbeFailure[] = [];
+    let omittedProbeFailures = 0;
+    const inventory = () => processInventory(options.processInventoryProbe, async failure => {
+      if (probeFailures.length < 256) probeFailures.push(failure); else omittedProbeFailures++;
+      // Preserve useful diagnostics without storing a process table or arbitrary
+      // command/error text, which can contain personal prompts and credentials.
+      await writeFile(path.join(directory, 'process-probe-errors.json'), JSON.stringify({ failures: probeFailures, omitted: omittedProbeFailures }), { mode: 0o600 });
+    });
     const descendants = new Map<number, OwnedChild>();
     let observing: Promise<void> | undefined;
     const observe = () => {
       if (observing || exited || !child.pid) return;
-      observing = processInventory().then(async inventory => {
+      observing = inventory().then(async inventory => {
         const parents = new Set([child.pid!, ...[...descendants.values()].filter(known => inventory.some(entry => entry.pid === known.pid && entry.identity === known.identity)).map(known => known.pid)]);
         for (let round = 0; round < inventory.length; round++) {
           let changed = false;
@@ -182,7 +200,7 @@ export function hostCheckExecutor(options: { checksRoot: string; integrationRoot
         if (!closed) await Promise.race([new Promise<void>(done => child.once('close', () => done())), delay(500)]);
         if (!closed) cleanupErrors.push('Host check output pipes remain open after its process group ended; descendant execution is uncertain and private snapshots were retained.');
         child.stdout?.destroy(); child.stderr?.destroy();
-        try { await stopKnownDescendants([...descendants.values()]); }
+        try { await stopKnownDescendants([...descendants.values()], inventory); }
         catch (error) { cleanupErrors.push(message(error)); }
         if (child.pid) {
           try { await confirmGroupStopped(child.pid); }
@@ -200,7 +218,7 @@ export function hostCheckExecutor(options: { checksRoot: string; integrationRoot
         }
         if (outcome?.error) stderr += `${stderr ? '\n' : ''}${outcome.error}`;
         if (spawnError) stderr += `${stderr ? '\n' : ''}${spawnError.message}`;
-        const result: CommandResult = { command: context.command, exitCode: timedOut || outcome?.timedOut ? 124 : canceled || outcome?.canceled ? 130 : outcome?.exitCode ?? 127, stdout, stderr, timedOut: timedOut || outcome?.timedOut || false, startedAt, endedAt: new Date().toISOString(), executionTargetKind: 'host-macos', hostPermissions: 'full-host', ...(cleanupErrors.length ? { cleanupErrors } : {}) };
+        const result: CommandResult & { processProbeFailures?: InventoryProbeFailure[]; omittedProcessProbeFailures?: number } = { command: context.command, exitCode: timedOut || outcome?.timedOut ? 124 : canceled || outcome?.canceled ? 130 : outcome?.exitCode ?? 127, stdout, stderr, timedOut: timedOut || outcome?.timedOut || false, startedAt, endedAt: new Date().toISOString(), executionTargetKind: 'host-macos', hostPermissions: 'full-host', ...(cleanupErrors.length ? { cleanupErrors } : {}), ...(probeFailures.length ? { processProbeFailures: probeFailures } : {}), ...(omittedProbeFailures ? { omittedProcessProbeFailures: omittedProbeFailures } : {}) };
         try { await writeFile(path.join(directory, 'completed.json'), JSON.stringify({ terminationConfirmed: cleanupErrors.length === 0, result }), { flag: 'wx', mode: 0o600 }); }
         catch (error) { cleanupErrors.push(`Could not retain host check termination evidence: ${message(error)}`); result.cleanupErrors = cleanupErrors; }
         if (cleanupErrors.length) failures.set(context.path, [...failures.get(context.path) ?? [], ...cleanupErrors]);
@@ -296,20 +314,40 @@ async function confirmGroupStopped(pid: number): Promise<void> {
   throw new Error('Host check process group termination is unconfirmed; execution outcome is uncertain and private snapshots were retained.');
 }
 
-async function processInventory(): Promise<Array<OwnedChild & { parent: number }>> {
-  const result = await execute('/bin/ps', ['-U', String(process.getuid!()), '-o', 'pid=,ppid=,stat=,lstart=,command='], { env: privateEnvironment, timeout: 1000, maxBuffer: 8 * 1024 * 1024 });
-  return result.stdout.split('\n').flatMap(line => {
+async function processInventory(probe: InventoryProbe = async options => (await execute('/bin/ps', ['-U', String(process.getuid!()), '-o', 'pid=,ppid=,stat=,lstart=,command='], { env: privateEnvironment, timeout: options.timeoutMs, maxBuffer: options.maxBuffer })).stdout, recordFailure: (failure: InventoryProbeFailure) => Promise<void>): Promise<Array<OwnedChild & { parent: number }>> {
+  let stdout: string | undefined;
+  for (let attempt = 1; attempt <= inventoryProbeAttempts; attempt++) {
+    try { stdout = await probe({ timeoutMs: inventoryProbeTimeoutMs, maxBuffer: inventoryProbeMaxBuffer }); break; }
+    catch (error) {
+      const failure = inventoryProbeFailure(error, attempt);
+      await recordFailure(failure);
+      if (attempt === inventoryProbeAttempts) throw new Error(`Host check process inventory is unavailable after ${inventoryProbeAttempts} probes: ${JSON.stringify(failure)}`);
+      // Compilers can temporarily saturate the host. A fresh successful probe
+      // recovers the observation; exhausted retries still fence all cleanup.
+      await delay(100);
+    }
+  }
+  return stdout!.split('\n').flatMap(line => {
     const match = /^\s*(\d+)\s+(\d+)\s+(\S+)\s+(.+)$/.exec(line);
     return match && !match[3]!.startsWith('Z') ? [{ pid: Number(match[1]), parent: Number(match[2]), identity: match[4]!.trim() }] : [];
   });
 }
 
+function inventoryProbeFailure(error: unknown, attempt: number): InventoryProbeFailure {
+  const fields = error && typeof error === 'object' ? error as Record<string, unknown> : {};
+  const byteLength = (value: unknown) => typeof value === 'string' ? Buffer.byteLength(value) : Buffer.isBuffer(value) ? value.length : null;
+  return { probe: 'descendant-inventory', at: new Date().toISOString(), attempt, timeoutMs: inventoryProbeTimeoutMs, maxBuffer: inventoryProbeMaxBuffer,
+    code: typeof fields.code === 'number' && Number.isFinite(fields.code) ? fields.code : typeof fields.code === 'string' && /^[A-Z0-9_]{1,64}$/.test(fields.code) ? fields.code : null,
+    signal: typeof fields.signal === 'string' && /^SIG[A-Z0-9]{1,16}$/.test(fields.signal) ? fields.signal : null,
+    killed: typeof fields.killed === 'boolean' ? fields.killed : null, stdoutBytes: byteLength(fields.stdout), stderrBytes: byteLength(fields.stderr) };
+}
+
 /** A detached tool keeps its captured birth/command identity after reparenting.
  * Never signal a replacement PID or an unobserved snapshot user.
  */
-async function stopKnownDescendants(children: OwnedChild[]): Promise<void> {
+async function stopKnownDescendants(children: OwnedChild[], inventoryProbe: () => Promise<Array<OwnedChild & { parent: number }>>): Promise<void> {
   if (!children.length) return;
-  const inventory = await processInventory();
+  const inventory = await inventoryProbe();
   for (const child of children) {
     const current = inventory.find(entry => entry.pid === child.pid);
     if (!current || current.identity !== child.identity) continue;
@@ -318,7 +356,7 @@ async function stopKnownDescendants(children: OwnedChild[]): Promise<void> {
     try { process.kill(child.pid, 'SIGKILL'); } catch (error) { if (!missingProcess(error)) throw error; }
   }
   for (let round = 0; round < 20; round++) {
-    const live = await processInventory();
+    const live = await inventoryProbe();
     // Exec changes the command identity, and PID reuse changes the birth
     // identity. Neither proves the previously owned writer has stopped. Do not
     // signal the new identity; retain the uncertainty while that PID is live.
