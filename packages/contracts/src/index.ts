@@ -196,8 +196,17 @@ export interface InspectionSourceIdentity {
   snapshotId: string; sha256: string; candidateId?: string; candidateCommit?: string; checkedCommit?: string;
   roots?: Array<{ id: string; sha256: string; commit?: string }>;
 }
+export interface InspectionVerificationAcceptance {
+  version: 1;
+  /** Original author assignment, never the later mutable task description. */
+  task: NonNullable<AttemptInspection["contract"]>;
+  /** Canonical completion requirements retained for this final-review revision. */
+  goal?: { revision: number; objective: string; criteria: string[]; taskContracts: Array<{ taskId: string; attemptId: string; authorityGeneration: number; assignmentGoalRevision: number; contract: NonNullable<AttemptInspection["contract"]> }> };
+}
 export interface InspectionVerificationRun {
   id: string; authority: InspectionAuthority; source: InspectionSourceIdentity; quality: TaskQualityRequirements;
+  /** Missing only on historical verifiers that did not receive the full acceptance contract. */
+  acceptanceContract?: InspectionVerificationAcceptance;
   /** Final product inspection retains an accepted author identity and fences the current goal revision separately. */
   purpose?: "task" | "goal-final"; goalRevision?: number;
   policySha256: string; ownerDeviceId: string; executionTargetKind: ExecutionTargetKind; executionTargetId: string;

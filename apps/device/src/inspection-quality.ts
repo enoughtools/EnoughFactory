@@ -1,26 +1,33 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
-import type { InspectionAction, InspectionAuthority, InspectionEvidence, InspectionJob, InspectionSourceIdentity, TaskQualityRequirements } from '@enoughfactory/contracts';
-import { UI_QUALITY_CHECK_COMMAND, type CheckResult } from '@enoughfactory/factory';
+import type { Attempt, Chat, FactoryTask, Goal, InspectionAction, InspectionAuthority, InspectionEvidence, InspectionJob, InspectionSourceIdentity, InspectionVerificationRun, Session, TaskQualityRequirements } from '@enoughfactory/contracts';
+import { UI_QUALITY_CHECK_COMMAND, type AttemptDetail, type CheckResult } from '@enoughfactory/factory';
 import type { ArtifactManifest, ArtifactStore } from '@enoughfactory/workspaces';
 import type { Store } from './store.ts';
 import type { InspectionObservation } from './inspection-jobs.ts';
 import { factoryQualityEvidenceContext, parseQualityEvidenceReport, validateQualityEvidence, type QualityEvidenceReport, type QualityEvidenceResolver, type QualityGateResult, type QualityObservationReceipt, type QualityPlatform } from './factory-quality.ts';
+import { inspectionAcceptanceContractSha256, inspectionQualityPolicySha256, inspectionVerificationKey } from './inspection-verification-identity.ts';
 
 type QualityStore = Pick<Store, 'get' | 'set' | 'list' | 'events' | 'append' | 'transaction'>;
 export interface InspectionImageDelivery {
   id: string; chatId: string; eventId: string; artifactSha256: string;
   authority: InspectionAuthority; route: 'tool-image' | 'image-input' | 'image-view';
 }
+/** Derived from an original verifier owner by the service, never from authored report JSON. */
+export interface InspectionQualityVerification {
+  runId: string; chatId: string; acceptanceContractSha256: string;
+}
 /** Written by the reference tool after returning the original reference content. */
 export interface InspectionReferenceView {
   id: string; referenceId: string; authority: InspectionAuthority;
   source: InspectionSourceIdentity; artifacts?: ArtifactManifest[]; artifactIds?: string[]; inspectedAt: string;
+  verification?: InspectionQualityVerification;
 }
 export interface InspectionQualityRecord {
   id: string; authority: InspectionAuthority; quality: TaskQualityRequirements;
   source: InspectionSourceIdentity; reportArtifact: ArtifactManifest;
   gate: QualityGateResult; createdAt: string; sequence: number;
+  verification?: InspectionQualityVerification;
 }
 export interface InspectionQualityEquivalence {
   id: string; reportId: string; authority: InspectionAuthority;
@@ -46,8 +53,9 @@ const B = { reports: 'inspection-quality-reports', equivalences: 'inspection-qua
 const platform = (value: unknown): value is QualityPlatform => value === 'web' || value === 'macos' || value === 'ios-simulator';
 const sha = (value: unknown): value is string => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
 const sequence = (value: unknown): value is number => Number.isSafeInteger(value) && Number(value) >= 0;
-const delivered = (value: InspectionImageDelivery, authority: InspectionAuthority, digest: string): boolean => value.artifactSha256 === digest
+const delivered = (value: InspectionImageDelivery, authority: InspectionAuthority, digest: string, verification?: InspectionQualityVerification): boolean => value.artifactSha256 === digest
   && isDeepStrictEqual(value.authority, authority) && typeof value.chatId === 'string' && !!value.chatId.trim()
+  && (!verification || value.chatId === verification.chatId)
   && typeof value.eventId === 'string' && !!value.eventId.trim() && ['tool-image', 'image-input', 'image-view'].includes(value.route);
 
 /** Explicit content equivalence, never an assertion that two Git commits are the same identity. */
@@ -74,19 +82,76 @@ export class InspectionQualityService {
     if (!this.options.authorityCurrent(authority)) throw new Error('Quality submission belongs to stale inspection authority.');
   }
 
-  async submit(input: { authority: InspectionAuthority; quality: TaskQualityRequirements; report: unknown }): Promise<InspectionQualityRecord> {
+  private assertVerification(verification: InspectionQualityVerification | undefined, authority: InspectionAuthority, quality: TaskQualityRequirements, source: InspectionSourceIdentity, submitting = false): void {
+    if (!verification) return;
+    const run = this.options.store.get<InspectionVerificationRun>('inspection-verifier-runs', verification.runId);
+    const chat = run?.chatId && this.options.store.get<Chat>('chats', run.chatId);
+    const session = run?.sessionId && this.options.store.get<Session>('sessions', run.sessionId);
+    const sessionKind = session && (session.executionTargetKind ?? 'container');
+    const targetId = session && (session.executionTargetId ?? (sessionKind === 'container' ? 'container' : undefined));
+    if (!verification.runId?.trim() || !verification.chatId?.trim() || !sha(verification.acceptanceContractSha256) || !run ||
+      !run.acceptanceContract || run.id !== inspectionVerificationKey(run) || !isDeepStrictEqual(run.authority, authority) ||
+      !isDeepStrictEqual(run.quality, quality) || run.policySha256 !== inspectionQualityPolicySha256(quality) || !inspectionSourceContentMatches(run.source, source) ||
+      run.chatId !== verification.chatId || inspectionAcceptanceContractSha256(run.acceptanceContract) !== verification.acceptanceContractSha256 ||
+      (submitting ? run.status !== 'running' : !['running', 'succeeded'].includes(run.status)) ||
+      !chat || !session || chat.id !== verification.chatId || chat.verificationRunId !== run.id || chat.sessionId !== run.sessionId || chat.deviceId !== run.ownerDeviceId || chat.runtime !== 'codex' ||
+      (submitting ? chat.status !== 'running' : !['running', 'idle'].includes(chat.status)) ||
+      session.verificationRunId !== run.id || session.deviceId !== run.ownerDeviceId ||
+      sessionKind !== run.executionTargetKind || targetId !== run.executionTargetId ||
+      (submitting ? session.status !== 'ready' : !['ready', 'stopped'].includes(session.status))) throw new Error('Quality evidence does not belong to the original current verification run, conversation and acceptance contract.');
+    const original = this.options.store.get<AttemptDetail>('factory-attempt-details', authority.attemptId);
+    if (!original?.contract || original.id !== authority.attemptId || original.goalId !== authority.goalId || (original.assignmentGoalRevision ?? original.goalRevision) !== authority.goalRevision
+      || !isDeepStrictEqual(original.contract, run.acceptanceContract.task)
+      || run.purpose !== 'goal-final' && !isDeepStrictEqual(original.contract.quality, quality)) throw new Error('Quality evidence does not match the original frozen author acceptance contract.');
+    if (run.purpose === 'goal-final') {
+      const goal = this.options.store.get<Goal>('goals', authority.goalId);
+      const retained = run.acceptanceContract.goal;
+      if (!goal || goal.revision !== run.goalRevision || retained?.revision !== goal.revision || retained.objective !== goal.objective || !isDeepStrictEqual(retained.criteria, goal.criteria)) throw new Error('Quality evidence belongs to a retired final acceptance revision.');
+      if (!Array.isArray(retained.taskContracts) || new Set(retained.taskContracts.map(value => value.taskId)).size !== retained.taskContracts.length) throw new Error('Final quality evidence has no original accepted task contract identities.');
+      for (const covered of retained.taskContracts) {
+        const task = this.options.store.get<FactoryTask>('tasks', covered.taskId);
+        const attempt = this.options.store.get<Attempt>('attempts', covered.attemptId);
+        const detail = this.options.store.get<AttemptDetail>('factory-attempt-details', covered.attemptId);
+        if (!task || task.id !== covered.taskId || task.goalId !== goal.id || task.status !== 'completed' || task.currentAttemptId !== covered.attemptId
+          || !attempt || attempt.id !== covered.attemptId || attempt.taskId !== task.id || attempt.status !== 'succeeded' || attempt.generation !== covered.authorityGeneration
+          || !detail?.contract || detail.id !== attempt.id || detail.goalId !== goal.id || (detail.assignmentGoalRevision ?? detail.goalRevision) !== covered.assignmentGoalRevision
+          || !isDeepStrictEqual(detail.contract, covered.contract) || !detail.integration || !detail.candidate?.commit || detail.integration.candidateCommit !== detail.candidate.commit) throw new Error('Final quality evidence does not match the original accepted task contracts and integration identities.');
+      }
+    }
+  }
+
+  private originalVerificationRecords(run: InspectionVerificationRun | undefined): unknown[] {
+    if (!run) return [];
+    const records: unknown[] = [this.options.store.get('factory-attempt-details', run.authority.attemptId)];
+    if (run.purpose === 'goal-final') {
+      records.push(this.options.store.get('goals', run.authority.goalId));
+      const covered = run.acceptanceContract?.goal?.taskContracts;
+      if (Array.isArray(covered)) for (const value of covered) records.push(this.options.store.get('tasks', value.taskId), this.options.store.get('attempts', value.attemptId), this.options.store.get('factory-attempt-details', value.attemptId));
+    }
+    return records;
+  }
+
+  async submit(input: { authority: InspectionAuthority; quality: TaskQualityRequirements; report: unknown; verification?: InspectionQualityVerification }): Promise<InspectionQualityRecord> {
     this.assertCurrent(input.authority);
     const report = parseQualityEvidenceReport(input.report);
     const quality = structuredClone(input.quality), authority = structuredClone(input.authority);
-    const gate = await this.validate(report, authority, quality);
+    const verification = input.verification && structuredClone(input.verification);
+    this.assertVerification(verification, authority, quality, report.source, true);
+    const ledger = verification && this.ledgerFingerprint(authority, verification);
+    const current = () => {
+      this.assertCurrent(authority); this.assertVerification(verification, authority, quality, report.source, true);
+      if (verification && this.ledgerFingerprint(authority, verification) !== ledger) throw new Error('Inspection evidence changed during bound quality submission.');
+    };
+    const gate = await this.validate(report, authority, quality, verification);
+    current();
     this.assertCurrent(authority);
-    const reportArtifact = await this.options.artifacts.put(JSON.stringify(report), { name: 'app-quality-review.json', mime: 'application/json', goalId: authority.goalId, taskId: authority.taskId, attemptId: authority.attemptId, metadata: { source: report.source, gateStatus: gate.status } });
-    this.assertCurrent(authority);
+    const reportArtifact = await this.options.artifacts.put(JSON.stringify(report), { name: 'app-quality-review.json', mime: 'application/json', goalId: authority.goalId, taskId: authority.taskId, attemptId: authority.attemptId, metadata: { source: report.source, gateStatus: gate.status, ...(verification ? { verification } : {}) } });
+    current();
     return this.options.store.transaction(() => {
-      this.assertCurrent(authority);
+      current();
       const id = randomUUID(), createdAt = this.now();
-      const next = this.options.store.append('inspection-journal', id, { kind: 'quality-submitted', at: createdAt, value: { authority, reportArtifactId: reportArtifact.id, gateStatus: gate.status } });
-      const record: InspectionQualityRecord = { id, authority, quality, source: report.source, reportArtifact, gate, createdAt, sequence: next };
+      const next = this.options.store.append('inspection-journal', id, { kind: 'quality-submitted', at: createdAt, value: { authority, reportArtifactId: reportArtifact.id, gateStatus: gate.status, ...(verification ? { verification } : {}) } });
+      const record: InspectionQualityRecord = { id, authority, quality, source: report.source, reportArtifact, gate, createdAt, sequence: next, ...(verification ? { verification } : {}) };
       this.options.store.set(B.reports, record); this.options.store.set('artifacts', reportArtifact);
       return record;
     });
@@ -96,36 +161,50 @@ export class InspectionQualityService {
   async check(input: {
     authority: InspectionAuthority; quality: TaskQualityRequirements; source: InspectionSourceIdentity;
     candidateCommit: string; checkedCommit?: string;
+    verification?: InspectionQualityVerification;
   }): Promise<InspectionQualityCheckResult> {
     this.assertCurrent(input.authority);
+    const requestedVerification = input.verification && structuredClone(input.verification);
+    this.assertVerification(requestedVerification, input.authority, input.quality, input.source);
     const reports = this.options.store.list<InspectionQualityRecord>(B.reports).filter(record => isDeepStrictEqual(record.authority, input.authority)
-      && isDeepStrictEqual(record.quality, input.quality) && inspectionSourceContentMatches(record.source, input.source)).sort((a, b) => b.sequence - a.sequence);
+      && isDeepStrictEqual(record.quality, input.quality) && inspectionSourceContentMatches(record.source, input.source)
+      && (!requestedVerification || isDeepStrictEqual(record.verification, requestedVerification))).sort((a, b) => b.sequence - a.sequence);
     const record = reports[0];
     const base = { command: UI_QUALITY_CHECK_COMMAND, candidateCommit: input.candidateCommit, checkedCommit: input.checkedCommit ?? input.candidateCommit };
     if (!record) {
       const reason = 'Current-source app quality evidence is missing. Open the app through its inspection tools, view the screenshots, verify the required workflows and submit the visual review.';
       return { ...base, passed: false, exitCode: 1, output: reason, recovery: { condition: 'inspection-evidence', reason } };
     }
-    const ledger = this.ledgerFingerprint(input.authority);
+    const verification = requestedVerification ?? record.verification;
+    try { this.assertVerification(verification, input.authority, input.quality, input.source); }
+    catch (error) {
+      if (requestedVerification) throw error;
+      const reason = 'The retained quality report belongs to an unavailable verification owner. Reconcile the original verifier before accepting its evidence.';
+      return { ...base, passed: false, exitCode: 1, output: reason, recovery: { condition: 'inspection-evidence', reason } };
+    }
+    const ledger = this.ledgerFingerprint(input.authority, verification);
     let report: QualityEvidenceReport;
     try {
       const manifest = await this.options.artifacts.get(record.reportArtifact.id);
       if (!isDeepStrictEqual(manifest, record.reportArtifact)) throw new Error('Quality report manifest changed.');
+      if (!isDeepStrictEqual(manifest.metadata?.verification, record.verification)) throw new Error('Quality report verification owner changed.');
       report = parseQualityEvidenceReport(JSON.parse((await this.options.artifacts.read(manifest)).toString('utf8')));
       if (!isDeepStrictEqual(report.source, record.source)) throw new Error('Quality report source changed.');
     } catch {
       const reason = `Quality report ${record.id} is unavailable or failed retained artifact verification. Inspect again or restore the original evidence.`;
       return { ...base, passed: false, exitCode: 1, output: reason, recovery: { condition: 'inspection-evidence', reason } };
     }
-    const gate = await this.validate(report, input.authority, input.quality);
+    const gate = await this.validate(report, input.authority, input.quality, verification);
     this.assertCurrent(input.authority);
-    if (this.ledgerFingerprint(input.authority) !== ledger) {
+    this.assertVerification(verification, input.authority, input.quality, input.source);
+    if (this.ledgerFingerprint(input.authority, verification) !== ledger) {
       const reason = 'Inspection evidence changed during quality verification. Verify the latest recorded outcomes before accepting this source.';
       return { ...base, passed: false, exitCode: 1, output: reason, recovery: { condition: 'inspection-evidence', reason } };
     }
     const equivalence: InspectionQualityEquivalence = { id: randomUUID(), reportId: record.id, authority: input.authority, testedSource: record.source, checkedSource: input.source, candidateCommit: input.candidateCommit, checkedCommit: base.checkedCommit, createdAt: this.now(), basis: 'exact-source-digest-and-all-root-digests' };
     this.options.store.transaction(() => {
       this.assertCurrent(input.authority);
+      this.assertVerification(verification, input.authority, input.quality, input.source);
       this.options.store.set(B.equivalences, equivalence);
       this.options.store.append('inspection-journal', equivalence.id, { kind: 'quality-checked', at: equivalence.createdAt, value: { reportId: record.id, gateStatus: gate.status, candidateCommit: input.candidateCommit, checkedCommit: base.checkedCommit } });
     });
@@ -152,7 +231,8 @@ export class InspectionQualityService {
     if (!record || record.authority.goalId !== input.goalId) throw new Error('This quality report is not retained for your goal.');
     const manifest = await this.options.artifacts.get(record.reportArtifact.id);
     if (manifest.mime !== 'application/json' || manifest.size > 128 * 1024 || !isDeepStrictEqual(manifest, record.reportArtifact)
-      || manifest.goalId !== record.authority.goalId || manifest.taskId !== record.authority.taskId || manifest.attemptId !== record.authority.attemptId) throw new Error('The original quality report manifest changed.');
+      || manifest.goalId !== record.authority.goalId || manifest.taskId !== record.authority.taskId || manifest.attemptId !== record.authority.attemptId
+      || !isDeepStrictEqual(manifest.metadata?.verification, record.verification)) throw new Error('The original quality report manifest changed.');
     const original = (await this.options.artifacts.read(manifest)).toString('utf8');
     const report = parseQualityEvidenceReport(JSON.parse(original));
     if (!isDeepStrictEqual(report.source, record.source)) throw new Error('Quality report source changed.');
@@ -203,6 +283,8 @@ export class InspectionQualityService {
     const fingerprint = () => {
       const jobs = this.options.store.list<InspectionJob>(B.jobs).filter(record => record.authority.goalId === goal.id);
       const jobIds = new Set(jobs.map(job => job.id)), sessionIds = new Set(jobs.flatMap(job => job.sessionId ? [job.sessionId] : []));
+      const verifiers = this.options.store.list<InspectionVerificationRun>('inspection-verifier-runs').filter(run => run.authority.goalId === goal.id);
+      const verifierChatIds = new Set(verifiers.flatMap(run => run.chatId ? [run.chatId] : [])), verifierSessionIds = new Set(verifiers.flatMap(run => run.sessionId ? [run.sessionId] : []));
       return createHash('sha256').update(JSON.stringify([
         this.options.store.get('factory-controller-runs', controller.id), this.options.store.get('goals', goal.id),
         this.options.store.list<ControllerInspectionImageDelivery>('controller-image-deliveries').filter(record => record.controllerRunId === controller.id),
@@ -212,6 +294,7 @@ export class InspectionQualityService {
         this.options.store.list<InspectionEvidence>(B.evidence).filter(record => record.authority.goalId === goal.id), jobs,
         this.options.store.list<InspectionAction>(B.actions).filter(action => jobIds.has(action.jobId)),
         this.options.store.list<InspectionObservation>(B.observations).filter(observation => sessionIds.has(observation.sessionId)),
+        verifiers, this.options.store.list<Chat>('chats').filter(chat => verifierChatIds.has(chat.id)), this.options.store.list<Session>('sessions').filter(session => verifierSessionIds.has(session.id)), verifiers.map(run => this.originalVerificationRecords(run)),
       ])).digest('hex');
     };
     const ledger = fingerprint();
@@ -236,7 +319,8 @@ export class InspectionQualityService {
       try {
         if (!sequence(record.sequence)) throw new Error('Quality report sequence is unavailable.');
         const { report } = await this.controllerReport({ goalId: goal.id, reportId: record.id });
-        const gate = await this.validate(report, record.authority, record.quality);
+        this.assertVerification(record.verification, record.authority, record.quality, report.source);
+        const gate = await this.validate(report, record.authority, record.quality, record.verification);
         validated.set(record.id, { report, gate });
         if (gate.status !== 'ready-for-review') issues.push(`Latest current-source quality report ${record.id} is ${gate.status}: ${gate.issues.slice(0, 3).join(' ')}`);
       } catch { validated.set(record.id, undefined); issues.push(`Latest current-source quality report ${record.id} is unavailable or failed original artifact verification.`); }
@@ -303,19 +387,21 @@ export class InspectionQualityService {
     return this.options.store.events<{ kind?: string }>('inspection-journal', id).find(event => event.value.kind === kind)?.seq;
   }
   /** Fence trusted-record changes across asynchronous artifact hashing/peer retrieval. */
-  private ledgerFingerprint(authority: InspectionAuthority): string {
+  private ledgerFingerprint(authority: InspectionAuthority, verification?: InspectionQualityVerification): string {
     const buckets = [B.reports, B.evidence, B.actions, B.jobs, B.deliveries, B.references];
     const records = buckets.map(bucket => ({ bucket, records: this.options.store.list<{ id: string; authority?: InspectionAuthority }>(bucket).filter(record => isDeepStrictEqual(record.authority, authority)) }));
     const sessionIds = new Set(this.options.store.list<InspectionJob>(B.jobs).filter(job => isDeepStrictEqual(job.authority, authority)).flatMap(job => job.sessionId ? [job.sessionId] : []));
-    return createHash('sha256').update(JSON.stringify([records, this.options.store.list<InspectionObservation>(B.observations).filter(observation => sessionIds.has(observation.sessionId))])).digest('hex');
+    const run = verification && this.options.store.get<InspectionVerificationRun>('inspection-verifier-runs', verification.runId);
+    const owner = verification ? [run, this.options.store.get('chats', verification.chatId), run?.sessionId ? this.options.store.get('sessions', run.sessionId) : undefined, this.originalVerificationRecords(run)] : [];
+    return createHash('sha256').update(JSON.stringify([records, this.options.store.list<InspectionObservation>(B.observations).filter(observation => sessionIds.has(observation.sessionId)), owner])).digest('hex');
   }
-  private async validate(report: QualityEvidenceReport, authority: InspectionAuthority, quality: TaskQualityRequirements): Promise<QualityGateResult> {
-    const gate = await validateQualityEvidence(report, { ...quality, authority, source: report.source }, this.resolver(authority, report.source));
+  private async validate(report: QualityEvidenceReport, authority: InspectionAuthority, quality: TaskQualityRequirements, verification?: InspectionQualityVerification): Promise<QualityGateResult> {
+    const gate = await validateQualityEvidence(report, { ...quality, authority, source: report.source }, this.resolver(authority, report.source, verification));
     for (const required of quality.workflows) {
       const workflow = report.workflows.find(value => value.id === required.id && value.platform === required.platform);
       if (!workflow || workflow.outcome !== 'passed') continue;
       try {
-        const after = await this.observation(workflow.after, authority, report.source);
+        const after = await this.observation(workflow.after, authority, report.source, verification);
         const assertion = workflow.assertionEvidenceId && this.options.store.get<InspectionEvidence>(B.evidence, workflow.assertionEvidenceId);
         const order = assertion && this.eventSequence(assertion.id, 'evidence-published');
         if (!after || !assertion || assertion.kind !== 'assertion' || assertion.jobId !== after.evidence.jobId || assertion.sessionId !== after.evidence.sessionId
@@ -335,9 +421,9 @@ export class InspectionQualityService {
     }
     return gate;
   }
-  private resolver(authority: InspectionAuthority, source: InspectionSourceIdentity): QualityEvidenceResolver {
+  private resolver(authority: InspectionAuthority, source: InspectionSourceIdentity, verification?: InspectionQualityVerification): QualityEvidenceResolver {
     return {
-      observation: id => this.observation(id, authority, source),
+      observation: id => this.observation(id, authority, source, verification),
       action: async id => {
         const action = this.options.store.get<InspectionAction>(B.actions, id);
         const job = action && this.options.store.get<InspectionJob>(B.jobs, action.jobId);
@@ -347,7 +433,8 @@ export class InspectionQualityService {
         return { action, source: job.source, platform: targetPlatform, sequence: order };
       },
       reference: async id => {
-        const views = this.options.store.list<InspectionReferenceView>(B.references).filter(view => view.referenceId === id && isDeepStrictEqual(view.authority, authority) && isDeepStrictEqual(view.source, source)).reverse();
+        const views = this.options.store.list<InspectionReferenceView>(B.references).filter(view => view.referenceId === id && isDeepStrictEqual(view.authority, authority) && isDeepStrictEqual(view.source, source)
+          && (!verification || isDeepStrictEqual(view.verification, verification))).reverse();
         for (const view of views) {
           if (!view.inspectedAt || !view.artifacts?.length || view.artifacts.length > 16 || new Set(view.artifacts.map(artifact => artifact.id)).size !== view.artifacts.length) continue;
           try {
@@ -355,7 +442,7 @@ export class InspectionQualityService {
               const artifact = await this.options.artifacts.get(original.id);
               if (!isDeepStrictEqual(artifact, original) || artifact.goalId !== authority.goalId || artifact.taskId !== authority.taskId || artifact.attemptId !== authority.attemptId) throw new Error('Reference manifest changed.');
               await this.options.artifacts.path(artifact);
-              if (artifact.mime.startsWith('image/') && !this.options.store.list<InspectionImageDelivery>(B.deliveries).some(delivery => delivered(delivery, authority, artifact.sha256))) throw new Error('Reference pixels were not delivered.');
+              if (artifact.mime.startsWith('image/') && !this.options.store.list<InspectionImageDelivery>(B.deliveries).some(delivery => delivered(delivery, authority, artifact.sha256, verification))) throw new Error('Reference pixels were not delivered.');
             }
             return true;
           } catch {
@@ -370,7 +457,7 @@ export class InspectionQualityService {
   private jobPlatform(job: InspectionJob): QualityPlatform | undefined {
     return job.capability === 'chromium-inspection' ? 'web' : job.capability === 'macos-app-inspection' ? 'macos' : job.capability === 'ios-simulator-inspection' ? 'ios-simulator' : undefined;
   }
-  private async observation(id: string, authority: InspectionAuthority, source: InspectionSourceIdentity): Promise<QualityObservationReceipt | undefined> {
+  private async observation(id: string, authority: InspectionAuthority, source: InspectionSourceIdentity, verification?: InspectionQualityVerification): Promise<QualityObservationReceipt | undefined> {
     const evidence = this.options.store.get<InspectionEvidence>(B.evidence, id);
     if (!evidence || evidence.kind !== 'screenshot' || !isDeepStrictEqual(evidence.authority, authority) || !isDeepStrictEqual(evidence.source, source)) return undefined;
     const observed = typeof evidence.metadata?.observationId === 'string' ? this.options.store.get<InspectionObservation>(B.observations, evidence.metadata.observationId)
@@ -387,7 +474,7 @@ export class InspectionQualityService {
     const manifest = await this.options.artifacts.get(evidence.artifact.id);
     if (!isDeepStrictEqual(manifest, evidence.artifact)) return undefined;
     await this.options.artifacts.path(manifest);
-    const delivery = this.options.store.list<InspectionImageDelivery>(B.deliveries).find(value => delivered(value, authority, manifest.sha256));
+    const delivery = this.options.store.list<InspectionImageDelivery>(B.deliveries).find(value => delivered(value, authority, manifest.sha256, verification));
     return { evidence, observationId: observed.id, platform: targetPlatform, sequence: order, ...(delivery ? { imageDelivery: { chatId: delivery.chatId, eventId: delivery.eventId, artifactSha256: delivery.artifactSha256, route: delivery.route } } : {}) };
   }
 }

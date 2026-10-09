@@ -3,10 +3,12 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test, { type TestContext } from 'node:test';
-import type { InspectionAction, InspectionAuthority, InspectionEvidence, InspectionJob, InspectionSourceIdentity, TaskQualityRequirements } from '@enoughfactory/contracts';
+import type { Chat, InspectionAction, InspectionAuthority, InspectionEvidence, InspectionJob, InspectionSourceIdentity, InspectionVerificationAcceptance, InspectionVerificationRun, Session, TaskQualityRequirements } from '@enoughfactory/contracts';
 import { ArtifactStore } from '@enoughfactory/workspaces';
+import type { AttemptDetail } from '@enoughfactory/factory';
 import { Store } from './store.ts';
-import { InspectionQualityService, inspectionSourceContentMatches, type InspectionImageDelivery, type InspectionQualityEquivalence, type InspectionReferenceView } from './inspection-quality.ts';
+import { InspectionQualityService, inspectionSourceContentMatches, type InspectionImageDelivery, type InspectionQualityEquivalence, type InspectionQualityRecord, type InspectionQualityVerification, type InspectionReferenceView } from './inspection-quality.ts';
+import { inspectionAcceptanceContractSha256, inspectionQualityPolicySha256, inspectionVerificationKey } from './inspection-verification-identity.ts';
 import type { InspectionObservation } from './inspection-jobs.ts';
 import type { QualityEvidenceReport } from './factory-quality.ts';
 
@@ -224,6 +226,225 @@ test('source-content matching is independent of synthetic commit IDs and rejects
   assert.equal(inspectionSourceContentMatches({ ...source, roots: [null] } as unknown as InspectionSourceIdentity, source), false);
 });
 
+function verifierOwner(f: Awaited<ReturnType<typeof fixture>>, label = 'current') {
+  const acceptanceContract: InspectionVerificationAcceptance = { version: 1, task: { title: 'Native draft workflow', description: `Verify the complete ${label} assigned workflow and appearance`, acceptanceCriteria: ['Close keeps the draft and restores the inbox'], expectedOutputs: ['Verified native draft persistence'], dependsOn: [], checks: ['verify-native-draft'], quality: f.quality, planRevision: 4 } };
+  const identity = { authority: f.authority, source: f.checked, quality: f.quality, acceptanceContract };
+  const id = inspectionVerificationKey(identity), chatId = `verifier-chat-${label}`, sessionId = `verifier-session-${label}`;
+  const run: InspectionVerificationRun = { ...identity, id, chatId, sessionId, policySha256: inspectionQualityPolicySha256(f.quality), ownerDeviceId: 'mac', executionTargetKind: 'host-macos', executionTargetId: 'mac-host', status: 'running', createdAt: '2026-10-08T00:00:00Z', updatedAt: '2026-10-08T00:00:00Z', deadlineAt: '2026-10-08T00:20:00Z' };
+  const chat: Chat = { id: chatId, sessionId, deviceId: 'mac', verificationRunId: id, runtime: 'codex', approvalMode: 'approve-all', status: 'running', title: 'Independent verifier', createdAt: run.createdAt, updatedAt: run.updatedAt };
+  const session: Session = { id: sessionId, projectId: 'project', deviceId: 'mac', verificationRunId: id, executionTargetKind: 'host-macos', executionTargetId: 'mac-host', status: 'ready', name: 'independent-verifier', services: [], createdAt: run.createdAt, updatedAt: run.updatedAt };
+  const original: AttemptDetail = { id: f.authority.attemptId, goalId: f.authority.goalId, goalRevision: f.authority.goalRevision, assignmentGoalRevision: f.authority.goalRevision, contract: structuredClone(acceptanceContract.task), phase: 'checking', cancellation: 'none' };
+  f.store.set('factory-attempt-details', original);
+  f.store.set('inspection-verifier-runs', run); f.store.set('chats', chat); f.store.set('sessions', session);
+  const verification: InspectionQualityVerification = { runId: id, chatId, acceptanceContractSha256: inspectionAcceptanceContractSha256(acceptanceContract) };
+  const deliver = () => {
+    for (const evidence of f.evidence) f.store.set('provider-image-deliveries', { id: `${label}-delivery-${evidence.id}`, chatId, eventId: `${label}-image-${evidence.id}`, artifactSha256: evidence.artifact.sha256, authority: f.authority, route: 'tool-image' });
+    const view = f.store.get<InspectionReferenceView>('inspection-reference-views', 'reference-view')!;
+    f.store.set('inspection-reference-views', { ...view, id: `${label}-reference-view`, verification });
+  };
+  const submit = () => f.service.submit({ authority: f.authority, quality: f.quality, report: f.report, verification });
+  const check = (source = f.checked) => f.service.check({ authority: f.authority, quality: f.quality, source, candidateCommit: f.checked.candidateCommit!, checkedCommit: source.checkedCommit, verification });
+  return { run, chat, session, original, verification, deliver, submit, check };
+}
+
+test('contract-bound quality requires this original verifier report, screenshot conversation and reference inspection', async t => {
+  const f = await fixture(t);
+  await f.service.submit({ authority: f.authority, quality: f.quality, report: f.report });
+  const owner = verifierOwner(f);
+  assert.equal((await owner.check()).passed, false, 'An older unbound passing report cannot satisfy the new verifier contract.');
+  assert.equal((await owner.submit()).gate.status, 'evidence-required', 'Author images and unbound references do not belong to the verifier.');
+  owner.deliver();
+  const record = await owner.submit();
+  assert.equal(record.gate.status, 'ready-for-review');
+  assert.deepEqual(record.verification, owner.verification);
+  assert.deepEqual(record.reportArtifact.metadata?.verification, owner.verification);
+  assert.equal((await owner.check()).passed, true);
+  assert.equal((await owner.check({ ...f.checked, snapshotId: 'combined-snapshot', checkedCommit: '1'.repeat(40) })).passed, true, 'Exact source-content equivalence remains valid for the combined commit.');
+  f.store.set('inspection-verifier-runs', { ...owner.run, status: 'succeeded' });
+  f.store.set('chats', { ...owner.chat, status: 'idle' });
+  f.store.set('sessions', { ...owner.session, status: 'stopped' });
+  assert.equal((await owner.check()).passed, true, 'Durable evidence survives confirmed verifier teardown.');
+  assert.equal((await f.check()).passed, true, 'The generic evidence call continues to read the bound report history.');
+});
+
+test('bound references and reference pixels must belong to the exact verifier binding and conversation', async t => {
+  const f = await fixture(t), owner = verifierOwner(f);
+  owner.deliver();
+  const original = f.store.get<InspectionReferenceView>('inspection-reference-views', 'current-reference-view')!;
+  f.store.set('inspection-reference-views', { ...original, verification: { ...owner.verification, acceptanceContractSha256: '9'.repeat(64) } });
+  assert.equal((await owner.submit()).gate.status, 'evidence-required');
+  const referenceImage = await f.artifacts.put('Distinct original reference pixels', { name: 'reference.png', mime: 'image/png', goalId: f.authority.goalId, taskId: f.authority.taskId, attemptId: f.authority.attemptId });
+  f.store.set('inspection-reference-views', { ...original, artifacts: [referenceImage] });
+  f.store.set('provider-image-deliveries', { id: 'old-reference-image', authority: f.authority, artifactSha256: referenceImage.sha256, chatId: 'older-verifier-chat', eventId: 'old-image', route: 'tool-image' });
+  assert.equal((await owner.submit()).gate.status, 'evidence-required', 'Another conversation seeing the reference image is insufficient.');
+  f.store.set('provider-image-deliveries', { id: 'current-reference-image', authority: f.authority, artifactSha256: referenceImage.sha256, chatId: owner.chat.id, eventId: 'current-image', route: 'tool-image' });
+  assert.equal((await owner.submit()).gate.status, 'ready-for-review');
+});
+
+test('different-run, wrong-chat and changed contract bindings cannot reuse a passing report', async t => {
+  const f = await fixture(t), previous = verifierOwner(f, 'older'); previous.deliver();
+  await previous.submit();
+  const current = verifierOwner(f, 'newer'); current.deliver();
+  assert.equal((await current.check()).passed, false, 'Same source and quality under a different full acceptance contract needs its own report.');
+  const record = await current.submit();
+  f.store.set('inspection-quality-reports', { ...record, verification: previous.verification });
+  assert.equal((await current.check()).passed, false, 'A previous run binding cannot satisfy this owner.');
+  f.store.set('inspection-quality-reports', { ...record, verification: { ...current.verification, chatId: previous.chat.id } });
+  assert.equal((await current.check()).passed, false, 'A substituted chat binding cannot satisfy this owner.');
+  f.store.set('inspection-quality-reports', { ...record, verification: { ...current.verification, acceptanceContractSha256: '9'.repeat(64) } });
+  assert.equal((await current.check()).passed, false, 'A substituted acceptance digest cannot satisfy this owner.');
+  f.store.set<InspectionQualityRecord>('inspection-quality-reports', { ...record, verification: previous.verification });
+  const oldRun = f.store.get<InspectionVerificationRun>('inspection-verifier-runs', previous.run.id)!;
+  f.store.set('inspection-verifier-runs', { ...oldRun, status: 'succeeded' });
+  f.store.set('chats', { ...previous.chat, status: 'idle' });
+  await assert.rejects(previous.check(), /original frozen author acceptance contract/, 'A canonically bound old report cannot certify changed original requirements.');
+  f.store.set('factory-attempt-details', previous.original);
+  const altered = await previous.check();
+  assert.equal(altered.passed, false, 'A record binding changed without its immutable artifact metadata cannot certify that report.');
+  f.store.set('inspection-quality-reports', { ...record, verification: undefined });
+  assert.equal((await f.check()).passed, false, 'Removing a bound record field cannot turn its original artifact into unbound acceptance.');
+});
+
+test('persisted verifier authority, key, policy, source and provider ownership independently gate bound submissions', async t => {
+  const cases: Array<[string, (f: Awaited<ReturnType<typeof fixture>>, owner: ReturnType<typeof verifierOwner>) => void]> = [
+    ['missing run', (f, owner) => f.store.delete('inspection-verifier-runs', owner.run.id)],
+    ['retired run', (f, owner) => f.store.set('inspection-verifier-runs', { ...owner.run, status: 'canceled' })],
+    ['failed run', (f, owner) => f.store.set('inspection-verifier-runs', { ...owner.run, status: 'failed' })],
+    ['unknown run', (f, owner) => f.store.set('inspection-verifier-runs', { ...owner.run, status: 'unknown' })],
+    ['wrong authority', (f, owner) => f.store.set('inspection-verifier-runs', { ...owner.run, authority: { ...f.authority, authorityGeneration: 3 } })],
+    ['changed source', (f, owner) => f.store.set('inspection-verifier-runs', { ...owner.run, source: { ...owner.run.source, sha256: '9'.repeat(64) } })],
+    ['changed quality', (f, owner) => f.store.set('inspection-verifier-runs', { ...owner.run, quality: { ...f.quality, referenceIds: [] } })],
+    ['changed policy digest', (f, owner) => f.store.set('inspection-verifier-runs', { ...owner.run, policySha256: '9'.repeat(64) })],
+    ['changed full contract', (f, owner) => f.store.set('inspection-verifier-runs', { ...owner.run, acceptanceContract: { ...owner.run.acceptanceContract!, task: { ...owner.run.acceptanceContract!.task, acceptanceCriteria: ['Different criterion'] } } })],
+    ['missing full contract', (f, owner) => f.store.set('inspection-verifier-runs', { ...owner.run, acceptanceContract: undefined })],
+    ['wrong chat run', (f, owner) => f.store.set('chats', { ...owner.chat, verificationRunId: 'another-run' })],
+    ['wrong chat session', (f, owner) => f.store.set('chats', { ...owner.chat, sessionId: 'another-session' })],
+    ['wrong chat owner', (f, owner) => f.store.set('chats', { ...owner.chat, deviceId: 'foreign' })],
+    ['inactive chat', (f, owner) => f.store.set('chats', { ...owner.chat, status: 'idle' })],
+    ['wrong session run', (f, owner) => f.store.set('sessions', { ...owner.session, verificationRunId: 'another-run' })],
+    ['wrong session owner', (f, owner) => f.store.set('sessions', { ...owner.session, deviceId: 'foreign' })],
+    ['wrong session target', (f, owner) => f.store.set('sessions', { ...owner.session, executionTargetId: 'foreign-target' })],
+    ['unknown session', (f, owner) => f.store.set('sessions', { ...owner.session, status: 'unknown' })],
+    ['wrong requested chat', (_f, owner) => { owner.verification.chatId = 'another-chat'; }],
+    ['wrong requested digest', (_f, owner) => { owner.verification.acceptanceContractSha256 = '9'.repeat(64); }],
+  ];
+  for (const [name, change] of cases) await t.test(name, async t => {
+    const f = await fixture(t), owner = verifierOwner(f); owner.deliver(); change(f, owner);
+    await assert.rejects(owner.submit(), /verification run/);
+    assert.deepEqual(f.store.list('inspection-quality-reports'), []);
+  });
+});
+
+test('container defaults retain exact private ownership while native target identity remains explicit', async t => {
+  const f = await fixture(t), owner = verifierOwner(f);
+  const container = { ...owner.run, executionTargetKind: 'container' as const, executionTargetId: 'container' };
+  f.store.set('inspection-verifier-runs', container);
+  f.store.set('sessions', { ...owner.session, executionTargetKind: undefined, executionTargetId: undefined });
+  owner.deliver();
+  assert.equal((await owner.submit()).gate.status, 'ready-for-review');
+});
+
+function finalVerifierOwner(f: Awaited<ReturnType<typeof fixture>>) {
+  const owner = verifierOwner(f);
+  const goal = { id: f.authority.goalId, revision: 5, objective: 'Deliver the complete native mail client', criteria: ['Sending works', 'Offline drafts survive restart'], status: 'running' };
+  f.store.set('goals', goal);
+  const candidate = { id: 'accepted-candidate', commit: f.checked.candidateCommit!, baseCommit: '0'.repeat(40) };
+  const detail: AttemptDetail = { ...owner.original, phase: 'done', candidate, integration: { candidateCommit: candidate.commit, commit: f.checked.checkedCommit!, previousHead: candidate.baseCommit, checks: [] } };
+  const task = { id: f.authority.taskId, goalId: goal.id, title: detail.contract!.title, description: detail.contract!.description, dependsOn: [], status: 'completed', currentAttemptId: f.authority.attemptId, createdAt: owner.run.createdAt, updatedAt: owner.run.updatedAt };
+  const attempt = { id: f.authority.attemptId, taskId: task.id, status: 'succeeded', generation: f.authority.authorityGeneration, deviceId: 'mac', candidate: candidate.commit, startedAt: owner.run.createdAt, endedAt: owner.run.updatedAt };
+  f.store.set('factory-attempt-details', detail); f.store.set('tasks', task); f.store.set('attempts', attempt);
+  const acceptanceContract: InspectionVerificationAcceptance = { ...owner.run.acceptanceContract!, goal: { revision: goal.revision, objective: goal.objective, criteria: goal.criteria,
+    taskContracts: [{ taskId: f.authority.taskId, attemptId: f.authority.attemptId, authorityGeneration: f.authority.authorityGeneration, assignmentGoalRevision: f.authority.goalRevision, contract: owner.run.acceptanceContract!.task }] } };
+  const final = { ...owner.run, purpose: 'goal-final' as const, goalRevision: goal.revision, acceptanceContract };
+  final.id = inspectionVerificationKey(final);
+  f.store.set('inspection-verifier-runs', final);
+  f.store.set('chats', { ...owner.chat, verificationRunId: final.id });
+  f.store.set('sessions', { ...owner.session, verificationRunId: final.id });
+  owner.verification.runId = final.id; owner.verification.acceptanceContractSha256 = inspectionAcceptanceContractSha256(acceptanceContract);
+  owner.deliver();
+  return { ...owner, run: final, goal, task, attempt, detail };
+}
+
+test('bound final acceptance retains the exact current objective and criteria revision', async t => {
+  const f = await fixture(t), owner = finalVerifierOwner(f);
+  assert.equal((await owner.submit()).gate.status, 'ready-for-review');
+  assert.equal((await owner.check()).passed, true);
+  f.store.set('goals', { ...owner.goal, criteria: [...owner.goal.criteria, 'New native workflow'] });
+  await assert.rejects(owner.check(), /retired final acceptance revision/);
+  f.store.set('goals', { ...owner.goal, revision: 6 });
+  await assert.rejects(owner.submit(), /retired final acceptance revision/);
+});
+
+test('bound acceptance independently authenticates original frozen author requirements', async t => {
+  const cases: Array<[string, (f: Awaited<ReturnType<typeof fixture>>, owner: ReturnType<typeof verifierOwner>) => void]> = [
+    ['missing original', (f, owner) => f.store.delete('factory-attempt-details', owner.original.id)],
+    ['wrong original goal', (f, owner) => f.store.set('factory-attempt-details', { ...owner.original, goalId: 'other' })],
+    ['wrong original assignment revision', (f, owner) => f.store.set('factory-attempt-details', { ...owner.original, assignmentGoalRevision: 5 })],
+    ['changed original criterion', (f, owner) => f.store.set('factory-attempt-details', { ...owner.original, contract: { ...owner.original.contract!, acceptanceCriteria: [] } })],
+    ['changed original check', (f, owner) => f.store.set('factory-attempt-details', { ...owner.original, contract: { ...owner.original.contract!, checks: [] } })],
+  ];
+  for (const [name, change] of cases) await t.test(name, async t => {
+    const f = await fixture(t), owner = verifierOwner(f); owner.deliver(); await owner.submit(); change(f, owner);
+    await assert.rejects(owner.submit(), /original frozen author acceptance contract/);
+    await assert.rejects(owner.check(), /original frozen author acceptance contract/);
+    assert.deepEqual(f.store.list('inspection-quality-equivalences'), []);
+  });
+  await t.test('self-consistent fabricated run contract', async t => {
+    const f = await fixture(t), owner = verifierOwner(f);
+    const acceptanceContract = { ...owner.run.acceptanceContract!, task: { ...owner.run.acceptanceContract!.task, acceptanceCriteria: [] } };
+    const forged = { ...owner.run, acceptanceContract }; forged.id = inspectionVerificationKey(forged);
+    f.store.set('inspection-verifier-runs', forged);
+    f.store.set('chats', { ...owner.chat, verificationRunId: forged.id }); f.store.set('sessions', { ...owner.session, verificationRunId: forged.id });
+    owner.verification.runId = forged.id; owner.verification.acceptanceContractSha256 = inspectionAcceptanceContractSha256(acceptanceContract);
+    owner.deliver();
+    await assert.rejects(owner.submit(), /original frozen author acceptance contract/, 'A matching key and digest cannot replace the original saved criteria.');
+  });
+});
+
+test('final bound evidence requires the original currently accepted task generation and integration', async t => {
+  const cases: Array<[string, (f: Awaited<ReturnType<typeof fixture>>, owner: ReturnType<typeof finalVerifierOwner>) => void]> = [
+    ['missing accepted task', (f, owner) => f.store.delete('tasks', owner.task.id)],
+    ['task reopened', (f, owner) => f.store.set('tasks', { ...owner.task, status: 'review' })],
+    ['task reassigned', (f, owner) => f.store.set('tasks', { ...owner.task, currentAttemptId: 'replacement' })],
+    ['accepted author unknown', (f, owner) => f.store.set('attempts', { ...owner.attempt, status: 'unknown' })],
+    ['accepted author generation changed', (f, owner) => f.store.set('attempts', { ...owner.attempt, generation: 3 })],
+    ['missing integration', (f, owner) => f.store.set('factory-attempt-details', { ...owner.detail, integration: undefined })],
+    ['different integrated candidate', (f, owner) => f.store.set('factory-attempt-details', { ...owner.detail, integration: { ...owner.detail.integration!, candidateCommit: '9'.repeat(40) } })],
+  ];
+  for (const [name, change] of cases) await t.test(name, async t => {
+    const f = await fixture(t), owner = finalVerifierOwner(f); await owner.submit(); change(f, owner);
+    await assert.rejects(owner.submit(), /original accepted task contracts/);
+    await assert.rejects(owner.check(), /original accepted task contracts/);
+    assert.deepEqual(f.store.list('inspection-quality-equivalences'), []);
+  });
+});
+
+test('generic quality probes preserve verifier reconciliation without accepting unavailable bound owners', async t => {
+  const f = await fixture(t), owner = verifierOwner(f); owner.deliver(); await owner.submit();
+  f.store.set('inspection-verifier-runs', { ...owner.run, status: 'unknown' });
+  const checked = await f.check();
+  assert.equal(checked.passed, false); assert.equal(checked.recovery?.condition, 'inspection-evidence');
+  await assert.rejects(owner.check(), /verification run/);
+  assert.deepEqual(f.store.list('inspection-quality-equivalences'), []);
+});
+
+test('bound ownership changes during artifact verification cannot publish or certify evidence', async t => {
+  await t.test('submission owner changed', async t => {
+    const f = await fixture(t), owner = verifierOwner(f); owner.deliver();
+    const read = f.artifacts.read.bind(f.artifacts); let changed = false;
+    f.artifacts.read = async artifact => { const bytes = await read(artifact); if (!changed) { changed = true; f.store.set('inspection-verifier-runs', { ...owner.run, status: 'unknown' }); } return bytes; };
+    await assert.rejects(owner.submit(), /verification run/);
+    assert.deepEqual(f.store.list('inspection-quality-reports'), []);
+  });
+  await t.test('check owner changed', async t => {
+    const f = await fixture(t), owner = verifierOwner(f); owner.deliver(); await owner.submit();
+    const read = f.artifacts.read.bind(f.artifacts); let changed = false;
+    f.artifacts.read = async artifact => { const bytes = await read(artifact); if (!changed) { changed = true; f.store.set('chats', { ...owner.chat, verificationRunId: 'new-owner' }); } return bytes; };
+    await assert.rejects(owner.check(), /verification run/);
+    assert.deepEqual(f.store.list('inspection-quality-equivalences'), []);
+  });
+});
+
 async function evaluatorFixture(f: Awaited<ReturnType<typeof fixture>>) {
   await f.service.submit({ authority: f.authority, quality: f.quality, report: f.report });
   f.store.set('goals', { id: f.authority.goalId, revision: 4, status: 'running' });
@@ -236,6 +457,17 @@ async function evaluatorFixture(f: Awaited<ReturnType<typeof fixture>>) {
   const check = () => f.service.reviewCheck({ goalId: f.authority.goalId, controllerRunId: 'evaluator', source: f.checked, quality: f.quality, review });
   return { review, check };
 }
+
+test('evaluator revalidates a bound report owner while original retired history stays readable', async t => {
+  const f = await fixture(t), evaluator = await evaluatorFixture(f), owner = verifierOwner(f);
+  owner.deliver(); const record = await owner.submit();
+  f.store.set('inspection-verifier-runs', { ...owner.run, status: 'succeeded' });
+  f.store.set('chats', { ...owner.chat, status: 'idle' });
+  assert.equal((await evaluator.check()).ready, true);
+  f.store.set('inspection-verifier-runs', { ...owner.run, status: 'unknown' });
+  assert.equal((await evaluator.check()).ready, false);
+  assert.deepEqual((await f.service.controllerReport({ goalId: f.authority.goalId, reportId: record.id })).record.verification, owner.verification);
+});
 
 test('completion requires a separate current evaluator to view original source-equivalent screenshots and references', async t => {
   const f = await fixture(t), evaluator = await evaluatorFixture(f);

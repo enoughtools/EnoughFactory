@@ -35,7 +35,7 @@ async function fixture(t: TestContext) {
   const firstC = await commit('let screen = "Composer"\n', 'First retained candidate');
   git('-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '--quiet', '--allow-empty', '-m', 'First integrated result');
   const firstM = git('rev-parse', 'HEAD');
-  const store = new Store(dataDir), goal = { id: 'goal', projectId: 'project', revision: 12, status: 'running' } as Goal;
+  const store = new Store(dataDir), goal = { id: 'goal', projectId: 'project', revision: 12, status: 'running', objective: 'Build the complete native Mail app.', criteria: ['Every accepted task meets its complete original workflow criteria.'] } as Goal;
   const run: ControllerRun = { id: 'evaluator', goalId: goal.id, role: 'evaluator', status: 'completed', sessionId: 'review-session', chatId: 'review-chat', updatedAt: new Date().toISOString() };
   const context = { chat: { id: run.chatId, sessionId: run.sessionId, runtime: 'codex' }, session: { id: run.sessionId, projectId: 'project', workingDirectories: [{ id: 'enough-ui', name: 'enough-ui', path: referencePath }] }, execution: { kind: 'host-macos', targetId: 'mac-host', workdir }, signal: new AbortController().signal } as AgentToolBridgeContext;
   const project = { id: 'project', path: canonicalPath, deviceId: 'mac', name: 'Mail', workingDirectories: [{ id: 'enough-ui', name: 'enough-ui', path: referencePath }] } as Project;
@@ -43,7 +43,7 @@ async function fixture(t: TestContext) {
   const accepted = (id: string, candidateCommit: string, mergedCommit: string, quality: TaskQualityRequirements, revision: number, at: string) => {
     const task = { id, goalId: goal.id, status: 'completed', currentAttemptId: `${id}-author`, quality, updatedAt: at } as FactoryTask;
     const attempt = { id: task.currentAttemptId!, taskId: id, generation: revision, deviceId: 'mac', status: 'succeeded', endedAt: at } as Attempt;
-    const detail: AttemptDetail = { id: attempt.id, goalId: goal.id, goalRevision: revision, assignmentGoalRevision: revision, contract: { title: id, description: `Implement ${id}`, dependsOn: [], checks: [], planRevision: revision, quality }, candidate: { id: `${id}-candidate`, commit: candidateCommit, baseCommit: initial }, integration: { candidateCommit, commit: mergedCommit, previousHead: initial, checks: [] }, phase: 'done', cancellation: 'none' };
+    const detail: AttemptDetail = { id: attempt.id, goalId: goal.id, goalRevision: revision, assignmentGoalRevision: revision, contract: { title: id, description: `Implement ${id}`, acceptanceCriteria: [`Complete the original ${id} flow, including exact restored values.`], dependsOn: [], checks: [], planRevision: revision, quality }, candidate: { id: `${id}-candidate`, commit: candidateCommit, baseCommit: initial }, integration: { candidateCommit, commit: mergedCommit, previousHead: initial, checks: [] }, phase: 'done', cancellation: 'none' };
     store.set('tasks', task); store.set('attempts', attempt); store.set('factory-attempt-details', detail);
     return { task, attempt, detail, authority: { goalId: goal.id, goalRevision: revision, taskId: id, attemptId: attempt.id, authorityGeneration: revision, policyRevision: revision } satisfies InspectionAuthority };
   };
@@ -82,6 +82,7 @@ test('stale task reports create one independent final verifier for the frozen un
   assert.notEqual(f.secondC, f.secondM); assert.notEqual(run.source.sha256, f.oldSource.sha256);
   assert.deepEqual(run.quality, { platforms: ['macos'], workflows: [{ id: 'compose', platform: 'macos' }, { id: 'search', platform: 'macos' }], referenceIds: ['enough-ui'] });
   assert.deepEqual(run.quality, inspectionGoalQuality(f.store, f.goal.id));
+  assert.deepEqual(run.acceptanceContract!.goal, { revision: f.goal.revision, objective: f.goal.objective, criteria: f.goal.criteria, taskContracts: [f.first, f.second].map(owner => ({ taskId: owner.task.id, attemptId: owner.attempt.id, authorityGeneration: owner.attempt.generation, assignmentGoalRevision: owner.detail.assignmentGoalRevision, contract: owner.detail.contract })) });
   assert.deepEqual(f.store.list<Attempt>('attempts'), before, 'Verification never allocates or reopens an author attempt.');
   assert.deepEqual(f.store.get('inspection-quality-reports', f.oldReport.id), f.oldReport, 'Historical evidence and its failed criteria remain intact.');
 });
@@ -120,4 +121,14 @@ test('an absent accepted integration identity produces an actionable wait rather
   const checked = await f.review();
   assert.equal(checked.ready, false); assert.match(checked.reason!, /retained accepted candidate|integration record/);
   assert.equal(f.store.list('inspection-verifier-runs').length, 0);
+});
+
+test('terminal tasks trigger full-contract final verification even when legacy coverage claims all workflows and the evaluator declines completion', async t => {
+  const f = await fixture(t), previous = f.store.get('inspection-quality-reports', f.oldReport.id);
+  f.service.quality.controllerReportContext = async () => ({ reports: [{ currentSource: true, currentAuthority: true, latestForPolicy: true, recordedStatus: 'ready-for-review', quality: inspectionGoalQuality(f.store, f.goal.id) }], omitted: 0 });
+  const checked = await f.service.reviewController({ goal: f.goal, run: f.run, resultText: JSON.stringify({ complete: false, summary: 'Original detailed restoration acceptance remains unverified.' }) });
+  assert.equal(checked.ready, false); assert.match(checked.reason!, /Final app verification waiting/);
+  const [run] = f.store.list<InspectionVerificationRun>('inspection-verifier-runs');
+  assert.equal(run!.purpose, 'goal-final'); assert.equal(run!.acceptanceContract!.goal!.taskContracts.length, 2);
+  assert.deepEqual(f.store.get('inspection-quality-reports', f.oldReport.id), previous);
 });

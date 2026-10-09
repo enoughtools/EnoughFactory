@@ -6,7 +6,8 @@ import path from 'node:path';
 import test, { type TestContext } from 'node:test';
 import { createHash } from 'node:crypto';
 import type { HostOperatorRebootTermination, HostProcessState, HostSupervisedTermination } from '@enoughfactory/agents';
-import type { Chat, ExecutionTargetAdvertisement, Goal, InspectionAuthority, InspectionSourceIdentity, InspectionVerificationRun, Project, Session, TaskQualityRequirements } from '@enoughfactory/contracts';
+import type { AttemptInspection, Chat, ExecutionTargetAdvertisement, FactoryTask, Goal, InspectionAuthority, InspectionSourceIdentity, InspectionVerificationAcceptance, InspectionVerificationRun, Project, Session, TaskQualityRequirements } from '@enoughfactory/contracts';
+import type { AttemptDetail } from '@enoughfactory/factory';
 import { ArtifactStore, InspectionSnapshotManager, importInspectionSnapshot, type InspectionSnapshot, type InspectionSnapshotTransfer } from '@enoughfactory/workspaces';
 import type { DeviceApp } from './app.ts';
 import type { AgentToolBridgeContext, ChatController, RunOptions } from './chats.ts';
@@ -17,6 +18,13 @@ import type { DelegatedNativeInspectionReadiness } from './inspection-delegation
 
 const authority: InspectionAuthority = { goalId: 'goal', goalRevision: 12, taskId: 'task', attemptId: 'author-attempt', authorityGeneration: 3, policyRevision: 12 };
 const quality: TaskQualityRequirements = { platforms: ['macos'], workflows: [{ id: 'close-draft', platform: 'macos' }], referenceIds: ['enough-ui'] };
+const frozenAcceptanceTask: NonNullable<AttemptInspection['contract']> = {
+  title: 'Preserve complete draft content', description: 'Reopen a saved draft without losing its content.\nRestore the exact original recipient, subject and multiline body after cancellation.',
+  kind: 'feature', acceptanceCriteria: ['Reopening restores the exact original recipient, subject and body.', 'Canceling changes restores every original draft field.'],
+  expectedOutputs: ['A working native draft editor', 'Original UI workflow and restoration evidence'], estimatedMinutes: 40,
+  writePaths: ['apps/mail/DraftEditor.swift'], resources: { cpus: 2, memoryGiB: 3 }, execution: { target: 'host-macos', requiredCapabilities: ['mac-shell'] },
+  quality, dependsOn: ['account-storage'], checks: ['sh scripts/check-draft-restoration.sh'], planRevision: 12,
+};
 const ready: ExecutionTargetAdvertisement[] = [{
   id: 'mac-host', kind: 'host-macos', protocolVersion: 1, readiness: 'ready', runtimes: ['codex'], capacity: 1,
   capabilities: [
@@ -68,6 +76,12 @@ async function fixture(t: TestContext, extraFileMode = 0o644) {
     roots: snapshot.roots.map(root => ({ id: root.id, sha256: root.sourceDigest, ...(root.sourceCommit ? { commit: root.sourceCommit } : {}) })),
   };
   const project: Project = { id: 'mail-project', name: 'EnoughMail', path: main, deviceId: 'mac', createdAt: new Date().toISOString(), runtime: 'codex', approvalMode: 'approve-all', rules: [] };
+  const goal: Goal = { id: authority.goalId, projectId: project.id, coordinatorId: 'mac', title: 'Build EnoughMail', objective: 'Build the complete EnoughMail client.\nPreserve exact saved draft state.',
+    criteria: ['The native client runs and every original draft field survives reopening.'], status: 'running', autonomy: 'autonomous', approvalMode: 'approve-all', runtime: 'codex',
+    createdAt: project.createdAt, updatedAt: project.createdAt, revision: authority.goalRevision, concurrency: 1 };
+  const detail: AttemptDetail = { id: authority.attemptId, goalId: authority.goalId, goalRevision: authority.goalRevision, assignmentGoalRevision: authority.goalRevision,
+    contract: structuredClone(frozenAcceptanceTask), phase: 'checking', cancellation: 'none' };
+  store.set('goals', goal); store.set('factory-attempt-details', detail);
   const sessions = new Map<string, Session>(), calls: ProviderCall[] = [], preparations: VerificationPreparation[] = [], stopped: string[] = [], interrupted: string[] = [];
   const preparedSources = new Map<string, InspectionSnapshot>();
   const retiredHostSessions: Array<{ sessionId: string; cwd: string }> = [];
@@ -158,9 +172,9 @@ async function fixture(t: TestContext, extraFileMode = 0o644) {
   const verifiers: InspectionVerifier[] = [];
   const verifier = new InspectionVerifier(options); verifiers.push(verifier);
   t.after(async () => { for (const service of verifiers) await service.close(); store.close(); await rm(directory, { recursive: true, force: true }); });
-  const input: VerificationInput = { authority, source, snapshot, quality, project };
+  const input: VerificationInput = { authority, source, snapshot, quality, project, acceptanceContract: { version: 1, task: structuredClone(detail.contract!) } };
   return {
-    directory, dataDir, main, design, store, artifacts, snapshotManager, snapshot, source, originalCommit, input, verifier, options,
+    directory, dataDir, main, design, store, artifacts, snapshotManager, snapshot, source, originalCommit, input, verifier, options, goal, detail,
     calls, preparations, stopped, interrupted, retiredHostSessions, sessions, checks: () => checks,
     setCurrent: (value: boolean) => { current = value; }, setPassed: (value: boolean) => { passed = value; },
     setAvailable: (value: boolean) => { available = value; }, setProvider: (value: typeof providerMode) => { providerMode = value; },
@@ -174,6 +188,31 @@ async function fixture(t: TestContext, extraFileMode = 0o644) {
         attemptId: authority.attemptId, verificationRunId: run.id, signal: new AbortController().signal };
     },
   };
+}
+
+/** A different planned quality policy receives an honest corresponding author contract. */
+function withFrozenQuality(f: { store: Store; input: VerificationInput }, selected: TaskQualityRequirements): VerificationInput {
+  const detail = f.store.get<AttemptDetail>('factory-attempt-details', authority.attemptId)!;
+  const contract = { ...detail.contract!, quality: structuredClone(selected) };
+  f.store.set('factory-attempt-details', { ...detail, contract });
+  return { ...f.input, quality: selected, acceptanceContract: { version: 1, task: contract } };
+}
+
+/** Publish the original fixture provider's positive teardown; no OS process is started. */
+function settledFixtureProvider(f: Awaited<ReturnType<typeof fixture>>, run: InspectionVerificationRun): void {
+  assert.ok(run.startedAt && run.sessionId && run.chatId);
+  assert.equal(f.store.get<Chat>('chats', run.chatId)!.status, 'idle');
+  assert.equal(f.store.get<Session>('sessions', run.sessionId)!.status, 'stopped');
+  const cwd = f.preparations.find(item => item.run.id === run.id)!.snapshot.roots[0]!.path;
+  const observedAt = new Date().toISOString(), processKey = `provider-${run.id}`, recordPath = `/owned/${processKey}.json`;
+  const proof: HostSupervisedTermination = { schemaVersion: 2, kind: 'supervised-termination', evidence: 'complete-owned-teardown', observedAt,
+    currentBoot: { schemaVersion: 1, platform: 'darwin', machineId: 'a'.repeat(64), bootId: '11111111-1111-4111-8111-111111111111', startedAt: observedAt, observedAt, uptimeMs: 1000 },
+    previousStatus: 'exited', previousUpdatedAt: observedAt, priorRecordSha256: 'b'.repeat(64), processKey, sessionId: run.sessionId, cwd, inventoryComplete: true,
+    supervisor: { pid: 1337, path: recordPath.replace(/\.json$/, '.cjs'), identity: `Original supervisor ${recordPath.replace(/\.json$/, '.cjs')} ${processKey}` },
+    children: [], exitCode: null, exitSignal: 'SIGKILL' };
+  f.setHostProcesses([{ processKey, recordPath, sessionId: run.sessionId, pid: 1337, cwd, createdAt: run.startedAt, state: 'exited', termination: proof }]);
+  // These provider-only fixtures contain no native/browser inspection jobs.
+  f.options.reconcileInspection = async original => original.id === run.id;
 }
 
 /** Real native ownership/capture/disposal without starting any provider, GUI or Docker process. */
@@ -198,7 +237,7 @@ async function nativeFixture(t: TestContext) {
 async function legacyContainerFixture(t: TestContext, seed: 'waiting' | 'unknown', state: 'ready' | 'stopped' = 'stopped') {
   const f = await fixture(t), restarted: string[] = [];
   const quality: TaskQualityRequirements = { platforms: ['web'], workflows: [{ id: 'open-inbox', platform: 'web' }], referenceIds: ['enough-mail-web'] };
-  const input: VerificationInput = { ...f.input, quality };
+  const input: VerificationInput = withFrozenQuality(f, quality);
   const target: ExecutionTargetAdvertisement = { id: 'private-container', kind: 'container', protocolVersion: 1, readiness: 'ready', runtimes: ['codex'], capabilities: [{ kind: 'linux-shell', readiness: 'ready' }, { kind: 'chromium-inspection', readiness: 'ready' }] };
   let lease = false, sourceChecks = 0;
   const fakeSessions = {
@@ -261,7 +300,7 @@ async function pairedVerifierFixture(t: TestContext, quality: TaskQualityRequire
   let pairedTargets: DelegatedNativeInspectionReadiness[] = [structuredClone(pairedMac)];
   const projectQueries: string[] = [];
   const verifier = f.anotherVerifier({ readiness: async () => localTargets, delegatedReadiness: async projectId => { projectQueries.push(projectId); return pairedTargets; }, ...overrides });
-  return { ...f, verifier, input: { ...f.input, quality }, projectQueries,
+  return { ...f, verifier, input: withFrozenQuality(f, quality), projectQueries,
     local: (targets: ExecutionTargetAdvertisement[]) => { localTargets = targets; }, paired: (targets: DelegatedNativeInspectionReadiness[]) => { pairedTargets = targets; } };
 }
 
@@ -466,6 +505,196 @@ test('final verification requires a valid canonical goal revision before retaini
   assert.deepEqual(f.store.list(INSPECTION_VERIFIER_RUNS), []);
   assert.deepEqual(f.store.list('inspection-verifier-inputs'), []);
   assert.equal(f.calls.length, 0); assert.equal(f.preparations.length, 0);
+});
+
+function promptedAcceptance(prompt: string): InspectionVerificationAcceptance {
+  const projection = prompt.split('Frozen authoritative acceptance contract (complete):')[1];
+  assert.ok(projection, 'The independent verifier must receive the full frozen acceptance contract');
+  return JSON.parse(projection.split('\n\n')[0]!.trim()) as InspectionVerificationAcceptance;
+}
+
+test('independent acceptance retains the full frozen author contract instead of a weaker mutable task', async t => {
+  const f = await fixture(t); f.setPassed(true);
+  const mutableTask: FactoryTask = { id: authority.taskId, goalId: authority.goalId, title: 'Just launch the app', description: 'Open one screen', dependsOn: [],
+    acceptanceCriteria: ['One screenshot exists'], expectedOutputs: ['A screenshot'], quality: { ...quality, workflows: [] }, status: 'review', currentAttemptId: authority.attemptId,
+    createdAt: f.goal.createdAt, updatedAt: f.goal.updatedAt };
+  f.store.set('tasks', mutableTask);
+  const run = await f.verifier.ensure({ ...f.input, acceptanceContract: undefined });
+  assert.equal(run.status, 'succeeded'); assert.deepEqual(run.acceptanceContract, f.input.acceptanceContract);
+  assert.deepEqual(promptedAcceptance(f.calls[0]!.prompt), f.input.acceptanceContract);
+  assert.deepEqual(run.acceptanceContract!.task, f.detail.contract);
+  assert.equal(run.acceptanceContract!.task.description, frozenAcceptanceTask.description, 'Multiline restoration requirements cannot be shortened into workflow names');
+  assert.deepEqual(run.acceptanceContract!.task.acceptanceCriteria, frozenAcceptanceTask.acceptanceCriteria);
+  assert.deepEqual(run.acceptanceContract!.task.expectedOutputs, frozenAcceptanceTask.expectedOutputs);
+  assert.match(f.calls[0]!.prompt, /valueEquals/, 'Exact draft restoration requires an exact observed value assertion');
+  assert.deepEqual(f.store.get<AttemptDetail>('factory-attempt-details', authority.attemptId), f.detail);
+  assert.deepEqual(f.store.get<FactoryTask>('tasks', authority.taskId), mutableTask);
+});
+
+test('acceptance verification rejects missing or stale frozen contracts and caller substitutions before retaining an owner', async t => {
+  for (const change of ['missing-detail', 'missing-contract', 'missing-quality', 'wrong-goal', 'wrong-assignment', 'substituted-projection', 'forged-quality'] as const) await t.test(change, async inner => {
+    const f = await fixture(inner);
+    let input = f.input;
+    if (change === 'missing-detail') f.store.delete('factory-attempt-details', authority.attemptId);
+    else if (change === 'missing-contract') f.store.set('factory-attempt-details', { ...f.detail, contract: undefined });
+    else if (change === 'missing-quality') {
+      const contract = { ...f.detail.contract!, quality: undefined };
+      f.store.set('factory-attempt-details', { ...f.detail, contract });
+      input = { ...f.input, acceptanceContract: { version: 1, task: contract } };
+    }
+    else if (change === 'wrong-goal') f.store.set('factory-attempt-details', { ...f.detail, goalId: 'another-goal' });
+    else if (change === 'wrong-assignment') f.store.set('factory-attempt-details', { ...f.detail, assignmentGoalRevision: authority.goalRevision + 1 });
+    else if (change === 'forged-quality') input = { ...f.input, quality: { ...quality, workflows: [] } };
+    else input = { ...f.input, acceptanceContract: { version: 1, task: { ...f.detail.contract!, acceptanceCriteria: ['A screenshot exists'], description: 'Only launch the app' } } };
+    assert.throws(() => f.verifier.ensure(input), /frozen|contract|assignment|authority|acceptance/i);
+    assert.deepEqual(f.store.list(INSPECTION_VERIFIER_RUNS), []); assert.deepEqual(f.store.list('inspection-verifier-inputs'), []);
+    assert.equal(f.calls.length, 0); assert.equal(f.preparations.length, 0);
+  });
+});
+
+test('final acceptance derives the complete current goal objective and criteria separately from frozen author revision', async t => {
+  const f = await fixture(t); f.setPassed(true);
+  const goal = { ...f.goal, revision: 41, objective: 'Build the entire current EnoughMail client.\nDeliver native compose, reply and draft restoration.',
+    criteria: ['Every current mail feature has a working native equivalent.', 'Canceling an edited draft restores the exact original recipient, subject and multiline body.'] };
+  f.store.set('goals', goal);
+  const aggregateQuality: TaskQualityRequirements = { ...quality, referenceIds: [...quality.referenceIds, 'enough-mail-web'], workflows: [...quality.workflows, { id: 'reply-reopen-current-delivery', platform: 'macos' }] };
+  const run = await f.verifier.ensure({ ...f.input, purpose: 'goal-final', goalRevision: goal.revision, quality: aggregateQuality, acceptanceContract: undefined });
+  const expected: InspectionVerificationAcceptance = { version: 1, task: f.detail.contract!, goal: { revision: goal.revision, objective: goal.objective, criteria: goal.criteria, taskContracts: [] } };
+  assert.equal(run.status, 'succeeded'); assert.equal(run.authority.goalRevision, 12); assert.equal(run.goalRevision, 41);
+  assert.deepEqual(run.acceptanceContract, expected); assert.deepEqual(promptedAcceptance(f.calls[0]!.prompt), expected);
+  assert.deepEqual(run.quality, aggregateQuality); assert.deepEqual(run.acceptanceContract!.task.quality, quality, 'Final aggregate quality remains distinct from the original author contract');
+  assert.deepEqual(f.store.get<AttemptDetail>('factory-attempt-details', authority.attemptId), f.detail);
+});
+
+test('changing frozen acceptance during asynchronous verifier preparation fences provider admission', async t => {
+  const f = await fixture(t); f.setPassed(true);
+  const entered = deferred<void>(), release = deferred<void>();
+  f.setPreparationHook(async () => { entered.resolve(); await release.promise; });
+  const result = f.verifier.ensure(f.input); await entered.promise;
+  const strengthened = { ...f.detail, contract: { ...f.detail.contract!, acceptanceCriteria: [...f.detail.contract!.acceptanceCriteria!, 'Draft restoration also preserves every attachment.'] } };
+  f.store.set('factory-attempt-details', strengthened); release.resolve();
+  const run = await result;
+  assert.equal(run.status, 'waiting'); assert.match(run.reason!, /acceptance|contract|retired|changed/i);
+  assert.equal(f.calls.length, 0); assert.equal(f.checks(), 0);
+  assert.deepEqual(run.acceptanceContract, f.input.acceptanceContract, 'The old verifier record keeps the requirements it actually owned');
+  assert.deepEqual(f.store.get<AttemptDetail>('factory-attempt-details', authority.attemptId), strengthened);
+});
+
+test('changing current final goal criteria fences an admitted verifier without rewriting its original acceptance', async t => {
+  const f = await fixture(t); f.setProvider('hold'); f.setPassed(true);
+  const goal = { ...f.goal, revision: 41, criteria: ['All original native acceptance criteria pass'] }; f.store.set('goals', goal);
+  const input = { ...f.input, purpose: 'goal-final' as const, goalRevision: goal.revision, acceptanceContract: undefined };
+  const result = f.verifier.ensure(input); await eventually(() => f.calls.length === 1);
+  const running = f.store.list<InspectionVerificationRun>(INSPECTION_VERIFIER_RUNS)[0]!;
+  assert.ok(await f.verifier.verificationSource(f.context(running)));
+  f.store.set('goals', { ...goal, criteria: [...goal.criteria, 'Every reopened draft retains original attachments'] });
+  await assert.rejects(f.verifier.verificationSource(f.context(running)), /acceptance|contract|changed|retired/i);
+  f.finishProvider(); const fenced = await result;
+  assert.equal(fenced.status, 'failed'); assert.equal(f.checks(), 0);
+  assert.deepEqual(fenced.acceptanceContract!.goal!.criteria, goal.criteria);
+});
+
+test('acceptance-bound identity preserves the old unbound key and never promotes a legacy completed review', async t => {
+  const f = await fixture(t); f.setPassed(true);
+  const legacyInput = { ...f.input, acceptanceContract: undefined }, legacyKey = inspectionVerificationKey(legacyInput);
+  // The production key canonicalizes object keys; removing the optional projection
+  // must reproduce the original identifier rather than silently reclassify history.
+  const canonical = (value: unknown): string => Array.isArray(value) ? `[${value.map(canonical).join(',')}]` : value && typeof value === 'object'
+    ? `{${Object.entries(value).filter(([, item]) => item !== undefined).sort(([a], [b]) => a.localeCompare(b)).map(([key, item]) => `${JSON.stringify(key)}:${canonical(item)}`).join(',')}}`
+    : JSON.stringify(value) ?? 'null';
+  const originalKey = 'verify-' + createHash('sha256').update(canonical({ version: 1, authority, source: { sha256: f.source.sha256,
+    roots: (f.source.roots ?? []).map(({ id, sha256 }) => ({ id, sha256 })).sort((a, b) => a.id.localeCompare(b.id)) }, quality })).digest('hex');
+  assert.equal(legacyKey, originalKey);
+  const boundKey = inspectionVerificationKey(f.input); assert.notEqual(boundKey, legacyKey);
+  const at = new Date().toISOString(), legacy: InspectionVerificationRun = { id: legacyKey, authority, source: f.source, quality, policySha256: inspectionQualityPolicySha256(quality),
+    ownerDeviceId: 'mac', executionTargetKind: 'host-macos', executionTargetId: 'mac-host', status: 'succeeded', createdAt: at, updatedAt: at, completedAt: at, deadlineAt: at };
+  f.store.set(INSPECTION_VERIFIER_RUNS, legacy);
+  const run = await f.verifier.ensure(legacyInput);
+  assert.equal(run.id, boundKey); assert.equal(run.status, 'succeeded'); assert.equal(f.calls.length, 1);
+  assert.deepEqual(f.store.get<InspectionVerificationRun>(INSPECTION_VERIFIER_RUNS, legacyKey), legacy);
+  assert.deepEqual(run.acceptanceContract, f.input.acceptanceContract);
+  assert.notEqual(inspectionVerificationKey({ ...f.input, acceptanceContract: { ...f.input.acceptanceContract!, task: { ...f.detail.contract!, description: 'Different original requirements' } } }), boundKey);
+});
+
+test('acceptance migration waits for the exact legacy provider and positively reconciles it before allocating a bound reviewer', async t => {
+  for (const settled of [false, true]) await t.test(settled ? 'original teardown and inspection reconciliation proven' : 'original provider remains unknown', async inner => {
+    const f = await fixture(inner); f.setProvider('unknown');
+    f.store.set('goals', { ...f.goal, concurrency: 2 });
+    const original = await f.verifier.ensure(f.input);
+    assert.equal(original.status, 'unknown'); assert.equal(f.calls.length, 1); assert.equal(f.preparations.length, 1);
+    const legacyKey = inspectionVerificationKey({ ...f.input, acceptanceContract: undefined });
+    f.store.set('chats', { ...f.store.get<Chat>('chats', original.chatId!)!, status: 'idle' });
+    f.store.set('sessions', { ...f.store.get<Session>('sessions', original.sessionId!)!, status: 'stopped' });
+    if (settled) {
+      settledFixtureProvider(f, original);
+    }
+    const { acceptanceContract: _acceptance, ...unbound } = original;
+    const legacy: InspectionVerificationRun = { ...unbound, id: legacyKey };
+    const inputs = retained(f, original);
+    f.store.delete(INSPECTION_VERIFIER_RUNS, original.id); f.store.set(INSPECTION_VERIFIER_RUNS, legacy);
+    f.store.delete('inspection-verifier-inputs', original.id); f.store.set('inspection-verifier-inputs', { ...inputs, id: legacyKey });
+    f.store.set('chats', { ...f.store.get<Chat>('chats', legacy.chatId!)!, verificationRunId: legacyKey });
+    f.store.set('sessions', { ...f.store.get<Session>('sessions', legacy.sessionId!)!, verificationRunId: legacyKey });
+    const oldChat = f.store.get<Chat>('chats', legacy.chatId!)!, oldSession = f.store.get<Session>('sessions', legacy.sessionId!)!;
+    let reconciliations = 0;
+    f.options.reconcileInspection = async prior => { reconciliations++; assert.deepEqual(prior, legacy); return settled; };
+    f.setProvider('success');
+    const bound = await f.verifier.ensure(f.input);
+    assert.equal(bound.id, inspectionVerificationKey(f.input)); assert.notEqual(bound.id, legacyKey);
+    if (settled) {
+      assert.equal(bound.status, 'failed', `An ended old provider permits a fresh review but cannot establish genuine passing UI receipts: ${bound.reason}`);
+      assert.equal(f.calls.length, 2); assert.equal(f.preparations.length, 2); assert.equal(reconciliations, 1);
+    } else {
+      assert.equal(bound.status, 'waiting'); assert.match(bound.reason!, /earlier verification owner.*reconciliation/i);
+      assert.equal(f.calls.length, 1); assert.equal(f.preparations.length, 1); assert.equal(reconciliations, 0);
+      assert.equal(bound.chatId, undefined); assert.equal(bound.sessionId, undefined);
+    }
+    assert.deepEqual(f.store.get<InspectionVerificationRun>(INSPECTION_VERIFIER_RUNS, legacyKey), legacy);
+    assert.deepEqual(f.store.get<Chat>('chats', legacy.chatId!), oldChat); assert.deepEqual(f.store.get<Session>('sessions', legacy.sessionId!), oldSession);
+  });
+});
+
+test('acceptance migration retains its exact source before an old-owner wait and resumes after temporary input removal', async t => {
+  const f = await fixture(t); f.setProvider('unknown'); f.store.set('goals', { ...f.goal, concurrency: 2 });
+  const original = await f.verifier.ensure(f.input);
+  assert.equal(original.status, 'unknown');
+  const { acceptanceContract: _acceptance, ...unbound } = original;
+  const legacy: InspectionVerificationRun = { ...unbound, id: inspectionVerificationKey({ ...f.input, acceptanceContract: undefined }) };
+  const originalInputs = retained(f, original);
+  f.store.delete(INSPECTION_VERIFIER_RUNS, original.id); f.store.set(INSPECTION_VERIFIER_RUNS, legacy);
+  f.store.delete('inspection-verifier-inputs', original.id); f.store.set('inspection-verifier-inputs', { ...originalInputs, id: legacy.id });
+  f.store.set('chats', { ...f.store.get<Chat>('chats', legacy.chatId!)!, status: 'idle', verificationRunId: legacy.id });
+  f.store.set('sessions', { ...f.store.get<Session>('sessions', legacy.sessionId!)!, status: 'stopped', verificationRunId: legacy.id });
+  f.options.reconcileInspection = async () => false;
+  const waiting = await f.verifier.ensure(f.input);
+  assert.equal(waiting.status, 'waiting'); assert.equal(f.calls.length, 1); assert.equal(f.preparations.length, 1);
+  const saved = retained(f, waiting);
+  assert.equal(saved.transfer.snapshotId, f.snapshot.id); assert.equal(saved.transfer.sourceDigest, f.source.sha256);
+  assert.ok(saved.snapshot);
+  for (const artifact of [saved.transfer.sourceManifest, ...saved.transfer.sourceArtifacts.map(root => root.manifest)]) await f.artifacts.path(artifact);
+  await f.snapshotManager.remove(f.snapshot); await absent(f.snapshot.path);
+  const fresh = await f.snapshotManager.create({ roots: [
+    { id: 'primary', name: 'primary', path: f.main, sourceCommit: f.originalCommit, kind: 'git', originalPath: '/workspaces/mail', manifestSha256: 'a'.repeat(64) },
+    { id: 'enough-ui', name: 'enough-ui', path: f.design, kind: 'folder', originalPath: '/workspaces/enough-ui', manifestSha256: 'b'.repeat(64) },
+  ], context: authority });
+  assert.notEqual(fresh.id, f.snapshot.id); assert.equal(fresh.sourceDigest, f.source.sha256);
+  const freshSource: InspectionSourceIdentity = { ...f.source, snapshotId: fresh.id, roots: fresh.roots.map(root => ({ id: root.id, sha256: root.sourceDigest,
+    ...(root.sourceCommit ? { commit: root.sourceCommit } : {}) })) };
+  assert.equal(inspectionVerificationKey({ ...f.input, source: freshSource }), waiting.id);
+  settledFixtureProvider(f, original);
+  let reconciliations = 0;
+  f.options.reconcileInspection = async prior => { reconciliations++; assert.deepEqual(prior, legacy); return true; };
+  f.setProvider('success');
+  const resumed = await f.verifier.ensure({ ...f.input, snapshot: fresh, source: freshSource });
+  assert.equal(resumed.id, waiting.id); assert.deepEqual(resumed.source, waiting.source);
+  assert.equal(resumed.status, 'failed', 'Durable source and settled prior execution still require original UI receipts');
+  assert.equal(reconciliations, 1); assert.equal(f.calls.length, 2); assert.equal(f.preparations.length, 2);
+  const executionSnapshot = f.preparations.at(-1)!.snapshot;
+  assert.equal(executionSnapshot.id, f.snapshot.id); assert.equal(executionSnapshot.sourceDigest, f.source.sha256);
+  assert.equal(await readFile(path.join(executionSnapshot.roots[0]!.path, 'Main.swift'), 'utf8'), 'let heading = "Exact dirty source"\r\n');
+  assert.equal(await readFile(path.join(executionSnapshot.roots[1]!.path, 'Tokens.swift'), 'utf8'), 'let spacing = 12\n');
+  assert.equal(retained(f, resumed).transfer.snapshotId, saved.transfer.snapshotId);
+  assert.deepEqual(f.store.get<InspectionVerificationRun>(INSPECTION_VERIFIER_RUNS, legacy.id), legacy);
 });
 
 test('a known setup failure waits and retries the same independent owner without rerunning its author', async t => {
@@ -680,9 +909,10 @@ test('an unconfirmed setup process remains unknown and cannot allocate or dispat
 
 test('changing the current goal revision fences a running final verifier while preserving frozen author authority', async t => {
   const f = await fixture(t); f.setProvider('hold'); f.setPassed(true);
-  const goal = { id: authority.goalId, revision: 41, approvalMode: 'approve-all' } as Goal;
+  const goal: Goal = { ...f.goal, revision: 41, objective: 'Deliver the complete current EnoughMail client', criteria: ['Every current mail workflow works', 'Draft restoration preserves all fields'] };
   f.store.set('goals', goal);
-  const input: VerificationInput = { ...f.input, purpose: 'goal-final', goalRevision: goal.revision };
+  const input: VerificationInput = { ...f.input, purpose: 'goal-final', goalRevision: goal.revision,
+    acceptanceContract: { ...f.input.acceptanceContract!, goal: { revision: goal.revision, objective: goal.objective, criteria: goal.criteria, taskContracts: [] } } };
   const result = f.verifier.ensure(input); await eventually(() => f.calls.length === 1);
   const running = f.store.list<InspectionVerificationRun>(INSPECTION_VERIFIER_RUNS)[0]!;
   assert.equal(running.purpose, 'goal-final'); assert.equal(running.goalRevision, 41);
@@ -695,9 +925,12 @@ test('changing the current goal revision fences a running final verifier while p
   assert.equal(retired.status, 'canceled'); assert.match(retired.reason!, /goal revision was retired/);
   assert.equal(f.checks(), 0, 'An older final owner cannot publish a passing quality result');
   assert.equal(f.stopped.length, 1);
-  assert.equal((await f.verifier.ensure(input)).id, retired.id); assert.equal(f.calls.length, 1);
+  assert.throws(() => f.verifier.ensure(input), /current canonical goal revision/);
+  assert.deepEqual(f.store.get<InspectionVerificationRun>(INSPECTION_VERIFIER_RUNS, retired.id), retired); assert.equal(f.calls.length, 1);
+  settledFixtureProvider(f, retired);
   f.setProvider('success');
-  const current = await f.verifier.ensure({ ...input, goalRevision: 42 });
+  const current = await f.verifier.ensure({ ...input, goalRevision: 42,
+    acceptanceContract: { ...input.acceptanceContract!, goal: { ...input.acceptanceContract!.goal!, revision: 42 } } });
   assert.notEqual(current.id, retired.id); assert.equal(current.status, 'succeeded');
   assert.equal(current.goalRevision, 42); assert.equal(current.authority.goalRevision, 12);
 });
@@ -996,9 +1229,11 @@ test('concurrent requests and byte-equivalent candidate/integration commits shar
 test('changed quality policy or secondary-root content receives a distinct verifier owner', async t => {
   const f = await fixture(t);
   const first = await f.verifier.ensure(f.input);
+  settledFixtureProvider(f, first);
   const policy = { ...quality, referenceIds: ['enough-ui', 'enough-mail-web'] };
-  const second = await f.verifier.ensure({ ...f.input, quality: policy });
+  const second = await f.verifier.ensure(withFrozenQuality(f, policy));
   assert.notEqual(first.id, second.id);
+  withFrozenQuality(f, quality);
   await writeFile(path.join(f.design, 'Tokens.swift'), 'let spacing = 16\n');
   const snapshot = await f.snapshotManager.create({ roots: [
     { id: 'primary', name: 'primary', path: f.main }, { id: 'enough-ui', name: 'enough-ui', path: f.design },

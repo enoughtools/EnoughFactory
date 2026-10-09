@@ -84,6 +84,59 @@ function retainedCandidateInput(f: Awaited<ReturnType<typeof fixture>>) {
   f.store.set('factory-attempt-details',{...f.store.get<Record<string,unknown>>('factory-attempt-details','attempt')!,id:'attempt',candidate,cancellation:'none',phase:'checking',result:{status:'succeeded'},checks:[{command:'original-check',passed:false,candidateCommit:candidate.commit,checkedCommit:candidate.commit}]});
   return {goal,task:f.store.get('tasks','task'),attempt,candidate,quality:f.quality} as Parameters<typeof f.service.retainedVerificationSettled>[0];
 }
+
+test('exact-source rejected fixture audit fails a UI-quality check without allocating a readiness-dependent verifier',async t=>{
+  const f=await fixture(t);
+  const verdict=await f.service.artifacts.put(Buffer.from(JSON.stringify({approved:false,blockedReasons:['Fixture startup still opens production credentials.']})),{goalId:'goal',taskId:'task',attemptId:'attempt',name:'original-source-judgment.json',mime:'application/json'});
+  f.store.set('inspection-profile-audits',{id:'original-rejected-audit',authority:f.authority,source:f.source,status:'rejected',proposal:{profile:{id:'fixture'}},reason:'Fixture startup still opens production credentials.',verdict});
+  let allocations=0,readiness=0;
+  Object.assign(f.service.native,{readiness:async()=>{readiness++;return{status:'setup-required',reasons:['Actual screen access is unavailable.']};}});
+  Object.assign(f.service.verifier,{ensure:async()=>{allocations++;assert.fail('A source audit rejection must reach repair before any verifier admission.');}});
+  const input={goal:{...f.store.get('goals','goal'),projectId:'project'},task:f.store.get('tasks','task'),attempt:f.store.get('attempts','attempt'),candidate:{id:'C',commit:'c'.repeat(40)},quality:f.quality,path:f.workdir,workingDirectories:[{path:f.referencePath,containerPath:'enough-ui'}],checkedCommit:'c'.repeat(40),signal:new AbortController().signal} as Parameters<typeof f.service.qualityCheck>[0];
+  const checked=await f.service.qualityCheck(input);
+  assert.equal(checked.passed,false);assert.equal(checked.exitCode,1);assert.equal(checked.recovery,undefined);
+  assert.match(checked.output,/Fixture startup still opens production credentials/);assert(checked.output.includes(verdict.id));assert(checked.output.includes(verdict.sha256));
+  assert.equal(allocations,0);assert.equal(readiness,0);assert.equal(f.store.list('inspection-verifier-runs').length,0);assert.equal(f.store.list('chats').length,0);
+  assert.equal(f.store.list('inspection-quality-reports').length,0,'The test has no invented UI report');
+  await writeFile(path.join(f.workdir,'README.md'),'A different current source');
+  Object.assign(f.service.verifier,{ensure:async()=>{allocations++;return{status:'waiting',reason:'Actual screen access is unavailable.'};}});
+  const unrelated=await f.service.qualityCheck(input);
+  assert.equal(unrelated.recovery?.condition,'inspection-evidence');assert.match(unrelated.output,/Actual screen access/);assert.equal(allocations,1,'An older-source rejection cannot fail the current source');
+});
+
+test('an older source quality pass still waits for contract-aware independent verification',async t=>{
+  const f=await fixture(t);
+  let checks=0,allocations=0;
+  let setupPending=false,verifierStatus:'waiting'|'failed'|'canceled'='waiting';
+  Object.assign(f.service.quality,{check:async(input:Parameters<typeof f.service.quality.check>[0])=>{
+    checks++;
+    assert.equal(input.verification,undefined,'The first evidence lookup has no new independent contract-bound result');
+    return{command:'ui-quality',candidateCommit:input.candidateCommit,checkedCommit:input.checkedCommit,passed:true,exitCode:0,output:'An earlier current-source quality report passed.'};
+  }});
+  Object.assign(f.service.verifier,{ensure:async(input:Parameters<typeof f.service.verifier.ensure>[0])=>{
+    allocations++;
+    assert.equal(input.source.sha256,f.source.sha256);
+    assert.deepEqual(input.quality,f.quality);
+    return{status:verifierStatus,reason:`The current frozen acceptance contract has independent verification ${verifierStatus}.`};
+  }});
+  Object.assign(f.service.profileSetup,{pending:()=>setupPending?{auditId:'original-pending-audit',status:'pending',reason:'The current fixture source audit is pending.'}:undefined,maintain:()=>{}});
+  const input={goal:{...f.store.get('goals','goal'),projectId:'project'},task:f.store.get('tasks','task'),attempt:f.store.get('attempts','attempt'),candidate:{id:'C',commit:'c'.repeat(40)},quality:f.quality,path:f.workdir,workingDirectories:[{path:f.referencePath,containerPath:'enough-ui'}],checkedCommit:'c'.repeat(40),signal:new AbortController().signal} as Parameters<typeof f.service.qualityCheck>[0];
+  setupPending=true;
+  const pending=await f.service.qualityCheck(input);
+  assert.equal(pending.passed,false);assert.equal(pending.exitCode,1);assert.equal(pending.recovery?.condition,'inspection-evidence');
+  assert.match(pending.output,/fixture source audit is pending/);assert.equal(allocations,0,'A pending source audit does not admit another verifier');
+  setupPending=false;
+  for(const status of ['waiting','failed','canceled'] as const){
+    verifierStatus=status;
+    const checked=await f.service.qualityCheck(input);
+    assert.equal(checked.passed,false,status);assert.equal(checked.exitCode,1,status);
+    assert.equal(checked.recovery?.condition,status==='waiting'?'inspection-evidence':undefined,status);
+    assert.match(checked.output,/current frozen acceptance contract/);
+  }
+  assert.equal(checks,4);assert.equal(allocations,3,'An earlier pass cannot skip the new independent verifier');
+  assert.equal(f.store.list('inspection-quality-reports').length,0,'The injected earlier lookup does not fabricate a new accepted report');
+  assert.equal(f.store.list('chats').length,0,'The injected admission wait performs no live provider work');
+});
 function retainUnknownVerifier(f: Awaited<ReturnType<typeof fixture>>, input: ReturnType<typeof retainedCandidateInput>): InspectionVerificationRun {
   const source={...f.source,candidateId:input.candidate.id,candidateCommit:input.candidate.commit,checkedCommit:input.candidate.commit};
   const run:InspectionVerificationRun={id:inspectionVerificationKey({authority:f.authority,source,quality:f.quality}),authority:f.authority,source,quality:f.quality,policySha256:inspectionQualityPolicySha256(f.quality),ownerDeviceId:'mac',executionTargetKind:'host-macos',executionTargetId:'mac-host',status:'unknown',sessionId:'original-verifier-session',chatId:'original-verifier-chat',startedAt:new Date().toISOString(),createdAt:new Date().toISOString(),updatedAt:new Date().toISOString(),deadlineAt:new Date().toISOString()};

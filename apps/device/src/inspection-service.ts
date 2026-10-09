@@ -21,7 +21,8 @@ import { createContainerInspectionBridge, createHostInspectionBridge, inspection
 import { NativeInspectionAdapter, type NativeFixtureProfile, type NativeInspectionBuild } from './inspection-native.ts';
 import { NativeBuildRunner } from './inspection-build-runner.ts';
 import { InspectionQualityService, inspectionSourceContentMatches } from './inspection-quality.ts';
-import { InspectionVerifier, inspectionQualityPolicySha256, inspectionVerificationKey } from './inspection-verifier.ts';
+import { InspectionVerifier, inspectionAcceptanceContractSha256, inspectionQualityPolicySha256, inspectionVerificationKey } from './inspection-verifier.ts';
+import { verificationContractChunk, verificationContractFullyRead, type VerificationContractRead } from './inspection-verification-contract.ts';
 import { evaluateObservedCondition } from './inspection-condition.ts';
 import { NativeProfileSetup } from './inspection-profile-setup.ts';
 import { NativeProfileSync } from './inspection-profile-sync.ts';
@@ -44,6 +45,7 @@ const nativeProfileSchema=objectSchema({
 },['id','build','launchArguments']);
 const tools=[
   {name:'factory_capabilities',description:'Get actual execution and inspection readiness and configured native profiles.',inputSchema:objectSchema({})},
+  {name:'factory_verification_contract',description:'Read the complete original frozen acceptance contract for this independent verifier in bounded ranges. Continue at nextOffset until totalCharacters; requirements are never summarized or silently omitted.',inputSchema:objectSchema({offset:{type:'integer',minimum:0},maxCharacters:{type:'integer',minimum:1,maximum:16000}},['offset','maxCharacters'])},
   {name:'factory_native_profile_propose',description:'Set up testing for a new native app. Propose a fixed build and isolated fixture using the exact profile schema (platform is build.platform); Factory independently audits actual immutable source before issuing its profile receipt. No manual receipt or host SDK is needed for the source review. Poll factory_native_profile_status. Any source edit requires a fresh audit.',inputSchema:objectSchema({requestId:string,profile:nativeProfileSchema,auditPaths:{type:'array',minItems:1,maxItems:128,items:objectSchema({rootId:{type:'string',description:'Declared source root ID from factory_capabilities; primary for the app source.'},path:{type:'string',description:'Relative original source file path in that root.'},purposes:{type:'array',minItems:1,items:{type:'string',enum:['entry','storage','credentials','providers','preferences','notifications','build']}}},['rootId','path','purposes'])}},['requestId','profile','auditPaths'])},
   {name:'factory_native_profile_status',description:'Read your independent native setup audit and concrete findings. Waiting preserves your source and author; unknown ownership is reconciled before the same review continues.',inputSchema:objectSchema({auditId:string,waitSeconds:{type:'integer',minimum:0,maximum:30}},['auditId'])},
   {name:'factory_native_build',description:'Capture your dirty/untracked source and build an exact private native product using a configured profile. Returns a durable job; poll it before launching.',inputSchema:objectSchema({profileId:string,requestId:string},['profileId','requestId'])},
@@ -243,13 +245,15 @@ export class InspectionService {
       const source:InspectionSourceIdentity={snapshotId:snapshot.id,sha256:snapshot.sourceDigest,candidateId:input.candidate.id,candidateCommit:input.candidate.commit,checkedCommit:input.checkedCommit,roots:snapshot.roots.map(root=>({id:root.id,sha256:root.sourceDigest,...(root.sourceCommit?{commit:root.sourceCommit}:{})}))};
       this.profileSetup.bindCandidate(authority,input.candidate,source);
       const checked=await this.quality.check({authority,quality:input.quality,source,candidateCommit:input.candidate.commit,checkedCommit:input.checkedCommit});
-      if(checked.passed||!checked.recovery)return checked;
-      const setup=this.profileSetup.pending(authority,source);if(setup&&setup.status!=='rejected'){this.profileSetup.maintain();return{...checked,output:`Native testing setup is ${setup.status}: ${setup.reason} The successful author and exact candidate remain retained.`,recovery:checked.recovery};}
+      if(!checked.passed&&!checked.recovery)return checked;
+      const setup=this.profileSetup.pending(authority,source);
+      if(setup?.status==='rejected')return{...checked,passed:false,exitCode:1,output:`Native fixture audit ${setup.auditId} rejected this exact source: ${setup.reason}${setup.verdict?` Original judgment artifact ${setup.verdict.id} (${setup.verdict.sha256}).`:''}`,recovery:undefined};
+      if(setup){this.profileSetup.maintain();const reason=`Native testing setup is ${setup.status}: ${setup.reason} The successful author and exact candidate remain retained.`;return{...checked,passed:false,exitCode:1,output:reason,recovery:{condition:'inspection-evidence',reason}};}
       const project=this.app.store.get<Project>('projects',input.goal.projectId);if(!project)throw new Error('The verification project is unavailable.');
       const run=await this.verifier.ensure({authority,quality:input.quality,source,snapshot,project,signal:input.signal});
-      if(run.status==='succeeded')return this.quality.check({authority,quality:input.quality,source,candidateCommit:input.candidate.commit,checkedCommit:input.checkedCommit});
-      if(['failed','canceled'].includes(run.status))return {...checked,output:run.reason||'Independent application verification failed.',recovery:undefined};
-      const reason=run.reason||'Independent application verification is waiting for inspection readiness.';return {...checked,output:reason,recovery:{condition:'inspection-evidence',reason}};
+      if(run.status==='succeeded'&&run.acceptanceContract&&run.chatId)return this.quality.check({authority,quality:input.quality,source,candidateCommit:input.candidate.commit,checkedCommit:input.checkedCommit,verification:{runId:run.id,chatId:run.chatId,acceptanceContractSha256:inspectionAcceptanceContractSha256(run.acceptanceContract)}});
+      if(['failed','canceled'].includes(run.status))return {...checked,passed:false,exitCode:1,output:run.reason||'Independent application verification failed.',recovery:undefined};
+      const reason=run.reason||'Independent application verification is waiting for inspection readiness.';return {...checked,passed:false,exitCode:1,output:reason,recovery:{condition:'inspection-evidence',reason}};
     }finally{await this.snapshots.remove(snapshot);}
   };
   async readiness():Promise<ExecutionTargetAdvertisement[]>{
@@ -398,17 +402,12 @@ export class InspectionService {
     let current:SourceRecord|undefined;
     try{let review:unknown;try{review=decision.visualReview;}catch{/* The protocol parser retains its own decision error. */}
       const tasks=this.app.store.list<FactoryTask>('tasks').filter(task=>task.goalId===input.goal.id);
-      const reports=await this.quality.controllerReportContext({goalId:input.goal.id,source:canonical.source});
-      const currentPolicies=reports.reports.filter(report=>report.currentSource&&report.currentAuthority&&report.latestForPolicy&&!report.unavailable&&report.recordedStatus==='ready-for-review').flatMap(report=>report.quality?[report.quality as TaskQualityRequirements]:[]);
-      const currentCoverage=quality.platforms.every(platform=>currentPolicies.some(policy=>policy.platforms.includes(platform)))
-        &&quality.workflows.every(workflow=>currentPolicies.some(policy=>policy.workflows.some(item=>item.id===workflow.id&&item.platform===workflow.platform)))
-        &&quality.referenceIds.every(id=>currentPolicies.some(policy=>policy.referenceIds.includes(id)));
-      if(decision.complete!==true&&(currentCoverage||tasks.some(task=>!['completed','canceled'].includes(task.status))))return {ready:true,evidenceIds:[]};
+      if(decision.complete!==true&&tasks.some(task=>!['completed','canceled'].includes(task.status)))return {ready:true,evidenceIds:[]};
       try{current=await this.prepareControllerSource(context,input.goal,input.run,canonical);}catch(error){input.signal?.throwIfAborted();return {ready:false,reason:(error as Error).message,evidenceIds:[]};}
       if(!inspectionSourceContentMatches(current.source,canonical.source))return {ready:false,reason:'The evaluator workspace differs from the current integrated project or one of its reference folders. Refresh verification from the current source; retained screenshots cannot certify changed or reverted code.',evidenceIds:[]};
       if(canonical.clean===false)return {ready:false,reason:'The integrated project has uncommitted changes or changed while its source was captured. Commit or restore those changes before final app verification; no completed commit can certify this working tree.',evidenceIds:[]};
       let checked=decision.complete===true?await this.quality.reviewCheck({goalId:input.goal.id,controllerRunId:input.run.id,source:canonical.source,quality,review}):{ready:false,reason:'Inspect the independently verified current integrated product before deciding completion.',evidenceIds:[] as string[]};
-      if(!checked.ready){
+      {
         if(tasks.some(task=>!['completed','canceled'].includes(task.status)))return {ready:false,reason:'Finish or explicitly cancel the remaining goal tasks before final app verification. Their recorded requirements remain part of acceptance.',evidenceIds:[]};
         const anchors=tasks.filter(task=>task.status==='completed').flatMap(task=>{
           const attempt=task.currentAttemptId?this.app.store.get<Attempt>('attempts',task.currentAttemptId):undefined,detail=attempt?this.app.store.get<AttemptDetail>('factory-attempt-details',attempt.id):undefined;
@@ -417,19 +416,18 @@ export class InspectionService {
         }).sort((left,right)=>(right.attempt.endedAt||right.task.updatedAt||'').localeCompare(left.attempt.endedAt||left.task.updatedAt||'')||right.task.id.localeCompare(left.task.id));
         const anchor=anchors[0];
         if(!anchor||!canonical.checkedCommit){
-          if(!currentCoverage)return {ready:false,reason:'Current-source app evidence is missing, and final verification needs a retained accepted candidate plus a clean integrated Git commit. Restore the accepted candidate and integration record or finish integration before verifying the app.',evidenceIds:[]};
+          return {ready:false,reason:'Final verification needs a retained accepted candidate plus a clean integrated Git commit. Restore the accepted candidate and integration record or finish integration before verifying the app.',evidenceIds:[]};
         }else{
           const revision=anchor.detail.assignmentGoalRevision??anchor.detail.goalRevision??input.goal.revision;
           const authority:InspectionAuthority={goalId:input.goal.id,goalRevision:revision,taskId:anchor.task.id,attemptId:anchor.attempt.id,authorityGeneration:anchor.attempt.generation,policyRevision:revision};
           const source:InspectionSourceIdentity={...canonical.source,candidateId:anchor.detail.candidate!.id,candidateCommit:anchor.detail.candidate!.commit,checkedCommit:canonical.checkedCommit};
           const probe=await this.quality.check({authority,quality,source,candidateCommit:source.candidateCommit!,checkedCommit:source.checkedCommit});
           if(!probe.passed&&!probe.recovery)return {ready:false,reason:`Final app verification found defects that still require repair: ${probe.output}`,evidenceIds:[]};
-          const exactPolicy=reports.reports.some(report=>report.taskId===authority.taskId&&report.currentSource&&JSON.stringify(report.quality)===JSON.stringify(quality));
-          if(!probe.passed&&(!currentCoverage||exactPolicy)){
+          {
             const project=this.app.store.get<Project>('projects',input.goal.projectId)!;
             const verification=await this.verifier.ensure({authority,source,snapshot:canonical.snapshot,quality,project,purpose:'goal-final',goalRevision:input.goal.revision,signal:input.signal});
-            if(verification.status!=='succeeded')return {ready:false,reason:`Final app verification ${verification.status}: ${verification.reason||'Waiting for current-source screenshots and workflow assertions. The accepted author attempt remains retained.'}`,evidenceIds:[]};
-            const verified=await this.quality.check({authority,quality,source,candidateCommit:source.candidateCommit!,checkedCommit:source.checkedCommit});
+            if(verification.status!=='succeeded'||!verification.acceptanceContract||!verification.chatId)return {ready:false,reason:`Final app verification ${verification.status}: ${verification.reason||'Waiting for current-source screenshots and workflow assertions under the complete original acceptance contract. The accepted author attempt remains retained.'}`,evidenceIds:[]};
+            const verified=await this.quality.check({authority,quality,source,candidateCommit:source.candidateCommit!,checkedCommit:source.checkedCommit,verification:{runId:verification.id,chatId:verification.chatId,acceptanceContractSha256:inspectionAcceptanceContractSha256(verification.acceptanceContract)}});
             if(!verified.passed)return {ready:false,reason:`Final app verification needs attention: ${verified.recovery?.reason||verified.output}`,evidenceIds:[]};
             checked=await this.quality.reviewCheck({goalId:input.goal.id,controllerRunId:input.run.id,source:canonical.source,quality,review});
           }
@@ -532,7 +530,9 @@ export class InspectionService {
     if(name==='factory_quality_submit'){
       const detail=this.app.store.get<AttemptDetail>('factory-attempt-details',authority.attemptId),quality=verification?.run.quality||detail?.contract?.quality||this.app.store.get<FactoryTask>('tasks',authority.taskId)?.quality;
       if(!quality)throw new Error('This task has no configured visual/workflow acceptance contract.');
-      const checked=await this.quality.submit({authority,quality,report:args.report});this.app.emit('inspection-evidence',{authority,reportId:checked.id});return result(checked);
+      const bound=verification?.run.acceptanceContract&&verification.run.chatId?{runId:verification.run.id,chatId:verification.run.chatId,acceptanceContractSha256:inspectionAcceptanceContractSha256(verification.run.acceptanceContract)}:undefined;
+      if(bound&&!verificationContractFullyRead(verification!.run.acceptanceContract!,bound.runId,bound.chatId,this.app.store.events<VerificationContractRead>('inspection-verification-contract-reads',bound.runId).map(event=>event.value)))throw new Error('Read every original acceptance contract range with factory_verification_contract before submitting verification.');
+      const checked=await this.quality.submit({authority,quality,report:args.report,...(bound?{verification:bound}:{})});this.app.emit('inspection-evidence',{authority,reportId:checked.id});return result(checked);
     }
     if(name==='factory_reference'){
       const source=typeof args.sourceSnapshotId==='string'?this.app.store.get<SourceRecord>('inspection-source-snapshots',args.sourceSnapshotId):undefined;
@@ -549,12 +549,19 @@ export class InspectionService {
       const mime=/\.png$/i.test(target)?'image/png':/\.jpe?g$/i.test(target)?'image/jpeg':'text/plain';
       if(mime==='text/plain'&&bytes.length>128*1024)throw new Error('Choose a reference file smaller than 128 KiB so its full contents can be inspected.');
       const artifact=await this.artifacts.put(bytes,{goalId:authority.goalId,taskId:authority.taskId,attemptId:authority.attemptId,name:path.basename(target),mime});
-      this.app.store.set('factory-artifacts',artifact);this.app.store.set('inspection-reference-views',{id:randomUUID(),referenceId:args.referenceId,authority,source:source.source,artifactIds:[artifact.id],artifacts:[artifact],inspectedAt:new Date().toISOString()});
+      const bound=verification?.run.acceptanceContract&&verification.run.chatId?{runId:verification.run.id,chatId:verification.run.chatId,acceptanceContractSha256:inspectionAcceptanceContractSha256(verification.run.acceptanceContract)}:undefined;
+      this.app.store.set('factory-artifacts',artifact);this.app.store.set('inspection-reference-views',{id:randomUUID(),referenceId:args.referenceId,authority,source:source.source,artifactIds:[artifact.id],artifacts:[artifact],inspectedAt:new Date().toISOString(),...(bound?{verification:bound}:{})});
       return {content:[text({referenceId:args.referenceId,artifact}),mime.startsWith('image/')?{type:'image',mimeType:mime,data:bytes.toString('base64')}:{type:'text',text:bytes.toString('utf8').slice(0,128*1024)}]};
       };
       if(source.verificationRunId){const verified=await this.verifier.verificationSource(context);if(!verified||verified.run.id!==source.verificationRunId||verified.id!==source.id)throw new Error('This reference source belongs to another verifier.');return inspect(verified.snapshot);}
       if(this.app.store.get('inspection-source-retention',source.id))return this.retention.use(source.id,inspect,context.signal);
       await this.snapshots.verify(source.snapshot,context.signal);return inspect(source.snapshot);
+    }
+    if(name==='factory_verification_contract'){
+      if(!verification?.run.acceptanceContract||verification.run.chatId!==context.chat.id)throw new Error('Only the current independent verifier can read its original acceptance contract.');
+      const chunk=verificationContractChunk(verification.run.acceptanceContract,Number(args.offset),Number(args.maxCharacters));
+      this.app.store.append('inspection-verification-contract-reads',verification.run.id,{runId:verification.run.id,chatId:context.chat.id,contractSha256:chunk.contractSha256,offset:chunk.offset,end:chunk.nextOffset});
+      return result(chunk);
     }
     if(name==='factory_capabilities'){const project=this.app.store.get<Project>('projects',context.session.projectId),projectId=project?.sourceProjectId||project?.id||'',detail=this.app.store.get<AttemptDetail>('factory-attempt-details',authority.attemptId);return result({targets:await this.readiness(),delegatedTargets:await this.delegation?.capabilities(projectId)||[],profiles:this.profiles(projectId).map(profile=>({id:profile.id,build:profile.build})),quality:verification?.run.quality||detail?.contract?.quality||this.app.store.get<FactoryTask>('tasks',authority.taskId)?.quality});}
     if(name==='factory_job_status'){

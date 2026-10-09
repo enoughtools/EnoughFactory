@@ -1,7 +1,8 @@
 import { createHash } from 'node:crypto';
 import { chmod, cp, lchmod, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
-import type { Chat, ChatEvent, ExecutionCapability, ExecutionTargetAdvertisement, Goal, InspectionAuthority, InspectionSourceIdentity, InspectionVerificationRun, Project, Session, TaskQualityRequirements } from '@enoughfactory/contracts';
+import type { Attempt, Chat, ChatEvent, ExecutionCapability, ExecutionTargetAdvertisement, FactoryTask, Goal, InspectionAuthority, InspectionSourceIdentity, InspectionVerificationAcceptance, InspectionVerificationRun, Project, Session, TaskQualityRequirements } from '@enoughfactory/contracts';
+import type { AttemptDetail } from '@enoughfactory/factory';
 import type { HostProcessState } from '@enoughfactory/agents';
 import { ArtifactStore, InspectionSnapshotManager, WorkspaceManager, exportInspectionContainerRoots, exportInspectionSnapshot, importInspectionSnapshot, verifyInspectionSnapshotContents, writeAtomic, type InspectionSnapshot, type InspectionSnapshotTransfer, type WorkspaceRecord } from '@enoughfactory/workspaces';
 import { dockerInvocation } from '@enoughfactory/runtime';
@@ -11,7 +12,10 @@ import { goalAgentCount } from './factory-agent-capacity.ts';
 import { factoryQualityInstructions } from './factory-quality.ts';
 import { inspectionSourceContentMatches, type InspectionQualityService } from './inspection-quality.ts';
 import type { DelegatedNativeInspectionReadiness } from './inspection-delegation.ts';
+import { canonicalVerificationValue as canonical, inspectionAcceptanceContractSha256, inspectionQualityPolicySha256, inspectionVerificationKey } from './inspection-verification-identity.ts';
+import { INLINE_VERIFICATION_CONTRACT_CHARACTERS, verificationContractContent } from './inspection-verification-contract.ts';
 import { exec } from './util.ts';
+export { inspectionAcceptanceContractSha256, inspectionQualityPolicySha256, inspectionVerificationKey } from './inspection-verification-identity.ts';
 
 export const INSPECTION_VERIFIER_RUNS = 'inspection-verifier-runs';
 const INPUTS = 'inspection-verifier-inputs';
@@ -19,12 +23,15 @@ const terminal = new Set<InspectionVerificationRun['status']>(['succeeded', 'fai
 const sha = /^[a-f0-9]{64}$/;
 const commit = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/;
 const setupOwnerChangedReason = 'The independent setup owner changed.';
+const digest = (value: unknown): string => createHash('sha256').update(canonical(value)).digest('hex');
 
 export interface VerificationInput {
   authority: InspectionAuthority;
   purpose?: 'task' | 'goal-final';
   /** Current canonical goal revision, independently of the frozen author assignment. */
   goalRevision?: number;
+  /** Optional caller projection is checked against the original durable contract. */
+  acceptanceContract?: InspectionVerificationAcceptance;
   source: InspectionSourceIdentity;
   /** The exact candidate or combined integration-check snapshot, never the author's live worktree. */
   snapshot: InspectionSnapshot;
@@ -74,19 +81,6 @@ export interface InspectionVerifierOptions {
   prepareExecution?: (input: VerificationPreparation) => Promise<Session>;
   /** Stop-only reconciliation of original inspection jobs; no uncertain action is replayed. */
   reconcileInspection?: (run: InspectionVerificationRun, signal: AbortSignal) => Promise<boolean>;
-}
-
-function canonical(value: unknown): string {
-  if (Array.isArray(value)) return `[${value.map(canonical).join(',')}]`;
-  if (value && typeof value === 'object') return `{${Object.entries(value).filter(([, item]) => item !== undefined).sort(([a], [b]) => a.localeCompare(b)).map(([key, item]) => `${JSON.stringify(key)}:${canonical(item)}`).join(',')}}`;
-  return JSON.stringify(value) ?? 'null';
-}
-function digest(value: unknown): string { return createHash('sha256').update(canonical(value)).digest('hex'); }
-export function inspectionQualityPolicySha256(quality: TaskQualityRequirements): string { return digest(quality); }
-export function inspectionVerificationKey(input: Pick<VerificationInput, 'authority' | 'source' | 'quality' | 'purpose' | 'goalRevision'>): string {
-  // Commit identities remain recorded separately: byte-equivalent C and M reuse the
-  // same review; different source or policy always receives a new verifier owner.
-  return `verify-${digest({ version: 1, authority: input.authority, ...(input.purpose === 'goal-final' ? { purpose: input.purpose, goalRevision: input.goalRevision } : {}), source: { sha256: input.source.sha256, roots: (input.source.roots ?? []).map(({ id, sha256 }) => ({ id, sha256 })).sort((a, b) => a.id.localeCompare(b.id)) }, quality: input.quality })}`;
 }
 
 function hostProofMatchesVerifier(process: HostProcessState, run: InspectionVerificationRun, workdir: string): boolean {
@@ -173,8 +167,27 @@ export class InspectionVerifier {
   private assertCurrent(run: InspectionVerificationRun, signal?: AbortSignal): void {
     signal?.throwIfAborted();
     const current = this.get(run.id);
-    if (this.closing || terminal.has(current.status) || current.ownerDeviceId !== this.options.app.device.id || !this.options.authorityCurrent(current.authority)) throw new Error('Inspection verifier authority was retired.');
+    if (this.closing || terminal.has(current.status) || current.ownerDeviceId !== this.options.app.device.id || current.id !== inspectionVerificationKey(current) || !this.options.authorityCurrent(current.authority)) throw new Error('Inspection verifier authority was retired.');
     if (current.purpose === 'goal-final' && this.options.app.store.get<Goal>('goals', current.authority.goalId)?.revision !== current.goalRevision) throw new Error('The final verification goal revision was retired.');
+    if (current.acceptanceContract && canonical(this.acceptanceContract(current)) !== canonical(current.acceptanceContract)) throw new Error('The frozen verification acceptance contract changed.');
+  }
+  private acceptanceContract(input: Pick<VerificationInput, 'authority' | 'purpose' | 'goalRevision' | 'quality'>): InspectionVerificationAcceptance {
+    const detail = this.options.app.store.get<AttemptDetail>('factory-attempt-details', input.authority.attemptId);
+    if (!detail?.contract || detail.id !== input.authority.attemptId || detail.goalId !== input.authority.goalId || (detail.assignmentGoalRevision ?? detail.goalRevision) !== input.authority.goalRevision) throw new Error('Independent verification requires the original frozen author acceptance contract.');
+    const task = structuredClone(detail.contract);
+    if (typeof task.title !== 'string' || typeof task.description !== 'string' || !Number.isSafeInteger(task.planRevision) || task.acceptanceCriteria !== undefined && (!Array.isArray(task.acceptanceCriteria) || task.acceptanceCriteria.some(item => typeof item !== 'string'))) throw new Error('The original frozen author acceptance contract is invalid.');
+    if (input.purpose !== 'goal-final') return { version: 1, task };
+    const goal = this.options.app.store.get<Goal>('goals', input.authority.goalId);
+    if (!goal || goal.revision !== input.goalRevision || typeof goal.objective !== 'string' || !Array.isArray(goal.criteria) || goal.criteria.some(item => typeof item !== 'string')) throw new Error('Final verification requires the original objective and completion criteria at the current canonical goal revision.');
+    const taskContracts = this.options.app.store.list<FactoryTask>('tasks').filter(value => value.goalId === goal.id && value.status === 'completed').sort((left, right) => left.id.localeCompare(right.id)).flatMap(value => {
+      const author = value.currentAttemptId ? this.options.app.store.get<Attempt>('attempts', value.currentAttemptId) : undefined;
+      const original = author ? this.options.app.store.get<AttemptDetail>('factory-attempt-details', author.id) : undefined;
+      const required = original?.contract?.quality;
+      if (!required || !required.platforms.some(platform => input.quality.platforms.includes(platform))) return [];
+      if (!author || author.taskId !== value.id || author.status !== 'succeeded' || !original?.contract || original.id !== author.id || original.goalId !== goal.id || !original.integration || original.integration.candidateCommit !== original.candidate?.commit) throw new Error('Final verification requires every accepted task’s original frozen contract and integration identity.');
+      return [{ taskId: value.id, attemptId: author.id, authorityGeneration: author.generation, assignmentGoalRevision: original.assignmentGoalRevision ?? original.goalRevision, contract: structuredClone(original.contract) }];
+    });
+    return { version: 1, task, goal: { revision: goal.revision, objective: goal.objective, criteria: structuredClone(goal.criteria), taskContracts } };
   }
   private snapshotManager(id: string): InspectionSnapshotManager {
     return new InspectionSnapshotManager({ dataDir: path.join(this.options.app.dataDir, 'workspace-data', 'inspection-verification', id), artifacts: this.artifacts });
@@ -192,6 +205,10 @@ export class InspectionVerifier {
   ensure(input: VerificationInput): Promise<InspectionVerificationRun> {
     this.validate(input);
     input.signal?.throwIfAborted();
+    const acceptanceContract = this.acceptanceContract(input);
+    if (input.acceptanceContract && canonical(input.acceptanceContract) !== canonical(acceptanceContract)) throw new Error('The supplied acceptance projection differs from the original frozen contract.');
+    if (input.purpose !== 'goal-final' && canonical(acceptanceContract.task.quality) !== canonical(input.quality)) throw new Error('Task verification quality differs from the original frozen author contract.');
+    input = { ...input, acceptanceContract };
     const id = inspectionVerificationKey(input), existing = this.options.app.store.get<InspectionVerificationRun>(INSPECTION_VERIFIER_RUNS, id);
     const live = this.active.get(id);
     if (live) return live.promise;
@@ -202,7 +219,7 @@ export class InspectionVerifier {
     const target = input.quality.platforms.includes('web') ? 'container' : 'host-macos';
     if (!existing) {
       const at = this.now();
-      this.options.app.store.set<InspectionVerificationRun>(INSPECTION_VERIFIER_RUNS, { id, authority: structuredClone(input.authority), ...(input.purpose === 'goal-final' ? { purpose: input.purpose, goalRevision: input.goalRevision } : {}), source: structuredClone(input.source), quality: structuredClone(input.quality), policySha256: inspectionQualityPolicySha256(input.quality), ownerDeviceId: this.options.app.device.id, executionTargetKind: target, executionTargetId: target === 'container' ? 'container' : 'mac-host', status: 'queued', createdAt: at, updatedAt: at, deadlineAt: new Date(Date.now() + this.timeoutMs).toISOString() });
+      this.options.app.store.set<InspectionVerificationRun>(INSPECTION_VERIFIER_RUNS, { id, authority: structuredClone(input.authority), ...(input.purpose === 'goal-final' ? { purpose: input.purpose, goalRevision: input.goalRevision } : {}), acceptanceContract: structuredClone(acceptanceContract), source: structuredClone(input.source), quality: structuredClone(input.quality), policySha256: inspectionQualityPolicySha256(input.quality), ownerDeviceId: this.options.app.device.id, executionTargetKind: target, executionTargetId: target === 'container' ? 'container' : 'mac-host', status: 'queued', createdAt: at, updatedAt: at, deadlineAt: new Date(Date.now() + this.timeoutMs).toISOString() });
     }
     const abort = new AbortController();
     const forward = () => abort.abort(input.signal?.reason);
@@ -384,9 +401,20 @@ export class InspectionVerifier {
     let snapshot: InspectionSnapshot | undefined;
     try {
       this.assertCurrent(this.get(id), abort.signal);
-      // Source retention needs no provider slot; own C before any capacity/readiness wait.
+      // Source retention needs no provider slot; own C before any ownership,
+      // capacity or readiness wait can outlive the caller's temporary snapshot.
       snapshot = await this.retain(id, input, abort.signal);
       this.assertCurrent(this.get(id), abort.signal);
+      // A stronger contract gets a new owner, while any older owner still keeps
+      // its original authority, conversation, evidence and uncertain effects.
+      const siblings = this.options.app.store.list<InspectionVerificationRun>(INSPECTION_VERIFIER_RUNS).filter(run => run.id !== id && (!run.acceptanceContract || !terminal.has(run.status)) && canonical(run.authority) === canonical(input.authority) && inspectionSourceContentMatches(run.source, input.source));
+      for (const sibling of siblings) {
+        const settled = await this.providerSettled(sibling);
+        this.assertCurrent(this.get(id), abort.signal);
+        if (!settled.ready || (sibling.sessionId || sibling.chatId || sibling.startedAt) && (!this.options.reconcileInspection || !await this.options.reconcileInspection(sibling, abort.signal))) return this.patch(id, { status: 'waiting', reason: `An earlier verification owner must finish reconciliation before this full-contract review: ${settled.reason || 'Its original inspection effects are not confirmed stopped.'}` });
+        this.assertCurrent(this.get(id), abort.signal);
+        if (canonical(this.get(sibling.id)) !== canonical(sibling) || !this.providerOwnerCurrent(sibling)) return this.patch(id, { status: 'waiting', reason: 'An earlier verification owner changed during acceptance migration. Its execution remains retained.' });
+      }
       const claimed = this.options.app.store.transaction(() => {
         const current = this.get(id);
         if (!['queued', 'waiting'].includes(current.status)) return false;
@@ -447,7 +475,7 @@ export class InspectionVerifier {
       } finally { abort.signal.removeEventListener('abort', stop); }
       assertCurrent();
       await this.snapshotManager(id).verify(snapshot, abort.signal);
-      const checked = await this.options.quality.check({ authority: run.authority, quality: run.quality, source: run.source, candidateCommit: run.source.candidateCommit!, checkedCommit: run.source.checkedCommit });
+      const checked = await this.options.quality.check({ authority: run.authority, quality: run.quality, source: run.source, candidateCommit: run.source.candidateCommit!, checkedCommit: run.source.checkedCommit, verification: { runId: id, chatId: chat.id, acceptanceContractSha256: inspectionAcceptanceContractSha256(run.acceptanceContract!) } });
       assertCurrent();
       const setup=!checked.passed&&checked.recovery?this.options.pendingNativeSetup?.(run.authority,run.source):undefined;
       if(setup&&setup.status!=='rejected')return this.patch(id,{status:'waiting',reason:`Native fixture setup is ${setup.status}: ${setup.reason} Continue this same verifier conversation after setup.`,completedAt:undefined});
@@ -473,9 +501,13 @@ export class InspectionVerifier {
   }
 
   private prompt(run: InspectionVerificationRun, context: string): string {
+    const contract = verificationContractContent(run.acceptanceContract!);
+    const acceptance = contract.totalCharacters <= INLINE_VERIFICATION_CONTRACT_CHARACTERS ? `Frozen authoritative acceptance contract (complete): ${contract.content}` : `Frozen authoritative acceptance contract manifest: ${JSON.stringify({ contractSha256: contract.contractSha256, totalCharacters: contract.totalCharacters })}. The complete original requirements are retained without summarizing or dropping criteria. Before testing, read every character using factory_verification_contract with offset 0 and maxCharacters 16000, then continue at each nextOffset until totalCharacters. Factory requires this conversation's full original contract reads before accepting its quality report.`;
     return [
       'Independently verify the exact saved application source below. The author has finished; you are a separate verifier and must not resume, repair, commit or integrate its source. Native builds and app start/restart must use the Factory inspection tools bound to the immutable checked snapshot. For web, you may use shell to launch the declared local fixture/development server from this owned verification workspace; operate and inspect its browser only through Factory tools. Use shell to inspect source and discover declared build/reference paths. Preserve the checked source bytes and keep generated files out of source roots.',
       `Verification run: ${run.id}\nChecked source: ${JSON.stringify(run.source)}\nFrozen quality requirements: ${JSON.stringify(run.quality)}`,
+      acceptance,
+      'Treat every original acceptance criterion, task description and final-goal completion criterion as required. Workflow IDs only organize evidence; a passed interaction does not establish the whole criterion. For restoration or persistence of message content, use factory_assert valueEquals on the entire observed string, including every line, and exact From/To/subject/body fields required by the contract. valueIncludes, matching the first line, an empty standalone draft, or a successful click cannot establish whole-message restoration. Exercise the required populated Reply flow, software keyboard, first/middle/last lines, close/reopen and confirmed restart when specified; retain the exact distinctive multiline expected text and compare the full restored body after each required transition. Never send mail unless the original contract explicitly requires and authorizes it. If the observation cannot expose an entire required value, report that acceptance evidence as blocked instead of claiming it passed.',
       'Use factory_capabilities. For native platforms select the configured fixture profile, factory_native_build, poll its job, then factory_native_start. For web start the app from this private verification workspace and use factory_browser_start. View original screenshot image tool responses, inspect required reference/design-system files with factory_reference, execute every required workflow, re-observe and use factory_assert on resulting state. Distinguish screenshot evidence IDs from observation/action IDs.',
       'Submit a version 1 QualityEvidenceReport through factory_quality_submit using the EXACT Checked source object. Each passed workflow requires before/action/after plus assertionEvidenceId. Review hierarchy, spacing, clipping, typography, controls and states against the inspected reference; record serious defects honestly. Missing capabilities or failed interactions are blocked/failed evidence, never a success claim. Finish by stopping the owned app/browser sessions. Do not ask the user or start another author attempt.',
       context,
