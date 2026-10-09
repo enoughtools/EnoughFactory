@@ -12,7 +12,7 @@ async function main() {
   const chats=new ChatController(app);
   await app.listen();
   const inspection=await initializeInspection(app,chats,network);
-  await initializeFactory(app,chats,network,{qualityCheck:inspection.qualityCheck,reviewController:inspection.reviewController});
+  await initializeFactory(app,chats,network,{qualityCheck:inspection.qualityCheck,reviewController:inspection.reviewController,prepareControllerReview:inspection.prepareControllerReview});
   console.log(`EnoughFactory device service ready at http://127.0.0.1:${app.port}`);
   for(const signal of ['SIGINT','SIGTERM'] as const)process.on(signal,()=>{void app.close().then(()=>process.exit(0));});
 }

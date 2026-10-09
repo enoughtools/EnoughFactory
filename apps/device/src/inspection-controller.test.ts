@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
-import { mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
+import { execFileSync, spawn } from 'node:child_process';
+import { chmod, lstat, mkdir, mkdtemp, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { createInterface } from 'node:readline';
@@ -11,6 +11,7 @@ import type { DeviceApp } from './app.ts';
 import type { AgentToolBridge, AgentToolBridgeContext, ChatController } from './chats.ts';
 import type { QualityEvidenceReport } from './factory-quality.ts';
 import { InspectionService } from './inspection-service.ts';
+import type { VerificationInput } from './inspection-verifier.ts';
 import { Store } from './store.ts';
 import { prepareControllerContext } from './controller-context.ts';
 
@@ -77,10 +78,10 @@ async function fixture(t: TestContext, options: { generatedContext?: boolean; ag
   store.set('factory-attempt-details', { id: 'attempt', assignmentGoalRevision: 4, contract: { quality } });
   const app = { dataDir: path.join(directory, 'service'), device: { id: 'mac', capacity: 1 }, store,
     runtime: { endpoint: { host: 'unix:///no-docker-needed', cliPath: '/usr/bin/false', configDirectory: path.join(directory, 'private-docker') } },
-    sessions: { record: (id: string) => { assert.equal(id, run.sessionId); return context.session; }, execution: (id: string) => { assert.equal(id, run.sessionId); return context.execution; } },
+    sessions: { record: (id: string) => { assert.equal(id, run.sessionId); return context.session; }, execution: (id: string) => { assert.equal(id, run.sessionId); return context.execution; }, owns: (id:string)=>id===run.sessionId },
     changed: () => {}, emit: () => {}, withServiceOperation: async <T>(operation: (signal: AbortSignal) => Promise<T>) => operation(abort.signal),
   } as unknown as DeviceApp;
-  const service = new InspectionService(app, {} as ChatController);
+  const service = new InspectionService(app, {isRunning:()=>false} as unknown as ChatController);
   const snapshot = await service.snapshots.create({ roots: [{ id: 'primary', name: 'primary', path: workdir }, { id: 'enough-ui', name: 'enough-ui', path: referencePath }], context: { goalId: goal.id, taskId: authority.taskId, attemptId: authority.attemptId } });
   const source: InspectionSourceIdentity = { snapshotId: snapshot.id, sha256: snapshot.sourceDigest, roots: snapshot.roots.map(root => ({ id: root.id, sha256: root.sourceDigest, ...(root.sourceCommit ? { commit: root.sourceCommit } : {}) })) };
   const { token } = service.jobs.issueAuthority(authority, { capabilities: ['macos-app-inspection'], executionTargetIds: ['mac-host'] });
@@ -242,6 +243,81 @@ test('an evaluator cannot certify an older private checkout while the canonical 
   t.mock.method(f.service.quality, 'reviewCheck', async () => assert.fail('A noncanonical checkout must reject before the visual guard'));
   const checked = await f.service.reviewController({ goal: f.goal, run: f.run, resultText: JSON.stringify({ complete: true, visualReview: f.review(actual) }) });
   assert.equal(checked.ready, false); assert.match(checked.reason!, /workspace differs/);
+});
+
+test('evaluator preparation materializes exact canonical modes in primary and additional roots while retaining its original source audit', {timeout:15000},async t=>{
+  const f=await fixture(t,{generatedContext:true});
+  const reference=f.context.session.workingDirectories!.find(root=>root.id==='enough-ui')!;
+  await chmod(path.join(f.workdir,'README.md'),0o666);await chmod(path.join(reference.path,'Button.swift'),0o666);
+  await mkdir(path.join(f.workdir,'scripts'));await mkdir(path.join(f.canonicalPath,'scripts'));
+  await chmod(path.join(f.workdir,'scripts'),0o777);await chmod(path.join(f.canonicalPath,'scripts'),0o755);
+  const generated=f.context.session.workingDirectories!.find(root=>root.id!=='enough-ui')!;
+  const preserved=path.join(generated.path,'service-evidence-retained.txt');await writeFile(preserved,'Retained generated evidence',{mode:0o666});await chmod(preserved,0o666);
+  const before=value<ReviewList>(await f.provider.call('factory_review_screens'));assert.equal(before.controllerSourceMatchesCanonical,false);
+  await f.service.prepareControllerReview({goal:f.goal,run:f.run});
+  assert.equal((await lstat(path.join(f.workdir,'README.md'))).mode&0o777,0o644);
+  assert.equal((await lstat(path.join(reference.path,'Button.swift'))).mode&0o777,0o644);
+  assert.equal((await lstat(path.join(f.workdir,'scripts'))).mode&0o777,0o755);
+  assert.equal((await lstat(preserved)).mode&0o777,0o666,'Generated controller evidence is outside declared source preparation');
+  const audits=f.store.list<{status:string;previous:InspectionSourceIdentity;actual:InspectionSourceIdentity;canonical:InspectionSourceIdentity;previousTransfer:{sourceManifest:{id:string}}}>('controller-source-preparations');
+  assert.equal(audits.length,1);assert.equal(audits[0]!.status,'ready');
+  assert.notEqual(audits[0]!.previous.sha256,audits[0]!.canonical.sha256);assert.equal(audits[0]!.actual.sha256,audits[0]!.canonical.sha256);
+  const retained=await f.service.artifacts.read(await f.service.artifacts.get(audits[0]!.previousTransfer.sourceManifest.id));
+  assert.match(retained.toString(),/"mode":438/,'Original 0666 provenance stays retained rather than normalized');
+});
+
+test('evaluator preparation refuses changed source bytes instead of replacing them or altering canonical modes', {timeout:15000},async t=>{
+  const f=await fixture(t);await chmod(path.join(f.workdir,'README.md'),0o666);
+  await writeFile(path.join(f.workdir,'README.md'),'Changed evaluator source bytes');
+  await assert.rejects(f.service.prepareControllerReview({goal:f.goal,run:f.run}),/Changed bytes, paths and symlink targets/);
+  assert.equal((await lstat(path.join(f.workdir,'README.md'))).mode&0o777,0o666);
+  assert.equal((await lstat(path.join(f.canonicalPath,'README.md'))).mode&0o777,0o644);
+  assert.equal(f.store.list('controller-source-preparations').length,0);
+});
+
+test('changed symlink targets and lost ownership cannot enter evaluator permission preparation', {timeout:15000},async t=>{
+  for(const defect of ['symlink','owner'] as const)await t.test(defect,async t=>{
+    const f=await fixture(t);await chmod(path.join(f.workdir,'README.md'),0o666);
+    if(defect==='symlink'){
+      await symlink('README.md',path.join(f.canonicalPath,'source-link'));
+      await symlink('different-target',path.join(f.workdir,'source-link'));
+    }else Object.assign(f.service.app.sessions,{owns:()=>false});
+    await assert.rejects(f.service.prepareControllerReview({goal:f.goal,run:f.run}),defect==='symlink'?/Changed bytes, paths and symlink targets/:/preparation owner changed/);
+    assert.equal((await lstat(path.join(f.workdir,'README.md'))).mode&0o777,0o666);
+    assert.equal(f.store.list('controller-source-preparations').length,0);
+  });
+});
+
+test('an honest incomplete evaluator drives missing canonical-M verification before reviewing new evidence', {timeout:15000},async t=>{
+  const f=await fixture(t),git=(...args:string[])=>execFileSync('git',['-C',f.canonicalPath,...args],{encoding:'utf8'}).trim();
+  git('init','--quiet');git('add','.');git('-c','user.name=Fixture','-c','user.email=fixture@example.invalid','commit','--quiet','-m','Accepted integration');
+  const checkedCommit=git('rev-parse','HEAD'),candidateCommit='a'.repeat(40),candidateId='accepted-C';
+  const detail=f.store.get<Record<string,unknown>&{id:string}>('factory-attempt-details','attempt')!;
+  f.store.set('factory-attempt-details',{...detail,goalId:f.goal.id,goalRevision:f.goal.revision,candidate:{id:candidateId,commit:candidateCommit},integration:{candidateCommit,commit:checkedCommit}});
+  // Historical C screenshots retain their widened container modes; M is exact
+  // host canonical source and must receive a separate goal-final verifier.
+  t.mock.method(f.service.quality,'controllerReportContext',async()=>({reports:[],omitted:0}));
+  t.mock.method(f.service.quality,'check',async()=>({command:'enoughfactory:ui-quality',candidateCommit,checkedCommit,passed:false,output:'Current M evidence is missing.',recovery:{condition:'inspection-evidence' as const,reason:'Missing current M screenshots'}}));
+  let calls=0;
+  t.mock.method(f.service.verifier,'ensure',async(input:VerificationInput)=>{
+    calls++;assert.equal(input.purpose,'goal-final');assert.equal(input.goalRevision,f.goal.revision);
+    assert.equal(input.authority.attemptId,'attempt');assert.equal(input.authority.authorityGeneration,2);
+    assert.equal(input.source.candidateCommit,candidateCommit);assert.equal(input.source.checkedCommit,checkedCommit);
+    assert.deepEqual(input.quality,f.quality);assert.equal(input.snapshot.sourceDigest,input.source.sha256);
+    return {id:'final-M-verifier',...input,policySha256:'b'.repeat(64),ownerDeviceId:'mac',executionTargetKind:'host-macos' as const,executionTargetId:'mac-host',status:'waiting' as const,createdAt:new Date().toISOString(),updatedAt:new Date().toISOString(),deadlineAt:new Date(Date.now()+60000).toISOString(),reason:'Testing the exact current M product.'};
+  });
+  const result=await f.service.reviewController({goal:f.goal,run:f.run,resultText:JSON.stringify({complete:false,summary:'Canonical current-source evidence is missing.',criteria:[]})});
+  assert.equal(calls,1);assert.equal(result.ready,false);assert.match(result.reason!,/Final app verification waiting/);
+  assert.equal(f.store.get<{generation:number}>('attempts','attempt')!.generation,2);
+});
+
+test('an actionable evaluator repair plan bypasses redundant final verification without changing its requirements', {timeout:15000},async t=>{
+  const f=await fixture(t);
+  t.mock.method(f.service.verifier,'ensure',async()=>assert.fail('A genuine repair plan must return to planning'));
+  t.mock.method(f.service.quality,'controllerReportContext',async()=>assert.fail('A genuine repair plan does not need completion evidence'));
+  const repair={complete:false,summary:'Compose controls clip and need repair.',criteria:[],additionalTasks:[{key:'repair-compose-clipping',title:'Fix compose clipping',description:'Repair the observed clipped controls.',dependsOn:[]}]};
+  assert.deepEqual(await f.service.reviewController({goal:f.goal,run:f.run,resultText:JSON.stringify(repair)}),{ready:true,evidenceIds:[]});
+  assert.deepEqual(f.store.get<{quality:TaskQualityRequirements}>('tasks','task')!.quality,f.quality);
 });
 
 test('canonical source changes during final evidence verification refuse completion', { timeout: 15000 }, async t => {

@@ -37,6 +37,7 @@ async function fixture(t: TestContext, quality = true, extraRoot = false) {
   const turns: TurnInput[] = [], reviews: ReviewInput[] = [];
   const responses = [initialText, followupText, newRevisionText];
   let review: Review = async () => ready();
+  let prepareReview: NonNullable<FactoryInspectionPorts['prepareControllerReview']> = async () => {};
   let current!: { app: DeviceApp; chats: ChatController; factory: Awaited<ReturnType<typeof initializeFactory>> };
   async function start() {
     const previous = process.env.ENOUGHFACTORY_HOME;
@@ -67,7 +68,7 @@ async function fixture(t: TestContext, quality = true, extraRoot = false) {
       }
       return { threadId: input.threadId ?? `fixture-thread-${input.chatId}`, text: responses.shift() ?? evaluation(`Additional evaluation ${turns.length}`) };
     });
-    const factory = await initializeFactory(app, chats, undefined, { reviewController: async input => {
+    const factory = await initializeFactory(app, chats, undefined, { prepareControllerReview: input=>prepareReview(input),reviewController: async input => {
       reviews.push(structuredClone({ ...input, signal: undefined }));
       assert.equal(input.goal.id, goal.id); assert.equal(input.run.role, 'evaluator');
       assert.equal(input.run.chatId, turns.at(-1)!.chatId);
@@ -95,13 +96,32 @@ async function fixture(t: TestContext, quality = true, extraRoot = false) {
     await git(primary, 'add', '.'); await git(primary, 'commit', '--quiet', '-m', 'integrated source changed');
   };
   const changeLibrary = async () => { expectedLibrary = 'updated selected library source\n'; await writeFile(path.join(library, 'source.txt'), expectedLibrary); };
-  return { directory, primary, library, goal, project, task, turns, reviews, state, runs, complete, restart, changePrimary, changeLibrary, review: (handler: Review) => { review = handler; } };
+  return { directory, primary, library, goal, project, task, turns, reviews, state, runs, complete, restart, changePrimary, changeLibrary, review: (handler: Review) => { review = handler; },prepareReview:(handler:typeof prepareReview)=>{prepareReview=handler;} };
 }
 
 function isInspectionWait(error: unknown): boolean {
   assert.equal((error as { recovery: string }).recovery, 'inspection-evidence');
   assert.match((error as Error).message, /native|inspect|evidence/i); return true;
 }
+
+test('canonical evaluator source preparation finishes before its first provider turn',nativeMac,async t=>{
+  const f=await fixture(t,true,true);let prepared=0;
+  f.prepareReview(async input=>{
+    prepared++;assert.equal(f.turns.length,0);assert.equal(input.goal.id,f.goal.id);
+    assert.equal(f.state().app.sessions.record(input.run.sessionId).status,'ready');
+    assert.equal(f.state().chats.get(input.run.chatId!).status,'idle');
+    assert(input.signal instanceof AbortSignal);assert.equal(input.signal.aborted,false);
+  });
+  await f.complete();assert.equal(prepared,1);assert.equal(f.turns.length,1);
+});
+
+test('changed evaluator source preparation cannot dispatch a provider or fabricate its result',nativeMac,async t=>{
+  const f=await fixture(t);f.prepareReview(async()=>{throw new Error('Canonical evaluator source bytes changed before preparation.');});
+  await assert.rejects(f.complete(),/source bytes changed/);assert.equal(f.turns.length,0);
+  const run=f.runs()[0]!;assert.equal(run.status,'failed');
+  assert.equal(f.state().app.store.events('chat',run.chatId!).length,0);
+  assert.equal(f.state().app.store.get('chat-results',run.chatId!),undefined);
+});
 
 test('missing evaluator inspection triggers one follow-up in the same conversation and accepts only the reviewed result', nativeMac, async t => {
   const f = await fixture(t); let calls = 0;

@@ -99,6 +99,7 @@ interface ControllerReviewContinuation {id:string;goalId:string;goalRevision:num
 
 /** The service owns execution and the supervisor; no open window is required. */
 export interface FactoryInspectionPorts {
+  prepareControllerReview?: (input:{goal:Goal;run:ControllerRun;signal?:AbortSignal})=>Promise<void>;
   reviewController?: (input:{goal:Goal;run:ControllerRun;resultText:string;signal?:AbortSignal})=>Promise<{ready:boolean;reason?:string;evidenceIds:string[]}>;
   qualityCheck?: (input:FactoryVerificationContext & {candidate:Candidate;quality:TaskQualityRequirements;path:string;workingDirectories?:Array<{path:string;containerPath:string;commit:string}>;checkedCommit:string;signal?:AbortSignal})=>Promise<CheckResult>;
 }
@@ -817,6 +818,7 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
         const chat = chats.create({ sessionId: session.id, runtime: goal.runtime, approvalMode: goal.approvalMode, title: `${goal.title} · ${role}` });
         chatId = chat.id;
         app.store.set('factory-controller-runs', { ...record, chatId: chat.id, status: 'running', updatedAt: now() });
+        if(role==='evaluator'&&needsControllerReview(goal))await inspection.prepareControllerReview?.({goal,run:{...record,chatId:chat.id,status:'running'},signal});
         providerInvoked = true;
         const systemInstructions = [`You are the EnoughFactory ${role}. ${host?'You run on the configured Mac with full same-user host access in a private Git snapshot; this is not a container sandbox.':'This container contains an isolated snapshot of the current project repository with full container permissions.'} Inspect the actual source and relevant runtime evidence to make your decision under ${goal.approvalMode} policy. Your role is to decide the next factory action; implementation belongs to assigned worker tasks. Do not modify product source as part of this decision. Return the structured JSON requested in the prompt. Goal: ${goal.objective}`, role === 'evaluator' ? 'Audit current behavior in the integrated primary repository. Historical candidate source bundles are not duplicated into this audit; full stored task/attempt contracts, checks and integration records remain available through the evidence manifest. Historical artifact references do not promise their bodies are present and cannot be claimed inspected.' : '', validationInstructions(host?'host-macos':'container'),factoryQualityInstructions(role),toolchainInstructions(app.sessions.record(session.id).developmentToolchain),executionInstructions(context.instructions,session.id)].filter(Boolean).join('\n\n');
         const result = await chats.run(chat.id, prompt, { autonomous: goal.autonomy === 'autonomous',systemInstructions });

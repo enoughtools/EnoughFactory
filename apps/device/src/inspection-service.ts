@@ -6,7 +6,8 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import type { Attempt, ControllerRun, ExecutionCapability, ExecutionTargetAdvertisement, FactoryTask, Goal, InspectionAuthority, InspectionJob, InspectionSourceIdentity, InspectionVerificationRun, Project, TaskQualityRequirements } from '@enoughfactory/contracts';
 import { readJsonObject, type AttemptDetail } from '@enoughfactory/factory';
-import { ArtifactStore, InspectionSnapshotManager, exportInspectionContainerRoots, type ArtifactManifest, type InspectionSnapshot } from '@enoughfactory/workspaces';
+import { ArtifactStore, InspectionSnapshotManager, exportInspectionContainerRoots, exportInspectionSnapshot, type ArtifactManifest, type InspectionSnapshot } from '@enoughfactory/workspaces';
+import { dockerInvocation } from '@enoughfactory/runtime';
 import { BrowserInspectionManager, type BrowserToolResult } from '@enoughfactory/browser-inspection';
 import { NativeInspectionBackend, type NativeAction } from '@enoughfactory/native-inspection';
 import type { DeviceApp } from './app.ts';
@@ -50,6 +51,15 @@ interface BackendRecord {id:string;kind:'native'|'browser';backendSessionId:stri
 interface BuildRecord {id:string;buildId:string;preparationArtifact?:ArtifactManifest;source?:InspectionSourceIdentity;finishedAt?:string;retiredAt?:string;}
 interface Submission {id:string;kind:'build'|'native'|'browser';chatSessionId:string;containerId?:string;profile?:NativeFixtureProfile;buildId?:string;snapshot?:InspectionSnapshot;}
 interface GrantToken {id:string;token:string;grantId:string;authority:InspectionAuthority;}
+// Service-owned preparation only. File descriptors keep chmod from following a
+// replaced symlink; every selected entry still has to match canonical bytes.
+const controllerModesScript=`const fs=require('node:fs/promises'),C=require('node:fs').constants,p=require('node:path'),crypto=require('node:crypto');
+(async()=>{const changes=JSON.parse(process.argv[1]);for(const {root,entry} of changes){
+if(!p.isAbsolute(root)||await fs.realpath(root)!==root||!entry.path||entry.path.split('/').some(x=>!x||x==='.'||x==='..'))throw Error('Unsafe controller source path.');
+const parts=entry.path.split('/');for(let i=1;i<parts.length;i++){const parent=await fs.lstat(p.join(root,...parts.slice(0,i)));if(!parent.isDirectory()||parent.isSymbolicLink())throw Error('Changed controller source parent.');}
+const target=p.join(root,...parts),state=await fs.lstat(target);if(entry.kind==='symlink'){if(!state.isSymbolicLink()||await fs.readlink(target)!==entry.target||typeof fs.lchmod!=='function')throw Error('Changed or unsupported controller source link.');await fs.lchmod(target,entry.mode);continue;}
+const handle=await fs.open(target,C.O_RDONLY|C.O_NOFOLLOW|(entry.kind==='directory'?C.O_DIRECTORY:0));try{const actual=await handle.stat();if(entry.kind==='directory'?!actual.isDirectory():!actual.isFile()||actual.size!==entry.size||crypto.createHash('sha256').update(await handle.readFile()).digest('hex')!==entry.sha256)throw Error('Controller source bytes changed during preparation.');await handle.chmod(entry.mode);}finally{await handle.close();}
+}})().catch(e=>{process.stderr.write(e.message);process.exitCode=1;});`;
 
 /** Service-owned visual tools. Provider processes receive only their own opaque authority. */
 export class InspectionService {
@@ -195,7 +205,7 @@ export class InspectionService {
   private goalQuality(goalId:string):TaskQualityRequirements|undefined {
     return inspectionGoalQuality(this.app.store,goalId);
   }
-  private async captureControllerSource(context:AgentToolBridgeContext,goal:Goal,controllerRunId:string):Promise<SourceRecord>{
+  private async controllerContext(context:AgentToolBridgeContext,goal:Goal,controllerRunId:string):Promise<AgentToolBridgeContext>{
     const project=this.app.store.get<Project>('projects',goal.projectId);if(!project)throw new Error('The integrated project is unavailable.');
     const declared=project.workingDirectories||[],mounted=context.session.workingDirectories||[];
     const direct=declared.map(root=>mounted.filter(item=>item.id===root.id));
@@ -214,7 +224,10 @@ export class InspectionService {
       try{const actual=await realpath(root.path);if(aggregated&&!actual.startsWith((await realpath(aggregate[0]!.path))+path.sep))throw new Error('Reference folder escapes its controller context.');}
       catch(error){context.signal.throwIfAborted();throw new Error(`The evaluator cannot read declared reference folder ${root.name}: ${(error as Error).message}`);}
     }
-    return this.captureActual({...context,session:{...context.session,workingDirectories:roots}});
+    return {...context,session:{...context.session,workingDirectories:roots}};
+  }
+  private async captureControllerSource(context:AgentToolBridgeContext,goal:Goal,controllerRunId:string):Promise<SourceRecord>{
+    return this.captureActual(await this.controllerContext(context,goal,controllerRunId));
   }
   private async canonicalSource(goal:Goal,signal?:AbortSignal):Promise<SourceRecord&{clean?:boolean;checkedCommit?:string}>{
     const project=this.app.store.get<Project>('projects',goal.projectId);if(!project)throw new Error('The integrated project is unavailable.');
@@ -233,27 +246,75 @@ export class InspectionService {
     const clean=primary?.kind==='git'?Boolean(before?.clean&&after?.clean&&before.commit===after.commit&&primary.sourceCommit===after.commit):undefined;
     return {id:snapshot.id,snapshot,...(clean!==undefined?{clean}:{}),...(clean?{checkedCommit:after!.commit}:{}),source:{snapshotId:snapshot.id,sha256:snapshot.sourceDigest,roots:snapshot.roots.map(root=>({id:root.id,sha256:root.sourceDigest,...(root.sourceCommit?{commit:root.sourceCommit}:{})}))}};
   }
+  /** Materialize canonical permissions, never normalize them out of source identity. */
+  private async prepareControllerSource(context:AgentToolBridgeContext,goal:Goal,run:ControllerRun,canonical:SourceRecord):Promise<SourceRecord>{
+    let current=await this.captureControllerSource(context,goal,run.id);
+    if(inspectionSourceContentMatches(current.source,canonical.source))return current;
+    const contents=(snapshot:InspectionSnapshot)=>JSON.stringify(snapshot.manifest.roots.map(root=>({id:root.id,name:root.name,entries:root.entries.map(({mode:_mode,...entry})=>entry)})));
+    if(contents(current.snapshot)!==contents(canonical.snapshot)){await this.snapshots.remove(current.snapshot);throw new Error('The evaluator workspace differs from the current integrated project or one of its reference folders. Changed bytes, paths and symlink targets require a fresh evaluator source context.');}
+    const assertCurrent=()=>{
+      context.signal.throwIfAborted();const saved=this.app.store.get<ControllerRun>('factory-controller-runs',run.id),actual=this.app.store.get<Goal>('goals',goal.id);
+      if(this.closing||saved?.sessionId!==context.session.id||saved.chatId!==context.chat.id||saved.role!=='evaluator'||!['starting','running','waiting'].includes(saved.status)||actual?.revision!==goal.revision||['paused','completed','failed','canceled'].includes(actual.status)||!this.app.sessions.owns(context.session.id)||this.chats.isRunning(context.chat.id))throw new Error('The evaluator source preparation owner changed.');
+    };
+    const selected=await this.controllerContext(context,goal,run.id),paths=new Map([['primary',context.execution.workdir],...(selected.session.workingDirectories||[]).map(root=>[root.id,root.path] as [string,string])]);
+    const originalEntries=new Map(current.snapshot.manifest.roots.map(root=>[root.id,new Map(root.entries.map(entry=>[entry.path,entry]))]));
+    const changes=canonical.snapshot.manifest.roots.flatMap(root=>root.entries.filter(entry=>originalEntries.get(root.id)!.get(entry.path)!.mode!==entry.mode).map(entry=>({rootId:root.id,root:paths.get(root.id)!,entry}))).sort((left,right)=>right.entry.path.split('/').length-left.entry.path.split('/').length);
+    let auditId:string|undefined;
+    try{
+      assertCurrent();
+      const project=this.app.store.get<Project>('projects',goal.projectId)!,canonicalPaths=new Map([['primary',project.path],...(project.workingDirectories||[]).map(root=>[root.id,root.path] as [string,string])]);
+      for(const change of changes){if(!change.root)throw new Error('The evaluator omitted a declared source root.');if(context.execution.kind==='host-macos'&&await realpath(change.root)===await realpath(canonicalPaths.get(change.rootId)!))throw new Error('Canonical source permissions cannot be changed while preparing an evaluator.');}
+      const previous=await exportInspectionSnapshot({snapshot:current.snapshot,artifacts:this.artifacts,context:{goalId:goal.id,taskId:'control-evaluator',attemptId:run.id},signal:context.signal});
+      for(const artifact of [previous.sourceManifest,...previous.sourceArtifacts.map(root=>root.manifest)])this.app.store.set('factory-artifacts',artifact);
+      auditId=randomUUID();this.app.store.set('controller-source-preparations',{id:auditId,controllerRunId:run.id,goalId:goal.id,goalRevision:goal.revision,sessionId:context.session.id,chatId:context.chat.id,status:'preparing',previous:current.source,previousTransfer:previous,canonical:canonical.source,changedModes:changes.length,createdAt:new Date().toISOString()});
+      for(let offset=0;offset<changes.length;offset+=32){
+        assertCurrent();const args=['-e',controllerModesScript,JSON.stringify(changes.slice(offset,offset+32))];
+        if(context.execution.kind==='container'){const invocation=dockerInvocation(this.app.runtime.endpoint,['exec','--user','0',context.execution.containerId!,'/opt/enoughfactory/node/bin/node',...args]);await execute(invocation.command,invocation.args,{env:invocation.env,timeout:30000,maxBuffer:1024*1024,signal:context.signal});}
+        else await execute(process.execPath,args,{timeout:30000,maxBuffer:1024*1024,signal:context.signal});
+      }
+      assertCurrent();const restored=await this.captureControllerSource(context,goal,run.id);
+      if(!inspectionSourceContentMatches(restored.source,canonical.source)){await this.snapshots.remove(restored.snapshot);throw new Error('The evaluator source changed while canonical permissions were materialized.');}
+      this.app.store.set('controller-source-preparations',{...this.app.store.get<{id:string}>('controller-source-preparations',auditId)!,status:'ready',actual:restored.source,completedAt:new Date().toISOString()});
+      await this.snapshots.remove(current.snapshot);current=restored;return current;
+    }catch(error){if(auditId)this.app.store.set('controller-source-preparations',{...this.app.store.get<{id:string}>('controller-source-preparations',auditId)!,status:'failed',error:(error as Error).message,completedAt:new Date().toISOString()});await this.snapshots.remove(current.snapshot);throw error;}
+  }
+  prepareControllerReview:NonNullable<FactoryInspectionPorts['prepareControllerReview']>=async input=>{
+    if(!this.goalQuality(input.goal.id))return;
+    const chat=input.run.chatId&&this.app.store.get<import('@enoughfactory/contracts').Chat>('chats',input.run.chatId);if(!chat)throw new Error('The evaluator source preparation conversation is unavailable.');
+    const context:AgentToolBridgeContext={chat,session:this.app.sessions.record(input.run.sessionId),execution:this.app.sessions.execution(input.run.sessionId),signal:input.signal||new AbortController().signal};
+    const canonical=await this.canonicalSource(input.goal,input.signal);let current:SourceRecord|undefined;
+    try{
+      if(canonical.clean===false)throw new Error('The integrated project changed before evaluator source preparation.');
+      current=await this.prepareControllerSource(context,input.goal,input.run,canonical);
+      const after=await this.canonicalSource(input.goal,input.signal);
+      try{if(!inspectionSourceContentMatches(after.source,canonical.source)||after.clean===false||after.checkedCommit!==canonical.checkedCommit)throw new Error('The integrated project changed during evaluator source preparation.');}finally{await this.snapshots.remove(after.snapshot);}
+    }finally{await this.snapshots.remove(canonical.snapshot);if(current)await this.snapshots.remove(current.snapshot);}
+  };
   reviewController=async(input:{goal:Goal;run:ControllerRun;resultText:string;signal?:AbortSignal})=>{
     const quality=this.goalQuality(input.goal.id);if(!quality)return {ready:true,evidenceIds:[]};
-    const decision=readJsonObject(input.resultText);if(decision.complete!==true)return {ready:true,evidenceIds:[]};
+    const decision=readJsonObject(input.resultText);
+    // An actionable repair plan returns to planning. Missing canonical evidence
+    // alone is a service-owned verification step, independent of a success claim.
+    if(decision.complete!==true&&Array.isArray(decision.additionalTasks)&&decision.additionalTasks.length)return {ready:true,evidenceIds:[]};
     const chat=input.run.chatId&&this.app.store.get<import('@enoughfactory/contracts').Chat>('chats',input.run.chatId);
     if(!chat)return {ready:false,reason:'The evaluator conversation is unavailable.',evidenceIds:[]};
     const context:AgentToolBridgeContext={chat,session:this.app.sessions.record(input.run.sessionId),execution:this.app.sessions.execution(input.run.sessionId),signal:input.signal||new AbortController().signal};
     const canonical=await this.canonicalSource(input.goal,input.signal);
     let current:SourceRecord|undefined;
     try{let review:unknown;try{review=decision.visualReview;}catch{/* The protocol parser retains its own decision error. */}
-      try{current=await this.captureControllerSource(context,input.goal,input.run.id);}catch(error){input.signal?.throwIfAborted();return {ready:false,reason:(error as Error).message,evidenceIds:[]};}
+      const tasks=this.app.store.list<FactoryTask>('tasks').filter(task=>task.goalId===input.goal.id);
+      const reports=await this.quality.controllerReportContext({goalId:input.goal.id,source:canonical.source});
+      const currentPolicies=reports.reports.filter(report=>report.currentSource&&report.currentAuthority&&report.latestForPolicy&&!report.unavailable&&report.recordedStatus==='ready-for-review').flatMap(report=>report.quality?[report.quality as TaskQualityRequirements]:[]);
+      const currentCoverage=quality.platforms.every(platform=>currentPolicies.some(policy=>policy.platforms.includes(platform)))
+        &&quality.workflows.every(workflow=>currentPolicies.some(policy=>policy.workflows.some(item=>item.id===workflow.id&&item.platform===workflow.platform)))
+        &&quality.referenceIds.every(id=>currentPolicies.some(policy=>policy.referenceIds.includes(id)));
+      if(decision.complete!==true&&(currentCoverage||tasks.some(task=>!['completed','canceled'].includes(task.status))))return {ready:true,evidenceIds:[]};
+      try{current=await this.prepareControllerSource(context,input.goal,input.run,canonical);}catch(error){input.signal?.throwIfAborted();return {ready:false,reason:(error as Error).message,evidenceIds:[]};}
       if(!inspectionSourceContentMatches(current.source,canonical.source))return {ready:false,reason:'The evaluator workspace differs from the current integrated project or one of its reference folders. Refresh verification from the current source; retained screenshots cannot certify changed or reverted code.',evidenceIds:[]};
       if(canonical.clean===false)return {ready:false,reason:'The integrated project has uncommitted changes or changed while its source was captured. Commit or restore those changes before final app verification; no completed commit can certify this working tree.',evidenceIds:[]};
-      let checked=await this.quality.reviewCheck({goalId:input.goal.id,controllerRunId:input.run.id,source:canonical.source,quality,review});
+      let checked=decision.complete===true?await this.quality.reviewCheck({goalId:input.goal.id,controllerRunId:input.run.id,source:canonical.source,quality,review}):{ready:false,reason:'Inspect the independently verified current integrated product before deciding completion.',evidenceIds:[] as string[]};
       if(!checked.ready){
-        const tasks=this.app.store.list<FactoryTask>('tasks').filter(task=>task.goalId===input.goal.id);
         if(tasks.some(task=>!['completed','canceled'].includes(task.status)))return {ready:false,reason:'Finish or explicitly cancel the remaining goal tasks before final app verification. Their recorded requirements remain part of acceptance.',evidenceIds:[]};
-        const reports=await this.quality.controllerReportContext({goalId:input.goal.id,source:canonical.source});
-        const currentPolicies=reports.reports.filter(report=>report.currentSource&&report.currentAuthority&&report.latestForPolicy&&!report.unavailable&&report.recordedStatus==='ready-for-review').flatMap(report=>report.quality?[report.quality as TaskQualityRequirements]:[]);
-        const currentCoverage=quality.platforms.every(platform=>currentPolicies.some(policy=>policy.platforms.includes(platform)))
-          &&quality.workflows.every(workflow=>currentPolicies.some(policy=>policy.workflows.some(item=>item.id===workflow.id&&item.platform===workflow.platform)))
-          &&quality.referenceIds.every(id=>currentPolicies.some(policy=>policy.referenceIds.includes(id)));
         const anchors=tasks.filter(task=>task.status==='completed').flatMap(task=>{
           const attempt=task.currentAttemptId?this.app.store.get<Attempt>('attempts',task.currentAttemptId):undefined,detail=attempt?this.app.store.get<AttemptDetail>('factory-attempt-details',attempt.id):undefined;
           if(!attempt||attempt.status!=='succeeded'||!detail?.candidate||!detail.integration||detail.integration.candidateCommit!==detail.candidate.commit||!/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(detail.candidate.commit)||!/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(detail.integration.commit))return [];
