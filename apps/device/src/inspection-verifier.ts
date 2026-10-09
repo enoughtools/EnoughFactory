@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { chmod, cp, lchmod, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
-import type { Chat, ExecutionCapability, ExecutionTargetAdvertisement, Goal, InspectionAuthority, InspectionSourceIdentity, InspectionVerificationRun, Project, Session, TaskQualityRequirements } from '@enoughfactory/contracts';
+import type { Chat, ChatEvent, ExecutionCapability, ExecutionTargetAdvertisement, Goal, InspectionAuthority, InspectionSourceIdentity, InspectionVerificationRun, Project, Session, TaskQualityRequirements } from '@enoughfactory/contracts';
 import { ArtifactStore, InspectionSnapshotManager, WorkspaceManager, exportInspectionContainerRoots, exportInspectionSnapshot, importInspectionSnapshot, verifyInspectionSnapshotContents, writeAtomic, type InspectionSnapshot, type InspectionSnapshotTransfer, type WorkspaceRecord } from '@enoughfactory/workspaces';
 import { dockerInvocation } from '@enoughfactory/runtime';
 import type { DeviceApp } from './app.ts';
@@ -63,6 +63,8 @@ export interface InspectionVerifierOptions {
   timeoutMs?: number;
   /** Alternate owner must prepare and verify exact private execution copies before return. */
   prepareExecution?: (input: VerificationPreparation) => Promise<Session>;
+  /** Stop-only reconciliation of original inspection jobs; no uncertain action is replayed. */
+  reconcileInspection?: (run: InspectionVerificationRun, signal: AbortSignal) => Promise<boolean>;
 }
 
 function canonical(value: unknown): string {
@@ -130,7 +132,8 @@ export class InspectionVerifier {
     const live = this.active.get(id);
     if (live) return live.promise;
     const reconcileSetup = existing && this.preDispatchContainerSetupUnknown(existing);
-    if (existing && terminal.has(existing.status) && !reconcileSetup) return Promise.resolve(existing);
+    const reconcileReboot = existing && this.interruptedHostVerifier(existing);
+    if (existing && terminal.has(existing.status) && !reconcileSetup && !reconcileReboot) return Promise.resolve(existing);
     if (existing && ['preparing', 'running'].includes(existing.status)) return Promise.resolve(this.patch(id, { status: 'unknown', completedAt: undefined, reason: 'The verifier process lost its service owner. Reconcile its retained conversation and jobs before continuing.' }));
     const target = input.quality.platforms.includes('web') ? 'container' : 'host-macos';
     if (!existing) {
@@ -142,6 +145,7 @@ export class InspectionVerifier {
     input.signal?.addEventListener('abort', forward, { once: true });
     const promise = Promise.resolve().then(async () => {
       if (reconcileSetup && !await this.reconcilePreDispatchContainerSetup(id, input, abort.signal)) return this.get(id);
+      if (reconcileReboot && !await this.reconcileInterruptedHostVerifier(id, input, abort.signal)) return this.get(id);
       return this.execute(id, input, abort);
     }).then(() => this.get(id)).finally(() => { input.signal?.removeEventListener('abort', forward); this.active.delete(id); });
     this.active.set(id, { promise, abort });
@@ -149,7 +153,80 @@ export class InspectionVerifier {
   }
 
   private preDispatchContainerSetupUnknown(run: InspectionVerificationRun): boolean {
-    return run.status === 'unknown' && run.executionTargetKind === 'container' && !!run.sessionId && run.chatId === undefined && run.startedAt === undefined && run.completedAt === undefined;
+    return run.status === 'unknown' && run.executionTargetKind === 'container' && !!run.sessionId && run.completedAt === undefined &&
+      (run.chatId === undefined && run.startedAt === undefined || !!run.chatId && !!run.startedAt && !!this.unusedReservedChat(run));
+  }
+
+  /** ChatController journals the user input before any asynchronous provider admission. */
+  private unusedReservedChat(run: InspectionVerificationRun): Chat | undefined {
+    const chat = run.chatId && this.options.app.store.get<Chat>('chats', run.chatId);
+    if (!chat || chat.sessionId !== run.sessionId || chat.verificationRunId !== run.id || chat.deviceId !== run.ownerDeviceId || chat.runtime !== 'codex' || chat.status !== 'idle' || chat.threadId !== undefined || chat.attemptId !== undefined || chat.error !== undefined || this.options.chats.isRunning(chat.id)) return undefined;
+    if (this.options.app.store.events('chat', chat.id).length || this.options.app.store.get('chat-results', chat.id) || this.options.app.store.get('chat-turn-failures', chat.id)) return undefined;
+    return chat;
+  }
+
+  private interruptedHostVerifier(run: InspectionVerificationRun): boolean {
+    return run.status === 'unknown' && run.executionTargetKind === 'host-macos' && !!run.sessionId && !!run.chatId && !!run.startedAt && run.completedAt === undefined;
+  }
+
+  /** A positively identified reboot ends old processes, not their verification result. */
+  private async reconcileInterruptedHostVerifier(id: string, input: VerificationInput, signal: AbortSignal): Promise<boolean> {
+    const original = this.get(id), originalChat = this.options.app.store.get<Chat>('chats', original.chatId!);
+    const eligible = () => {
+      signal.throwIfAborted();
+      const run = this.get(id), chat = this.options.app.store.get<Chat>('chats', original.chatId!);
+      if (this.closing || !this.interruptedHostVerifier(run) || canonical(run) !== canonical(original) || run.ownerDeviceId !== this.options.app.device.id || run.id !== inspectionVerificationKey(run) || run.policySha256 !== inspectionQualityPolicySha256(run.quality) || !this.options.authorityCurrent(run.authority)) return false;
+      if (run.purpose === 'goal-final' && this.options.app.store.get<Goal>('goals', run.authority.goalId)?.revision !== run.goalRevision) return false;
+      if (canonical(run.authority) !== canonical(input.authority) || canonical(run.quality) !== canonical(input.quality) || run.source.candidateId !== input.source.candidateId || run.source.candidateCommit !== input.source.candidateCommit || !inspectionSourceContentMatches(run.source, input.source)) return false;
+      if (!chat || !originalChat || canonical(chat) !== canonical(originalChat) || chat.verificationRunId !== id || chat.sessionId !== run.sessionId || chat.deviceId !== run.ownerDeviceId || chat.runtime !== 'codex' || ['running', 'waiting'].includes(chat.status) || this.options.chats.isRunning(chat.id)) return false;
+      const session = this.options.app.sessions.record(run.sessionId!);
+      return session.verificationRunId === id && session.deviceId === run.ownerDeviceId && session.executionTargetKind === 'host-macos' && this.options.app.sessions.owns(session.id)
+        && !this.options.app.store.list<Chat>('chats').some(other => other.sessionId === session.id && other.id !== chat.id && ['running', 'waiting'].includes(other.status));
+    };
+    try {
+      if (!eligible() || !this.options.reconcileInspection) return false;
+      const execution = this.options.app.sessions.execution(original.sessionId!);
+      if (execution.kind !== 'host-macos') return false;
+      const processes = (await this.options.chats.manager.hostProcesses()).filter(process => process.sessionId === original.sessionId || process.sessionId.startsWith(`${original.sessionId}-decision-`));
+      const originalProcesses = processes.filter(process => process.sessionId === original.sessionId && process.cwd === execution.workdir && Date.parse(process.createdAt ?? '') >= Date.parse(original.startedAt!));
+      // Empty inventories and same-boot missing/recycled PIDs are not evidence.
+      if (!originalProcesses.length || processes.some(process => process.state !== 'exited') || !originalProcesses.every(process => {
+        const proof = process.termination;
+        return proof?.schemaVersion === 2 && proof.kind === 'host-reboot' && proof.evidence === 'boot-identity-change' && proof.previousBoot?.platform === proof.currentBoot.platform && proof.previousBoot.machineId === proof.currentBoot.machineId && proof.previousBoot.bootId !== proof.currentBoot.bootId;
+      })) return false;
+      const bindings = this.options.app.store.events<ChatEvent>('chat', original.chatId!).map(event => event.value).filter(event => event.kind === 'status' && event.data?.status === 'running' && typeof event.data.threadId === 'string').map(event => event.data!.threadId as string);
+      const threadIds = new Set([...(originalChat!.threadId ? [originalChat!.threadId] : []), ...bindings]);
+      if (threadIds.size !== 1) return false;
+      const threadId = [...threadIds][0]!;
+      if (!threadId.trim() || threadId.length > 256) return false;
+      const saved = this.options.app.store.get<VerificationInputs>(INPUTS, id);
+      if (!saved || saved.retiredAt || saved.retirement) return false;
+      for (const artifact of [saved.transfer.sourceManifest, ...saved.transfer.sourceArtifacts.map(root => root.manifest)]) {
+        if (canonical(await this.artifacts.get(artifact.id)) !== canonical(artifact)) return false;
+        await this.artifacts.path(artifact);
+      }
+      const snapshot = await importInspectionSnapshot({ dataDir: path.join(this.options.app.dataDir, 'workspace-data', 'inspection-verification', id), artifacts: this.artifacts, sourceArtifacts: saved.transfer.sourceArtifacts, sourceManifest: saved.transfer.sourceManifest, expectedSource: { snapshotId: original.source.snapshotId, sourceDigest: original.source.sha256 }, context: original.authority, signal });
+      if (!eligible() || !inspectionSourceContentMatches(original.source, { snapshotId: snapshot.id, sha256: snapshot.sourceDigest, roots: snapshot.roots.map(root => ({ id: root.id, sha256: root.sourceDigest })) })) return false;
+      await this.assertExecutionSource(original.sessionId!, snapshot, signal);
+      if (!eligible() || !await this.options.reconcileInspection(original, signal) || !eligible()) return false;
+      // Ordinary stop hooks check every original provider and retain extra-root
+      // files. They do not claim old actions or the old verifier turn succeeded.
+      await this.options.app.sessions.stop(original.sessionId!);
+      if (!eligible() || this.options.app.sessions.record(original.sessionId!).status !== 'stopped') return false;
+      await this.assertExecutionSource(original.sessionId!, snapshot, signal);
+      this.options.app.store.transaction(() => {
+        if (!eligible()) throw new Error('The reboot continuation owner changed.');
+        this.options.app.store.append('inspection-verifier-reconciliation', id, { action: 'host-reboot-continuation', previous: original, chat: originalChat, processes: originalProcesses, threadId, source: original.source, at: this.now() });
+        this.options.app.store.set(INPUTS, { ...saved, snapshot });
+        this.options.app.store.set('chats', { ...originalChat!, threadId });
+        this.patch(id, { status: 'waiting', reason: 'The original host provider ended during a confirmed reboot. Continuing its retained independent verification conversation with fresh inspection sessions.', completedAt: undefined });
+      });
+      return true;
+    } catch {
+      // Any changed source/authority, missing receipt or uncertain backend keeps
+      // the old unknown result and cannot admit another provider turn.
+      return false;
+    }
   }
 
   /** Only a removed original container and no provider dispatch permit setup replay. */
@@ -163,8 +240,9 @@ export class InspectionVerifier {
       if (canonical(run.authority) !== canonical(input.authority) || canonical(run.quality) !== canonical(input.quality) || run.source.candidateId !== input.source.candidateId || run.source.candidateCommit !== input.source.candidateCommit || !inspectionSourceContentMatches(run.source, input.source)) return false;
       const session = this.options.app.sessions.record(run.sessionId!);
       const archive = this.options.app.sessions.archivedEnvironment(session.id);
+      const unused = this.unusedReservedChat(run);
       return (session.executionTargetKind === undefined ? 'container' : session.executionTargetKind) === 'container' && session.deviceId === run.ownerDeviceId && session.verificationRunId === run.id && session.status === 'stopped' && this.options.app.sessions.owns(session.id)
-        && !this.options.app.store.list<Chat>('chats').some(chat => chat.sessionId === session.id)
+        && !this.options.app.store.list<Chat>('chats').some(chat => chat.sessionId === session.id && chat.id !== unused?.id)
         && archive?.status === 'removed' && archive.id === session.id && /^[a-f0-9]{64}$/.test(archive.containerId)
         && archive.receipt?.version === 2 && archive.receipt.status === 'removed' && archive.receipt.containerId === archive.containerId && archive.receipt.identity.sessionId === session.id
         && archive.receipt.identity.name === archive.name && archive.receipt.identity.sessionName === session.name
@@ -174,6 +252,7 @@ export class InspectionVerifier {
       if (!eligible() || !this.options.app.sessions.canRetireEnvironment(original.sessionId!)) return false;
       return await this.options.app.sessions.withStoppedInputs(original.sessionId!, async () => {
         if (!eligible()) return false;
+        if (original.chatId && (!this.options.reconcileInspection || !await this.options.reconcileInspection(original, signal) || !eligible())) return false;
         const saved = this.options.app.store.get<VerificationInputs>(INPUTS, id);
         if (!saved || saved.retiredAt || saved.retirement) return false;
         for (const artifact of [saved.transfer.sourceManifest, ...saved.transfer.sourceArtifacts.map(root => root.manifest)]) {
@@ -184,7 +263,7 @@ export class InspectionVerifier {
         if (!eligible() || !inspectionSourceContentMatches(original.source, { snapshotId: snapshot.id, sha256: snapshot.sourceDigest, roots: snapshot.roots.map(root => ({ id: root.id, sha256: root.sourceDigest })) })) return false;
         this.options.app.store.transaction(() => {
           if (!eligible()) throw new Error('The stopped setup reconciliation owner changed.');
-          this.options.app.store.append('inspection-verifier-reconciliation', id, { action: 'stopped-container-setup', previous: original, sessionId: original.sessionId, source: original.source, archiveContainerId: this.options.app.sessions.archivedEnvironment(original.sessionId!)!.containerId, at: this.now() });
+          this.options.app.store.append('inspection-verifier-reconciliation', id, { action: original.chatId ? 'unused-container-verifier-chat' : 'stopped-container-setup', previous: original, ...(original.chatId ? { chat: this.unusedReservedChat(original), providerAdmission: 'no-journaled-turn', archiveReceipt: this.options.app.sessions.archivedEnvironment(original.sessionId!)!.receipt } : {}), sessionId: original.sessionId, source: original.source, archiveContainerId: this.options.app.sessions.archivedEnvironment(original.sessionId!)!.containerId, at: this.now() });
           this.options.app.store.set(INPUTS, { ...saved, snapshot });
           this.patch(id, { status: 'waiting', reason: 'The original container was confirmed removed before any verifier turn started. Retrying the retained independent setup.', completedAt: undefined });
         });
@@ -273,16 +352,21 @@ export class InspectionVerifier {
       assertCurrent();
       await this.snapshotManager(id).verify(snapshot, abort.signal);
       const goal = this.options.app.store.get<Goal>('goals', run.authority.goalId);
-      const chat = this.options.chats.create({ sessionId: session.id, runtime: 'codex', approvalMode: goal?.approvalMode ?? input.project.approvalMode, title: `Verify ${run.source.checkedCommit!.slice(0, 12)}`, verificationRunId: id });
-      this.patch(id, { status: 'running', chatId: chat.id, startedAt: this.now() });
+      const chat = run.chatId ? this.options.app.store.get<Chat>('chats', run.chatId) : this.options.chats.create({ sessionId: session.id, runtime: 'codex', approvalMode: goal?.approvalMode ?? input.project.approvalMode, title: `Verify ${run.source.checkedCommit!.slice(0, 12)}`, verificationRunId: id });
+      if (!chat || chat.sessionId !== session.id || chat.verificationRunId !== id || chat.deviceId !== run.ownerDeviceId || chat.runtime !== 'codex' || this.options.chats.isRunning(chat.id)) throw Object.assign(new Error(setupOwnerChangedReason), { code: 'HOST_PROCESS_UNKNOWN' });
+      this.patch(id, { status: 'running', chatId: chat.id, startedAt: run.startedAt ?? this.now() });
       const stop = () => { void this.options.chats.interrupt(chat.id).catch(() => {}); };
       abort.signal.addEventListener('abort', stop, { once: true });
       try {
         assertCurrent();
         const context = await this.options.quality.context({ authority: run.authority, source: run.source, referenceIds: run.quality.referenceIds });
         assertCurrent();
+        const continuation = run.chatId ? 'Continue this same independent verification conversation after service-owned reconciliation. An interrupted prior turn is not a success. Its unknown actions remain unknown: never repeat their old request IDs or use stale observation/element IDs. All original inspection sessions were confirmed stopped before this continuation. Start fresh owned inspection sessions, inspect their actual state, and complete the full frozen workflow and visual review contract for this same exact source. Do not resume or change the ended author.\n\n' : '';
+        const turn = this.options.chats.run(chat.id, continuation + this.prompt(this.get(id), context), { attemptId: run.authority.attemptId, verificationRunId: id, autonomous: true, systemInstructions: factoryQualityInstructions('evaluator') });
+        // ChatController's synchronous guards precede its durable user event and
+        // any provider admission. A guard rejection did not dispatch a model.
         dispatched = true;
-        await abortable(this.options.chats.run(chat.id, this.prompt(this.get(id), context), { attemptId: run.authority.attemptId, verificationRunId: id, autonomous: true, systemInstructions: factoryQualityInstructions('evaluator') }), abort.signal);
+        await abortable(turn, abort.signal);
         providerEnded = true;
       } finally { abort.signal.removeEventListener('abort', stop); }
       assertCurrent();

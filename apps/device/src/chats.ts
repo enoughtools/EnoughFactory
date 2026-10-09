@@ -78,6 +78,9 @@ export class ChatController {
   event(chatId:string,event:AgentEvent):ChatEvent{
     const record:ChatEvent={...event,id:id('event'),chatId,seq:0,at:now()};
     const seq=this.app.store.append('chat',chatId,record);record.seq=seq;
+    // Bind the provider conversation as soon as it exists. A reboot can end a
+    // turn before its final result, but must not replace the original thread.
+    if(event.kind==='status'&&event.data?.status==='running'&&typeof event.data.threadId==='string'&&event.data.threadId.trim())this.patch(chatId,{threadId:event.data.threadId});
     if(event.kind==='approval'&&event.data?.approval){const approval=event.data.approval as Approval;this.app.store.set('approvals',approval);if(approval.status!=='pending')this.approvals.delete(approval.id);}
     this.app.emit('chat',record);this.app.changed();return record;
   }
@@ -132,7 +135,7 @@ export class ChatController {
       }
       });
       } finally {signal.removeEventListener('abort',abort);await bridge?.release?.();}
-    }).then(result=>{this.app.store.set('chat-results',{id:chatId,result,attemptId:options.attemptId,completedAt:now()});this.patch(chatId,{status:'idle',threadId:result.threadId||chat.threadId});return result;}).catch(error=>{const current=this.get(chatId);this.app.store.set('chat-turn-failures',{id:chatId,attemptId:options.attemptId,error:error.message,code:error.code,agentStarted:error.agentStarted,executionEnded:error.executionEnded===true,completedAt:now()});this.patch(chatId,{status:current.status==='interrupted'?'interrupted':'failed',error:error.message});throw error;}).finally(()=>{this.running.delete(chatId);this.turnAborts.delete(chatId);});
+    }).then(result=>{this.app.store.set('chat-results',{id:chatId,result,attemptId:options.attemptId,completedAt:now()});this.patch(chatId,{status:'idle',threadId:result.threadId||this.get(chatId).threadId});return result;}).catch(error=>{const current=this.get(chatId);this.app.store.set('chat-turn-failures',{id:chatId,attemptId:options.attemptId,error:error.message,code:error.code,agentStarted:error.agentStarted,executionEnded:error.executionEnded===true,completedAt:now()});this.patch(chatId,{status:current.status==='interrupted'?'interrupted':'failed',error:error.message});throw error;}).finally(()=>{this.running.delete(chatId);this.turnAborts.delete(chatId);});
     this.running.set(chatId,job);return job;
   }
   private async cancelHostSession(sessionId:string):Promise<void>{

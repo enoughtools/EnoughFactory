@@ -102,6 +102,25 @@ test('native chat uses service admission and actual private roots while Docker i
   assert.equal(f.store.get<{ result: TurnResult }>('chat-results', chat.id)?.result.text, 'completed native work');
 });
 
+test('a provider thread is durable before an interrupted host turn ends', { timeout: 10_000 }, async t => {
+  const f = fixture(t), chat = f.createChat();
+  f.manager.runTurn = async (input, callbacks) => {
+    f.turns.push({ input, callbacks });
+    await callbacks.onEvent({ kind: 'status', text: 'Agent running', data: { status: 'running', threadId: 'original-provider-thread' } });
+    assert.equal(f.controller.get(chat.id).threadId, 'original-provider-thread');
+    throw Object.assign(new AgentError('Host transport interrupted.', 'HOST_PROCESS_UNKNOWN'), { agentStarted: true, executionEnded: false });
+  };
+  await assert.rejects(f.controller.run(chat.id, 'Inspect exact source'), /transport interrupted/);
+  assert.equal(f.controller.get(chat.id).threadId, 'original-provider-thread');
+  assert.equal(f.controller.get(chat.id).status, 'failed');
+  f.manager.runTurn = async input => {
+    assert.equal(input.threadId, 'original-provider-thread');
+    return { text: 'Continued original conversation with no final thread field.' };
+  };
+  await f.controller.run(chat.id, 'Continue after reconciliation');
+  assert.equal(f.controller.get(chat.id).threadId, 'original-provider-thread');
+});
+
 test('pinned preparation precedes scoped bridge configuration and image callback; failure still releases bridge', { timeout: 10_000 }, async t => {
   const f = fixture(t), chat = f.createChat();
   const image = Buffer.from([0x89, 0x50, 0x4e, 0x47]), imageReference = { artifactId: 'image-artifact', sha256: 'b'.repeat(64), mimeType: 'image/png', byteLength: image.length };

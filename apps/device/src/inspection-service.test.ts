@@ -4,7 +4,7 @@ import { mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test, { type TestContext } from 'node:test';
-import type { InspectionAuthority, InspectionEvidence, InspectionSourceIdentity, TaskQualityRequirements } from '@enoughfactory/contracts';
+import type { InspectionAuthority, InspectionEvidence, InspectionSourceIdentity, InspectionVerificationRun, TaskQualityRequirements } from '@enoughfactory/contracts';
 import type { BrowserObservation } from '@enoughfactory/browser-inspection';
 import type { DeviceApp } from './app.ts';
 import type { AgentToolBridgeContext, ChatController } from './chats.ts';
@@ -21,6 +21,8 @@ interface TestSeam {
   active: Map<string, Promise<void>>;
   closing: boolean;
   recoverOwnedSessions(): Promise<void>;
+  reconcileVerifierInspection(run: InspectionVerificationRun, signal: AbortSignal): Promise<boolean>;
+  contexts: Map<string, AgentToolBridgeContext>;
 }
 const value = <T>(result: ToolResult): T => JSON.parse(result.content.find(block => block.type === 'text')!.text!) as T;
 
@@ -145,6 +147,43 @@ test('restart reconciliation releases only confirmed owned resources and preserv
   await f.seam.recoverOwnedSessions();
   assert.equal(f.service.jobs.getJob(job.id)!.status,'failed');assert.equal(f.service.jobs.getSession(session.id)!.status,'stopped');
   assert.equal(f.service.jobs.leases(job.id)[0]!.status,'released');assert.equal(f.service.jobs.actions(session.id)[0]!.status,'unknown');
+});
+
+test('verifier reboot reconciliation stops only its original jobs while unrelated active inspection survives',async t=>{
+  const f=await fixture(t),owned=f.createSession();
+  const action=f.service.jobs.beginAction(f.token,owned.session.id,{idempotencyKey:'interrupted-action',kind:'observe',arguments:{}});
+  f.service.jobs.markActionRunning(action.action.id);f.service.jobs.recoverAfterRestart();
+  const otherAuthority={...f.authority,taskId:'other-task',attemptId:'other-attempt'};
+  f.store.set('tasks',{id:otherAuthority.taskId,goalId:'goal',currentAttemptId:otherAuthority.attemptId});
+  f.store.set('attempts',{id:otherAuthority.attemptId,taskId:otherAuthority.taskId,generation:2,status:'running'});
+  f.store.set('factory-attempt-details',{id:otherAuthority.attemptId,assignmentGoalRevision:4});
+  const otherToken=f.service.jobs.issueAuthority(otherAuthority,{capabilities:['chromium-inspection'],executionTargetIds:['container']}).token;
+  const other=f.service.jobs.createJob(otherToken,{idempotencyKey:'other-live-browser',executionTargetId:'container',capability:'chromium-inspection',source:{snapshotId:'other-source',sha256:'e'.repeat(64)},profile:{}});
+  assert.equal(f.service.jobs.claimNext()!.id,other.id);f.service.jobs.markRunning(other.id);
+  const otherSession=f.service.jobs.openSession(other.id);f.service.jobs.markSessionReady(otherSession.id);
+  f.store.set('inspection-backends',{id:otherSession.id,kind:'browser',backendSessionId:'other-live-backend'});
+  f.seam.active.set(other.id,Promise.resolve());
+  f.seam.contexts.set('other-context',{...f.context,attemptId:otherAuthority.attemptId});
+  let ownStops=0,otherStops=0;
+  Object.assign(f.service.native,{recoverStop:async(id:string)=>{assert.equal(id,'backend');ownStops++;return {status:'stopped'};}});
+  Object.assign(f.service.browser,{retire:async()=>{otherStops++;throw new Error('Unrelated browser must remain live');}});
+  const run={id:'original-verifier',authority:f.authority,source:f.source} as InspectionVerificationRun;
+  assert.equal(await f.seam.reconcileVerifierInspection(run,new AbortController().signal),true);
+  assert.equal(ownStops,1);assert.equal(otherStops,0);
+  assert.equal(f.service.jobs.getJob(owned.job.id)!.status,'failed');assert.equal(f.service.jobs.getSession(owned.session.id)!.status,'stopped');
+  assert.equal(f.service.jobs.actions(owned.session.id)[0]!.status,'unknown');
+  assert.equal(f.service.jobs.getJob(other.id)!.status,'running');assert.equal(f.service.jobs.getSession(otherSession.id)!.status,'ready');
+  assert.equal(f.service.jobs.leases(other.id)[0]!.status,'held');
+});
+
+test('verifier reconciliation cannot stop or replace a related inspection with a live job or tool context',async t=>{
+  for(const owner of ['job','context'] as const)await t.test(owner,async t=>{
+    const f=await fixture(t),{job,session}=f.createSession();
+    if(owner==='job')f.seam.active.set(job.id,Promise.resolve());else f.seam.contexts.set('live-context',f.context);
+    let stops=0;Object.assign(f.service.native,{recoverStop:async()=>{stops++;return {status:'stopped'};}});
+    assert.equal(await f.seam.reconcileVerifierInspection({id:'original-verifier',authority:f.authority,source:f.source} as InspectionVerificationRun,new AbortController().signal),false);
+    assert.equal(stops,0);assert.equal(f.service.jobs.getSession(session.id)!.status,'ready');assert.equal(f.service.jobs.leases(job.id)[0]!.status,'held');
+  });
 });
 
 test('reusing a native build request with different semantic arguments rejects before another capture', async t => {

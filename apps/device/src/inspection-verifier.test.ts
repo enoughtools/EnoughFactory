@@ -4,6 +4,7 @@ import { chmod, cp, lstat, mkdir, mkdtemp, readFile, readlink, realpath, rename,
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test, { type TestContext } from 'node:test';
+import type { HostProcessState } from '@enoughfactory/agents';
 import type { Chat, ExecutionTargetAdvertisement, Goal, InspectionAuthority, InspectionSourceIdentity, InspectionVerificationRun, Project, Session, TaskQualityRequirements } from '@enoughfactory/contracts';
 import { ArtifactStore, InspectionSnapshotManager, importInspectionSnapshot, type InspectionSnapshot, type InspectionSnapshotTransfer } from '@enoughfactory/workspaces';
 import type { DeviceApp } from './app.ts';
@@ -71,7 +72,7 @@ async function fixture(t: TestContext, extraFileMode = 0o644) {
   let current = true, providerMode: 'success' | 'hold' | 'unknown' = 'success', passed = false, available = true;
   let providerPending: ReturnType<typeof deferred<{ text: string }>> | undefined;
   let stopFails = false, checks = 0;
-  let hostProcesses: Array<{ sessionId: string; state: 'active' | 'unknown' | 'exited' }> = [];
+  let hostProcesses: Array<Pick<HostProcessState, 'sessionId' | 'state'> & Partial<HostProcessState>> = [];
   let preparationHook: ((input: VerificationPreparation) => Promise<void>) | undefined;
   const app = {
     dataDir, device: { id: 'mac' }, store, emit() {}, changed() {},
@@ -92,6 +93,10 @@ async function fixture(t: TestContext, extraFileMode = 0o644) {
         if (stopFails) throw new Error('Owned verifier process termination could not be confirmed');
         const session = store.get<Session>('sessions', id)!;
         store.set('sessions', { ...session, status: 'stopped' });
+      },
+      restart: async (id: string) => {
+        assert.equal(store.get<Session>('sessions', id)?.status, 'stopped');
+        store.set('sessions', { ...store.get<Session>('sessions', id)!, status: 'ready' });
       },
     },
   } as unknown as DeviceApp;
@@ -211,6 +216,7 @@ async function legacyContainerFixture(t: TestContext, seed: 'waiting' | 'unknown
   };
   const verifier = f.anotherVerifier({
     app: { ...f.options.app, sessions: fakeSessions } as unknown as DeviceApp, readiness: async () => [target],
+    reconcileInspection: async () => true,
     prepareExecution: async preparation => {
       const prepared = await f.options.prepareExecution!(preparation);
       const session = { ...prepared, status: state, executionTargetKind: undefined, containerId: 'legacy-container' } as Session;
@@ -238,6 +244,59 @@ async function legacyContainerFixture(t: TestContext, seed: 'waiting' | 'unknown
   assert.equal(run.status, seed === 'waiting' ? 'waiting' : 'unknown'); assert.equal(f.calls.length, 0);
   return { ...f, verifier, input, run, containerSessions: fakeSessions, restarted, sourceChecks: () => sourceChecks };
 }
+
+async function unusedContainerChatFixture(t: TestContext) {
+  const f = await legacyContainerFixture(t, 'unknown');
+  const chat = f.options.chats.create({ sessionId: f.run.sessionId!, runtime: 'codex', approvalMode: 'approve-all', verificationRunId: f.run.id });
+  const run = { ...f.run, chatId: chat.id, startedAt: new Date().toISOString() };
+  f.store.set(INSPECTION_VERIFIER_RUNS, run); f.setPassed(true);
+  return { ...f, run, chat };
+}
+
+test('a legacy synchronous admission failure reuses its unused reserved chat only after original container removal', async t => {
+  const f = await unusedContainerChatFixture(t), before = structuredClone(f.run);
+  assert.equal(f.store.events('chat', f.chat.id).length, 0);
+  const result = await f.verifier.ensure(f.input);
+  assert.equal(result.status, 'succeeded'); assert.equal(result.id, f.run.id); assert.equal(result.chatId, f.chat.id);
+  assert.equal(result.sessionId, f.run.sessionId); assert.deepEqual(result.source, f.run.source); assert.equal(result.startedAt, f.run.startedAt);
+  assert.equal(f.calls.length, 1); assert.equal(f.calls[0]!.chatId, f.chat.id); assert.equal(f.store.list<Chat>('chats').length, 1);
+  assert.deepEqual(f.restarted, [f.run.sessionId]);
+  const audit = f.store.events<{ action: string; previous: InspectionVerificationRun; providerAdmission: string }>('inspection-verifier-reconciliation', f.run.id);
+  assert.equal(audit.length, 1); assert.equal(audit[0]!.value.action, 'unused-container-verifier-chat');
+  assert.equal(audit[0]!.value.providerAdmission, 'no-journaled-turn'); assert.deepEqual(audit[0]!.value.previous, before);
+});
+
+test('reserved container chat recovery rejects any durable indication of provider admission or unresolved ownership', async t => {
+  const cases: Array<[string, (f: Awaited<ReturnType<typeof unusedContainerChatFixture>>) => void]> = [
+    ['durable user admission event', f => { f.store.append('chat', f.chat.id, { kind: 'message', role: 'user', text: 'Verification input' }); }],
+    ['provider status event', f => { f.store.append('chat', f.chat.id, { kind: 'status', data: { status: 'running', threadId: 'provider-thread' } }); }],
+    ['provider result receipt', f => { f.store.set('chat-results', { id: f.chat.id, result: { text: 'Provider finished' } }); }],
+    ['provider failure receipt', f => { f.store.set('chat-turn-failures', { id: f.chat.id, agentStarted: true, executionEnded: false }); }],
+    ['provider conversation identity', f => { f.store.set('chats', { ...f.chat, threadId: 'provider-thread' }); }],
+    ['interrupted chat may have executed', f => { f.store.set('chats', { ...f.chat, status: 'interrupted' }); }],
+    ['removed-container receipt absent', f => { f.store.delete('session-container-retirement', f.run.sessionId!); }],
+    ['another chat owns this session', f => { f.store.set('chats', { ...f.chat, id: 'another-chat' }); }],
+    ['source or task authority changed', f => f.setCurrent(false)],
+  ];
+  for (const [label, mutate] of cases) await t.test(label, async inner => {
+    const f = await unusedContainerChatFixture(inner); mutate(f);
+    const before = f.store.get<InspectionVerificationRun>(INSPECTION_VERIFIER_RUNS, f.run.id)!;
+    assert.deepEqual(await f.verifier.ensure(f.input), before); assert.equal(f.calls.length, 0); assert.deepEqual(f.restarted, []);
+    assert.equal(f.store.events('inspection-verifier-reconciliation', f.run.id).length, 0);
+  });
+});
+
+test('a synchronous chat guard rejection is a waiting setup owner and never an unknown dispatched provider', async t => {
+  const f = await fixture(t), originalRun = f.options.chats.run;
+  f.options.chats.run = () => { throw Object.assign(new Error('Verifier admission guard rejected before any user event.'), { code: 'INSPECTION_VERIFICATION_STALE' }); };
+  const waiting = await f.verifier.ensure(f.input);
+  assert.equal(waiting.status, 'waiting'); assert.ok(waiting.chatId); assert.equal(f.calls.length, 0);
+  assert.equal(f.store.events('chat', waiting.chatId!).length, 0);
+  f.options.chats.run = originalRun; f.setPassed(true);
+  const result = await f.verifier.ensure(f.input);
+  assert.equal(result.status, 'succeeded'); assert.equal(result.chatId, waiting.chatId); assert.equal(result.sessionId, waiting.sessionId);
+  assert.equal(f.calls.length, 1); assert.equal(f.store.list<Chat>('chats').length, 1);
+});
 
 type RetainedInputs = { id: string; transfer: InspectionSnapshotTransfer; snapshot?: InspectionSnapshot; retiredAt?: string; retirement?: { primarySource?: InspectionSnapshotTransfer; [key: string]: unknown } };
 function retained(f: { store: Store }, run: InspectionVerificationRun): RetainedInputs {
@@ -903,6 +962,89 @@ test('interrupted or restarted unknown verifier owners stay fenced and keep thei
     assert.equal(f.stopped.length, 0);
     assert.equal((await f.anotherVerifier().ensure(f.input)).status, 'unknown'); assert.equal(f.calls.length, 1);
   });
+});
+
+async function rebootedVerifierFixture(t: TestContext) {
+  const f = await fixture(t); f.setProvider('unknown');
+  const interrupted = await f.verifier.ensure(f.input);
+  assert.equal(interrupted.status, 'unknown'); assert.ok(interrupted.startedAt);
+  const run: InspectionVerificationRun = { ...interrupted, deadlineAt: '2000-01-01T00:00:00.000Z' };
+  f.store.set(INSPECTION_VERIFIER_RUNS, run);
+  const chat = f.store.get<Chat>('chats', run.chatId!)!;
+  f.store.set('chats', { ...chat, status: 'interrupted' });
+  f.store.append('chat', chat.id, { kind: 'status', text: 'Agent running', data: { status: 'running', threadId: 'original-rebooted-provider-thread' } });
+  const process: HostProcessState = {
+    processKey: 'original-owned-provider', sessionId: run.sessionId!, createdAt: run.startedAt,
+    cwd: f.preparations[0]!.snapshot.roots[0]!.path, state: 'exited', recordPath: '/owned/original-process.json',
+    termination: {
+      schemaVersion: 2, kind: 'host-reboot', evidence: 'boot-identity-change', observedAt: new Date().toISOString(),
+      currentBoot: { schemaVersion: 1, platform: 'darwin', machineId: 'fixture-machine', bootId: 'current-boot', startedAt: new Date().toISOString(), observedAt: new Date().toISOString(), uptimeMs: 1000 },
+      previousBoot: { schemaVersion: 1, platform: 'darwin', machineId: 'fixture-machine', bootId: 'previous-boot', startedAt: '2026-10-08T00:00:00Z', observedAt: '2026-10-08T00:00:01Z', uptimeMs: 1000 },
+      previousStatus: 'outcome-unknown', previousUpdatedAt: run.startedAt!, priorRecordSha256: 'a'.repeat(64),
+    },
+  };
+  f.setHostProcesses([process]); f.setProvider('success'); f.setPassed(true);
+  let reconciliations = 0, allowInspection = true;
+  const recovered = f.anotherVerifier({ reconcileInspection: async selected => {
+    reconciliations++; assert.equal(selected.id, run.id); return allowInspection;
+  } });
+  return { ...f, run, chat, process, recovered, reconciliations: () => reconciliations, setInspectionSafe: (value: boolean) => { allowInspection = value; } };
+}
+
+test('confirmed host reboot continues the original independent verifier chat and candidate with a fresh deadline', async t => {
+  const f = await rebootedVerifierFixture(t);
+  const unknownAction = { id: 'original-uncertain-action', status: 'unknown', observationId: 'stale-original-observation', requestId: 'original-request', source: f.run.source };
+  f.store.set('inspection-actions', unknownAction);
+  const result = await f.recovered.ensure(f.input);
+  assert.equal(result.status, 'succeeded'); assert.equal(result.id, f.run.id);
+  assert.equal(result.sessionId, f.run.sessionId); assert.equal(result.chatId, f.run.chatId);
+  assert.equal(result.startedAt, f.run.startedAt); assert.deepEqual(result.authority, f.run.authority); assert.deepEqual(result.source, f.run.source);
+  assert.ok(Date.parse(result.deadlineAt) > Date.now());
+  assert.equal(f.calls.length, 2); assert.equal(f.preparations.length, 1); assert.equal(f.reconciliations(), 1);
+  assert.equal(f.calls[1]!.chatId, f.calls[0]!.chatId); assert.equal(f.calls[1]!.options.attemptId, authority.attemptId);
+  assert.match(f.calls[1]!.prompt, /never repeat their old request IDs/);
+  assert.equal(f.store.get<Chat>('chats', f.run.chatId!)!.threadId, 'original-rebooted-provider-thread');
+  assert.equal(f.store.list<Chat>('chats').length, 1, 'No new verifier chat or author exists');
+  assert.deepEqual(f.store.get('inspection-actions', unknownAction.id), unknownAction, 'Prior unknown action is never relabeled or replayed');
+  const audit = f.store.events<{ action: string; previous: InspectionVerificationRun; threadId: string }>('inspection-verifier-reconciliation', result.id);
+  assert.equal(audit.length, 1); assert.equal(audit[0]!.value.action, 'host-reboot-continuation');
+  assert.deepEqual(audit[0]!.value.previous, f.run); assert.equal(audit[0]!.value.previous.status, 'unknown');
+  assert.equal(audit[0]!.value.previous.deadlineAt, '2000-01-01T00:00:00.000Z');
+  assert.equal((await f.recovered.ensure(f.input)).status, 'succeeded'); assert.equal(f.calls.length, 2);
+});
+
+test('reboot continuation refuses absent ownership, same-boot uncertainty, stale authority and unresolved inspections', async t => {
+  const cases: Array<[string, (f: Awaited<ReturnType<typeof rebootedVerifierFixture>>) => void | Promise<void>]> = [
+    ['missing process inventory', f => f.setHostProcesses([])],
+    ['ordinary exited process without reboot proof', f => f.setHostProcesses([{ ...f.process, termination: undefined }])],
+    ['obsolete timestamp-only reboot proof', f => f.setHostProcesses([{ ...f.process, termination: { ...f.process.termination!, schemaVersion: 1 } as unknown as HostProcessState['termination'] }])],
+    ['same boot identity cannot prove a reboot', f => f.setHostProcesses([{ ...f.process, termination: { ...f.process.termination!, previousBoot: f.process.termination!.currentBoot } }])],
+    ['same-boot missing provider remains unknown', f => f.setHostProcesses([{ ...f.process, state: 'unknown', termination: undefined }])],
+    ['another working directory', f => f.setHostProcesses([{ ...f.process, cwd: '/other/source' }])],
+    ['process predates this verifier turn', f => f.setHostProcesses([{ ...f.process, createdAt: '2000-01-01T00:00:00Z' }])],
+    ['unknown autonomous decision process', f => f.setHostProcesses([f.process, { ...f.process, sessionId: `${f.run.sessionId}-decision-unknown`, state: 'unknown' }])],
+    ['no original thread identity', f => { f.store.delete('chats', f.chat.id); }],
+    ['ambiguous provider thread', f => { f.store.append('chat', f.chat.id, { kind: 'status', data: { status: 'running', threadId: 'different-thread' } }); }],
+    ['changed task authority', f => f.setCurrent(false)],
+    ['changed quality policy digest', f => { f.store.set(INSPECTION_VERIFIER_RUNS, { ...f.run, policySha256: 'b'.repeat(64) }); }],
+    ['unresolved original inspection backend', f => f.setInspectionSafe(false)],
+    ['another active chat in the original session', f => { f.store.set('chats', { ...f.chat, id: 'another-active-chat', status: 'running' }); }],
+    ['changed private checked source bytes', async f => { const filename = path.join(f.preparations[0]!.snapshot.roots[0]!.path, 'Main.swift'); await chmod(filename, 0o640); await writeFile(filename, 'Changed source after reboot'); }],
+  ];
+  for (const [label, mutate] of cases) await t.test(label, async inner => {
+    const f = await rebootedVerifierFixture(inner); await mutate(f);
+    const before = f.store.get<InspectionVerificationRun>(INSPECTION_VERIFIER_RUNS, f.run.id)!;
+    const result = await f.recovered.ensure(f.input);
+    assert.deepEqual(result, before); assert.equal(result.status, 'unknown'); assert.equal(f.calls.length, 1); assert.equal(f.preparations.length, 1);
+    assert.equal(f.store.events('inspection-verifier-reconciliation', f.run.id).length, 0);
+  });
+});
+
+test('reboot continuation rechecks authority after stop-only inspection reconciliation', async t => {
+  const f = await rebootedVerifierFixture(t);
+  const raced = f.anotherVerifier({ reconcileInspection: async () => { f.setCurrent(false); return true; } });
+  assert.equal((await raced.ensure(f.input)).status, 'unknown');
+  assert.equal(f.calls.length, 1); assert.equal(f.stopped.length, 0); assert.equal(f.store.events('inspection-verifier-reconciliation', f.run.id).length, 0);
 });
 
 test('an unconfirmed execution stop overrides a passing gate with unknown ownership', async t => {

@@ -75,7 +75,7 @@ export class InspectionService {
     this.jobs=new InspectionJobs(app.store,{deviceId:app.device.id,authorityCurrent:authority=>this.authorityCurrent(authority)});
     this.snapshots=new InspectionSnapshotManager({dataDir:path.join(app.dataDir,'inspection'),artifacts:this.artifacts});
     this.quality=new InspectionQualityService({store:app.store,artifacts:this.artifacts,authorityCurrent:authority=>this.authorityCurrent(authority)});
-    this.verifier=new InspectionVerifier({app,chats,quality:this.quality,authorityCurrent:authority=>this.authorityCurrent(authority),readiness:()=>this.readiness()});
+    this.verifier=new InspectionVerifier({app,chats,quality:this.quality,authorityCurrent:authority=>this.authorityCurrent(authority),readiness:()=>this.readiness(),reconcileInspection:(run,signal)=>this.reconcileVerifierInspection(run,signal)});
     this.retention=new InspectionRetention({dataDir:path.join(app.dataDir,'inspection'),artifacts:this.artifacts,store:app.store,jobs:this.jobs,activeJobIds:()=>new Set(this.active.keys())});
     this.browser=new BrowserInspectionManager({endpoint:app.runtime.endpoint,dataDir:path.join(app.dataDir,'inspection','browser'),artifacts:this.artifacts,onRecord:()=>app.changed()});
     const backend=new NativeInspectionBackend({directory:path.join(app.dataDir,'inspection','native-sessions')});
@@ -545,8 +545,8 @@ export class InspectionService {
     for(const artifact of [...new Map(originals.map(artifact=>[artifact.id,artifact])).values()]){this.app.store.set('factory-artifacts',artifact);if(publish&&!retained.has(artifact.id))this.jobs.publishEvidence(job.id,{kind:built.productArtifacts.some(product=>product.id===artifact.id)?'build-product':'log',artifact,metadata:{status:built.status}});}
     this.app.store.set('inspection-build-results',{id:job.id,buildId:built.id,preparationArtifact:built.preparationArtifact,source:job.source,finishedAt:new Date().toISOString()} satisfies BuildRecord);
   }
-  private async recoverOwnedBuilds():Promise<void>{
-    for(const job of this.jobs.listJobs().filter(job=>job.ownerDeviceId===this.app.device.id&&job.capability==='apple-compilation'&&job.status==='unknown'&&!this.active.has(job.id)&&!this.app.store.get('inspection-delegation-owner-jobs',job.id))){
+  private async recoverOwnedBuilds(run?:InspectionVerificationRun):Promise<void>{
+    for(const job of this.jobs.listJobs().filter(job=>job.ownerDeviceId===this.app.device.id&&(!run||this.verifierOwnsJob(run,job))&&job.capability==='apple-compilation'&&job.status==='unknown'&&!this.inspectionJobActive(job)&&!this.app.store.get('inspection-delegation-owner-jobs',job.id))){
       if(this.closing)return;const outcome=await this.builds.cancel(job.id);
       if(outcome.status!=='completed'){this.jobs.markUnknown(job.id,outcome.reason);continue;}
       if(outcome.build)this.retainBuild(job,outcome.build,false);
@@ -568,8 +568,13 @@ export class InspectionService {
   }
   private canRetireVerifier(run:InspectionVerificationRun):boolean{
     if(this.closing||[...this.contexts.values()].some(context=>context.verificationRunId===run.id))return false;
-    const related=this.jobs.listJobs().filter(job=>job.authority.attemptId===run.authority.attemptId||job.source.snapshotId===run.source.snapshotId);
-    return related.every(job=>!this.active.has(job.id)&&['succeeded','failed','canceled'].includes(job.status)&&this.jobs.sessions(job.id).every(session=>session.status==='stopped')&&this.jobs.leases(job.id).every(lease=>lease.status!=='held'));
+    const related=this.jobs.listJobs().filter(job=>this.verifierOwnsJob(run,job));
+    return related.every(job=>!this.inspectionJobActive(job)&&['succeeded','failed','canceled'].includes(job.status)&&this.jobs.sessions(job.id).every(session=>session.status==='stopped')&&this.jobs.leases(job.id).every(lease=>lease.status!=='held'));
+  }
+  private verifierOwnsJob(run:InspectionVerificationRun,job:InspectionJob):boolean{return job.authority.attemptId===run.authority.attemptId||job.source.snapshotId===run.source.snapshotId;}
+  private inspectionJobActive(job:InspectionJob):boolean{return this.active.has(job.id)||[...this.contexts.values()].some(context=>!context.signal.aborted&&context.attemptId===job.authority.attemptId);}
+  private async reconcileVerifierInspection(run:InspectionVerificationRun,signal:AbortSignal):Promise<boolean>{
+    signal.throwIfAborted();await this.recoverOwnedSessions(run);await this.recoverOwnedBuilds(run);signal.throwIfAborted();return this.canRetireVerifier(run);
   }
   private async stopSession(id:string):Promise<void>{
     const session=this.jobs.getSession(id);if(!session)return;
@@ -582,8 +587,8 @@ export class InspectionService {
     try{this.jobs.finishJob(session.jobId,{status:'succeeded'});}catch{this.jobs.reconcileJob(session.jobId,{status:'failed',reason:'Owned session stopped after authority changed or its outcome became uncertain.',releaseConfirmed:true});}
     this.app.changed();this.pump();
   }
-  private async recoverOwnedSessions():Promise<void>{
-    for(const job of this.jobs.listJobs().filter(job=>job.ownerDeviceId===this.app.device.id&&!this.app.store.get('inspection-delegation-owner-jobs',job.id))){
+  private async recoverOwnedSessions(run?:InspectionVerificationRun):Promise<void>{
+    for(const job of this.jobs.listJobs().filter(job=>job.ownerDeviceId===this.app.device.id&&(!run||this.verifierOwnsJob(run,job))&&!this.inspectionJobActive(job)&&!this.app.store.get('inspection-delegation-owner-jobs',job.id))){
       for(const session of this.jobs.sessions(job.id).filter(session=>session.status!=='stopped')){
         if(this.closing)return;const backend=this.app.store.get<BackendRecord>('inspection-backends',session.id);if(!backend)continue;
         try{
