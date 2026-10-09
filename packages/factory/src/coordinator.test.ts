@@ -1336,6 +1336,96 @@ test("completion records evidence for every explicit criterion after all work is
   assert.equal(evidence[0]!.head, "integrated-head");
 });
 
+function evaluationIdentities(factory: ReturnType<typeof harness>) {
+  const prompt = factory.evaluationPrompts.at(-1)!;
+  const line = prompt.split("\n").find(value => value.startsWith("Criterion identities (goal "))!;
+  assert.ok(line, "The evaluator receives the frozen criterion identities");
+  return { line, entries: JSON.parse(line.slice(line.indexOf(": ") + 2)) as Array<{ ordinal: number; criterionId: string }> };
+}
+
+async function finishCriteriaTask(factory: ReturnType<typeof harness>, required: string[]) {
+  factory.planning(async () => ({ ...plan, criteria: required }));
+  const goal = factory.coordinator.create({ projectId: project.id, objective: "Deliver the original mailbox contract", criteria: required, concurrency: 1 });
+  for (let step = 0; step < 2; step++) { await factory.coordinator.tick(); await factory.coordinator.waitForIdle(); }
+  assert.equal(factory.calls.integrate, 1);
+  return goal;
+}
+
+test("criterion identities accept an ID-only audit without rewriting literal escapes in the original requirement", async () => {
+  const factory = harness(), required = ["Show the app", "Preserve exact body First line\\nSecond line\\nThird line"];
+  const goal = await finishCriteriaTask(factory, required);
+  let originalResponse: unknown;
+  factory.evaluating(async () => {
+    const identities = evaluationIdentities(factory);
+    assert.ok(identities.line.includes(`goal ${goal.id}, revision ${goal.revision}`));
+    assert.deepEqual(identities.entries.map(entry => entry.ordinal), [1, 2]);
+    assert.equal(new Set(identities.entries.map(entry => entry.criterionId)).size, required.length);
+    originalResponse = { complete: true, summary: "Every original requirement has current evidence", criteria: identities.entries.map(entry => ({ criterionId: entry.criterionId, satisfied: true, evidence: [`artifact:proof-${entry.ordinal}`] })) };
+    return originalResponse as EvaluationResponse;
+  });
+  await factory.coordinator.tick(); await factory.coordinator.waitForIdle();
+  assert.equal(factory.store.get<Goal>("goals", goal.id)!.status, "completed");
+  assert.deepEqual(factory.store.get<Goal>("goals", goal.id)!.criteria, required);
+  const recorded = factory.store.list<EvaluationRecord>("factory-evaluations")[0]!;
+  assert.deepEqual(recorded.evaluation.criteria.map(entry => entry.criterion), required);
+  assert.deepEqual(recorded.evaluation.criteria.map(entry => entry.criterionId), evaluationIdentities(factory).entries.map(entry => entry.criterionId));
+  assert.equal(Object.hasOwn((originalResponse as EvaluationResponse).criteria[1]!, "criterion"), false, "Resolving an assessment does not rewrite the original response");
+  assert.equal(factory.calls.goalCheck, 1);
+});
+
+test("criterion identities from a prior goal revision cannot fall back to correctly echoed text", async () => {
+  const factory = harness(), goal = await finishTask(factory);
+  let priorIds: string[] = [];
+  factory.evaluating(async () => {
+    priorIds = evaluationIdentities(factory).entries.map(entry => entry.criterionId);
+    return { ...completeEvaluation, complete: false, criteria: completeEvaluation.criteria.map((entry, ordinal) => ({ ...entry, criterionId: priorIds[ordinal], satisfied: false })) };
+  });
+  await factory.coordinator.tick(); await factory.coordinator.waitForIdle();
+  const priorRecord = factory.store.list<EvaluationRecord>("factory-evaluations")[0]!;
+  factory.planning(async () => ({ ...plan, tasks: [] }));
+  await factory.coordinator.tick(); await factory.coordinator.waitForIdle();
+  factory.evaluating(async () => {
+    const current = evaluationIdentities(factory).entries.map(entry => entry.criterionId);
+    assert.equal(current.every((id, ordinal) => id !== priorIds[ordinal]), true);
+    return { ...completeEvaluation, criteria: completeEvaluation.criteria.map((entry, ordinal) => ({ ...entry, criterionId: priorIds[ordinal] })) };
+  });
+  await factory.coordinator.tick(); await factory.coordinator.waitForIdle();
+  const current = factory.store.get<Goal>("goals", goal.id)!;
+  assert.equal(current.revision, goal.revision + 1);
+  assert.notEqual(current.status, "completed");
+  assert.deepEqual(current.criteria, criteria);
+  assert.equal(factory.calls.evaluator, 2);
+  assert.deepEqual(factory.store.list<EvaluationRecord>("factory-evaluations"), [priorRecord], "The invalid new response cannot rewrite an earlier evaluation");
+  assert.ok(factory.store.list<Decision>("decisions").some(entry => entry.kind === "decision-repair" && entry.text.includes("identity does not belong to this goal revision")));
+});
+
+for (const failure of ["missing", "false", "evidenceless"] as const) {
+  test(`valid criterion identities cannot complete a goal with a ${failure} assessment`, async () => {
+    const factory = harness(), goal = await finishTask(factory);
+    factory.evaluating(async () => {
+      const entries = evaluationIdentities(factory).entries.map(entry => ({ criterionId: entry.criterionId, satisfied: true, evidence: [`artifact:proof-${entry.ordinal}`] }));
+      if (failure === "missing") entries.pop();
+      if (failure === "false") entries[1]!.satisfied = false;
+      if (failure === "evidenceless") entries[1]!.evidence = [];
+      return { complete: true, summary: "An assessment remains incomplete", criteria: entries } as unknown as EvaluationResponse;
+    });
+    await factory.coordinator.tick(); await factory.coordinator.waitForIdle();
+    assert.notEqual(factory.store.get<Goal>("goals", goal.id)!.status, "completed");
+    assert.deepEqual(factory.store.get<Goal>("goals", goal.id)!.criteria, criteria);
+    assert.ok(factory.store.list<Decision>("decisions").some(entry => entry.kind === "evaluation-incomplete"));
+  });
+}
+
+test("legacy evaluator text still distinguishes literal escapes from real newlines", async () => {
+  const factory = harness(), required = ["Show the app", "Preserve body First line\\nSecond line"];
+  const goal = await finishCriteriaTask(factory, required);
+  factory.evaluating(async () => ({ complete: true, summary: "A text echo changed the requirement", criteria: required.map(criterion => ({ criterion: criterion.replaceAll("\\n", "\n"), satisfied: true, evidence: ["artifact:proof"] })) }));
+  await factory.coordinator.tick(); await factory.coordinator.waitForIdle();
+  assert.notEqual(factory.store.get<Goal>("goals", goal.id)!.status, "completed");
+  assert.deepEqual(factory.store.get<Goal>("goals", goal.id)!.criteria, required);
+  assert.ok(factory.store.list<Decision>("decisions").some(entry => entry.kind === "evaluation-incomplete"));
+});
+
 test("evaluation dispatches independent follow-up work before waiting for external evidence", async () => {
   const factory = harness();
   const goal = await finishTask(factory);

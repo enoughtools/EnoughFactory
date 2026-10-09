@@ -1,4 +1,4 @@
-import type { EvaluationResponse, PlanResponse, PlannedTask } from "./types.js";
+import type { EvaluationCriterionBinding, EvaluationResponse, PlanResponse, PlannedTask } from "./types.js";
 import { FactoryDecisionError } from "./errors.js";
 import { EXECUTION_CAPABILITIES, type ApplicationAcceptance, type TaskKind, type TaskExecutionRequirements, type TaskQualityRequirements, type QualityPlatform, type ExecutionCapability } from "@enoughfactory/contracts";
 
@@ -190,14 +190,33 @@ export function readPlan(text: string): PlanResponse {
   return { summary: object.summary.trim(), criteria, tasks: readTasks(object.tasks), checks: readCheckCommands(object.checks) };
 }
 
-export function readEvaluation(text: string): EvaluationResponse {
+export function readEvaluation(text: string, bindings?: readonly EvaluationCriterionBinding[]): EvaluationResponse {
   const object = readJsonObject(text);
   if (typeof object.complete !== "boolean" || typeof object.summary !== "string" || !Array.isArray(object.criteria)) throw new FactoryDecisionError("Evaluation must contain complete, summary and a criteria evidence array.");
+  const assessed = new Set<string>();
   const criteria = object.criteria.map(entry => {
-    if (!entry || typeof entry !== "object") throw new FactoryDecisionError("Criterion evidence is invalid.");
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) throw new FactoryDecisionError("Criterion evidence is invalid.");
     const item = entry as Record<string, unknown>;
-    if (typeof item.criterion !== "string" || typeof item.satisfied !== "boolean") throw new FactoryDecisionError("Each criterion needs its original text and a satisfied boolean.");
-    return { criterion: item.criterion, satisfied: item.satisfied, evidence: strings(item.evidence, "criterion evidence", true) };
+    if (typeof item.satisfied !== "boolean") throw new FactoryDecisionError("Each criterion needs a satisfied boolean.");
+    let binding: EvaluationCriterionBinding | undefined;
+    if (item.criterionId !== undefined) {
+      if (typeof item.criterionId !== "string" || !/^criterion-[a-f0-9]{64}$/.test(item.criterionId)) throw new FactoryDecisionError("Criterion identity is invalid. Use an identity supplied for this evaluation.");
+      binding = bindings?.find(value => value.criterionId === item.criterionId);
+      if (!binding) throw new FactoryDecisionError("Criterion identity does not belong to this goal revision.");
+      if (item.criterion !== undefined && item.criterion !== binding.criterion) throw new FactoryDecisionError("Criterion text contradicts its identity. Omit echoed text or use the exact original text.");
+    } else {
+      if (typeof item.criterion !== "string") throw new FactoryDecisionError("Each criterion needs its supplied identity or exact original text.");
+      const matches = bindings?.filter(value => value.criterion === item.criterion) ?? [];
+      if (matches.length > 1) throw new FactoryDecisionError("Criterion text is ambiguous. Use its supplied identity.");
+      binding = matches[0];
+    }
+    if (binding) {
+      if (assessed.has(binding.criterionId)) throw new FactoryDecisionError("Evaluation assesses the same criterion more than once.");
+      assessed.add(binding.criterionId);
+    }
+    return { criterion: binding?.criterion ?? item.criterion as string,
+      ...(item.criterionId === undefined ? {} : { criterionId: binding!.criterionId }),
+      satisfied: item.satisfied, evidence: strings(item.evidence, "criterion evidence", true) };
   });
   return { complete: object.complete, summary: object.summary, criteria,
     ...(object.additionalTasks === undefined ? {} : { additionalTasks: readTasks(object.additionalTasks) }),

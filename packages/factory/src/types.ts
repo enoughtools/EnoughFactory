@@ -135,7 +135,8 @@ export interface AttemptDetail {
   checkRecoveryHistory?: Array<{ at: string; automatic: boolean; checks: CheckResult[]; error?: string; evidenceIds: string[] }>;
   recoveryObservation?: { phase: AttemptDetail["phase"]; reason: string; retryAt: string; failures: number };
 }
-export interface CriterionEvidence { criterion: string; satisfied: boolean; evidence: string[]; }
+export interface EvaluationCriterionBinding { criterionId: string; criterion: string; }
+export interface CriterionEvidence { criterion: string; criterionId?: string; satisfied: boolean; evidence: string[]; }
 export interface EvaluationResponse {
   complete: boolean; summary: string; criteria: CriterionEvidence[];
   additionalTasks?: PlannedTask[]; waitReason?: string; wakeCondition?: string;

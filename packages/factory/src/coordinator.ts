@@ -949,6 +949,9 @@ export class FactoryCoordinator {
       await this.replan(goal.id, error.message); return;
     }
     const operation = this.beginOperation(goal, "evaluator"), project = this.project(goal);
+    const criterionBindings = goal.criteria.map((criterion, ordinal) => ({ criterion,
+      criterionId: `criterion-${createHash("sha256").update(JSON.stringify(["enoughfactory/criterion/v1", goal.id, goal.revision, ordinal, createHash("sha256").update(criterion, "utf8").digest("hex")])).digest("hex")}`,
+    }));
     try {
       const repository = await this.options.workspaces.inspect(project);
       if (!this.operationCurrent(goal.id, operation)) return;
@@ -985,8 +988,9 @@ export class FactoryCoordinator {
       const recordRequirements: ControllerRecordRequirement[] = [];
       const prompt = controllerPrompt(evidence => [
         "You are the EnoughFactory completion evaluator. Audit the entire original objective against the actual repository and retained execution evidence. A worker's final response, green unrelated tests or partial implementation do not prove completion.",
-        "Inspect/run only meaningful checks needed for uncertain criteria. Return JSON {complete:boolean,summary:string,criteria:[{criterion:string,satisfied:boolean,evidence:string[]}],additionalTasks?:[{key,title,description,kind:'feature'|'unit'|'architecture'|'test',acceptanceCriteria:string[],expectedOutputs:string[],dependsOn:string[],checks:string[],requiredCheckEnvironment?:string[],execution?:{target?:'auto'|'container'|'host-macos',requiredCapabilities?:string[],delegatedCapabilities?:string[]},quality?:{platforms:('web'|'macos'|'ios-simulator')[],workflows:[{id,platform}],referenceIds:string[]}}],waitReason?:string,wakeCondition?:string}. Use task kinds for concrete delivery outcomes, not mandatory role ceremonies. Tasks needing independently supplied verification inputs must declare the supported requiredCheckEnvironment names; a prose prerequisite does not gate dispatch. Select author requirements and delegated tools from the execution inventory; absence of native or visual support cannot be replaced by portable test success.",
-        "Use each criterion's exact original text. Every satisfied criterion requires concrete current-state evidence such as files, runtime outcomes, exact commit check records or published URLs. If something remains, add actionable tasks. Never weaken the objective to declare completion. No mandatory human gate applies to autonomous plus approve-all.",
+        "Inspect/run only meaningful checks needed for uncertain criteria. Return JSON {complete:boolean,summary:string,criteria:[{criterionId:string,satisfied:boolean,evidence:string[]}],additionalTasks?:[{key,title,description,kind:'feature'|'unit'|'architecture'|'test',acceptanceCriteria:string[],expectedOutputs:string[],dependsOn:string[],checks:string[],requiredCheckEnvironment?:string[],execution?:{target?:'auto'|'container'|'host-macos',requiredCapabilities?:string[],delegatedCapabilities?:string[]},quality?:{platforms:('web'|'macos'|'ios-simulator')[],workflows:[{id,platform}],referenceIds:string[]}}],waitReason?:string,wakeCondition?:string}. Use task kinds for concrete delivery outcomes, not mandatory role ceremonies. Tasks needing independently supplied verification inputs must declare the supported requiredCheckEnvironment names; a prose prerequisite does not gate dispatch. Select author requirements and delegated tools from the execution inventory; absence of native or visual support cannot be replaced by portable test success.",
+        "Assess each original criterion using its supplied criterionId and omit echoed criterion text. Identities refer to the ordered required completion criteria below and apply only to this goal revision. Legacy criterion text is accepted only when it exactly matches an original requirement; do not reinterpret escapes or whitespace. Every satisfied criterion requires concrete current-state evidence such as files, runtime outcomes, exact commit check records or published URLs. If something remains, add actionable tasks. Never weaken the objective to declare completion. No mandatory human gate applies to autonomous plus approve-all.",
+        `Criterion identities (goal ${goal.id}, revision ${goal.revision}; ordinal follows the ordered required completion criteria): ${JSON.stringify(criterionBindings.map((binding, ordinal) => ({ ordinal: ordinal + 1, criterionId: binding.criterionId })))}`,
         "Also inspect the accepted tasks' acceptance criteria and expected deliverables. Integration records prove accepted source, not that every requested behavior or deliverable exists. Add concrete follow-up work for any unmet contract that matters to the original objective.",
         ...(goal.acceptance ? ["The application acceptance template also requires current integrated-source workflow and visual evidence on every configured platform, compared with its required design references. Inspect actual images and representative journeys. Additional material UI tasks need explicit quality policies with meaningful workflows; backend-only repairs can remain independent. Passing representative journeys does not prove every product feature: audit all original completion criteria separately."] : []),
         "The current integrated primary repository and attached current project folders are the sources for the final product audit. Historical candidate IDs and CAS references identify retained source; their bodies are optional evidence and are not automatically transferred for evaluation. Use the mounted manifest to determine actual available files. Never claim to have inspected a historical candidate body merely from its identity or integration record.",
@@ -999,7 +1003,7 @@ export class FactoryCoordinator {
       ], { recordReferences: this.options.runtime.controllerRecordReferences, recordRequirements });
       const response = await this.options.runtime.complete({ goal, role: "evaluator", prompt, project, signal: this.operationControllers.get(goal.id)?.signal, recordRequirements });
       if (!this.operationCurrent(goal.id, operation)) return;
-      const evaluation = readEvaluation(response.text);
+      const evaluation = readEvaluation(response.text, criterionBindings);
       const after = await this.options.workspaces.inspect(project);
       if (!this.operationCurrent(goal.id, operation)) return;
       if (after.head !== repository.head || after.status !== repository.status || after.fingerprint !== repository.fingerprint || after.diff !== repository.diff) {
@@ -1010,10 +1014,13 @@ export class FactoryCoordinator {
       const record: EvaluationRecord = { id: randomUUID(), goalId: goal.id, revision: goal.revision, at: this.now(), head: after.head, evaluation, ...(goalChecks ? { goalChecks } : {}) };
       this.options.store.set(TABLE.evaluations, record);
       const required = this.goal(goal.id).criteria;
-      const allSatisfied = required.length > 0 && required.every(criterion => {
-        const entry = evaluation.criteria.find(item => item.criterion === criterion);
-        return entry?.satisfied && entry.evidence.length > 0;
+      const unsatisfied = required.filter((criterion, ordinal) => {
+        const binding = criterionBindings[ordinal];
+        if (!binding || binding.criterion !== criterion) return true;
+        const entry = evaluation.criteria.find(item => item.criterionId === binding.criterionId || (item.criterionId === undefined && item.criterion === criterion));
+        return !entry?.satisfied || entry.evidence.length === 0;
       });
+      const allSatisfied = required.length > 0 && unsatisfied.length === 0;
       const extra = evaluation.additionalTasks ?? [];
       if (extra.length) {
         const completedKeys = new Set(this.tasks(goal.id).filter(task => task.status === "completed").map(task => this.taskDetail(task.id).key));
@@ -1040,7 +1047,7 @@ export class FactoryCoordinator {
       } else {
         this.decision(goal.id, "evaluation-incomplete", evaluation.summary || "Completion lacked evidence for all criteria.", { evaluationId: record.id, required });
         const failedChecks = goalChecksPassed ? "" : `Failed goal checks (all receipt outcomes retained for exact record indexes):\n${JSON.stringify(new ControllerEvidence().goalChecks(goalChecks))}`;
-        await this.replan(goal.id, `Completion remains unproven. ${evaluation.summary}\nUnsatisfied criteria: ${required.filter(criterion => !evaluation.criteria.some(item => item.criterion === criterion && item.satisfied && item.evidence.length)).join("; ")}\n${failedChecks}`);
+        await this.replan(goal.id, `Completion remains unproven. ${evaluation.summary}\nUnsatisfied criteria: ${unsatisfied.join("; ")}\n${failedChecks}`);
       }
       this.changed();
     } catch (error) { this.operationFailed(goal.id, operation, error); }

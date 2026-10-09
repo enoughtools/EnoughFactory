@@ -130,3 +130,68 @@ test("check commands retain arbitrary executables, scripts, compound shell logic
   assert.deepEqual(readTasks([{ ...task, checks: commands }])[0]!.checks, commands);
   assert.deepEqual(readPlan(JSON.stringify({ summary: "Deliver work", criteria: ["Verified"], tasks: [], checks: commands })).checks, commands);
 });
+
+const criterionBindings = [
+  { criterionId: `criterion-${"1".repeat(64)}`, criterion: String.raw`The original literal \n requirement is satisfied.` },
+  { criterionId: `criterion-${"2".repeat(64)}`, criterion: "The release artifact is available." },
+] as const;
+const evaluationText = (criteria: unknown[]) => JSON.stringify({ complete: true, summary: "Inspect the original requirements", criteria });
+const satisfiedEvidence = { satisfied: true, evidence: ["artifact:current-proof"] };
+
+test("criterion IDs resolve only against frozen bindings and preserve original literal requirement bytes", () => {
+  const required = structuredClone(criterionBindings);
+  const result = readEvaluation(evaluationText(required.map(({ criterionId }) => ({ criterionId, ...satisfiedEvidence }))), required);
+  assert.deepEqual(result.criteria, required.map(binding => ({ ...binding, ...satisfiedEvidence })));
+  assert.equal(result.criteria[0]!.criterion.includes("\\n"), true);
+  assert.equal(result.criteria[0]!.criterion.includes("\n"), false);
+  assert.deepEqual(required, criterionBindings, "resolving an ID cannot mutate the frozen requirement source");
+  assert.deepEqual(readEvaluation(evaluationText([{ ...required[0], ...satisfiedEvidence }]), required).criteria[0], { ...required[0], ...satisfiedEvidence });
+});
+
+test("legacy criterion text remains exact without adding an ID", () => {
+  const criterion = criterionBindings[0].criterion;
+  const legacy = { criterion, ...satisfiedEvidence };
+  assert.deepEqual(readEvaluation(evaluationText([legacy])).criteria, [legacy]);
+  assert.deepEqual(readEvaluation(evaluationText([legacy]), criterionBindings).criteria, [legacy]);
+  const realNewline = { criterion: criterion.replace("\\n", "\n"), ...satisfiedEvidence };
+  assert.notEqual(realNewline.criterion, criterion);
+  assert.deepEqual(readEvaluation(evaluationText([realNewline])).criteria, [realNewline], "legacy evidence is never normalized to a recorded requirement");
+  assert.deepEqual(readEvaluation(evaluationText([realNewline]), criterionBindings).criteria, [realNewline], "a real newline cannot bind to the original literal backslash-n requirement");
+});
+
+test("explicit invalid or unbound criterion IDs cannot fall back to correctly echoed original text", () => {
+  const original = criterionBindings[0].criterion;
+  for (const criterionId of [null, false, 1, [], {}, "", " ", "criterion-1", `criterion-${"A".repeat(64)}`, `criterion-${"3".repeat(64)}`]) {
+    assert.throws(() => readEvaluation(evaluationText([{ criterionId, criterion: original, ...satisfiedEvidence }]), criterionBindings), FactoryDecisionError, `Explicit ID ${JSON.stringify(criterionId)} cannot use its text as a fallback`);
+  }
+  const boundEntry = { ...criterionBindings[0], ...satisfiedEvidence };
+  assert.throws(() => readEvaluation(evaluationText([boundEntry])), FactoryDecisionError, "an ID requires its supplied frozen bindings");
+  assert.throws(() => readEvaluation(evaluationText([boundEntry]), []), FactoryDecisionError);
+  assert.throws(() => readEvaluation(evaluationText([boundEntry]), [criterionBindings[1]]), FactoryDecisionError, "an earlier revision's ID cannot bind to a different snapshot");
+  for (const criterion of [null, 1, original.replace("\\n", "\n"), `${original} extra`, criterionBindings[1].criterion]) {
+    assert.throws(() => readEvaluation(evaluationText([{ ...boundEntry, criterion }]), criterionBindings), FactoryDecisionError, "provided text cannot conflict with its exact bound requirement");
+  }
+  assert.throws(() => readEvaluation(evaluationText([{ ...satisfiedEvidence }]), criterionBindings), FactoryDecisionError, "each assessment still requires a criterion identity");
+});
+
+test("duplicate and ambiguous criterion assessments cannot select one convenient satisfied result", () => {
+  const first = { criterionId: criterionBindings[0].criterionId, ...satisfiedEvidence };
+  const legacy = { criterion: criterionBindings[0].criterion, ...satisfiedEvidence };
+  for (const entries of [[first, { ...first, satisfied: false, evidence: [] }], [legacy, first], [first, legacy], [legacy, legacy], [first, { ...criterionBindings[1], criterionId: criterionBindings[0].criterionId, ...satisfiedEvidence }]]) {
+    assert.throws(() => readEvaluation(evaluationText(entries), criterionBindings), FactoryDecisionError);
+  }
+  assert.throws(() => readEvaluation(evaluationText([legacy]), [criterionBindings[0], { ...criterionBindings[1], criterion: criterionBindings[0].criterion }]), FactoryDecisionError, "legacy text cannot choose between identical requirements with distinct IDs");
+});
+
+test("valid criterion identity does not manufacture positive assessment or missing evidence", () => {
+  const entries = [
+    { criterionId: criterionBindings[0].criterionId, satisfied: false, evidence: ["artifact:failed-outcome"] },
+    { criterionId: criterionBindings[1].criterionId, satisfied: true, evidence: [] },
+  ];
+  const result = readEvaluation(evaluationText(entries), criterionBindings);
+  assert.deepEqual(result.criteria, entries.map((entry, index) => ({ ...entry, criterion: criterionBindings[index]!.criterion })));
+  assert.deepEqual(readEvaluation(evaluationText([]), criterionBindings).criteria, [], "omitted assessments remain omitted for the coordinator's coverage gate");
+  for (const entry of [{ criterionId: criterionBindings[0].criterionId, evidence: [] }, { criterionId: criterionBindings[0].criterionId, satisfied: "true", evidence: [] }, { criterionId: criterionBindings[0].criterionId, satisfied: true }]) {
+    assert.throws(() => readEvaluation(evaluationText([entry]), criterionBindings), FactoryDecisionError);
+  }
+});
