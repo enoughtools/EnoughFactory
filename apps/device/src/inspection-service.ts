@@ -9,7 +9,7 @@ import { readJsonObject, type AttemptDetail } from '@enoughfactory/factory';
 import { ArtifactStore, InspectionSnapshotManager, WorkspaceManager, exportInspectionContainerRoots, exportInspectionSnapshot, type ArtifactManifest, type InspectionSnapshot, type WorkingDirectorySource } from '@enoughfactory/workspaces';
 import { dockerInvocation } from '@enoughfactory/runtime';
 import { RUNTIME_PINS } from '@enoughfactory/agents';
-import { BrowserInspectionManager, type BrowserToolResult } from '@enoughfactory/browser-inspection';
+import { BROWSER_VIEWPORT_MAX_DIMENSION, BrowserInspectionManager, validateBrowserViewport, type BrowserToolResult, type BrowserViewport } from '@enoughfactory/browser-inspection';
 import { NativeInspectionBackend, type NativeAction } from '@enoughfactory/native-inspection';
 import type { DeviceApp } from './app.ts';
 import type { FactoryInspectionPorts } from './factory.ts';
@@ -58,7 +58,7 @@ const tools=[
   {name:'factory_observe',description:'Inspect your owned app. Returns actual screenshot pixels and fresh actionable element IDs. Observe after each action.',inputSchema:objectSchema({sessionId:string,requestId:string},['sessionId','requestId'])},
   {name:'factory_native_action',description:'Interact using a fresh observation. Click/type require elementId from the last observation. Type also needs text: set mode explicitly to replace or append. Keys are enter, backspace, escape, tab, selectAll. Scroll needs elementId and direction. Re-observe after each action.',inputSchema:objectSchema({sessionId:string,requestId:string,observationId:string,action:objectSchema({kind:{type:'string',enum:['click','type','key','scroll']},elementId:string,text:string,mode:{type:'string',enum:['replace','append']},key:{type:'string',enum:['enter','backspace','escape','tab','selectAll']},direction:{type:'string',enum:['up','down','left','right']}},['kind'])},['sessionId','requestId','observationId','action'])},
   {name:'factory_native_restart',description:'Restart the exact owned app in the same fixture and simulator, preserving its data. Requires a fresh observation and confirmed previous process exit.',inputSchema:objectSchema({sessionId:string,requestId:string,observationId:string},['sessionId','requestId','observationId'])},
-  {name:'factory_browser_start',description:'Prepare an isolated Chromium browser sharing your author container localhost. Includes its supported tools.',inputSchema:objectSchema({requestId:string},['requestId'])},
+  {name:'factory_browser_start',description:'Prepare an isolated Chromium browser sharing your author container localhost. Set viewport width and height here when the contract requires dimensions before the first navigation or observation; omitted viewport keeps the browser default. Includes its supported tools.',inputSchema:objectSchema({requestId:string,viewport:objectSchema({width:{type:'integer',minimum:1,maximum:BROWSER_VIEWPORT_MAX_DIMENSION},height:{type:'integer',minimum:1,maximum:BROWSER_VIEWPORT_MAX_DIMENSION}},['width','height'])},['requestId'])},
   {name:'factory_browser_call',description:'Operate your own browser using its advertised Playwright tools. Inspect screenshot images and resulting state; fresh observation required for input.',inputSchema:objectSchema({sessionId:string,requestId:string,observationId:string,tool:string,arguments:{type:'object'}},['sessionId','requestId','tool','arguments'])},
   {name:'factory_assert',description:'Check a condition against the last actual UI observation. Use labelEquals for exact visible read-only text and valueEquals for exact observed editable values. Records the observed result; does not accept a model-written pass claim.',inputSchema:objectSchema({sessionId:string,observationId:string,labelIncludes:string,labelEquals:string,valueIncludes:string,valueEquals:string,absent:{type:'boolean'}},['sessionId','observationId','labelIncludes'])},
   {name:'factory_stop',description:'Stop your owned native/browser session and release its lease after backend acknowledgement.',inputSchema:objectSchema({sessionId:string},['sessionId'])},
@@ -68,7 +68,7 @@ const tools=[
 interface SourceRecord {id:string;snapshot:InspectionSnapshot;source:InspectionSourceIdentity;verificationRunId?:string;}
 interface BackendRecord {id:string;kind:'native'|'browser';backendSessionId:string;}
 interface BuildRecord {id:string;buildId:string;preparationArtifact?:ArtifactManifest;source?:InspectionSourceIdentity;finishedAt?:string;retiredAt?:string;}
-interface Submission {id:string;kind:'build'|'native'|'browser';chatSessionId:string;containerId?:string;profile?:NativeFixtureProfile;buildId?:string;snapshot?:InspectionSnapshot;}
+interface Submission {id:string;kind:'build'|'native'|'browser';chatSessionId:string;containerId?:string;profile?:NativeFixtureProfile;buildId?:string;snapshot?:InspectionSnapshot;viewport?:BrowserViewport;}
 interface GrantToken {id:string;token:string;grantId:string;authority:InspectionAuthority;}
 interface HostSetupRecord {id:'mac-shell';status:'preparing'|'failed'|'ready';attempts:number;attemptedAt:string;updatedAt:string;retryAfter:number;error?:string;runtimeKey?:string;}
 const hostSetupBucket='inspection-host-setup',hostSetupRetryMs=60000,hostSetupAutomaticAttempts=3;
@@ -659,16 +659,16 @@ export class InspectionService {
       return result({job,sessions:this.jobs.sessions(job.id),evidence:this.jobs.evidence(job.id),...(backend?.kind==='browser'&&job.sessionId&&this.jobs.getSession(job.sessionId)?.status==='ready'?{tools:await this.browser.listTools(backend.backendSessionId)}:{})});
     }
     if(name==='factory_native_build'||name==='factory_browser_start'){
-      const requestKey=createHash('sha256').update(JSON.stringify([authority,name,args.requestId])).digest('hex'),requestHash=createHash('sha256').update(JSON.stringify([name,args.profileId??null])).digest('hex');
+      const isBuild=name==='factory_native_build',viewport=isBuild?undefined:validateBrowserViewport(args.viewport);
+      const requestKey=createHash('sha256').update(JSON.stringify([authority,name,args.requestId])).digest('hex'),requestHash=createHash('sha256').update(JSON.stringify([name,args.profileId??null,...(viewport?[viewport]:[])])).digest('hex');
       const prior=this.app.store.get<{id:string;jobId:string;requestHash:string}>('inspection-request-jobs',requestKey);
       if(prior){if(prior.requestHash!==requestHash)throw new Error('Inspection request id was reused for different arguments.');return result({job:this.ownJob(token,prior.jobId),replayed:false});}
-      const isBuild=name==='factory_native_build';
       const project=this.app.store.get<Project>('projects',context.session.projectId),profile=isBuild?this.profiles(project?.sourceProjectId||project?.id||'').find(profile=>profile.id===args.profileId):undefined;
       if(isBuild&&!profile)throw new Error(`Set up this native app with factory_native_profile_propose, then poll factory_native_profile_status. Its independent source audit issues the configured profile. Existing setup audits: ${JSON.stringify(this.profileSetup.list(project?.sourceProjectId||project?.id||'').map(run=>({id:run.id,profileId:run.proposal.profile.id,status:run.status,reason:run.reason})))}`);
       if(!isBuild&&context.execution.kind!=='container')throw new Error('Browser inspection currently requires a container author. Native authors use the Mac/iPhone inspection tools.');
       const source=await this.capture(context,authority);
-      const job=this.jobs.createJob(token,{idempotencyKey:String(args.requestId),executionTargetId:isBuild?'mac-host':'container',capability:isBuild?'apple-compilation':'chromium-inspection',source:source.source,profile:isBuild?{profileId:profile!.id}:{}});
-      this.app.store.set('inspection-submissions',{id:job.id,kind:isBuild?'build':'browser',chatSessionId:context.session.id,containerId:context.execution.containerId,profile,snapshot:source.snapshot} satisfies Submission);
+      const job=this.jobs.createJob(token,{idempotencyKey:String(args.requestId),executionTargetId:isBuild?'mac-host':'container',capability:isBuild?'apple-compilation':'chromium-inspection',source:source.source,profile:isBuild?{profileId:profile!.id}:viewport?{viewport}:{} });
+      this.app.store.set('inspection-submissions',{id:job.id,kind:isBuild?'build':'browser',chatSessionId:context.session.id,containerId:context.execution.containerId,profile,snapshot:source.snapshot,...(viewport?{viewport}:{})} satisfies Submission);
       this.app.store.set('inspection-request-jobs',{id:requestKey,jobId:job.id,requestHash});
       this.pump();return result({job});
     }
@@ -789,7 +789,7 @@ export class InspectionService {
         }
         const session=this.jobs.openSession(selected.id);
         this.app.store.set('inspection-backends',{id:session.id,kind:'browser',backendSessionId:session.id} satisfies BackendRecord);
-        const owned=await this.browser.prepare({id:session.id,sessionId:submission.chatSessionId,goalId:selected.authority.goalId,taskId:selected.authority.taskId,attemptId:selected.authority.attemptId,authorContainerId:submission.containerId!,authorityGeneration:selected.authority.authorityGeneration,source:{snapshotSha256:selected.source.sha256,dirty:true}},{signal,assertCurrent:()=>{if(!this.authorityCurrent(selected.authority))throw new Error('The author assignment changed.');}});
+        const owned=await this.browser.prepare({id:session.id,sessionId:submission.chatSessionId,goalId:selected.authority.goalId,taskId:selected.authority.taskId,attemptId:selected.authority.attemptId,authorContainerId:submission.containerId!,authorityGeneration:selected.authority.authorityGeneration,source:{snapshotSha256:selected.source.sha256,dirty:true},...(submission.viewport?{viewport:submission.viewport}:{})},{signal,assertCurrent:()=>{if(!this.authorityCurrent(selected.authority))throw new Error('The author assignment changed.');}});
         this.jobs.markSessionReady(session.id);
       }).catch(error=>{
         const sessions=this.jobs.sessions(selected.id).filter(session=>session.status!=='stopped');

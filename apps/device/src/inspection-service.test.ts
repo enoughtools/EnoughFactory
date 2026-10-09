@@ -4,8 +4,9 @@ import { mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test, { type TestContext } from 'node:test';
-import type { InspectionAuthority, InspectionEvidence, InspectionSourceIdentity, InspectionVerificationRun, TaskQualityRequirements } from '@enoughfactory/contracts';
+import type { InspectionAuthority, InspectionEvidence, InspectionJob, InspectionSourceIdentity, InspectionVerificationRun, TaskQualityRequirements } from '@enoughfactory/contracts';
 import type { BrowserObservation } from '@enoughfactory/browser-inspection';
+import type { InspectionSnapshot } from '@enoughfactory/workspaces';
 import type { DeviceApp } from './app.ts';
 import type { AgentToolBridgeContext, ChatController } from './chats.ts';
 import { InspectionService } from './inspection-service.ts';
@@ -18,6 +19,7 @@ const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR
 interface ToolResult { content: Array<{ type: string; text?: string; data?: string; mimeType?: string }>; }
 interface TestSeam {
   call(context: AgentToolBridgeContext, token: string, name: string, args: Record<string, unknown>): Promise<ToolResult>;
+  capture(context: AgentToolBridgeContext, authority: InspectionAuthority): Promise<{ id: string; snapshot: InspectionSnapshot; source: InspectionSourceIdentity }>;
   pump(): void;
   active: Map<string, Promise<void>>;
   closing: boolean;
@@ -315,6 +317,122 @@ test('reusing a native build request with different semantic arguments rejects b
   assert.equal(value<{ job: { id: string } }>(await f.call('factory_native_build', { profileId: 'one', requestId: 'build' })).job.id, first.job.id);
   await assert.rejects(f.call('factory_native_build', { profileId: 'two', requestId: 'build' }), /reused|different arguments/);
   assert.equal(f.store.list('inspection-source-snapshots').length, count);
+});
+
+function recordedBrowserCapture(f: Awaited<ReturnType<typeof fixture>>) {
+  f.context.execution = { ...f.context.execution, kind: 'container', targetId: 'container', containerId: 'non-live-author-container' };
+  f.seam.closing = true;
+  let captures = 0;
+  f.seam.capture = async (context, authority) => {
+    captures++;
+    assert.equal(context, f.context);
+    assert.deepEqual(authority, f.authority);
+    return f.store.get<{ id: string; snapshot: InspectionSnapshot; source: InspectionSourceIdentity }>('inspection-source-snapshots', f.source.snapshotId)!;
+  };
+  return () => captures;
+}
+
+test('browser start rejects malformed initial viewports before source capture or job allocation', async t => {
+  const f = await fixture(t, 'web'), captures = recordedBrowserCapture(f);
+  const invalid: unknown[] = [
+    null, [], '1440x900', {}, { width: 1440 }, { height: 900 },
+    { width: 0, height: 900 }, { width: -1, height: 900 }, { width: 1440, height: 0 },
+    { width: 1440.5, height: 900 }, { width: 1440, height: 900.5 },
+    { width: '1440', height: 900 }, { width: 1440, height: true },
+    { width: Number.NaN, height: 900 }, { width: 1440, height: Number.POSITIVE_INFINITY },
+    { width: Number.MAX_SAFE_INTEGER + 1, height: 900 },
+    { width: 4097, height: 900 }, { width: 1440, height: 4097 },
+    { width: 1440, height: 900, scale: 1 },
+  ];
+  for (const [index, viewport] of invalid.entries()) {
+    await assert.rejects(f.call('factory_browser_start', { requestId: `invalid-${index}`, viewport }), /viewport/i);
+  }
+  assert.equal(captures(), 0);
+  assert.equal(f.store.list('inspection-jobs').length, 0);
+  assert.equal(f.store.list('inspection-submissions').length, 0);
+  assert.equal(f.store.list('inspection-request-jobs').length, 0);
+  assert.equal(f.store.list('inspection-source-snapshots').length, 1);
+});
+
+test('browser start retains canonical viewport dimensions and rejects conflicting request replay without recapturing source', async t => {
+  const f = await fixture(t, 'web'), captures = recordedBrowserCapture(f);
+  const viewport = { height: 4096, width: 1 };
+  const first = value<{ job: InspectionJob }>(await f.call('factory_browser_start', { requestId: 'sized-browser', viewport })).job;
+  viewport.width = 320; viewport.height = 240;
+  assert.deepEqual(first.profile, { viewport: { width: 1, height: 4096 } });
+  assert.deepEqual(first.source, f.source);
+  assert.deepEqual(first.authority, f.authority);
+  const submission = f.store.get<{ viewport?: { width: number; height: number }; snapshot: InspectionSnapshot; containerId: string }>('inspection-submissions', first.id)!;
+  assert.deepEqual(submission.viewport, { width: 1, height: 4096 });
+  assert.equal(submission.snapshot.id, f.source.snapshotId);
+  assert.equal(submission.containerId, f.context.execution.containerId);
+  assert.deepEqual(f.service.jobs.getJob(first.id)!.profile, first.profile, 'Mutating the caller object cannot change retained dimensions');
+  const replay = value<{ job: InspectionJob }>(await f.call('factory_browser_start', { requestId: 'sized-browser', viewport: { width: 1, height: 4096 } })).job;
+  assert.equal(replay.id, first.id);
+  for (const args of [
+    { requestId: 'sized-browser', viewport: { width: 2, height: 4096 } },
+    { requestId: 'sized-browser', viewport: { width: 1, height: 4095 } },
+    { requestId: 'sized-browser' },
+  ]) await assert.rejects(f.call('factory_browser_start', args), /reused|different arguments/);
+  assert.equal(captures(), 1);
+  assert.equal(f.service.jobs.listJobs().length, 1);
+  assert.deepEqual(f.service.jobs.getJob(first.id)!.source, f.source);
+  assert.deepEqual(f.service.jobs.getJob(first.id)!.authority, f.authority);
+  assert.equal(f.store.list('inspection-source-snapshots').length, 1);
+});
+
+test('browser start keeps the omitted viewport default and distinguishes explicit dimensions on replay', async t => {
+  const f = await fixture(t, 'web'), captures = recordedBrowserCapture(f);
+  const first = value<{ job: InspectionJob }>(await f.call('factory_browser_start', { requestId: 'default-browser' })).job;
+  assert.deepEqual(first.profile, {});
+  assert.equal(Object.hasOwn(f.store.get<Record<string, unknown>>('inspection-submissions', first.id)!, 'viewport'), false);
+  assert.equal(value<{ job: InspectionJob }>(await f.call('factory_browser_start', { requestId: 'default-browser' })).job.id, first.id);
+  await assert.rejects(f.call('factory_browser_start', { requestId: 'default-browser', viewport: { width: 1440, height: 900 } }), /reused|different arguments/);
+  assert.equal(captures(), 1);
+  assert.equal(f.service.jobs.listJobs().length, 1);
+  assert.deepEqual(first.source, f.source);
+  assert.deepEqual(first.authority, f.authority);
+});
+
+test('delayed browser preparation uses the retained initial viewport before marking its session ready', async t => {
+  for (const viewport of [{ width: 1440, height: 900 }, undefined]) await t.test(viewport ? 'explicit dimensions' : 'omitted default', async t => {
+    const f = await fixture(t, 'web'), captures = recordedBrowserCapture(f);
+    const first = value<{ job: InspectionJob }>(await f.call('factory_browser_start', { requestId: 'delayed-browser', ...(viewport ? { viewport } : {}) })).job;
+    assert.equal(first.status, 'queued');
+    assert.equal(f.service.jobs.sessions(first.id).length, 0);
+    const restarted = new InspectionService(f.service.app, {} as ChatController), seam = restarted as unknown as TestSeam;
+    let release!: () => void, preparations = 0, toolReads = 0;
+    const pending = new Promise<void>(resolve => { release = resolve; });
+    Object.assign(restarted.browser, {
+      prepare: async (identity: Parameters<typeof restarted.browser.prepare>[0], options: Parameters<typeof restarted.browser.prepare>[1]) => {
+        preparations++;
+        assert.deepEqual(identity.viewport, viewport);
+        assert.equal(Object.hasOwn(identity, 'viewport'), viewport !== undefined);
+        assert.equal(identity.authorContainerId, f.context.execution.containerId);
+        assert.equal(identity.authorityGeneration, f.authority.authorityGeneration);
+        assert.deepEqual(identity.source, { snapshotSha256: f.source.sha256, dirty: true });
+        assert.equal(restarted.jobs.getSession(identity.id)!.status, 'starting');
+        options?.assertCurrent?.();
+        await pending;
+        return { id: identity.id, state: 'ready' };
+      },
+      listTools: async () => { toolReads++; return [{ name: 'browser_snapshot', inputSchema: { type: 'object' } }]; },
+    });
+    seam.pump();
+    const active = [...seam.active.values()], session = restarted.jobs.sessions(first.id)[0]!;
+    assert.equal(preparations, 1);
+    assert.equal(active.length, 1);
+    assert.equal(session.status, 'starting');
+    const before = value<{ tools?: unknown }>(await seam.call(f.context, f.token, 'factory_job_status', { jobId: first.id }));
+    assert.equal(before.tools, undefined); assert.equal(toolReads, 0);
+    release(); await Promise.all(active);
+    assert.equal(restarted.jobs.getSession(session.id)!.status, 'ready');
+    assert.deepEqual(restarted.jobs.getJob(first.id)!.source, f.source);
+    assert.deepEqual(restarted.jobs.getJob(first.id)!.authority, f.authority);
+    const after = value<{ tools: Array<{ name: string }> }>(await seam.call(f.context, f.token, 'factory_job_status', { jobId: first.id }));
+    assert.equal(after.tools[0]!.name, 'browser_snapshot'); assert.equal(toolReads, 1);
+    assert.equal(captures(), 1, 'A delayed pump never recaptures or replaces the retained source');
+  });
 });
 
 test('reference inspection binds configured reference identity and retains the exact returned original manifest', async t => {

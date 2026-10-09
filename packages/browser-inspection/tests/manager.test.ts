@@ -76,11 +76,51 @@ test('two authors keep loopback networking, profiles and processes independent w
   assert.equal(runs[1]![runs[1]!.indexOf('--network')+1], `container:${authorB}`);
   assert.ok(runs.every(command => !command.includes('-p') && !command.includes('--publish') && !command.includes('--ipc=host') && !command.includes('--mount')));
   assert.ok(runs.every(command => command.includes('--shared-browser-context') && command.includes('--output-max-size')));
+  assert.ok(runs.every(command => !command.includes('--viewport-size')), 'Omitted viewport leaves the pinned browser default unchanged');
+  assert.equal(a.viewport, undefined);
   assert.equal(a.mcpSessionId, 'test-mcp-session');
   assert.equal((await f.manager.listTools(a.id))[0]!.name, 'browser_snapshot');
   await f.manager.retire(a.id); await f.manager.retire(b.id);
   assert.equal(f.containers.get(authorA)?.State.Running, true);
   assert.equal(f.containers.get(authorB)?.State.Running, true);
+});
+
+test('initial viewport is copied and applied at launch before any browser observation or navigation', async t => {
+  const f = await fixture(t), viewport = { width: 1280, height: 900 };
+  const manager = new BrowserInspectionManager({ ...f.options, runDocker: async (endpoint, args, options) => {
+    if (args[0] === 'run') {
+      assert.equal(args[args.indexOf('--viewport-size') + 1], '1280x900');
+      assert.equal(f.requests.length, 0, 'The launch size must exist before even MCP initialization');
+    }
+    return f.options.runDocker(endpoint, args, options);
+  } });
+  const preparation = manager.prepare({ ...f.identity, viewport });
+  viewport.height = 720;
+  const lease = await preparation;
+  assert.deepEqual(lease.viewport, { width: 1280, height: 900 });
+  assert.deepEqual((await manager.get(lease.id)).viewport, lease.viewport);
+  assert.deepEqual(lease.source, f.identity.source);
+  assert.equal(f.requests.some(request => request.method === 'tools/call'), false, 'Preparation does not manufacture a workflow observation or navigate');
+  const restarted = new BrowserInspectionManager(f.options);
+  const retained = await restarted.prepare({ ...f.identity, viewport: { width: 1280, height: 900 } });
+  assert.equal(retained.containerId, lease.containerId);
+  for (const changed of [{ width: 1280, height: 720 }, undefined]) {
+    await assert.rejects(restarted.prepare({ ...f.identity, viewport: changed }), /another attempt|identity/i);
+  }
+  assert.equal(f.commands.filter(command => command[0] === 'run').length, 1, 'A changed viewport cannot silently replace a retained browser');
+  await manager.retire(lease.id);
+});
+
+test('invalid initial viewports reject before runtime access or browser allocation', async t => {
+  const f = await fixture(t);
+  for (const viewport of [null, '1280x900', [], {}, { width: 1280 }, { width: 1280, height: 900, scale: 1 },
+    { width: '1280', height: 900 }, { width: 0, height: 900 }, { width: 1280, height: -1 },
+    { width: 1.5, height: 900 }, { width: NaN, height: 900 }, { width: 1280, height: Infinity },
+    { width: 4097, height: 900 }, { width: 1280, height: Number.MAX_SAFE_INTEGER }]) {
+    await assert.rejects(f.manager.prepare({ ...f.identity, viewport: viewport as never }), error => error instanceof BrowserInspectionError && error.code === 'INVALID_VIEWPORT');
+  }
+  assert.equal(f.commands.length, 0);
+  assert.equal(f.records.length, 0);
 });
 
 test('real image bytes remain in provider result while durable events contain only immutable artifact references', async t => {

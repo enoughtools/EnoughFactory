@@ -7,6 +7,7 @@ import { dockerInvocation, type DockerRuntimeEndpoint } from '@enoughfactory/run
 import upstreamLock from './image-assets/upstream-package-lock.json' with { type: 'json' };
 import upstreamBrowsers from './image-assets/upstream-browsers.json' with { type: 'json' };
 import { BROWSER_IMAGE_PATHS, BROWSER_PINS, type BrowserImagePlatform } from './pins.ts';
+import { validateBrowserViewport, type BrowserViewport } from './types.ts';
 
 export interface PreparedBrowserImage {
   image: string;
@@ -52,10 +53,11 @@ function platform(value: string): BrowserImagePlatform {
 }
 
 /** Arguments are passed directly to the image entrypoint, never through a shell. */
-export function browserMcpArguments(port: number): string[] {
+export function browserMcpArguments(port: number, viewport?: BrowserViewport): string[] {
   if (!Number.isSafeInteger(port) || port < 1024 || port > 65535) throw new Error('The private browser port must be between 1024 and 65535.');
+  const initial = validateBrowserViewport(viewport);
   // Pinned MCP compares the complete HTTP Host header, including the port.
-  return ['--host', '127.0.0.1', '--port', String(port), '--allowed-hosts', `127.0.0.1:${port}`, '--output-dir', BROWSER_IMAGE_PATHS.output, '--isolated', '--shared-browser-context', '--image-responses', 'allow'];
+  return ['--host', '127.0.0.1', '--port', String(port), '--allowed-hosts', `127.0.0.1:${port}`, '--output-dir', BROWSER_IMAGE_PATHS.output, '--isolated', '--shared-browser-context', '--image-responses', 'allow', ...(initial ? ['--viewport-size', `${initial.width}x${initial.height}`] : [])];
 }
 
 /** This layer adds only local metadata and writable output; upstream bytes remain digest-pinned. */

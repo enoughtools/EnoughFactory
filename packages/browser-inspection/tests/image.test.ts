@@ -222,5 +222,6 @@ test('a no-op probe cannot claim readiness without genuine screenshot evidence',
 
 test('MCP control is loopback-only with isolated persistent-per-attempt context and image output', () => {
   assert.deepEqual(browserMcpArguments(42319), ['--host', '127.0.0.1', '--port', '42319', '--allowed-hosts', '127.0.0.1:42319', '--output-dir', '/output', '--isolated', '--shared-browser-context', '--image-responses', 'allow']);
+  assert.deepEqual(browserMcpArguments(42319, { width: 1280, height: 900 }), [...browserMcpArguments(42319), '--viewport-size', '1280x900']);
   for (const port of [0, 80, 65536, 1.5, NaN]) assert.throws(() => browserMcpArguments(port), /private browser port/);
 });

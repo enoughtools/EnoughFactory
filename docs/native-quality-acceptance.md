@@ -48,7 +48,7 @@ Browser assertions parse the pinned Playwright MCP `Snapshot` section, with the 
 
 ## EnoughMail pilot
 
-The current web reference is the EnoughMail UI in the supplied `mail-web` working folder. In this development checkout its source is `forms/open-cloud/apps/mail/src/ui`: `MailApp.tsx`, `MailFrame.tsx`, `mailbox.css`, `Compose.tsx` and `Settings.tsx`. The actual library is the pinned EnoughUI source, with the native package vendored under `Vendor/EnoughUI` in the mail repository. Record the exact mounted reference identity used by the run; these local paths do not promise that future workers have them. Source inspection identifies intended flows; browser screenshots and exercised behavior establish the current web UX.
+The current web reference is the EnoughMail UI in the supplied `mail-web` project folder. Discover its paths from the declared project manifest, mounted root and original source inventory; `MailApp.tsx`, `MailFrame.tsx`, `mailbox.css`, `Compose.tsx` and `Settings.tsx` are useful entry points. The actual library is the pinned EnoughUI source, with the native package vendored under `Vendor/EnoughUI` in the mail repository. Record the exact mounted reference identity used by the run; these source names do not promise that future workers have the same paths. Source inspection identifies intended flows; browser screenshots and exercised behavior establish the current web UX.
 
 Source-backed design cues to verify against actual screens:
 

@@ -6,7 +6,7 @@ import { dockerInvocation, type DockerRuntimeEndpoint } from '@enoughfactory/run
 import { prepareBrowserImage, verifyBrowserImage, browserMcpArguments, BROWSER_PROBE_ENVIRONMENT, type PreparedBrowserImage } from './image.ts';
 import { MCP_FETCH_SCRIPT, runBrowserDocker, type BrowserDockerRunner } from './docker.ts';
 import { retainBrowserResult } from './evidence.ts';
-import { BrowserInspectionError, type BrowserCallOptions, type BrowserLease, type BrowserObservation, type BrowserSessionIdentity, type BrowserToolDefinition, type BrowserToolResult } from './types.ts';
+import { BrowserInspectionError, validateBrowserViewport, type BrowserCallOptions, type BrowserLease, type BrowserObservation, type BrowserSessionIdentity, type BrowserToolDefinition, type BrowserToolResult } from './types.ts';
 
 interface Container { Id: string; Name: string; State: { Running: boolean }; Config: { Labels?: Record<string, string>; Image?: string }; HostConfig?: { NetworkMode?: string; PortBindings?: unknown }; Image?: string; }
 interface RpcResponse { status: number; sessionId?: string; errorText?: string; message?: { id?: number; result?: unknown; error?: { code: number; message: string } }; }
@@ -56,12 +56,13 @@ export class BrowserInspectionManager {
   }
   private filename(id: string) { return join(this.root, `${safeId(id)}.json`); }
   private validateIdentity(identity: BrowserSessionIdentity) {
+    validateBrowserViewport(identity.viewport);
     for (const id of [identity.id, identity.sessionId, identity.attemptId, identity.goalId, identity.taskId].filter((value): value is string => value !== undefined)) safeId(id);
     safeId(identity.authorContainerId);
     if (!Number.isSafeInteger(identity.authorityGeneration) || identity.authorityGeneration < 1) throw new BrowserInspectionError('A positive authority generation is required.', 'INVALID_IDENTITY');
     if (identity.source?.commit && !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(identity.source.commit) || identity.source?.snapshotSha256 && !/^[a-f0-9]{64}$/.test(identity.source.snapshotSha256)) throw new BrowserInspectionError('Browser source identity is invalid.', 'INVALID_IDENTITY');
   }
-  private identity(record: BrowserSessionIdentity) { return { id: record.id, sessionId: record.sessionId, attemptId: record.attemptId, goalId: record.goalId, taskId: record.taskId, authorContainerId: record.authorContainerId, authorityGeneration: record.authorityGeneration }; }
+  private identity(record: BrowserSessionIdentity) { return { id: record.id, sessionId: record.sessionId, attemptId: record.attemptId, goalId: record.goalId, taskId: record.taskId, authorContainerId: record.authorContainerId, authorityGeneration: record.authorityGeneration, ...(record.viewport ? { viewport: record.viewport } : {}) }; }
   private identityHash(record: BrowserSessionIdentity) { return createHash('sha256').update(JSON.stringify(this.identity(record))).digest('hex'); }
   private async save(record: BrowserLease, expected?: { states: BrowserLease['state'][]; operationId?: string }): Promise<BrowserLease> {
     const previous = this.writes.get(record.id) ?? Promise.resolve();
@@ -116,6 +117,8 @@ export class BrowserInspectionManager {
     if (!browser.State.Running) throw new BrowserInspectionError('The browser session stopped; inspect its retained state before replacing it.', 'BROWSER_STOPPED');
   }
   async prepare(identity: BrowserSessionIdentity, options: { signal?: AbortSignal; onProgress?: (message: string) => void; assertCurrent?: () => void } = {}): Promise<BrowserLease> {
+    const viewport = validateBrowserViewport(identity.viewport);
+    identity = { ...identity, ...(viewport ? { viewport } : {}) };
     this.validateIdentity(identity); options.signal?.throwIfAborted(); options.assertCurrent?.();
     const active = this.preparations.get(identity.id);
     if (active) {
@@ -164,7 +167,7 @@ export class BrowserInspectionManager {
     const tag = { [labels.managed]: 'true', [labels.owner]: this.owner, [labels.kind]: 'session', [labels.id]: lease.id, [labels.author]: lease.authorContainerId, [labels.identity]: this.identityHash(lease), [labels.recipe]: image.recipeSha256 };
     options.onProgress?.('Starting an isolated browser');
     try {
-      const started = await this.run(this.endpoint, ['run', '-d', '--init', '--name', lease.name, '--network', `container:${lease.authorContainerId}`, '--shm-size', '256m', '--tmpfs', '/tmp:rw,nosuid,nodev,size=256m', ...Object.entries(BROWSER_PROBE_ENVIRONMENT).flatMap(([key,value])=>['--env',`${key}=${value}`]), '--memory', '768m', '--cpus', '1', '--cap-drop=ALL', '--security-opt', 'no-new-privileges', ...Object.entries(tag).flatMap(([key, value]) => ['--label', `${key}=${value}`]), image.image, ...browserMcpArguments(port), '--output-max-size', String(64 * 1024 ** 2)], { signal: options.signal, timeoutMs: 30_000 });
+      const started = await this.run(this.endpoint, ['run', '-d', '--init', '--name', lease.name, '--network', `container:${lease.authorContainerId}`, '--shm-size', '256m', '--tmpfs', '/tmp:rw,nosuid,nodev,size=256m', ...Object.entries(BROWSER_PROBE_ENVIRONMENT).flatMap(([key,value])=>['--env',`${key}=${value}`]), '--memory', '768m', '--cpus', '1', '--cap-drop=ALL', '--security-opt', 'no-new-privileges', ...Object.entries(tag).flatMap(([key, value]) => ['--label', `${key}=${value}`]), image.image, ...browserMcpArguments(port, lease.viewport), '--output-max-size', String(64 * 1024 ** 2)], { signal: options.signal, timeoutMs: 30_000 });
       if (started.code) throw new BrowserInspectionError('The isolated browser could not start.', 'BROWSER_START_FAILED');
       const containerId = started.stdout.trim();
       if (!fullId(containerId)) throw new BrowserInspectionError('Browser startup did not confirm its process identity.', 'BROWSER_START_UNKNOWN', true);

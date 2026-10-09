@@ -13,9 +13,11 @@ Support two complementary routes:
 
 Keep execution location separate from tool capabilities. A container author can use a Mac tool remotely, and a Mac host worker still needs explicit UI tools. Moving Codex onto macOS alone does not reproduce the feedback loop available in the Codex desktop app.
 
-## Verified starting point
+## Verified pre-implementation baseline
 
-| Area | Current implementation | Change needed |
+This was the starting point on 8 October 2026. Current implementation status appears at the end of this document.
+
+| Area | Baseline implementation | Change identified |
 | --- | --- | --- |
 | Agent execution | `TurnInput.containerId` is required; `AgentManager` creates `ContainerProcess` for Codex and other providers | Explicit execution targets and a Mac host process/workspace adapter |
 | Placement | Device identity, availability, workspace support and container capacity | Target capabilities, readiness, tool placement and separate resource leases |
@@ -27,7 +29,7 @@ Keep execution location separate from tool capabilities. A container author can 
 
 Important seams: [agent types](../packages/agents/src/types.ts), [agent manager](../packages/agents/src/index.ts), [Codex adapter](../packages/agents/src/codex.ts), [contracts](../packages/contracts/src/index.ts), [scheduler](../packages/factory/src/scheduler.ts), [coordinator](../packages/factory/src/coordinator.ts), [device factory](../apps/device/src/factory.ts), [Apple executor](../packages/workspaces/src/apple-checks.ts), [controller context](../apps/device/src/controller-context.ts), [artifact store](../packages/workspaces/src/artifacts.ts) and [preview gateway](../packages/previews/src/index.ts).
 
-Two existing couplings need deliberate correction. Apple checks currently enter `withRuntimeOperation`, which depends on container-runtime admission; host work needs independent service admission. Also, `checkResults()` flattens command results, while controller context carries external artifact references without their bodies. Native reports and actual image bytes must survive these paths.
+Two couplings were identified at that baseline. Apple checks entered `withRuntimeOperation`, which depended on container-runtime admission; host work needed independent service admission. Also, `checkResults()` flattened command results, while controller context carried external artifact references without their bodies. The extension needed to preserve native reports and deliver actual image bytes through these paths.
 
 ## Shared execution model
 
@@ -165,6 +167,8 @@ Explicit UI requirements now gate both candidate and integration checks. Missing
 
 New goal creation defaults to Application, with explicit platform and design-reference choices; Other work retains the general goal flow. The typed application template remains mandatory when a planner omits task quality. Plans must name representative workflows covering every selected platform, required references inherit into UI author contracts, and final review inspects the integrated application's actual images and workflow evidence. Backend and architecture work can proceed independently. These representative journeys supplement the original completion criteria; they do not guarantee every feature or infer acceptance requirements for existing goals and API callers that omit the template.
 
-Native UI testing requires a validated build/isolated-fixture profile, Xcode and the bundled testing assets. Mac interaction also needs an unlocked desktop and OS permissions. These prerequisites are probed; unavailable access does not count as passing. Fixture results remain separate from live-service, feature-parity, signing and distribution acceptance. The existing EnoughMail requirements are preserved.
+Native UI testing requires a validated build/isolated-fixture profile, Xcode and the bundled testing assets. Mac interaction also needs an unlocked desktop and Accessibility and Screen & System Audio Recording permissions for EnoughFactory Native Inspection. These prerequisites are probed; unavailable access does not count as passing. Fixture results remain separate from live-service, feature-parity, signing and distribution acceptance. The existing EnoughMail requirements are preserved.
+
+On 9 October 2026, the retained EnoughMail candidate (`4af8ddc73f2c`) and clean integrated commit (`93e01f9e0585`) passed macOS and iOS Simulator compilation and retained unsigned app products. Its final native UI task still has no allocated attempt because desktop and OS permission access is unavailable. The original UI workflows, reference-based visual review, authenticated services, signing and distribution criteria still require their own evidence.
 
 A new native app can now propose its own fixed testing profile through the normal Factory tool interface. The service freezes every source root and queues an independent source-only Codex audit of fixture routing, storage, preferences, credentials, providers, notifications and build initialization. The author’s selected files are discovery hints; original complete-file reads and the separate judgment accompany a service-issued whole-source receipt. At one maximum agent the author ends its turn and Factory resumes the same saved candidate after the audit. Rules/manual setup is actionable in Approvals. Mac uses a fresh private run namespace and iOS uses an owned Simulator app sandbox; source review is not runtime isolation proof, a native build, actual UI workflow evidence, live-service acceptance or signing. Authenticated paired Macs receive the original source and audit provenance before a profile becomes usable.
