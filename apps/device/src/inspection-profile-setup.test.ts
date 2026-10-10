@@ -6,12 +6,12 @@ import path from 'node:path';
 import { createInterface } from 'node:readline';
 import test, { type TestContext } from 'node:test';
 import type { Approval, Attempt, Chat, ExecutionTargetAdvertisement, Goal, InspectionAuthority, InspectionSourceIdentity, Project, Session } from '@enoughfactory/contracts';
-import { ArtifactStore, InspectionSnapshotManager, type ArtifactManifest, type InspectionSnapshot } from '@enoughfactory/workspaces';
+import { ArtifactStore, InspectionSnapshotManager, appleToolArguments, appleXcodeSigningSettings, type ArtifactManifest, type InspectionSnapshot } from '@enoughfactory/workspaces';
 import type { HostProcessState } from '@enoughfactory/agents';
 import type { DeviceApp } from './app.ts';
 import { ChatController, type AgentToolBridge, type AgentToolBridgeContext, type RunOptions } from './chats.ts';
 import type { NativeFixtureProfile } from './inspection-native.ts';
-import { NativeProfileSetup, PROFILE_AUDITS, validateNativeProfileProposal, type NativeProfileAudit, type NativeProfileProposal } from './inspection-profile-setup.ts';
+import { NativeProfileSetup, PROFILE_AUDITS, validateNativeProfileProposal, type NativeProfileAudit, type NativeProfileProposal, type NativeProfileBuildContext } from './inspection-profile-setup.ts';
 import { SessionController, type HostLaunchOptions } from './sessions.ts';
 import { Store } from './store.ts';
 
@@ -88,7 +88,7 @@ async function fixture(t: TestContext, effects: { retire?: boolean; target?: 'ho
   let markAdmitted!: () => void;
   const admitted = new Promise<void>(resolve => { markAdmitted = resolve; });
   let processes: Array<{ sessionId: string; state: string; createdAt: string } & Partial<Omit<HostProcessState, 'sessionId' | 'state' | 'createdAt'>>> = [];
-  const configured: Array<{ projectId: string; profile: NativeFixtureProfile }> = [], calls: Array<{ chatId: string; options: RunOptions }> = [], stopped: string[] = [];
+  const configured: Array<{ projectId: string; profile: NativeFixtureProfile }> = [], calls: Array<{ chatId: string; prompt: string; options: RunOptions }> = [], stopped: string[] = [];
   const app = {
     dataDir, device: { id: 'mac' }, store, emit() {}, changed() {}, withServiceOperation: async <T>(operation: (signal: AbortSignal) => Promise<T>) => operation(new AbortController().signal),
     sessions: {
@@ -115,8 +115,8 @@ async function fixture(t: TestContext, effects: { retire?: boolean; target?: 'ho
       store.set('chats', chat); return chat;
     },
     interrupt: async () => {},
-    run: async (chatId: string, _prompt: string, options: RunOptions) => {
-      calls.push({ chatId, options });
+    run: async (chatId: string, prompt: string, options: RunOptions) => {
+      calls.push({ chatId, prompt, options });
       markAdmitted();
       if (providerGate) {
         if (calls.length > 1) throw Object.assign(new Error('A second reviewer was admitted while the only slot was held'), { agentStarted: false });
@@ -622,6 +622,32 @@ for (const mode of ['none', 'partial'] as const) test(`an approving model respon
   assert.equal(run.status, 'rejected'); assert.match(run.reason!, /read.*complet/i);
   assert.equal(f.configured.length, 0); assert.equal(run.verdict, undefined); assert.equal(run.receipt, undefined);
   assert.equal(f.calls.length, 1);
+});
+
+test('independent source review receives the actual broker signing settings and retains the exact context', { timeout: 60000 }, async t => {
+  const f = await fixture(t), run = await f.execute(await f.propose());
+  assert.equal(run.status, 'configured'); assert(run.verdict);
+  const prompt = f.calls[0]!.prompt;
+  const contextLine = prompt.split('\n').find(line => line.startsWith('Factory build context: '));
+  assert(contextLine);
+  const context = JSON.parse(contextLine.slice('Factory build context: '.length)) as NativeProfileBuildContext;
+  assert.deepEqual(context, run.reviewBuildContext);
+  assert.equal(context.issuer, 'factory-broker');
+  assert.deepEqual(context.xcodeSigningSettings, appleXcodeSigningSettings());
+  assert.equal(context.productHandling, 'archive-and-extract-original-bytes-without-broker-resigning');
+  assert.equal(context.runtimeAccess, 'not-proven-by-source-audit-or-build-settings');
+  for (const platform of ['macos', 'ios-simulator'] as const) for (const configuration of ['Debug', 'Release'] as const) {
+    const args = appleToolArguments({ tool: 'xcodebuild', project: 'Demo.xcodeproj', scheme: 'Demo', platform, configuration }, '/owned/source', '/owned/scratch');
+    const signingArgs = args.filter(arg => /^(CODE_SIGNING_ALLOWED|CODE_SIGNING_REQUIRED|CODE_SIGN_IDENTITY)=/.test(arg));
+    assert.deepEqual(signingArgs, Object.entries(context.xcodeSigningSettings).map(([key, value]) => `${key}=${value}`));
+    assert.deepEqual(signingArgs, ['CODE_SIGNING_ALLOWED=NO', 'CODE_SIGNING_REQUIRED=NO', 'CODE_SIGN_IDENTITY=']);
+  }
+  assert.match(prompt, /custom build phases, signing commands, linker flags, embedded entitlements/);
+  assert.match(prompt, /compiler boundary does not sandbox the launched Mac app/);
+  assert.match(prompt, /entry\/parser, storage\/export, credential, provider and notification check/);
+  const judgment = JSON.parse((await f.artifacts.read(run.verdict)).toString()) as { buildContext: NativeProfileBuildContext };
+  assert.deepEqual(judgment.buildContext, context, 'Retained judgment preserves what the reviewer actually received.');
+  assert.throws(() => validateNativeProfileProposal({ ...f.proposal, reviewBuildContext: { issuer: 'factory-broker', xcodeSigningSettings: { CODE_SIGNING_ALLOWED: 'YES' } } }, f.snapshot), /Supply profile as an object/);
 });
 
 test('native setup retains the independent original-read verdict before installing an all-root v2 receipt', { timeout: 60000 }, async t => {

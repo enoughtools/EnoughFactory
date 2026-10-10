@@ -4,7 +4,7 @@ import path from 'node:path';
 import type { Approval, Attempt, Chat, ExecutionTargetAdvertisement, FactoryTask, Goal, InspectionAuthority, InspectionSourceIdentity, Project, Session } from '@enoughfactory/contracts';
 import { matchPolicyRule } from '@enoughfactory/agents';
 import { readJsonObject, type FactoryStore } from '@enoughfactory/factory';
-import { APPLE_CHECK_PREFIX, exportInspectionSnapshot, importInspectionSnapshot, parseAppleCheckCommand, writeAtomic, type ArtifactManifest, type ArtifactStore, type InspectionSnapshot, type InspectionSnapshotManager, type InspectionSnapshotTransfer, type WorkspaceRecord } from '@enoughfactory/workspaces';
+import { APPLE_CHECK_PREFIX, appleXcodeSigningSettings, exportInspectionSnapshot, importInspectionSnapshot, parseAppleCheckCommand, writeAtomic, type ArtifactManifest, type ArtifactStore, type InspectionSnapshot, type InspectionSnapshotManager, type InspectionSnapshotTransfer, type WorkspaceRecord } from '@enoughfactory/workspaces';
 import type { DeviceApp } from './app.ts';
 import type { AgentToolBridge, AgentToolBridgeContext, ChatController } from './chats.ts';
 import { createContainerInspectionBridge, createHostInspectionBridge, inspectionMcpHandler } from './inspection-mcp.ts';
@@ -21,6 +21,19 @@ export interface NativeProfileProposal {
   profile: Omit<NativeFixtureProfile, 'fixtureEvidenceSha256' | 'receipt'>;
   auditPaths: Array<{ rootId: string; path: string; purposes: Purpose[] }>;
 }
+export interface NativeProfileBuildContext {
+  version: 1;
+  issuer: 'factory-broker';
+  xcodeSigningSettings: ReturnType<typeof appleXcodeSigningSettings>;
+  compilerBoundary: 'macos-seatbelt-deny-default';
+  productHandling: 'archive-and-extract-original-bytes-without-broker-resigning';
+  runtimeAccess: 'not-proven-by-source-audit-or-build-settings';
+}
+function nativeProfileBuildContext(): NativeProfileBuildContext {
+  return { version: 1, issuer: 'factory-broker', xcodeSigningSettings: appleXcodeSigningSettings(),
+    compilerBoundary: 'macos-seatbelt-deny-default', productHandling: 'archive-and-extract-original-bytes-without-broker-resigning',
+    runtimeAccess: 'not-proven-by-source-audit-or-build-settings' };
+}
 export interface NativeProfileAudit {
   id: string; requestKey: string; proposalSha256: string; proposal: NativeProfileProposal;
   authority: InspectionAuthority; source: InspectionSourceIdentity; ownerDeviceId: string; projectId: string; sourceSessionId: string;
@@ -35,6 +48,8 @@ export interface NativeProfileAudit {
   sourceChanged?:boolean;
   sourceCacheFailure?:NativeAuditSourceCacheFailure;
   recoveryOf?:string;
+  /** Exact broker context supplied to this reviewer; absent on earlier recorded reviews. */
+  reviewBuildContext?: NativeProfileBuildContext;
 }
 export interface NativeAuditSourceCacheFailure {code:'ENOENT';snapshotId:string;sourceDigest:string;path:string;message:string;observedAt:string;}
 interface AuditRead { id: string; runId: string; chatId: string; rootId: string; path: string; fileSha256: string; offset: number; length: number; fileSize: number; artifact: ArtifactManifest; }
@@ -253,7 +268,7 @@ export class NativeProfileSetup {
       if(session.status==='stopped')await this.options.app.sessions.restart(session.id);
       await this.options.app.sessions.waitExecutionReady(session.id,20*60_000,abort.signal);this.assertCurrent(run,abort.signal);
       const chat=run.chatId?this.options.chats.get(run.chatId):this.options.chats.create({sessionId:session.id,runtime:'codex',approvalMode:'approve-all',title:`Audit native fixture ${run.proposal.profile.id}`,verificationRunId:id});
-      run=this.patch(id,{sessionId:session.id,chatId:chat.id,status:'running',startedAt:run.startedAt??new Date().toISOString()});
+      run=this.patch(id,{sessionId:session.id,chatId:chat.id,status:'running',startedAt:run.startedAt??new Date().toISOString(),reviewBuildContext:nativeProfileBuildContext()});
       const stop=()=>{void this.options.chats.interrupt(chat.id).catch(()=>{});};abort.signal.addEventListener('abort',stop,{once:true});
       let response:{text:string};try{this.assertCurrent(run,abort.signal);const turn=this.options.chats.run(chat.id,this.prompt(run),{attemptId:run.authority.attemptId,verificationRunId:id,autonomous:true,systemInstructions:'You are the independent native fixture source auditor. You have full permissions in an owned execution workspace; this is not a host sandbox. The application source is supplied read-only by Factory tools. Do not execute its code, build it, edit it or launch any app. Inspect actual original source and report honestly.'});dispatched=true;this.patch(id,{providerUnresolved:true});response=await turn;ended=true;this.patch(id,{providerUnresolved:false});}finally{abort.signal.removeEventListener('abort',stop);}
       return await this.finish(this.get(id),response.text,abort.signal);
@@ -285,7 +300,7 @@ export class NativeProfileSetup {
     }else{session=await this.options.app.sessions.create(project,`a-${run.id.slice(-18)}`,{developmentToolchain:'default',assertCurrent:()=>this.assertCurrent(run),onCreated:bind});bind(session);}
     return session;
   }
-  private prompt(run:NativeProfileAudit):string{return `Independently audit whether this exact native app's proposed fixture safely isolates user data. This is source judgment, not runtime proof. No SDK, GUI, build or launch is needed. The author’s auditPaths are untrusted starting hints, not a complete inventory. Use factory_profile_source to list every declared root's full file manifest and read original files. Follow the entry/constructor/dependency graph, Xcode build phases and fallback/error branches; discover additional relevant paths. Verify the fixture switch/runId is handled BEFORE production constructors; storage and preferences are isolated, keychain/credentials and providers use fixture implementations, personal data migration and notifications are disabled, malformed or incomplete invocation of the requested fixture mode refuses production fallback (normal user launch without fixture mode may intentionally use production), and exact build/launch arguments match. iOS uses a fresh owned Simulator and app sandbox; host tmp paths do not prove iOS sandbox storage. Mac must use the proposed unique fresh data root. Do not assume a filename/import or author assertion proves any of these. Read complete cited files (use offset chunks); every starting file must be read fully. Reject uncertainty and explain repairs. Do not change any source or ask the user.\nAudit: ${run.id}\nExact source: ${JSON.stringify(run.source)}\nProposal: ${JSON.stringify(run.proposal)}\nReturn ONLY JSON {"approved":boolean,"findings":[{"purpose":"entry|storage|credentials|providers|preferences|notifications|build","reasoning":"specific observed control flow and limits","files":[{"rootId":"primary","path":"actual/read/file"}]}],"blockedReasons":["concrete deficiencies"]}. Provide a finding for every purpose and cite only original files you read. Your model judgment and read receipts will remain separate from native build/runtime and UI acceptance.`;}
+  private prompt(run:NativeProfileAudit):string{return `Independently audit whether this exact native app's proposed fixture safely isolates user data. This is source judgment, not runtime proof. No SDK, GUI, build or launch is needed. The author’s auditPaths are untrusted starting hints, not a complete inventory. Use factory_profile_source to list every declared root's full file manifest and read original files. Follow the entry/constructor/dependency graph, Xcode build phases and fallback/error branches; discover additional relevant paths. Verify the fixture switch/runId is handled BEFORE production constructors; storage and preferences are isolated, keychain/credentials and providers use fixture implementations, personal data migration and notifications are disabled, malformed or incomplete invocation of the requested fixture mode refuses production fallback (normal user launch without fixture mode may intentionally use production), and exact build/launch arguments match. iOS uses a fresh owned Simulator and app sandbox; host tmp paths do not prove iOS sandbox storage. Mac must use the proposed unique fresh data root. The Factory build context below is service-supplied and its signing settings come from the same generator used by the fixed Apple build recipe. Xcode signing is disabled for these inspection products, and Factory archives/extracts their original bytes without adding a product signature. Do not infer that signed production entitlements apply to this preview merely because CODE_SIGN_ENTITLEMENTS names an entitlement file. Still review custom build phases, signing commands, linker flags, embedded entitlements and dependencies that could change the effective product. The compiler boundary does not sandbox the launched Mac app; build settings prove neither fixture isolation nor runtime access. Retain every entry/parser, storage/export, credential, provider and notification check, and reject unresolved actual access or source isolation. Do not assume a filename/import or author assertion proves any of these. Read complete cited files (use offset chunks); every starting file must be read fully. Reject uncertainty and explain repairs. Do not change any source or ask the user.\nAudit: ${run.id}\nExact source: ${JSON.stringify(run.source)}\nFactory build context: ${JSON.stringify(run.reviewBuildContext)}\nProposal: ${JSON.stringify(run.proposal)}\nReturn ONLY JSON {"approved":boolean,"findings":[{"purpose":"entry|storage|credentials|providers|preferences|notifications|build","reasoning":"specific observed control flow and limits","files":[{"rootId":"primary","path":"actual/read/file"}]}],"blockedReasons":["concrete deficiencies"]}. Provide a finding for every purpose and cite only original files you read. Your model judgment and read receipts will remain separate from native build/runtime and UI acceptance.`;}
   async bridge(context:AgentToolBridgeContext):Promise<AgentToolBridge|undefined>{
     const id=context.chat.verificationRunId;if(!id?.startsWith('profile-audit-'))return;
     const run=this.get(id);assertNativeProfileAuditChat(this.options.app.store,context.chat,this.options.app.device.id,context.attemptId,context.verificationRunId);
@@ -311,7 +326,7 @@ export class NativeProfileSetup {
     const fullyRead=(file:{rootId:string;path:string})=>{const parts=reads.filter(read=>read.rootId===file.rootId&&read.path===file.path).sort((a,b)=>a.offset-b.offset);let end=0;for(const part of parts){if(part.offset>end)return false;end=Math.max(end,part.offset+part.length);}return parts.length>0&&end===parts[0]!.fileSize;};
     if(run.proposal.auditPaths.some(file=>!fullyRead(file)))throw new Error('The independent audit did not read every original starting file completely.');
     for(const purpose of purposes){const finding=verdict.findings.find(finding=>finding.purpose===purpose);if(!finding||typeof finding.reasoning!=='string'||finding.reasoning.trim().length<30||finding.reasoning.length>8000||!Array.isArray(finding.files)||!finding.files.length||finding.files.some(file=>!safePath(file.path)||!fullyRead(file)))throw new Error(`The independent ${purpose} finding lacks concrete reasoning and complete original source reads.`);}
-    const verdictArtifact=await this.options.artifacts.put(JSON.stringify({version:1,kind:'independent-native-fixture-judgment',runId:run.id,chatId:run.chatId,source:run.source,proposalSha256:run.proposalSha256,judgment:'source-review-not-runtime-proof',verdict,readIds:reads.map(read=>read.id)}),{...run.authority,name:`fixture-judgment-${run.proposal.profile.id}.json`,mime:'application/json'});
+    const verdictArtifact=await this.options.artifacts.put(JSON.stringify({version:1,kind:'independent-native-fixture-judgment',runId:run.id,chatId:run.chatId,source:run.source,proposalSha256:run.proposalSha256,judgment:'source-review-not-runtime-proof',...(run.reviewBuildContext?{buildContext:run.reviewBuildContext}:{}),verdict,readIds:reads.map(read=>read.id)}),{...run.authority,name:`fixture-judgment-${run.proposal.profile.id}.json`,mime:'application/json'});
     this.patch(run.id,{verdict:verdictArtifact});
     if(!verdict.approved||verdict.blockedReasons?.length)return this.patch(run.id,{status:'rejected',reason:verdict.blockedReasons?.join('\n')||'The independent source reviewer found an unsafe or unverified fixture path.'});
     await this.sourceCurrent(run,signal);if(!this.setupApproved(run))throw new Error('Native setup approval policy changed during review.');

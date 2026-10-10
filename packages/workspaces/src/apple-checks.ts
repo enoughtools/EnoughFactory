@@ -15,6 +15,11 @@ export type AppleCheckProfile =
   | { tool: "swift"; package: string; action: "build" | "test" }
   | { tool: "xcodebuild"; project: string; scheme: string; platform: "macos" | "ios-simulator"; configuration: "Debug" | "Release" };
 
+/** Shared with source reviewers: these are broker overrides, never author profile options. */
+export function appleXcodeSigningSettings() {
+  return { CODE_SIGNING_ALLOWED: "NO", CODE_SIGNING_REQUIRED: "NO", CODE_SIGN_IDENTITY: "" } as const;
+}
+
 export function isAppleCheckCommand(command: string): boolean {
   return command === APPLE_CHECK_PREFIX || command.startsWith(`${APPLE_CHECK_PREFIX} `);
 }
@@ -185,7 +190,7 @@ export function appleToolArguments(profile: AppleCheckProfile, source: string, s
   // The outer boundary has already passed its controls. A nested SwiftPM sandbox
   // cannot be applied here, and compiler macro servers have the same restriction.
   // Disable those inner layers while keeping the verified outer boundary inherited.
-  return ["xcodebuild", profile.project.endsWith(".xcworkspace") ? "-workspace" : "-project", join(source, profile.project), "-scheme", profile.scheme, "-configuration", profile.configuration, "-sdk", profile.platform === "macos" ? "macosx" : "iphonesimulator", "-destination", profile.platform === "macos" ? "generic/platform=macOS" : "generic/platform=iOS Simulator", "-derivedDataPath", join(scratch, "build"), "-clonedSourcePackagesDirPath", join(scratch, "packages"), "-packageCachePath", join(scratch, "cache"), "-packageAuthorizationProvider", "netrc", "-IDEPackageSupportDisableManifestSandbox=YES", "OTHER_SWIFT_FLAGS=$(inherited) -disable-sandbox", "-disableAutomaticPackageResolution", "-skipPackageUpdates", "-disablePackageRepositoryCache", "-parallelizeTargets", "-jobs", "2", "CODE_SIGNING_ALLOWED=NO", "CODE_SIGNING_REQUIRED=NO", "CODE_SIGN_IDENTITY=", "COMPILER_INDEX_STORE_ENABLE=NO", `OBJROOT=${join(scratch, "build", "Intermediates")}`, `SYMROOT=${join(scratch, "build", "Products")}`, `DSTROOT=${join(scratch, "build", "Install")}`, `SHARED_PRECOMPS_DIR=${join(scratch, "modules")}`, `MODULE_CACHE_DIR=${join(scratch, "modules")}`, "build"];
+  return ["xcodebuild", profile.project.endsWith(".xcworkspace") ? "-workspace" : "-project", join(source, profile.project), "-scheme", profile.scheme, "-configuration", profile.configuration, "-sdk", profile.platform === "macos" ? "macosx" : "iphonesimulator", "-destination", profile.platform === "macos" ? "generic/platform=macOS" : "generic/platform=iOS Simulator", "-derivedDataPath", join(scratch, "build"), "-clonedSourcePackagesDirPath", join(scratch, "packages"), "-packageCachePath", join(scratch, "cache"), "-packageAuthorizationProvider", "netrc", "-IDEPackageSupportDisableManifestSandbox=YES", "OTHER_SWIFT_FLAGS=$(inherited) -disable-sandbox", "-disableAutomaticPackageResolution", "-skipPackageUpdates", "-disablePackageRepositoryCache", "-parallelizeTargets", "-jobs", "2", ...Object.entries(appleXcodeSigningSettings()).map(([key, value]) => `${key}=${value}`), "COMPILER_INDEX_STORE_ENABLE=NO", `OBJROOT=${join(scratch, "build", "Intermediates")}`, `SYMROOT=${join(scratch, "build", "Products")}`, `DSTROOT=${join(scratch, "build", "Install")}`, `SHARED_PRECOMPS_DIR=${join(scratch, "modules")}`, `MODULE_CACHE_DIR=${join(scratch, "modules")}`, "build"];
 }
 
 async function captureAppleProducts(input: {
