@@ -61,6 +61,28 @@ function preparationArtifacts(candidates: CandidateRef[]): ArtifactManifest[] {
       .filter((artifact): artifact is ArtifactManifest => !!artifact);
   });
 }
+function workerPreparationBytes(store: FactoryStore, goal: Goal, task: FactoryTask, attempt: Pick<Attempt, 'id'>, previousCandidate?: CandidateRef): number {
+  const references = workerCandidates(store, goal, task, attempt).selected.map(item => item.candidate);
+  return preparationArtifactBytes(preparationArtifacts([...references, ...(previousCandidate ? [previousCandidate] : [])]));
+}
+/** A deferred author still needs its original preparation reserve despite its running task status. */
+export function factoryPreparationArtifactBytes(store: FactoryStore, goal: Goal): number {
+  const stage = store.get<ControlRecord>('factory-control', goal.id)?.stage;
+  const role = stage === 'plan' ? 'planner' : stage === 'evaluate' ? 'evaluator' : stage === 'diagnose' ? 'diagnosis' : undefined;
+  const controllerBytes = role ? preparationArtifactBytes(preparationArtifacts(controllerCandidates(store, goal.id, role).map(item => item.candidate))) : 0;
+  const taskBytes = store.list<FactoryTask>('tasks').filter(task => task.goalId === goal.id &&
+    (task.status === 'running' || !role && ['queued', 'ready'].includes(task.status))).map(task => {
+    // Before dispatch, current contracts set the floor. After a positive refusal,
+    // use the same frozen attempt contract as the scoped preparation reservation.
+    const attempt = task.status === 'running' && task.currentAttemptId ? store.get<Attempt>('attempts', task.currentAttemptId) : undefined;
+    const detail = attempt ? store.get<AttemptDetail>('factory-attempt-details', attempt.id) : undefined;
+    const deferred = task.status === 'running' && attempt?.status === 'created' && attempt.taskId === task.id
+      && detail?.goalId === goal.id && detail.capacityWait === 'preparing';
+    if (!deferred && (role || !['queued', 'ready'].includes(task.status))) return 0;
+    return workerPreparationBytes(store, goal, task, deferred ? attempt! : { id: '' }, store.get<TaskDetail>('factory-task-details', task.id)?.lastCandidate);
+  });
+  return Math.max(controllerBytes, 0, ...taskBytes);
+}
 function publicWorkerProject(project:Project):Project{return {...project,path:'',workingDirectories:project.workingDirectories?.map(root=>({...root,path:''}))};}
 function assertCapturedRoots(roots:WorkingDirectoryCapture[],expected:Array<{id:string;name:string;baseCommit:string}>):void{if(roots.length!==expected.length||expected.some(source=>!roots.some(root=>root.id===source.id&&root.name===source.name&&root.baseCommit===source.baseCommit)))throw new Error('Every prepared working folder must have an exact retained capture before this attempt can be accepted.');}
 export function factoryExecutionIsUncertain(error: { agentStarted?: boolean; executionEnded?: boolean; code?: string }): boolean {
@@ -119,18 +141,8 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
     const release = reserveDisk(`check:${randomUUID()}`, preparationArtifactBytes(preparationArtifacts(candidate ? [candidate] : [])));
     try { return await operation(); } finally { release(); }
   }
-  function workerPreparationBytes(goal: Goal, task: FactoryTask, attempt: Pick<Attempt, 'id'>, previousCandidate?: CandidateRef): number {
-    const references = workerCandidates(app.store, goal, task, attempt).selected.map(item => item.candidate);
-    return preparationArtifactBytes(preparationArtifacts([...references, ...(previousCandidate ? [previousCandidate] : [])]));
-  }
   function admission(goal: Goal) {
-    const stage = app.store.get<ControlRecord>('factory-control', goal.id)?.stage;
-    const role = stage === 'plan' ? 'planner' : stage === 'evaluate' ? 'evaluator' : stage === 'diagnose' ? 'diagnosis' : undefined;
-    // Before an attempt exists, use current task contracts rather than an older
-    // attempt's frozen assignment. Larger ready tasks conservatively set the floor.
-    const bytes = role ? preparationArtifactBytes(preparationArtifacts(controllerCandidates(app.store, goal.id, role).map(item => item.candidate)))
-      : Math.max(0, ...app.store.list<FactoryTask>('tasks').filter(task => task.goalId === goal.id && ['queued', 'ready'].includes(task.status))
-        .map(task => workerPreparationBytes(goal, task, { id: '' }, app.store.get<TaskDetail>('factory-task-details', task.id)?.lastCandidate)));
+    const bytes = factoryPreparationArtifactBytes(app.store, goal);
     return hostDisk.blocker(PREPARATION_HEADROOM_BYTES + bytes * 2);
   }
   app.sessions.afterCaptureBeforeStop.push(sessionId => releaseFactoryCodexPayload({ store: app.store, sessions: app.sessions, chats, manager: chats.manager }, sessionId));
@@ -563,7 +575,7 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
       const assertCurrent=()=>assertCurrentWorkerAssignment(app.store,{goal,task,attempt});
       assertCurrent();
       const checkInputs=freezeTaskCheckInputs(app.store,task.id,attempt.id,project);
-      const releaseDisk=reserveDisk(`attempt:${attempt.id}`,workerPreparationBytes(goal,task,attempt,previousCandidate));
+      const releaseDisk=reserveDisk(`attempt:${attempt.id}`,workerPreparationBytes(app.store,goal,task,attempt,previousCandidate));
       try {
       const host=isHostAttempt(attempt);
       const toolchainProfile=host?'default':await developmentToolchainChoice(project);

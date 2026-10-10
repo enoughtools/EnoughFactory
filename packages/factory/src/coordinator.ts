@@ -136,7 +136,10 @@ export class FactoryCoordinator {
         for (const attempt of this.attempts(goal.id)) {
           if (activeAttempts.has(attempt.status) && !this.busyAttempts.has(attempt.id) && !this.reconciling.has(attempt.id) && (!this.enabled || observedAt - (this.lastObservation.get(attempt.id) ?? 0) >= 10_000)) {
             if (this.attemptDetail(attempt.id).capacityWait) {
+              const detail = this.attemptDetail(attempt.id);
+              if (detail.recoveryObservation && detail.recoveryObservation.phase === detail.capacityWait && Date.parse(detail.recoveryObservation.retryAt) > observedAt) continue;
               if (["paused", "waiting", "draft"].includes(this.goal(goal.id).status) || this.checkBudget(this.goal(goal.id)) || !this.admit(goal.id)) continue;
+              this.lastObservation.set(attempt.id, observedAt);
               this.busyAttempts.add(attempt.id);
               this.track(this.execute(attempt).finally(() => this.busyAttempts.delete(attempt.id)));
               continue;
@@ -162,7 +165,7 @@ export class FactoryCoordinator {
           current = this.goal(goal.id); control = this.control(goal.id);
         }
         // A localized controller can also keep the goal running while disk waits.
-        if (control.waitingFor === "host-disk-space" && !this.verificationRetryDeferred(current.id) && this.options.admission && !this.options.admission(current)) {
+        if (control.waitingFor === "host-disk-space" && !this.diskRetryDeferred(current.id) && this.options.admission && !this.options.admission(current)) {
           this.wake(current.id, "Host disk space is available; continuing work.");
           current = this.goal(goal.id); control = this.control(goal.id);
         }
@@ -604,11 +607,13 @@ export class FactoryCoordinator {
     }
   }
 
-  private verificationRetryDeferred(goalId: string): boolean {
+  private diskRetryDeferred(goalId: string): boolean {
     const at = Date.parse(this.now());
     return this.tasks(goalId).some(task => {
-      if (task.status !== "review" || !task.currentAttemptId) return false;
+      if (!["running", "review"].includes(task.status) || !task.currentAttemptId) return false;
       const attempt = this.attempt(task.currentAttemptId), detail = this.attemptDetail(attempt.id);
+      if (task.status === "running") return attempt.status === "created" && this.isCurrent(attempt) && !!detail.capacityWait &&
+        detail.recoveryObservation?.phase === detail.capacityWait && Date.parse(detail.recoveryObservation.retryAt) > at;
       return attempt.status === "succeeded" && this.isCurrent(attempt) && !!detail.candidate &&
         ["checking", "integrating"].includes(detail.phase) && detail.recoveryObservation?.phase === detail.phase &&
         Date.parse(detail.recoveryObservation.retryAt) > at;
@@ -704,7 +709,7 @@ export class FactoryCoordinator {
         : await this.options.workspaces.prepare({ goal, task, attempt, project, previousCandidate: this.taskDetail(task.id).lastCandidate });
       if (!this.isCurrent(attempt)) return;
       this.options.store.transaction(() => {
-        this.options.store.set(TABLE.attemptDetails, { ...this.attemptDetail(attempt.id), workspace, phase: "executing" as const, capacityWait: undefined });
+        this.options.store.set(TABLE.attemptDetails, { ...this.attemptDetail(attempt.id), workspace, phase: "executing" as const, capacityWait: undefined, recoveryObservation: undefined });
         this.writeAttempt(attempt.id, { status: "running", baseCommit: workspace.baseCommit, ...(workspace.sessionId ? { sessionId: workspace.sessionId } : {}) });
       });
       executing = true;
@@ -1352,7 +1357,13 @@ export class FactoryCoordinator {
   private deferExecution(attempt: Attempt, reason: string, phase: "preparing" | "executing"): void {
     const task = this.task(attempt.taskId);
     this.options.store.transaction(() => {
-      this.options.store.set(TABLE.attemptDetails, { ...this.attemptDetail(attempt.id), capacityWait: phase, phase: "preparing" as const });
+      const detail = this.attemptDetail(attempt.id);
+      // Like exact check admission, preparation can be refused after a smaller
+      // general probe passed. Persist the next observation across service restarts
+      // so completion microtasks cannot repeatedly wake the same refused owner.
+      this.options.store.set(TABLE.attemptDetails, { ...detail, capacityWait: phase, phase: "preparing" as const,
+        recoveryObservation: { phase, reason, retryAt: new Date(Date.parse(this.now()) + 10_000).toISOString(),
+          failures: (detail.recoveryObservation?.phase === phase ? detail.recoveryObservation.failures : 0) + 1 } });
       this.writeAttempt(attempt.id, { status: "created", error: reason });
       this.writeTask(task.id, { status: "running" });
       this.capacityWait(task.goalId, reason);

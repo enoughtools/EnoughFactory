@@ -8,6 +8,7 @@ import type { ArtifactManifest } from '@enoughfactory/workspaces';
 
 test('low host space blocks dispatch before copies and parallel setup cannot spend the same headroom', async () => {
   const GiB = 1024 ** 3;
+  let at = Date.parse('2026-10-10T00:00:00Z');
   let available = Math.floor(3.87 * GiB), probeFails = false;
   const disk = new HostDiskAdmission(() => ['/owned-state', '/owned-runtime'], () => 'Test Mac', () => {
     if (probeFails) throw new Error('Filesystem unavailable');
@@ -29,7 +30,7 @@ test('low host space blocks dispatch before copies and parallel setup cannot spe
   let providerBlocked = true, checkArtifactBytes = 3 * GiB, retainController = true;
   const preparing = new Promise<void>(resolve => { releasePreparation = resolve; });
   const coordinator = new FactoryCoordinator({
-    store, deviceId: device.id, devices: () => [device], project: () => project,
+    store, deviceId: device.id, devices: () => [device], project: () => project, now: () => new Date(at),
     admission: () => disk.blocker(GiB + knownBytes * 2),
     runtime: {
       async complete() { planner++; return { text: JSON.stringify({ summary: 'Two independent mail tasks', criteria: ['Mail works'], checks: [], tasks: [
@@ -122,6 +123,7 @@ test('low host space blocks dispatch before copies and parallel setup cannot spe
   assert.equal(goal().status, 'waiting');
   assert.equal(captured, 2); assert.equal(checkouts, 0, 'Repeated disk waits create no new checkout or check report.');
   available = 10 * GiB; checkArtifactBytes = 0;
+  at += 10_000;
   await coordinator.tick(); await coordinator.waitForIdle();
   assert.equal(checkouts, 2);
   assert.ok(store.list<FactoryTask>('tasks').every(task => task.status === 'completed'));
