@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import type { FactoryState } from '@enoughfactory/contracts';
 import { browserPeerClient, PeerSocket, peerChanges, type ClientSocket } from './browserPeers';
 import { connectFactoryEvents, onFactoryForeground } from './live-updates';
+import { createCatalogRefresh } from './catalog-refresh';
 
 export interface Connection { url: string; token: string; mode?: 'http' | 'peer'; deviceId?: string; version?: string; appVersion?: string }
 export interface DesktopBridge {
@@ -111,26 +112,26 @@ export function useFactory() {
   const [bootstrapped, setBootstrapped] = useState(() => !window.enoughFactory);
   const bootstrappedRef = useRef(bootstrapped);
   const requestGeneration = useRef(0);
-  const refreshSequence = useRef(0);
   const desktopServiceUrl = useRef<string | null>(null);
   const desktopReconnectNeeded = useRef(Boolean(window.enoughFactory));
   const client = useRef(new DeviceClient(connection));
+  const catalogRefresh = useRef(createCatalogRefresh<FactoryState>({
+    generation: () => requestGeneration.current,
+    request: () => client.current.request<FactoryState>('/api/state', { signal: AbortSignal.timeout(8000) }),
+    onValue: (next, latestRequest) => {
+      setState(next);
+      if (latestRequest) { desktopReconnectNeeded.current = false; setError(null); }
+    },
+    onError: cause => {
+      desktopReconnectNeeded.current = Boolean(window.enoughFactory) && client.current.connection.mode !== 'peer' && client.current.connection.url === desktopServiceUrl.current;
+      setError(cause instanceof Error ? cause.message : 'The device is unavailable.');
+    },
+    onSettled: () => setLoading(false),
+  }));
   const refresh = useCallback(async () => {
     if (!bootstrappedRef.current) return;
     if (!canConnect(client.current.connection)) { setError(CONNECT_DEVICE_MESSAGE); setLoading(false); return; }
-    const generation = requestGeneration.current;
-    const sequence = ++refreshSequence.current;
-    const current = () => generation === requestGeneration.current && sequence === refreshSequence.current;
-    try {
-      const next = await client.current.request<FactoryState>('/api/state', { signal: AbortSignal.timeout(8000) });
-      if (!current()) return;
-      desktopReconnectNeeded.current = false; setState(next); setError(null);
-    } catch (cause) {
-      if (current()) {
-        desktopReconnectNeeded.current = Boolean(window.enoughFactory) && client.current.connection.mode !== 'peer' && client.current.connection.url === desktopServiceUrl.current;
-        setError(cause instanceof Error ? cause.message : 'The device is unavailable.');
-      }
-    } finally { if (current()) setLoading(false); }
+    await catalogRefresh.current();
   }, []);
   const setConnection = useCallback((next: Connection) => {
     bootstrappedRef.current = true; setBootstrapped(true);
