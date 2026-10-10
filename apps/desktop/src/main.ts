@@ -10,6 +10,7 @@ import { pathToFileURL } from 'node:url';
 import { connectExistingService, probeDeviceConnection, type DeviceConnection } from './service-connection.ts';
 import { finishIdleServiceHandoff, prepareServiceUpdate, type ServiceUpdateStatus } from './service-update.ts';
 import { createDesktopQuitController } from './desktop-lifetime.ts';
+import { requestLocalService } from './local-service-request.ts';
 
 type Connection = DeviceConnection;
 interface PreviewOptions { sessionId: string; url: string; bounds?: Rectangle }
@@ -62,11 +63,11 @@ function readConnection(): Connection | undefined {
 async function availableConnection(requireManagedRuntime = true): Promise<Connection | undefined> {
   const candidate = readConnection();
   if (!candidate) return;
-  return probeDeviceConnection(candidate, { serviceVersion: expectedServiceVersion, stateDirectory: dataDirectory, requireManagedRuntime });
+  return probeDeviceConnection(candidate, { serviceVersion: expectedServiceVersion, stateDirectory: dataDirectory, requireManagedRuntime, request: requestLocalService });
 }
 
 function existingService(): Promise<Connection | undefined> {
-  return connectExistingService({ readConnection, probe: candidate => probeDeviceConnection(candidate, { serviceVersion: expectedServiceVersion, stateDirectory: dataDirectory }), portOpen: servicePortOpen });
+  return connectExistingService({ readConnection, probe: candidate => probeDeviceConnection(candidate, { serviceVersion: expectedServiceVersion, stateDirectory: dataDirectory, request: requestLocalService }), portOpen: servicePortOpen });
 }
 
 async function serviceResources(): Promise<string> {
@@ -152,7 +153,7 @@ async function servicePortOpen(connection: Connection): Promise<boolean> {
 }
 
 async function idleUpdateStatus(connection: Connection): Promise<ServiceUpdateStatus | undefined> {
-  const response = await fetch(`${connection.url}/api/service/update-status`, {
+  const response = await requestLocalService(`${connection.url}/api/service/update-status`, {
     headers: { Authorization: `Bearer ${connection.token}` }, signal: AbortSignal.timeout(2_000),
   });
   if (response.status === 404 || response.status === 405) return undefined;
@@ -167,7 +168,7 @@ async function replaceIdleService(existing: Connection, durable: string): Promis
     async shutdown() {
       let response: Response;
       try {
-        response = await fetch(`${existing.url}/api/service/shutdown`, {
+        response = await requestLocalService(`${existing.url}/api/service/shutdown`, {
           method: 'POST', headers: { Authorization: `Bearer ${existing.token}`, 'Content-Type': 'application/json' },
           body: JSON.stringify({ onlyIfIdle: true, expectedVersion: existing.version }), signal: AbortSignal.timeout(5_000),
         });
@@ -251,7 +252,7 @@ async function deviceRequest<T>(path: string, method: string, body?: unknown, ti
   const connection = path === '/api/service/shutdown' ? await availableConnection(false)
     : method === 'DELETE' && path.startsWith('/api/previews/') ? readConnection() : await getConnection();
   if (!connection) throw new Error('The device service is unavailable.');
-  const response = await fetch(`${connection.url}${path}`, {
+  const response = await requestLocalService(`${connection.url}${path}`, {
     method, headers: { Authorization: `Bearer ${connection.token}`, 'Content-Type': 'application/json' },
     ...(body === undefined ? {} : { body: JSON.stringify(body) }), signal: AbortSignal.timeout(timeout),
   });
