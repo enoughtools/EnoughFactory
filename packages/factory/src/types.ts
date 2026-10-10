@@ -26,6 +26,8 @@ export interface CheckResult {
   appleValidation?: AppleValidationMetadata;
   executionTargetKind?: ExecutionTargetKind; hostPermissions?: "full-host";
   recovery?: { condition: "inspection-evidence" | "check-interrupted"; reason: string };
+  /** Owning immutable report used only to authenticate an inspection continuation. */
+  checkReportId?: string;
 }
 export interface RepositoryEvidence {
   head: string; branch: string; status: string; summary?: string; diff?: string;
@@ -39,6 +41,7 @@ export interface IntegrationResult {
 export const UI_QUALITY_CHECK_COMMAND = "enoughfactory:ui-quality";
 export interface FactoryVerificationContext {
   goal: Goal; task: FactoryTask; attempt: Attempt; quality?: TaskQualityRequirements;
+  contract?: AttemptInspection['contract'];
 }
 export type ConfirmCheckRecoveryResult = { status: "settled"; automatic: boolean; evidenceIds: string[] } | { status: "unknown"; reason: string };
 export interface RetainedVerificationRecovery {
@@ -49,7 +52,7 @@ export interface FactoryWorkspacePort {
   qualityChecks?: true;
   prepare(input: { goal: Goal; task: FactoryTask; attempt: Attempt; project: Project; previousCandidate?: CandidateRef }): Promise<WorkspaceRef>;
   capture(workspace: WorkspaceRef, input: { goal: Goal; task: FactoryTask; attempt: Attempt }): Promise<CandidateRef>;
-  check(project: Project, candidate: CandidateRef, commands: string[], verification?: FactoryVerificationContext): Promise<CheckResult[]>;
+  check(project: Project, candidate: CandidateRef, commands: string[], verification?: FactoryVerificationContext, continuation?: { previousChecks: CheckResult[] }): Promise<CheckResult[]>;
   /** Read-only owning proof of exact source and positively ended prior verification effects. */
   confirmCheckRecovery?(input: FactoryVerificationContext & { project: Project; candidate: CandidateRef; commands: string[]; previousChecks: CheckResult[] }): Promise<ConfirmCheckRecoveryResult>;
   /** Check an isolated exact final repository snapshot after task dependencies integrate. */

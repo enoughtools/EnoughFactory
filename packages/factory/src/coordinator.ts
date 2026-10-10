@@ -390,7 +390,7 @@ export class FactoryCoordinator {
     const author = await this.options.runtime.reconcile(original.attempt);
     const { spend: _legacySpend, ...currentResult } = (author.result ?? {}) as ExecutionResult & { spend?: unknown };
     if (author.status !== "succeeded" || !isDeepStrictEqual(currentResult, original.detail.result)) throw new Error("The owning author has not positively confirmed its original successful result.");
-    const proof = await this.options.workspaces.confirmCheckRecovery({ project: this.project(original.goal), goal: original.goal, task: original.task, attempt: original.attempt, quality: original.detail.contract!.quality, candidate: original.detail.candidate!, commands: original.commands, previousChecks: original.detail.checks! });
+    const proof = await this.options.workspaces.confirmCheckRecovery({ project: this.project(original.goal), goal: original.goal, task: original.task, attempt: original.attempt, quality: original.detail.contract!.quality, contract: original.detail.contract, candidate: original.detail.candidate!, commands: original.commands, previousChecks: original.detail.checks! });
     const current = this.retainedCheckState(attemptId, reserved);
     if (current.fingerprint !== original.fingerprint) throw new FactoryOperationError("stale", "The saved authority, source or check contract changed during verification recovery.");
     if (proof.status !== "settled") throw new Error(proof.reason);
@@ -775,18 +775,23 @@ export class FactoryCoordinator {
       const quality = frozenContract ? frozenContract.quality : task.quality;
       if (quality && !this.options.workspaces.qualityChecks) throw new Error("Configured UI acceptance requires the factory's verified inspection adapter. Source is retained; UI acceptance cannot be replaced by shell check success.");
       const checks = [...new Set([...(frozenContract?.checks ?? this.taskChecks(task.id)), ...(quality ? [UI_QUALITY_CHECK_COMMAND] : [])])];
-      const verification = { goal: this.goal(goal.id), task: this.task(task.id), attempt: this.attempt(attempt.id), quality };
+      const verification = { goal: this.goal(goal.id), task: this.task(task.id), attempt: this.attempt(attempt.id), quality, contract: frozenContract };
       let checkResults = this.attemptDetail(attempt.id).checks;
-      if (!checkResults) {
-        checkResults = await this.options.workspaces.check(project, candidate, checks, verification);
+      const continuation = checkResults?.some(check => !check.passed && check.command === UI_QUALITY_CHECK_COMMAND && check.recovery?.condition === "inspection-evidence")
+        ? { previousChecks: checkResults } : undefined;
+      if (!checkResults || continuation) {
+        checkResults = await this.options.workspaces.check(project, candidate, checks, verification, continuation);
         if (!this.isCurrent(attempt)) return;
         if (checkResults.some(check => check.candidateCommit !== candidate!.commit)) throw new Error("Verification returned evidence for a different candidate.");
+        // Keep the original command proofs before waiting for asynchronous screen
+        // evidence. The owning adapter authenticates them on an inspection wake;
+        // an explicit verification retry clears this checkpoint and runs afresh.
+        this.options.store.set(TABLE.attemptDetails, { ...this.attemptDetail(attempt.id), checks: checkResults });
         // A real failed check needs repair even when a separate visual receipt is
         // still pending; missing evidence cannot conceal an observed defect.
         const pending = checkResults.every(check => check.passed || check.recovery?.condition === "inspection-evidence")
           ? checkResults.find(check => !check.passed && check.recovery?.condition === "inspection-evidence") : undefined;
         if (pending?.recovery) throw new FactoryVerificationWaitError(pending.recovery.reason);
-        this.options.store.set(TABLE.attemptDetails, { ...this.attemptDetail(attempt.id), checks: checkResults });
       }
       if (checkResults.some(check => !check.passed)) throw new Error(`Candidate checks failed:\n${checkResults.filter(check => !check.passed).map(check => `${check.command}\n${check.output}`).join("\n")}`);
       if (checks.some(command => !checkResults!.some(check => check.command === command))) throw new Error("Verification omitted a configured check.");

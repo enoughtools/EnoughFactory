@@ -290,7 +290,8 @@ export class WorkspaceManager {
     await writeAtomic(join(this.root, "reports", `${report.id}.json`), report);
   }
 
-  async verify(input: { candidateId: string; commands: string[]; baseCommit?: string; signal?: AbortSignal; verification?: unknown }): Promise<CheckReport> {
+  async verify(input: { candidateId: string; commands: string[]; baseCommit?: string; signal?: AbortSignal; verification?: unknown; verificationSha256?: string }): Promise<CheckReport> {
+    if (input.verificationSha256 !== undefined && !/^[a-f0-9]{64}$/.test(input.verificationSha256)) throw new Error("Invalid frozen verification binding");
     const candidate = await this.candidate(input.candidateId);
     const path = join(this.root, "checks", randomUUID());
     let report: CheckReport | undefined;
@@ -299,14 +300,14 @@ export class WorkspaceManager {
       if (input.baseCommit && input.baseCommit !== candidate.baseCommit) {
         throw new Error("Combined checks require integrate() so the current target commit is imported and merged exactly");
       }
-      report = await this.checkAt(candidate, path, candidate.commit, input.commands, input.signal, input.baseCommit, input.verification);
+      report = await this.checkAt(candidate, path, candidate.commit, input.commands, input.signal, input.baseCommit, input.verification, input.verificationSha256);
       return report;
     } finally { await this.releaseCheck(path, report); }
   }
 
-  private async checkAt(candidate: Candidate, path: string, commit: string, commands: string[], signal?: AbortSignal, baseCommit?: string, verification?: unknown): Promise<CheckReport> {
+  private async checkAt(candidate: Candidate, path: string, commit: string, commands: string[], signal?: AbortSignal, baseCommit?: string, verification?: unknown, verificationSha256?: string): Promise<CheckReport> {
     const workingDirectories = await this.importWorkingDirectories(candidate, `${path}-working-directories`);
-    const report: CheckReport = { id: randomUUID(), candidateId: candidate.id, commit, baseCommit, candidateDevelopmentToolchain: frozenDevelopmentToolchain(candidate.developmentToolchain), status: commands.length ? "passed" : "not-configured", commands: [], logArtifact: undefined as unknown as ArtifactManifest, createdAt: new Date().toISOString() };
+    const report: CheckReport = { id: randomUUID(), candidateId: candidate.id, commit, baseCommit, candidateDevelopmentToolchain: frozenDevelopmentToolchain(candidate.developmentToolchain), status: commands.length ? "passed" : "not-configured", commands: [], logArtifact: undefined as unknown as ArtifactManifest, createdAt: new Date().toISOString(), ...(verificationSha256 ? { verificationSha256 } : {}) };
     for (const command of commands) {
       if (signal?.aborted) { report.status = "canceled"; break; }
       let result;
@@ -363,7 +364,9 @@ export class WorkspaceManager {
       sourceAuditSkipped = "Check source could not be audited; original command evidence and private snapshots were retained";
       dirty = undefined; actualHead = undefined; rootStates = undefined;
     }
-    if (!sourceAuditSkipped && (dirty || actualHead !== commit || unresolved.length || rootStates?.some(root => root.dirty || root.actualHead !== root.commit || !root.emptyDirectoriesMatch))) report.status = "failed";
+    const sourceChanged = !sourceAuditSkipped && (dirty || actualHead !== commit || unresolved.length || rootStates?.some(root => root.dirty || root.actualHead !== root.commit || !root.emptyDirectoriesMatch));
+    report.sourceIntegrity = sourceAuditSkipped ? "unconfirmed" : sourceChanged ? "failed" : "verified";
+    if (sourceChanged) report.status = "failed";
     try {
       await this.saveCheckReport(report, { dirty, actualHead, unresolved: sourceAuditSkipped ? undefined : unresolved, workingDirectories: rootStates, sourceAuditSkipped, retainedCheckPath: report.cleanupErrors?.length ? path : undefined }, candidate);
       this.unpersistedChecks.delete(path);

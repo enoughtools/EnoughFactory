@@ -157,6 +157,10 @@ export interface CheckReport {
   commands: CommandResult[];
   logArtifact: ArtifactManifest;
   createdAt: string;
+  /** Application-owned frozen authority and contract binding, absent on legacy reports. */
+  verificationSha256?: string;
+  /** Post-release audit outcome remains distinct from command or UI evidence status. */
+  sourceIntegrity?: "verified" | "failed" | "unconfirmed";
   /** A failed release keeps the private snapshots available for diagnosis. */
   cleanupErrors?: string[];
 }

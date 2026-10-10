@@ -555,6 +555,51 @@ test("inspection receipts arriving before the wait is persisted cannot lose thei
   });
 });
 
+test("inspection continuations retain original command proofs through repeated wakes and restart", async t => {
+  const worker: Device = { ...device, executionTargets: [{ id: "container", kind: "container", protocolVersion: 1, readiness: "ready",
+    capabilities: [{ kind: "linux-shell", readiness: "ready" }, { kind: "chromium-inspection", readiness: "ready" }] }] };
+  const factory = harness([worker]); factory.workspaces.qualityChecks = true;
+  factory.planning(async () => ({ ...plan, checks: [], tasks: [{ ...plan.tasks[0]!, checks: ["native-build", "native-tests"], quality: { platforms: ["web"], workflows: [], referenceIds: [] } }] }));
+  const originalCheck = factory.workspaces.check;
+  let ready = false, ordinaryRuns = 0, continuations = 0;
+  factory.workspaces.check = async (project, candidate, commands, verification, continuation) => {
+    assert.deepEqual(verification!.contract!.checks, commands.slice(0, -1), "the frozen check contract reaches the owning proof adapter");
+    let checks: CheckResult[];
+    if (continuation) {
+      continuations++;
+      assert.equal(continuation.previousChecks.length, commands.length);
+      assert.ok(continuation.previousChecks.slice(0, -1).every(check => check.passed));
+      checks = continuation.previousChecks.map(check => ({ ...check }));
+    } else {
+      ordinaryRuns++;
+      checks = (await originalCheck(project, candidate, commands, verification)).map(check => ({ ...check, checkedCommit: candidate.commit, checkReportId: "original-report" }));
+    }
+    return checks.map(check => check.command === UI_QUALITY_CHECK_COMMAND ? { ...check, passed: ready, exitCode: ready ? 0 : 1,
+      checkReportId: `ui-report-${continuations}`, ...(ready ? { recovery: undefined } : { recovery: { condition: "inspection-evidence" as const, reason: "Source audit is still producing its result." } }) } : check);
+  };
+  const goal = await planGoal(factory);
+  await factory.coordinator.tick(); await factory.coordinator.waitForIdle();
+  const task = factory.store.list<FactoryTask>("tasks")[0]!, author = factory.store.get<Attempt>("attempts", task.currentAttemptId!)!;
+  const retained = factory.store.get<AttemptDetail>("factory-attempt-details", author.id)!;
+  assert.equal(retained.checks!.length, 3, "passing commands and the pending UI receipt are durable before the wait");
+  for (let index = 0; index < 2; index++) {
+    factory.coordinator.notifyCondition("inspection-evidence", goal.id);
+    await factory.coordinator.tick(); await factory.coordinator.waitForIdle();
+  }
+  factory.coordinator.stop();
+  const recovered = factory.recover(); t.after(() => recovered.stop());
+  await recovered.start(); await recovered.waitForIdle();
+  assert.equal(ordinaryRuns, 1, "a durable inspection wait does not rerun native compilation on restart");
+  ready = true;
+  recovered.notifyCondition("inspection-evidence", goal.id);
+  await recovered.tick(); await recovered.waitForIdle();
+  assert.equal(ordinaryRuns, 1); assert.equal(continuations, 3);
+  assert.equal(factory.calls.execute, 1); assert.equal(factory.calls.capture, 1);
+  assert.equal(factory.store.list<Attempt>("attempts").length, 1);
+  assert.equal(factory.store.get<FactoryTask>("tasks", task.id)!.status, "completed");
+  assert.deepEqual(factory.integrationCommands, [["native-build", "native-tests", UI_QUALITY_CHECK_COMMAND]], "combined integration still checks every original command against M");
+});
+
 test("an unavailable branch cannot globally suspend progress unlocked by inspection evidence", async () => {
   const worker: Device = { ...device, executionTargets: [
     { id: "container", kind: "container", protocolVersion: 1, readiness: "ready",
@@ -2166,6 +2211,18 @@ test("retained verification recovery authenticates read-only eligibility and rec
   assert.equal(factory.store.list<Attempt>("attempts").length, 1); assert.equal(factory.calls.diagnosis, 0);
   assert.equal(factory.store.get<Goal>("goals", goal.id)!.revision, goal.revision);
   assert.equal(await factory.coordinator.verificationRecovery(attempt.id), undefined, "Accepted work cannot acquire another recovery action");
+});
+
+test("explicit public verification recheck never receives an inspection continuation checkpoint", async () => {
+  const { factory, attempt, expected, outcome } = await retainedVerificationFailure();
+  const originalCheck = factory.workspaces.check;
+  const received: Array<Parameters<FactoryWorkspacePort['check']>[4]> = [];
+  factory.workspaces.check = async (...input) => { received.push(input[4]); return originalCheck(...input); };
+  outcome("pass");
+  await factory.coordinator.recheckAttempt(attempt.id, expected); await factory.coordinator.waitForIdle();
+  assert.deepEqual(received, [undefined], "explicit retry requires fresh results from every frozen check");
+  assert.deepEqual(factory.candidateCommands[1], factory.candidateCommands[0]);
+  assert.equal(factory.calls.execute, 1); assert.equal(factory.calls.capture, 1);
 });
 
 test("retained verification recovery cannot accept a new defect or UI evidence for another candidate or combined source", async t => {

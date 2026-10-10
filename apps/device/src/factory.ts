@@ -18,7 +18,7 @@ import type { SessionController } from './sessions.ts';
 import { exec, HttpError, now } from './util.ts';
 import { inspectAttempt, inspectGoal, inspectTask, taskControlReason, taskDispatchBlocker } from './task-inspection.ts';
 import { factoryChatBinding } from './factory-chat.ts';
-import { confirmRetainedCheckRecovery } from './factory-check-recovery.ts';
+import { checkVerificationSha256, confirmInspectionCheckContinuation, confirmRetainedCheckRecovery } from './factory-check-recovery.ts';
 import { goalAgentCount } from './factory-agent-capacity.ts';
 import { controllerError } from './factory-controller-error.ts';
 import { releaseControllerInputs } from './factory-controller-inputs.ts';
@@ -630,10 +630,16 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
         await sleep(1500);
       }
     },
-    async check(_project, candidate, commands,verification) {
+    async check(_project, candidate, commands,verification,continuation) {
       return withCheckCapacity(async () => {
-      const report = await workspaces.verify({ candidateId: candidate.id, commands,verification }); rememberArtifacts(report.logArtifact);
-      return checkResults(report, candidate.commit);
+      const verificationSha256=verification?.quality&&verification.contract&&candidate.executionTargetKind==='host-macos'?checkVerificationSha256({candidate,verification,commands}):undefined;
+      const proof=verificationSha256&&verification&&continuation?await confirmInspectionCheckContinuation({workspaces,dataDir:app.dataDir,deviceId:app.device.id,candidate,verification,commands,previousChecks:continuation.previousChecks}):undefined;
+      const resumed=proof?.status==='settled';
+      const report = await workspaces.verify({ candidateId: candidate.id, commands:resumed?[UI_QUALITY_CHECK_COMMAND]:commands,verification,verificationSha256 }); rememberArtifacts(report.logArtifact);
+      const fresh=checkResults(report,candidate.commit);
+      // A failed cleanup/source audit is part of this new result, never replaced
+      // by the earlier passing commands. Integration still checks the full M.
+      return resumed?[...continuation!.previousChecks.filter(check=>check.command!==UI_QUALITY_CHECK_COMMAND),...fresh]:fresh;
       }, candidate);
     },
     async confirmCheckRecovery(input) {
@@ -654,7 +660,8 @@ export async function initializeFactory(app: DeviceApp, chats: ChatController, n
       const result = await workspaces.integrate({ candidateId: candidate.id, projectPath: project.path, commands: input.checks, isCurrent: input.isCurrent,verification:input.verification });
       if (result.report) rememberArtifacts(result.report.logArtifact);
       if(result.status==='checks-failed'&&result.report){
-        const pending=checkResults(result.report,candidate.commit).find(check=>!check.passed&&check.recovery?.condition==='inspection-evidence');
+        const results=checkResults(result.report,candidate.commit);
+        const pending=results.every(check=>check.passed||check.recovery?.condition==='inspection-evidence')?results.find(check=>!check.passed&&check.recovery?.condition==='inspection-evidence'):undefined;
         if(pending?.recovery)throw new FactoryVerificationWaitError(pending.recovery.reason);
       }
       if (result.status !== 'integrated' || !result.commit) {
@@ -1372,12 +1379,12 @@ function checkResults(report: CheckReport, candidateCommit: string): CheckResult
   const results:CheckResult[] = report.commands.map(command => {
     if(command.command===UI_QUALITY_CHECK_COMMAND){
       const quality=command.factoryQuality as CheckResult|undefined;
-      if(quality&&typeof quality==='object'&&!Array.isArray(quality)&&quality.command===UI_QUALITY_CHECK_COMMAND&&quality.candidateCommit===candidateCommit&&quality.checkedCommit===report.commit)return {...quality,passed:quality.passed===true&&command.exitCode===0&&!command.timedOut};
+      if(quality&&typeof quality==='object'&&!Array.isArray(quality)&&quality.command===UI_QUALITY_CHECK_COMMAND&&quality.candidateCommit===candidateCommit&&quality.checkedCommit===report.commit)return {...quality,passed:quality.passed===true&&command.exitCode===0&&!command.timedOut,...(report.verificationSha256?{checkReportId:report.id}:{})};
       return {command:command.command,passed:false,output:'Recorded UI quality evidence does not identify the exact checked source.',exitCode:1,candidateCommit,checkedCommit:report.commit};
     }
-    return {command:command.command,passed:command.exitCode===0&&!command.timedOut,output:`${command.stdout}${command.stderr}`,exitCode:command.exitCode,candidateCommit,checkedCommit:report.commit,developmentToolchain:command.developmentToolchain,executionTargetKind:command.executionTargetKind,hostPermissions:command.hostPermissions,...((command as Partial<AppleCheckResult>).appleValidation?{appleValidation:(command as AppleCheckResult).appleValidation}:{}),...(command.timedOut||report.status==='canceled'?{recovery:{condition:'check-interrupted' as const,reason:'The original verification was interrupted; saved work can be rechecked only after its owning effects and source are confirmed settled.'}}:{})};
+    return {command:command.command,passed:command.exitCode===0&&!command.timedOut,output:`${command.stdout}${command.stderr}`,exitCode:command.exitCode,candidateCommit,checkedCommit:report.commit,developmentToolchain:command.developmentToolchain,executionTargetKind:command.executionTargetKind,hostPermissions:command.hostPermissions,...((command as Partial<AppleCheckResult>).appleValidation?{appleValidation:(command as AppleCheckResult).appleValidation}:{}),...(report.verificationSha256?{checkReportId:report.id}:{}),...(command.timedOut||report.status==='canceled'?{recovery:{condition:'check-interrupted' as const,reason:'The original verification was interrupted; saved work can be rechecked only after its owning effects and source are confirmed settled.'}}:{})};
   });
-  if (['failed', 'canceled'].includes(report.status) && results.every(result => result.passed)) {
+  if (report.cleanupErrors?.length || report.sourceIntegrity === 'failed' || report.sourceIntegrity === 'unconfirmed' || ['failed', 'canceled'].includes(report.status) && results.every(result => result.passed)) {
     const output = report.cleanupErrors?.length
       ? `Factory could not confirm verification cleanup. The check workspace and process journals were retained.\n${report.cleanupErrors.join('\n')}`
       : report.status === 'canceled'

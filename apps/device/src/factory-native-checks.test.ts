@@ -137,6 +137,98 @@ test('native candidate ordinary checks run with Docker unavailable and retain fu
   f.assertNoDocker();
 });
 
+test('native inspection continuation checks only the UI gate while explicit verification stays fresh', { skip: process.platform !== 'darwin' }, async t => {
+  const f = await harness(t), commands = ['printf original-native-command-proof', UI_QUALITY_CHECK_COMMAND];
+  const verification: FactoryVerificationContext = { ...f.verification, contract: { title: f.task.title, description: f.task.description, checks: commands.slice(0, -1), quality: f.task.quality, dependsOn: [], planRevision: f.goal.revision } };
+  let ready = false;
+  f.respond(async input => ({ command: UI_QUALITY_CHECK_COMMAND, passed: ready, exitCode: ready ? 0 : 1, output: ready ? 'Current-source workflow accepted.' : 'The exact-source audit is still running.',
+    candidateCommit: input.candidate.commit, checkedCommit: input.checkedCommit, ...(ready ? {} : { recovery: { condition: 'inspection-evidence' as const, reason: 'The exact-source audit is still running.' } }) }));
+  const original = await f.factory.workspacePort.check(f.project, f.candidate, commands, verification);
+  assert.equal(original[0]!.passed, true); assert.equal(original[1]!.passed, false);
+  assert.ok(original.every(check => check.checkReportId));
+  let continued = original;
+  for (let index = 0; index < 2; index++) continued = await f.factory.workspacePort.check(f.project, f.candidate, commands, verification, { previousChecks: continued });
+  assert.deepEqual(continued[0], original[0], 'The passing ordinary result keeps its original report provenance.');
+  ready = true;
+  const accepted = await f.factory.workspacePort.check(f.project, f.candidate, commands, verification, { previousChecks: continued });
+  assert.ok(accepted.every(check => check.passed));
+  const reports = await f.reports();
+  assert.equal(reports.length, 4);
+  assert.equal(reports.filter(report => report.commands.some(command => command.command === commands[0])).length, 1, 'Native commands are not repeated for source-audit events.');
+  assert.ok(reports.filter(report => report.commands.length === 1).every(report => report.commands[0]!.command === UI_QUALITY_CHECK_COMMAND));
+  assert.ok(reports.every(report => report.verificationSha256 === reports[0]!.verificationSha256));
+  await f.factory.workspacePort.check(f.project, f.candidate, commands, verification);
+  assert.equal((await f.reports()).filter(report => report.commands.some(command => command.command === commands[0])).length, 2, 'An explicit fresh check runs all commands again.');
+  assert.equal(await git(f.project.path, 'rev-parse', 'HEAD'), f.base);
+  f.assertNoDocker();
+});
+
+test('missing native continuation evidence triggers fresh verification rather than retaining a passing assumption', { skip: process.platform !== 'darwin' }, async t => {
+  const f = await harness(t), commands = ['printf original-native-command-proof', UI_QUALITY_CHECK_COMMAND];
+  const verification: FactoryVerificationContext = { ...f.verification, contract: { title: f.task.title, description: f.task.description, checks: commands.slice(0, -1), quality: f.task.quality, dependsOn: [], planRevision: f.goal.revision } };
+  f.respond(async input => ({ command: UI_QUALITY_CHECK_COMMAND, passed: false, exitCode: 1, output: 'Pending native audit.', candidateCommit: input.candidate.commit, checkedCommit: input.checkedCommit,
+    recovery: { condition: 'inspection-evidence' as const, reason: 'Pending native audit.' } }));
+  const previous = await f.factory.workspacePort.check(f.project, f.candidate, commands, verification);
+  const report = (await f.reports())[0]!;
+  await rm(path.join(f.app.dataDir, 'workspace-data', 'reports', `${report.id}.json`));
+  const fresh = await f.factory.workspacePort.check(f.project, f.candidate, commands, verification, { previousChecks: previous });
+  assert.notEqual(fresh[0]!.checkReportId, previous[0]!.checkReportId);
+  assert.deepEqual((await f.reports())[0]!.commands.map(command => command.command), commands, 'The missing report cannot supply retained native build/test proof.');
+  f.assertNoDocker();
+});
+
+test('pending native UI evidence cannot hide uncertain report cleanup', async t => {
+  const f = await harness(t), reason = 'Host process teardown remains unconfirmed.';
+  const pending: CheckResult = { command: UI_QUALITY_CHECK_COMMAND, passed: false, exitCode: 1, output: 'Native screen evidence is pending.', candidateCommit: f.candidate.commit, checkedCommit: f.candidate.commit,
+    recovery: { condition: 'inspection-evidence', reason: 'Native screen evidence is pending.' } };
+  const report: CheckReport = { id: 'pending-with-uncertain-cleanup', candidateId: f.candidate.id, commit: f.candidate.commit, status: 'failed', createdAt: f.goal.updatedAt,
+    sourceIntegrity: 'unconfirmed', cleanupErrors: [reason], logArtifact: f.candidate.bundleArtifact, commands: [{ command: UI_QUALITY_CHECK_COMMAND, exitCode: 1, stdout: pending.output, stderr: '', startedAt: f.goal.createdAt, endedAt: f.goal.updatedAt, factoryQuality: pending }] };
+  t.mock.method(f.factory.workspaces, 'verify', async () => report);
+  const checks = await f.factory.workspacePort.check(f.project, f.candidate, [UI_QUALITY_CHECK_COMMAND], f.verification);
+  assert.equal(checks.length, 2);
+  assert.equal(checks[0]!.recovery?.condition, 'inspection-evidence');
+  assert.equal(checks[1]!.passed, false); assert.equal(checks[1]!.recovery, undefined, 'An uncertain cleanup is an observed problem rather than a pending screen receipt.');
+  assert.ok(checks[1]!.output.includes(reason));
+  f.assertNoDocker();
+});
+
+test('a native UI-only continuation preserves an observed source-integrity failure alongside pending screen evidence', { skip: process.platform !== 'darwin' }, async t => {
+  const f = await harness(t), commands = ['printf original-native-command-proof', UI_QUALITY_CHECK_COMMAND];
+  const verification: FactoryVerificationContext = { ...f.verification, contract: { title: f.task.title, description: f.task.description, checks: commands.slice(0, -1), quality: f.task.quality, dependsOn: [], planRevision: f.goal.revision } };
+  let mutate = false;
+  f.respond(async input => {
+    if (mutate) await writeFile(path.join(input.path, 'implementation.txt'), 'changed by an inspection callback\n');
+    return { command: UI_QUALITY_CHECK_COMMAND, passed: false, exitCode: 1, output: 'Native screen evidence is pending.', candidateCommit: input.candidate.commit, checkedCommit: input.checkedCommit,
+      recovery: { condition: 'inspection-evidence' as const, reason: 'Native screen evidence is pending.' } };
+  });
+  const previous = await f.factory.workspacePort.check(f.project, f.candidate, commands, verification);
+  mutate = true;
+  const checked = await f.factory.workspacePort.check(f.project, f.candidate, commands, verification, { previousChecks: previous });
+  assert.equal(checked.length, 3);
+  assert.deepEqual(checked[0], previous[0]);
+  assert.equal(checked[1]!.recovery?.condition, 'inspection-evidence');
+  assert.equal(checked[2]!.passed, false); assert.equal(checked[2]!.recovery, undefined);
+  assert.match(checked[2]!.output, /Checks changed the tracked candidate/);
+  const reports = await f.reports();
+  assert.ok(reports.some(report => report.commands.length === 1 && report.sourceIntegrity === 'failed'));
+  assert.equal(await git(f.project.path, 'rev-parse', 'HEAD'), f.base);
+  f.assertNoDocker();
+});
+
+test('combined-source integrity defects cannot be hidden by a simultaneous inspection wait', async t => {
+  const f = await harness(t);
+  f.respond(async input => {
+    await writeFile(path.join(input.path, 'implementation.txt'), 'changed combined verification source\n');
+    return { command: UI_QUALITY_CHECK_COMMAND, passed: false, exitCode: 1, output: 'Native screen evidence is pending.', candidateCommit: input.candidate.commit, checkedCommit: input.checkedCommit,
+      recovery: { condition: 'inspection-evidence' as const, reason: 'Native screen evidence is pending.' } };
+  });
+  await assert.rejects(f.factory.workspacePort.integrate(f.project, f.candidate, { checks: [UI_QUALITY_CHECK_COMMAND], isCurrent: () => true, verification: f.verification }),
+    (error: unknown) => error instanceof FactoryOperationError && error.kind === 'checks-failed');
+  assert.equal(await git(f.project.path, 'rev-parse', 'HEAD'), f.base);
+  assert.ok((await f.reports()).every(report => report.sourceIntegrity === 'failed'));
+  f.assertNoDocker();
+});
+
 test('successful commands with uncertain cleanup expose the actual failure without claiming source changed', async t => {
   const f = await harness(t), cleanup = 'Host check process inventory is unavailable after 2 probes: killed=true';
   const report: CheckReport = {
