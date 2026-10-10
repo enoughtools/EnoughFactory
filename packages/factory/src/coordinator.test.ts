@@ -4,7 +4,7 @@ import test from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
 import type { Attempt, Decision, Device, FactoryTask, Goal, Project } from "@enoughfactory/contracts";
 import { FactoryCoordinator } from "./coordinator.js";
-import { FactoryControllerError, FactoryVerificationWaitError } from "./errors.js";
+import { FactoryCapacityError, FactoryControllerError, FactoryVerificationWaitError } from "./errors.js";
 import { readPlan } from "./protocol.js";
 import { CONTROLLER_PROMPT_LIMIT, controllerTaskContract, controllerAttemptContract } from "./controller-evidence.js";
 import type {
@@ -1663,6 +1663,141 @@ test("localized planning retries preserve their scope while independent work com
   assert.equal(after.wakeAt, undefined);
 });
 
+test("saved review candidates wait for fresh disk admission without rewriting or repeating their author", async () => {
+  let diskAvailable = true;
+  const factory = harness([device], undefined, () => diskAvailable ? undefined : { condition: "host-disk-space", reason: "More host disk space is required." });
+  const goal = await finishTask(factory);
+  const task = factory.store.list<FactoryTask>("tasks")[0]!, attempt = factory.store.list<Attempt>("attempts")[0]!;
+  const retained: AttemptDetail = { ...factory.store.get<AttemptDetail>("factory-attempt-details", attempt.id)!, phase: "checking", checks: undefined, integration: undefined };
+  factory.store.set("factory-attempt-details", retained);
+  factory.store.set("tasks", { ...task, status: "review" as const });
+  const review = factory.store.get<FactoryTask>("tasks", task.id)!;
+  diskAvailable = false;
+  for (let index = 0; index < 3; index++) { await factory.coordinator.tick(); await factory.coordinator.waitForIdle(); }
+  assert.equal(factory.calls.check, 1, "General disk admission blocks recovery before another check snapshot is allocated.");
+  assert.equal(factory.calls.execute, 1); assert.equal(factory.calls.capture, 1);
+  assert.deepEqual(factory.store.get<FactoryTask>("tasks", task.id), review, "A stable disk wait does not repeatedly rewrite task progress.");
+  assert.deepEqual(factory.store.get<Attempt>("attempts", attempt.id), attempt);
+  assert.deepEqual(factory.store.get<AttemptDetail>("factory-attempt-details", attempt.id), retained);
+  assert.equal(factory.store.get<Goal>("goals", goal.id)!.status, "waiting");
+  diskAvailable = true;
+  await factory.coordinator.tick(); await factory.coordinator.waitForIdle();
+  assert.equal(factory.calls.check, 2);
+  assert.equal(factory.calls.execute, 1); assert.equal(factory.calls.capture, 1);
+  assert.equal(factory.store.get<FactoryTask>("tasks", task.id)!.currentAttemptId, attempt.id);
+  assert.equal(factory.store.get<FactoryTask>("tasks", task.id)!.status, "completed");
+});
+
+test("exact-candidate capacity races park successful verification durably and yield before retrying", async t => {
+  let at = Date.parse("2026-10-06T00:00:00Z"), checkAvailable = false;
+  // General preparation admission passes, but the exact candidate reservation
+  // needs more room. Bound the broken implementation's loop so this regression
+  // fails promptly instead of starving the test runner indefinitely.
+  const factory = harness([device], () => new Date(at), () => undefined);
+  factory.beforeCheck(async () => {
+    if (!checkAvailable && factory.calls.check < 4) throw new FactoryCapacityError("This candidate needs more host disk space.");
+  });
+  const goal = await planGoal(factory);
+  await factory.coordinator.tick(); await factory.coordinator.waitForIdle();
+  const task = factory.store.list<FactoryTask>("tasks")[0]!, attempt = factory.store.list<Attempt>("attempts")[0]!;
+  const original = factory.store.get<AttemptDetail>("factory-attempt-details", attempt.id)!;
+  const history: NonNullable<AttemptDetail["checkRecoveryHistory"]> = [{ at: goal.createdAt, automatic: false,
+    checks: [{ command: "original-check", passed: false, output: "Original failure remains recorded", candidateCommit: original.candidate!.commit }],
+    error: "Original verification failed", evidenceIds: ["original-evidence"] }];
+  factory.store.set("factory-attempt-details", { ...original, checkRecoveryHistory: history });
+  await factory.coordinator.start(); t.after(() => factory.coordinator.stop());
+  await delay(0); await factory.coordinator.waitForIdle();
+  assert.equal(factory.calls.check, 1, "Completed operations must yield without immediately scheduling the same rejected reservation.");
+  for (let index = 0; index < 3; index++) { await factory.coordinator.tick(); await factory.coordinator.waitForIdle(); }
+  assert.equal(factory.calls.check, 1);
+  assert.equal(factory.store.get<Attempt>("attempts", attempt.id)!.status, "succeeded", "Waiting for space does not invent an unknown or failed author outcome.");
+  assert.equal(factory.store.get<FactoryTask>("tasks", task.id)!.status, "review");
+  assert.equal(factory.store.get<Goal>("goals", goal.id)!.status, "waiting", "Smaller general admission cannot claim progress while the exact check is parked.");
+  assert.equal(factory.store.get<Goal>("goals", goal.id)!.nextAction, "This candidate needs more host disk space.");
+  assert.equal(Date.parse(factory.store.get<AttemptDetail>("factory-attempt-details", attempt.id)!.recoveryObservation!.retryAt) - at, 10_000);
+  at += 10_000;
+  await factory.coordinator.tick(); await factory.coordinator.waitForIdle();
+  assert.equal(factory.calls.check, 2, "A fresh bounded observation can retry exact admission once.");
+  const waiting = factory.store.get<AttemptDetail>("factory-attempt-details", attempt.id)!;
+  assert.equal(waiting.recoveryObservation!.failures, 2);
+  assert.deepEqual(waiting.candidate, original.candidate); assert.deepEqual(waiting.workspace, original.workspace);
+  assert.deepEqual(waiting.result, original.result); assert.deepEqual(waiting.contract, original.contract);
+  assert.deepEqual(waiting.checkRecoveryHistory, history); assert.equal(waiting.checks, undefined);
+  factory.coordinator.stop();
+  const recovered = factory.recover(); t.after(() => recovered.stop());
+  await recovered.start(); await recovered.waitForIdle();
+  assert.equal(factory.calls.check, 2, "Restart retains the candidate's pending capacity observation.");
+  assert.equal(factory.store.get<Attempt>("attempts", attempt.id)!.status, "succeeded");
+  at += 9_999; checkAvailable = true;
+  await recovered.tick(); await recovered.waitForIdle(); assert.equal(factory.calls.check, 2);
+  at++;
+  await recovered.tick(); await recovered.waitForIdle();
+  assert.equal(factory.calls.check, 3); assert.equal(factory.calls.integrate, 1);
+  assert.equal(factory.calls.execute, 1); assert.equal(factory.calls.capture, 1);
+  assert.equal(factory.store.get<FactoryTask>("tasks", task.id)!.currentAttemptId, attempt.id);
+  assert.equal(factory.store.get<FactoryTask>("tasks", task.id)!.status, "completed");
+  const completed = factory.store.get<AttemptDetail>("factory-attempt-details", attempt.id)!;
+  assert.deepEqual(completed.candidate, original.candidate); assert.deepEqual(completed.checkRecoveryHistory, history);
+  assert.equal(completed.recoveryObservation, undefined);
+});
+
+test("capacity-refused integration preserves passed candidate checks and resumes after restart", async t => {
+  let at = Date.parse("2026-10-06T00:00:00Z"), integrationAvailable = false;
+  const factory = harness([device], () => new Date(at), () => undefined);
+  factory.beforeIntegrationWrite(async () => { if (!integrationAvailable) throw new FactoryCapacityError("The private integration snapshot needs more host disk space."); });
+  const goal = await planGoal(factory);
+  await factory.coordinator.tick(); await factory.coordinator.waitForIdle();
+  const attempt = factory.store.list<Attempt>("attempts")[0]!, task = factory.store.list<FactoryTask>("tasks")[0]!;
+  const saved = factory.store.get<AttemptDetail>("factory-attempt-details", attempt.id)!;
+  assert.equal(saved.phase, "integrating"); assert.ok(saved.checks?.every(check => check.passed));
+  assert.equal(factory.calls.integrate, 0, "A typed capacity refusal occurs before integration effects.");
+  const recovered = factory.recover(); t.after(() => recovered.stop());
+  await recovered.start(); await recovered.waitForIdle();
+  assert.equal(factory.store.get<Attempt>("attempts", attempt.id)!.status, "succeeded");
+  assert.equal(factory.store.get<Goal>("goals", goal.id)!.status, "waiting");
+  assert.equal(factory.calls.check, 1); assert.equal(factory.calls.reconcileIntegration, 0);
+  assert.deepEqual(factory.store.get<AttemptDetail>("factory-attempt-details", attempt.id)!.checks, saved.checks);
+  at += 10_000; integrationAvailable = true;
+  await recovered.tick(); await recovered.waitForIdle();
+  assert.equal(factory.calls.integrate, 1); assert.equal(factory.calls.check, 1);
+  assert.equal(factory.calls.execute, 1); assert.equal(factory.calls.capture, 1);
+  assert.equal(factory.store.get<FactoryTask>("tasks", task.id)!.status, "completed");
+  assert.deepEqual(factory.store.get<AttemptDetail>("factory-attempt-details", attempt.id)!.candidate, saved.candidate);
+});
+
+test("capacity-waiting saved candidates respect pause and revoked authority", async t => {
+  for (const action of ["pause", "cancel", "retire"] as const) await t.test(action, async t => {
+    let at = Date.parse("2026-10-06T00:00:00Z"), checkAvailable = false;
+    const factory = harness([device], () => new Date(at), () => undefined);
+    factory.beforeCheck(async () => { if (!checkAvailable) throw new FactoryCapacityError("This candidate needs more host disk space."); });
+    const goal = await planGoal(factory);
+    await factory.coordinator.tick(); await factory.coordinator.waitForIdle();
+    const task = factory.store.list<FactoryTask>("tasks")[0]!, attempt = factory.store.list<Attempt>("attempts")[0]!;
+    const saved = factory.store.get<AttemptDetail>("factory-attempt-details", attempt.id)!;
+    factory.coordinator.pause(goal.id);
+    if (action === "cancel") await factory.coordinator.cancel(goal.id);
+    if (action === "retire") await factory.coordinator.retireAttempt(attempt.id);
+    at += 30_000; checkAvailable = true;
+    await factory.coordinator.start(); t.after(() => factory.coordinator.stop());
+    await factory.coordinator.waitForIdle();
+    await factory.coordinator.tick(); await factory.coordinator.waitForIdle();
+    assert.equal(factory.calls.check, 1, "Expired capacity observations do not start checks under paused or revoked authority.");
+    assert.equal(factory.calls.integrate, 0); assert.equal(factory.calls.execute, 1); assert.equal(factory.calls.capture, 1);
+    const retained = factory.store.get<AttemptDetail>("factory-attempt-details", attempt.id)!;
+    assert.deepEqual(retained.candidate, saved.candidate); assert.deepEqual(retained.workspace, saved.workspace);
+    assert.deepEqual(retained.result, saved.result); assert.deepEqual(retained.contract, saved.contract);
+    if (action === "pause") {
+      assert.equal(factory.store.get<Goal>("goals", goal.id)!.status, "paused");
+      factory.coordinator.resume(goal.id); await factory.coordinator.tick(); await factory.coordinator.waitForIdle();
+      assert.equal(factory.calls.check, 2); assert.equal(factory.calls.integrate, 1);
+      assert.equal(factory.calls.execute, 1); assert.equal(factory.calls.capture, 1);
+      assert.equal(factory.store.get<FactoryTask>("tasks", task.id)!.currentAttemptId, attempt.id);
+    } else {
+      assert.equal(factory.store.get<FactoryTask>("tasks", task.id)!.status, action === "cancel" ? "canceled" : "queued");
+    }
+  });
+});
+
 test("localized disk waits resume their controller from fresh admission while preserving independent work", async t => {
   for (const blockedBeforeRecovery of [false, true]) await t.test(blockedBeforeRecovery ? "capacity remains blocked before recovery" : "capacity recovered before the next tick", async () => {
     let diskAvailable = true;
@@ -2305,6 +2440,34 @@ test("retained verification recovery holds a paused goal until saved verificatio
     assert.equal(factory.store.get<FactoryTask>("tasks", independent.id)!.status, "completed", "Normal dispatch resumes after the verification reservation ends");
     assert.equal(factory.store.list<Attempt>("attempts").filter(item => item.taskId === task.id).length, 1, "The saved source still has its original author only");
   });
+});
+
+test("paused exact verification recheck releases its ownership into a visible capacity wait", async () => {
+  const { factory, goal, task, attempt, detail, expected, outcome } = await retainedVerificationFailure();
+  factory.coordinator.pause(goal.id); outcome("pass");
+  let available = false;
+  factory.beforeCheck(async () => { if (!available) throw new FactoryCapacityError("The exact retained candidate needs more host disk space."); });
+  await factory.coordinator.recheckAttempt(attempt.id, expected); await factory.coordinator.waitForIdle();
+  assert.deepEqual(factory.coordinator.serviceActivity(), { controllers: 0, attempts: 0, reconciliation: 0, pending: 0 });
+  const waiting = factory.store.get<AttemptDetail>("factory-attempt-details", attempt.id)!;
+  assert.equal(factory.store.get<Goal>("goals", goal.id)!.status, "waiting");
+  assert.equal(factory.store.get<Goal>("goals", goal.id)!.nextAction, "The exact retained candidate needs more host disk space.");
+  assert.equal(factory.store.get<FactoryTask>("tasks", task.id)!.status, "review");
+  assert.equal(factory.store.get<Attempt>("attempts", attempt.id)!.status, "succeeded");
+  assert.deepEqual(waiting.checkRecoveryHistory![0]!.checks, detail.checks);
+  assert.deepEqual(waiting.candidate, detail.candidate); assert.deepEqual(waiting.contract, detail.contract);
+  for (let index = 0; index < 3; index++) { await factory.coordinator.tick(); await factory.coordinator.waitForIdle(); }
+  assert.equal(factory.calls.check, 2, "The retained recheck does not retry its disk refusal through ordinary progress ticks.");
+  factory.coordinator.pause(goal.id);
+  available = true;
+  await factory.coordinator.tick(); await factory.coordinator.waitForIdle();
+  assert.equal(factory.calls.check, 2, "Pause continues to prohibit check recovery after the explicit operation ends.");
+  factory.coordinator.resume(goal.id);
+  await factory.coordinator.tick(); await factory.coordinator.waitForIdle();
+  assert.equal(factory.calls.check, 3); assert.equal(factory.calls.integrate, 1);
+  assert.equal(factory.calls.execute, 1); assert.equal(factory.calls.capture, 1);
+  assert.equal(factory.store.get<FactoryTask>("tasks", task.id)!.status, "completed");
+  assert.deepEqual(factory.store.get<AttemptDetail>("factory-attempt-details", attempt.id)!.checkRecoveryHistory, waiting.checkRecoveryHistory);
 });
 
 test("goal configuration preserves explicit pause across budget, runtime and execution waits while waking active waiting goals", async t => {

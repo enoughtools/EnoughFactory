@@ -92,7 +92,9 @@ export class FactoryCoordinator {
         }
         for (const attempt of this.attempts(goal.id).filter(item => this.isCurrent(item) && (activeAttempts.has(item.status) || (item.status === "succeeded" && this.task(item.taskId).status === "review")))) {
           const detail = this.attemptDetail(attempt.id);
-          if (detail.capacityWait || (attempt.status === "succeeded" && detail.verificationWait && detail.candidate && detail.phase === "checking")) continue;
+          if (detail.capacityWait || (attempt.status === "succeeded" && detail.candidate &&
+            ((detail.verificationWait && detail.phase === "checking") ||
+              (detail.recoveryObservation?.phase === detail.phase && ["checking", "integrating"].includes(detail.phase))))) continue;
           this.options.store.set(TABLE.attempts, { ...attempt, status: "unknown" as const });
           this.decision(goal.id, "attempt-recovered", "Execution status is unknown after service recovery; reconcile with its owner before continuing.", { attemptId: attempt.id });
         }
@@ -160,7 +162,7 @@ export class FactoryCoordinator {
           current = this.goal(goal.id); control = this.control(goal.id);
         }
         // A localized controller can also keep the goal running while disk waits.
-        if (control.waitingFor === "host-disk-space" && this.options.admission && !this.options.admission(current)) {
+        if (control.waitingFor === "host-disk-space" && !this.verificationRetryDeferred(current.id) && this.options.admission && !this.options.admission(current)) {
           this.wake(current.id, "Host disk space is available; continuing work.");
           current = this.goal(goal.id); control = this.control(goal.id);
         }
@@ -426,7 +428,17 @@ export class FactoryCoordinator {
       });
       this.track(this.processResult(this.attempt(attemptId), current.detail.result!).finally(() => {
         this.busyAttempts.delete(attemptId);
-        if (holdGoal) { this.busyGoals.delete(original.goal.id); this.changed(); }
+        if (holdGoal) {
+          this.busyGoals.delete(original.goal.id);
+          const attempt = this.attempt(attemptId), detail = this.attemptDetail(attemptId);
+          // A paused explicit recheck holds the goal while checking. Its capacity
+          // refusal becomes a normal durable wait once that reservation ends.
+          if (attempt.status === "succeeded" && this.isCurrent(attempt) && detail.recoveryObservation?.phase === detail.phase &&
+            ["checking", "integrating"].includes(detail.phase) && Date.parse(detail.recoveryObservation.retryAt) > Date.parse(this.now())) {
+            this.capacityWait(original.goal.id, detail.recoveryObservation.reason);
+          }
+          this.changed();
+        }
       }));
       scheduled = true;
     } finally { if (!scheduled || !holdGoal) this.busyGoals.delete(original.goal.id); if (!scheduled) this.busyAttempts.delete(attemptId); }
@@ -580,11 +592,27 @@ export class FactoryCoordinator {
       // Unknown capture/integration effects use the bounded reconciliation lane.
       // Scheduling them here bypasses that lane and creates a microtask retry loop.
       if (attempt.status !== "succeeded") continue;
-      if (this.attemptDetail(attempt.id).verificationWait) continue;
-      if (goal.status === "paused" && this.attemptDetail(attempt.id).candidate) continue;
+      const detail = this.attemptDetail(attempt.id);
+      if (detail.verificationWait) continue;
+      if (goal.status === "paused" && detail.candidate) continue;
+      if (detail.recoveryObservation?.phase === detail.phase && Date.parse(detail.recoveryObservation.retryAt) > Date.parse(this.now())) continue;
+      // Recovery runs before the goal's waiting-state gate. A saved author must
+      // still pass fresh preparation admission before retrying its checks.
+      if (detail.candidate && ["checking", "integrating"].includes(detail.phase) && !this.admit(goal.id)) continue;
       this.busyAttempts.add(attempt.id);
-      this.track(this.processResult(attempt, this.attemptDetail(attempt.id).result ?? { status: "succeeded", text: "Recovered retained candidate." }).finally(() => this.busyAttempts.delete(attempt.id)));
+      this.track(this.processResult(attempt, detail.result ?? { status: "succeeded", text: "Recovered retained candidate." }).finally(() => this.busyAttempts.delete(attempt.id)));
     }
+  }
+
+  private verificationRetryDeferred(goalId: string): boolean {
+    const at = Date.parse(this.now());
+    return this.tasks(goalId).some(task => {
+      if (task.status !== "review" || !task.currentAttemptId) return false;
+      const attempt = this.attempt(task.currentAttemptId), detail = this.attemptDetail(attempt.id);
+      return attempt.status === "succeeded" && this.isCurrent(attempt) && !!detail.candidate &&
+        ["checking", "integrating"].includes(detail.phase) && detail.recoveryObservation?.phase === detail.phase &&
+        Date.parse(detail.recoveryObservation.retryAt) > at;
+    });
   }
 
   private dispatch(goal: Goal, manageController = true): void {
@@ -789,6 +817,15 @@ export class FactoryCoordinator {
           this.writeTask(task.id, { status: "review" });
           this.decision(goal.id, receiptArrived ? "verification-recheck" : "verification-waiting", receiptArrived ? "Inspection evidence changed while the check returned; recheck this retained source once." : error.message, { taskId: task.id, attemptId: attempt.id, candidateId: retained.candidate?.id });
         } else if (error instanceof FactoryCapacityError) {
+          const retained = this.attemptDetail(attempt.id);
+          // The exact check reservation can exceed general admission, or free
+          // space can change between them. Persist a bounded observation so
+          // changed()/track() cannot immediately retry this successful author
+          // through an endless microtask loop. This is not a failed verdict.
+          this.options.store.set(TABLE.attemptDetails, { ...retained, recoveryObservation: {
+            phase: retained.phase, reason: error.message, retryAt: new Date(Date.parse(this.now()) + 10_000).toISOString(),
+            failures: (retained.recoveryObservation?.phase === retained.phase ? retained.recoveryObservation.failures : 0) + 1,
+          } });
           this.writeTask(task.id, { status: "review" });
           this.capacityWait(goal.id, error.message);
         } else if (this.goal(goal.id).status === "paused") {
