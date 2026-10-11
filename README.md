@@ -1,5 +1,7 @@
 # EnoughFactory
 
+**Project status (11 October 2026): suspended.** Factory is considered a failed project for now. The latest development source is retained on `codex/runtime-recovery-20261007`; the local app, private runtime and generated storage are being retired. The descriptions below record the intended product and do not establish that it is ready for use. See [the retirement record](docs/retirement-2026-10-11.md).
+
 **Your devices. One software factory.**
 
 EnoughFactory brings isolated development environments, agent conversations and autonomous goals into one desktop workspace. Run it on your Mac and Linux machines, connect the devices you own, and give the factory an outcome to work toward.
